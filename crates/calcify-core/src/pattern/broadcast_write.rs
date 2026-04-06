@@ -21,6 +21,13 @@ pub struct BroadcastWrite {
     /// Key: the integer address that each variable checks against.
     /// Value: the variable name that should be written to.
     pub address_map: HashMap<i64, String>,
+    /// Word-write spillover: when `isWordWrite == 1` and dest is address N,
+    /// also write the high byte to address N+1.
+    /// Key: the address being tested (N-1 in the condition).
+    /// Value: (target_var_name, value_expr for the high byte).
+    pub spillover_map: HashMap<i64, (String, Expr)>,
+    /// The property that gates spillover writes (e.g., `--isWordWrite`).
+    pub spillover_guard: Option<String>,
 }
 
 /// Result of broadcast pattern recognition.
@@ -40,19 +47,42 @@ pub struct BroadcastResult {
 /// pure `--addrDest*` checks are absorbed; register assignments that mix in
 /// execution logic (e.g. `--addrJump`) are left in the normal assignment loop.
 pub fn recognise_broadcast(assignments: &[Assignment]) -> BroadcastResult {
-    // Group by dest_property → (address, target_var_name, value_expr)
-    let mut groups: HashMap<String, Vec<(i64, String, Expr)>> = HashMap::new();
+    // Group direct ports by dest_property → (address, target_var_name, value_expr)
+    let mut direct_groups: HashMap<String, Vec<(i64, String, Expr)>> = HashMap::new();
+    // Group spillover ports by dest_property → (source_address, target_var_name, guard_property, value_expr)
+    let mut spillover_groups: HashMap<String, Vec<(i64, String, String, Expr)>> = HashMap::new();
     let mut pure_broadcast: HashSet<String> = HashSet::new();
 
     for assignment in assignments {
         if let Some(ports) = extract_broadcast_ports(assignment) {
             pure_broadcast.insert(assignment.property.clone());
-            for (dest_prop, addr, val_expr) in ports {
-                groups.entry(dest_prop).or_default().push((
-                    addr,
-                    assignment.property.clone(),
-                    val_expr,
-                ));
+            for port in ports {
+                match port {
+                    BroadcastPort::Direct {
+                        dest_property,
+                        address,
+                        value_expr,
+                    } => {
+                        direct_groups.entry(dest_property).or_default().push((
+                            address,
+                            assignment.property.clone(),
+                            value_expr,
+                        ));
+                    }
+                    BroadcastPort::Spillover {
+                        dest_property,
+                        source_address,
+                        guard_property,
+                        value_expr,
+                    } => {
+                        spillover_groups.entry(dest_property).or_default().push((
+                            source_address,
+                            assignment.property.clone(),
+                            guard_property,
+                            value_expr,
+                        ));
+                    }
+                }
             }
         }
     }
@@ -60,7 +90,7 @@ pub fn recognise_broadcast(assignments: &[Assignment]) -> BroadcastResult {
     let mut absorbed_properties = HashSet::new();
 
     // Only keep groups that are large enough to be a real broadcast pattern
-    let writes = groups
+    let writes = direct_groups
         .into_iter()
         .filter(|(_, entries)| entries.len() >= 10)
         .map(|(dest_property, entries)| {
@@ -75,10 +105,26 @@ pub fn recognise_broadcast(assignments: &[Assignment]) -> BroadcastResult {
                 .into_iter()
                 .map(|(addr, name, _)| (addr, name))
                 .collect();
+
+            // Build spillover map for this dest_property
+            let spillovers = spillover_groups.remove(&dest_property);
+            let (spillover_map, spillover_guard) = if let Some(spills) = spillovers {
+                let guard = spills.first().map(|(_, _, g, _)| g.clone());
+                let map = spills
+                    .into_iter()
+                    .map(|(src_addr, var_name, _, val_expr)| (src_addr, (var_name, val_expr)))
+                    .collect();
+                (map, guard)
+            } else {
+                (HashMap::new(), None)
+            };
+
             BroadcastWrite {
                 dest_property,
                 value_expr,
                 address_map,
+                spillover_map,
+                spillover_guard,
             }
         })
         .collect();
@@ -92,13 +138,32 @@ pub fn recognise_broadcast(assignments: &[Assignment]) -> BroadcastResult {
     }
 }
 
+/// A port extracted from a broadcast write assignment.
+#[derive(Debug)]
+enum BroadcastPort {
+    /// Direct write: `style(--addrDestX: ADDR) → value`
+    Direct {
+        dest_property: String,
+        address: i64,
+        value_expr: Expr,
+    },
+    /// Spillover write: `style(--addrDestX: ADDR) and style(--isWordWrite: 1) → value`
+    /// The address is the *source* address (N-1); the target cell is at N.
+    Spillover {
+        dest_property: String,
+        source_address: i64,
+        guard_property: String,
+        value_expr: Expr,
+    },
+}
+
 /// Extract all broadcast write ports from an assignment.
 ///
 /// Returns `None` if any branch tests a non-`--addrDest*` property (meaning
 /// the assignment has execution logic mixed in and is not a pure broadcast target).
 ///
-/// Returns `Some(vec of (dest_property, address, value_expr))` — one per branch.
-fn extract_broadcast_ports(assignment: &Assignment) -> Option<Vec<(String, i64, Expr)>> {
+/// Returns `Some(vec of BroadcastPort)` — one per branch.
+fn extract_broadcast_ports(assignment: &Assignment) -> Option<Vec<BroadcastPort>> {
     match &assignment.value {
         Expr::StyleCondition { branches, .. } => {
             let mut ports = Vec::with_capacity(branches.len());
@@ -110,7 +175,42 @@ fn extract_broadcast_ports(assignment: &Assignment) -> Option<Vec<(String, i64, 
                         }
                         match value {
                             Expr::Literal(v) => {
-                                ports.push((property.clone(), *v as i64, branch.then.clone()));
+                                ports.push(BroadcastPort::Direct {
+                                    dest_property: property.clone(),
+                                    address: *v as i64,
+                                    value_expr: branch.then.clone(),
+                                });
+                            }
+                            _ => return None,
+                        }
+                    }
+                    StyleTest::And(tests) if tests.len() == 2 => {
+                        // Match: style(--addrDestX: N) and style(--isWordWrite: 1)
+                        let (mut addr_test, mut guard_test) = (None, None);
+                        for t in tests {
+                            if let StyleTest::Single { property, value } = t {
+                                if property.starts_with("--addrDest") {
+                                    if let Expr::Literal(v) = value {
+                                        addr_test = Some((property.clone(), *v as i64));
+                                    }
+                                } else {
+                                    // Guard condition (e.g., --isWordWrite: 1)
+                                    if let Expr::Literal(v) = value {
+                                        if *v as i64 == 1 {
+                                            guard_test = Some(property.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        match (addr_test, guard_test) {
+                            (Some((dest_property, source_address)), Some(guard_property)) => {
+                                ports.push(BroadcastPort::Spillover {
+                                    dest_property,
+                                    source_address,
+                                    guard_property,
+                                    value_expr: branch.then.clone(),
+                                });
                             }
                             _ => return None,
                         }
@@ -154,6 +254,60 @@ mod tests {
         }
     }
 
+    /// Build a compound memory cell assignment matching the x86CSS pattern:
+    /// `--mN: if(style(--addrDestA:N):val1; style(--addrDestA:N-1) and style(--isWordWrite:1):val2; style(--addrDestB:N):valB; else:keep)`
+    fn make_compound_broadcast_assignment(name: &str, addr: i64) -> Assignment {
+        let mut branches = vec![StyleBranch {
+            condition: StyleTest::Single {
+                property: "--addrDestA".to_string(),
+                value: Expr::Literal(addr as f64),
+            },
+            then: Expr::Var {
+                name: "--addrValA1".to_string(),
+                fallback: None,
+            },
+        }];
+        // Spillover branch: only for addr > 0
+        if addr > 0 {
+            branches.push(StyleBranch {
+                condition: StyleTest::And(vec![
+                    StyleTest::Single {
+                        property: "--addrDestA".to_string(),
+                        value: Expr::Literal((addr - 1) as f64),
+                    },
+                    StyleTest::Single {
+                        property: "--isWordWrite".to_string(),
+                        value: Expr::Literal(1.0),
+                    },
+                ]),
+                then: Expr::Var {
+                    name: "--addrValA2".to_string(),
+                    fallback: None,
+                },
+            });
+        }
+        branches.push(StyleBranch {
+            condition: StyleTest::Single {
+                property: "--addrDestB".to_string(),
+                value: Expr::Literal(addr as f64),
+            },
+            then: Expr::Var {
+                name: "--addrValB".to_string(),
+                fallback: None,
+            },
+        });
+        Assignment {
+            property: format!("--{name}"),
+            value: Expr::StyleCondition {
+                branches,
+                fallback: Box::new(Expr::Var {
+                    name: format!("--__1{name}"),
+                    fallback: None,
+                }),
+            },
+        }
+    }
+
     #[test]
     fn recognises_broadcast_pattern() {
         let assignments: Vec<_> = (0..20)
@@ -178,5 +332,43 @@ mod tests {
         let result = recognise_broadcast(&assignments);
         assert!(result.writes.is_empty());
         assert!(result.absorbed_properties.is_empty());
+    }
+
+    #[test]
+    fn recognises_compound_broadcast_with_spillover() {
+        let assignments: Vec<_> = (0..20)
+            .map(|i| make_compound_broadcast_assignment(&format!("m{i}"), i))
+            .collect();
+
+        let result = recognise_broadcast(&assignments);
+        // Should have writes for both --addrDestA and --addrDestB
+        assert_eq!(result.writes.len(), 2);
+
+        let port_a = result
+            .writes
+            .iter()
+            .find(|w| w.dest_property == "--addrDestA")
+            .expect("should have port A");
+        let port_b = result
+            .writes
+            .iter()
+            .find(|w| w.dest_property == "--addrDestB")
+            .expect("should have port B");
+
+        assert_eq!(port_a.address_map.len(), 20);
+        assert_eq!(port_b.address_map.len(), 20);
+
+        // Port A should have spillover entries (19 — all except m0)
+        assert_eq!(port_a.spillover_map.len(), 19);
+        assert_eq!(port_a.spillover_guard, Some("--isWordWrite".to_string()));
+        // Spillover at source address 0 targets --m1
+        let (var_name, _) = port_a.spillover_map.get(&0).unwrap();
+        assert_eq!(var_name, "--m1");
+
+        // Port B should have no spillover
+        assert!(port_b.spillover_map.is_empty());
+
+        // All 20 should be absorbed
+        assert_eq!(result.absorbed_properties.len(), 20);
     }
 }

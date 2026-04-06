@@ -71,21 +71,36 @@ impl Evaluator {
             );
         }
 
-        // Filter out assignments absorbed into broadcast writes —
-        // they must not execute in the normal loop or they'll overwrite
-        // the broadcast result with stale "keep" values.
+        // Filter out:
+        // 1. Assignments absorbed into broadcast writes (would overwrite with stale values)
+        // 2. Triple-buffer copies (--__0*, --__1*, --__2*) which are no-ops in mutable state
         let assignments: Vec<Assignment> = program
             .assignments
             .iter()
-            .filter(|a| !broadcast_result.absorbed_properties.contains(&a.property))
+            .filter(|a| {
+                !broadcast_result.absorbed_properties.contains(&a.property)
+                    && !is_buffer_copy(&a.property)
+            })
             .cloned()
             .collect();
 
+        let buffer_copies = program
+            .assignments
+            .iter()
+            .filter(|a| is_buffer_copy(&a.property))
+            .count();
+
         log::info!(
-            "Assignments: {} kept, {} absorbed into broadcast writes",
+            "Assignments: {} kept, {} absorbed into broadcast writes, {} buffer copies skipped",
             assignments.len(),
             broadcast_result.absorbed_properties.len(),
+            buffer_copies,
         );
+        if log::log_enabled!(log::Level::Debug) {
+            for a in &assignments {
+                log::debug!("  kept: {}", a.property);
+            }
+        }
 
         Evaluator {
             functions,
@@ -97,7 +112,11 @@ impl Evaluator {
 
     /// Run a single tick: evaluate all assignments against the state.
     pub fn tick(&self, state: &mut State) -> TickResult {
-        let mut env = EvalEnv::new(&self.functions, &self.dispatch_tables);
+        let mut env = EvalEnv::new(
+            &self.functions,
+            &self.dispatch_tables,
+            self.assignments.len(),
+        );
 
         // Execute all assignments in declaration order
         for assignment in &self.assignments {
@@ -106,14 +125,29 @@ impl Evaluator {
             env.properties.insert(assignment.property.clone(), value);
         }
 
-        // Apply broadcast writes: O(1) HashMap lookup per write
+        // Apply broadcast writes: O(1) HashMap lookup per write.
+        // Writes go directly to state — no need to update env.properties since
+        // absorbed memory cells are never read by the remaining assignments
+        // (memory reads go through --readMem dispatch table which reads from state).
         for bw in &self.broadcast_writes {
             let dest = env.resolve_property(&bw.dest_property, state);
             let dest_i64 = dest as i64;
-            if let Some(var_name) = bw.address_map.get(&dest_i64) {
+            if let Some(_var_name) = bw.address_map.get(&dest_i64) {
                 let value = env.eval_expr(&bw.value_expr, state);
                 state.write_mem(dest_i64 as i32, value as i32);
-                env.properties.insert(var_name.clone(), value);
+            }
+            // Handle word-write spillover: if the guard (e.g., --isWordWrite) is set,
+            // also write the high byte to the next address (dest + 1).
+            if !bw.spillover_map.is_empty() {
+                if let Some(ref guard) = bw.spillover_guard {
+                    let guard_val = env.resolve_property(guard, state);
+                    if (guard_val as i64) == 1 {
+                        if let Some((_var_name, val_expr)) = bw.spillover_map.get(&dest_i64) {
+                            let value = env.eval_expr(val_expr, state);
+                            state.write_mem(dest_i64 as i32 + 1, value as i32);
+                        }
+                    }
+                }
             }
         }
 
@@ -171,6 +205,15 @@ impl Evaluator {
 
         changes
     }
+}
+
+/// Check if a property is a triple-buffer copy (`--__0*`, `--__1*`, `--__2*`).
+///
+/// These assignments exist for x86CSS's animation pipeline but are no-ops
+/// in calcify's mutable-state model — they just copy the canonical value
+/// to a buffer slot that resolves back to the same value via `resolve_property`.
+fn is_buffer_copy(name: &str) -> bool {
+    name.starts_with("--__0") || name.starts_with("--__1") || name.starts_with("--__2")
 }
 
 /// Strip x86CSS triple-buffer prefixes (`--__0`, `--__1`, `--__2`) from a property name.
@@ -246,11 +289,12 @@ impl<'a> EvalEnv<'a> {
     fn new(
         functions: &'a HashMap<String, FunctionDef>,
         dispatch_tables: &'a HashMap<String, DispatchTable>,
+        capacity: usize,
     ) -> Self {
         Self {
             functions,
             dispatch_tables,
-            properties: HashMap::new(),
+            properties: HashMap::with_capacity(capacity),
             call_depth: 0,
         }
     }
@@ -380,11 +424,19 @@ impl<'a> EvalEnv<'a> {
         if let Some(&v) = self.properties.get(name) {
             return v;
         }
-        // Try canonical name (strip buffer prefix) in computed properties
+        // For buffer-prefixed names (--__0X, --__1X, --__2X), try the canonical
+        // name in properties before falling back to state. Avoid allocation by
+        // checking state first (property_to_address strips the prefix internally).
         if name.starts_with("--__") && name.len() > 5 {
-            let canonical = format!("--{}", &name[5..]);
-            if let Some(&v) = self.properties.get(&canonical) {
-                return v;
+            // Check canonical name in computed properties (allocation-free via slice)
+            let suffix = &name[5..]; // e.g., "AX" from "--__1AX"
+                                     // Only allocate if the suffix could match a computed property
+                                     // In practice, buffer refs to registers resolve via property_to_address below
+            if !self.properties.is_empty() {
+                let canonical = format!("--{suffix}");
+                if let Some(&v) = self.properties.get(&canonical) {
+                    return v;
+                }
             }
         }
         if let Some(addr) = property_to_address(name) {
@@ -413,18 +465,37 @@ impl<'a> EvalEnv<'a> {
             return 0.0;
         }
 
-        // Check for a dispatch table optimisation
-        if let Some(table) = self.dispatch_tables.get(name).cloned() {
-            return self.eval_dispatch(name, &table, args, state);
+        // Check for a dispatch table optimisation.
+        // Borrow dispatch_tables via the lifetime reference to avoid cloning.
+        if let Some(table) = self.dispatch_tables.get(name) {
+            // Re-borrow to avoid holding &self across mutable calls
+            let table_key = table.key_property.clone();
+            let table_entries = &table.entries as *const HashMap<i64, Expr>;
+            let table_fallback = &table.fallback as *const Expr;
+            // SAFETY: dispatch_tables is behind &'a, the Evaluator outlives this call.
+            // We only need the pointer to avoid the borrow conflict with &mut self.
+            return unsafe {
+                self.eval_dispatch_raw(
+                    name,
+                    &table_key,
+                    &*table_entries,
+                    &*table_fallback,
+                    args,
+                    state,
+                )
+            };
         }
 
         let func = match self.functions.get(name) {
-            Some(f) => f.clone(), // Clone to avoid borrow conflict
+            Some(f) => f as *const FunctionDef,
             None => {
                 log::debug!("undefined function: {name}");
                 return 0.0;
             }
         };
+        // SAFETY: functions is behind &'a, the Evaluator outlives this call.
+        // The raw pointer avoids cloning the entire FunctionDef on every call.
+        let func = unsafe { &*func };
 
         self.call_depth += 1;
 
@@ -473,16 +544,23 @@ impl<'a> EvalEnv<'a> {
     }
 
     /// Evaluate using a dispatch table — O(1) lookup.
-    fn eval_dispatch(
+    /// Uses raw references to avoid cloning the dispatch table and function def.
+    ///
+    /// SAFETY: The caller must ensure `entries` and `fallback` pointers are valid
+    /// for the duration of the call. In practice they point into &'a data.
+    unsafe fn eval_dispatch_raw(
         &mut self,
         name: &str,
-        table: &DispatchTable,
+        key_property: &str,
+        entries: &HashMap<i64, Expr>,
+        fallback: &Expr,
         args: &[Expr],
         state: &State,
     ) -> f64 {
         // Bind function parameters first — the key property may be a parameter
-        let func = self.functions.get(name).cloned();
-        let old_props: Vec<(String, Option<f64>)> = if let Some(ref func) = func {
+        let func = self.functions.get(name).map(|f| f as *const FunctionDef);
+        let old_props: Vec<(String, Option<f64>)> = if let Some(func_ptr) = func {
+            let func = &*func_ptr;
             func.parameters
                 .iter()
                 .enumerate()
@@ -498,12 +576,12 @@ impl<'a> EvalEnv<'a> {
         };
 
         // Resolve the dispatch key after parameter binding
-        let key = self.resolve_property(&table.key_property, state) as i64;
+        let key = self.resolve_property(key_property, state) as i64;
 
-        let result = if let Some(result_expr) = table.entries.get(&key) {
+        let result = if let Some(result_expr) = entries.get(&key) {
             self.eval_expr(result_expr, state)
         } else {
-            self.eval_expr(&table.fallback, state)
+            self.eval_expr(fallback, state)
         };
 
         // Restore parameter bindings
@@ -531,7 +609,7 @@ mod tests {
     fn eval_literal() {
         let functions = HashMap::new();
         let dispatch = HashMap::new();
-        let mut env = EvalEnv::new(&functions, &dispatch);
+        let mut env = EvalEnv::new(&functions, &dispatch, 16);
         let state = State::default();
 
         assert_eq!(env.eval_expr(&Expr::Literal(42.0), &state), 42.0);
@@ -541,7 +619,7 @@ mod tests {
     fn eval_calc_operations() {
         let functions = HashMap::new();
         let dispatch = HashMap::new();
-        let mut env = EvalEnv::new(&functions, &dispatch);
+        let mut env = EvalEnv::new(&functions, &dispatch, 16);
         let state = State::default();
 
         let expr = Expr::Calc(CalcOp::Add(
@@ -567,7 +645,7 @@ mod tests {
     fn eval_var_from_state() {
         let functions = HashMap::new();
         let dispatch = HashMap::new();
-        let mut env = EvalEnv::new(&functions, &dispatch);
+        let mut env = EvalEnv::new(&functions, &dispatch, 16);
         let mut state = State::default();
         state.registers[state::reg::AX] = 0x1234;
 
@@ -582,7 +660,7 @@ mod tests {
     fn eval_var_fallback() {
         let functions = HashMap::new();
         let dispatch = HashMap::new();
-        let mut env = EvalEnv::new(&functions, &dispatch);
+        let mut env = EvalEnv::new(&functions, &dispatch, 16);
         let state = State::default();
 
         let expr = Expr::Var {
@@ -596,7 +674,7 @@ mod tests {
     fn eval_style_condition() {
         let functions = HashMap::new();
         let dispatch = HashMap::new();
-        let mut env = EvalEnv::new(&functions, &dispatch);
+        let mut env = EvalEnv::new(&functions, &dispatch, 16);
         let mut state = State::default();
         state.registers[state::reg::AX] = 2;
 
@@ -627,7 +705,7 @@ mod tests {
     fn eval_round() {
         let functions = HashMap::new();
         let dispatch = HashMap::new();
-        let mut env = EvalEnv::new(&functions, &dispatch);
+        let mut env = EvalEnv::new(&functions, &dispatch, 16);
         let state = State::default();
 
         let expr = Expr::Calc(CalcOp::Round(
@@ -661,7 +739,7 @@ mod tests {
         );
 
         let dispatch = HashMap::new();
-        let mut env = EvalEnv::new(&functions, &dispatch);
+        let mut env = EvalEnv::new(&functions, &dispatch, 16);
         let state = State::default();
 
         let expr = Expr::FunctionCall {
@@ -706,7 +784,7 @@ mod tests {
             },
         );
 
-        let mut env = EvalEnv::new(&functions, &dispatch);
+        let mut env = EvalEnv::new(&functions, &dispatch, 16);
         let state = State::default();
 
         // Look up key=42 → should return 999.0
