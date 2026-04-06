@@ -349,7 +349,7 @@ impl Evaluator {
                 if let Some(fb) = fallback {
                     return self.eval_expr(fb, state);
                 }
-                log::warn!("undefined variable: {name}");
+                log::debug!("undefined variable: {name}");
                 0.0
             }
 
@@ -501,7 +501,7 @@ impl Evaluator {
         let func = match self.functions.get(name) {
             Some(f) => f as *const FunctionDef,
             None => {
-                log::warn!("undefined function: {name}");
+                log::debug!("undefined function: {name}");
                 return 0.0;
             }
         };

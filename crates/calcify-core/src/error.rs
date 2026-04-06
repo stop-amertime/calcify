@@ -21,4 +21,11 @@ pub enum CalcifyError {
 
     #[error("pattern recognition error: {0}")]
     Pattern(String),
+
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[cfg(feature = "conformance")]
+    #[error("serialization error: {0}")]
+    Serde(#[from] serde_json::Error),
 }

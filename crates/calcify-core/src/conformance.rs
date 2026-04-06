@@ -233,17 +233,16 @@ pub struct ConformanceTrace {
 
 impl ConformanceTrace {
     /// Load a trace from a JSON file.
-    pub fn load(path: &str) -> Result<Self, String> {
-        let content =
-            std::fs::read_to_string(path).map_err(|e| format!("failed to read {path}: {e}"))?;
-        serde_json::from_str(&content).map_err(|e| format!("failed to parse {path}: {e}"))
+    pub fn load(path: &str) -> crate::Result<Self> {
+        let content = std::fs::read_to_string(path)?;
+        Ok(serde_json::from_str(&content)?)
     }
 
     /// Save a trace to a JSON file.
-    pub fn save(&self, path: &str) -> Result<(), String> {
-        let content =
-            serde_json::to_string_pretty(self).map_err(|e| format!("failed to serialize: {e}"))?;
-        std::fs::write(path, content).map_err(|e| format!("failed to write {path}: {e}"))
+    pub fn save(&self, path: &str) -> crate::Result<()> {
+        let content = serde_json::to_string_pretty(self)?;
+        std::fs::write(path, content)?;
+        Ok(())
     }
 }
 
