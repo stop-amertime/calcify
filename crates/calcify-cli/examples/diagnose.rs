@@ -2,8 +2,8 @@ use std::fs;
 
 fn main() {
     env_logger::init();
-    let css = fs::read_to_string("tests/fixtures/x86css-computational.css")
-        .expect("should read CSS file");
+    let css = fs::read_to_string("tests/fixtures/x86css-main.css")
+        .expect("should read tests/fixtures/x86css-main.css");
 
     println!(
         "CSS size: {} bytes, {} lines",

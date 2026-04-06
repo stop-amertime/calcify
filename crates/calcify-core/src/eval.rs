@@ -847,4 +847,133 @@ mod tests {
         assert_eq!(parse_mem_address("abc"), None);
         assert_eq!(parse_mem_address("12x"), None);
     }
+
+    #[test]
+    fn eval_division_by_zero() {
+        let mut eval = test_evaluator(HashMap::new(), HashMap::new());
+        let state = State::default();
+
+        let expr = Expr::Calc(CalcOp::Div(
+            Box::new(Expr::Literal(100.0)),
+            Box::new(Expr::Literal(0.0)),
+        ));
+        assert_eq!(eval.eval_expr(&expr, &state), 0.0);
+    }
+
+    #[test]
+    fn eval_mod_by_zero() {
+        let mut eval = test_evaluator(HashMap::new(), HashMap::new());
+        let state = State::default();
+
+        let expr = Expr::Calc(CalcOp::Mod(
+            Box::new(Expr::Literal(17.0)),
+            Box::new(Expr::Literal(0.0)),
+        ));
+        assert_eq!(eval.eval_expr(&expr, &state), 0.0);
+    }
+
+    #[test]
+    fn eval_negate() {
+        let mut eval = test_evaluator(HashMap::new(), HashMap::new());
+        let state = State::default();
+
+        let expr = Expr::Calc(CalcOp::Negate(Box::new(Expr::Literal(42.0))));
+        assert_eq!(eval.eval_expr(&expr, &state), -42.0);
+
+        let expr = Expr::Calc(CalcOp::Negate(Box::new(Expr::Literal(-7.0))));
+        assert_eq!(eval.eval_expr(&expr, &state), 7.0);
+    }
+
+    #[test]
+    fn eval_sign_and_abs() {
+        let mut eval = test_evaluator(HashMap::new(), HashMap::new());
+        let state = State::default();
+
+        assert_eq!(
+            eval.eval_expr(
+                &Expr::Calc(CalcOp::Sign(Box::new(Expr::Literal(42.0)))),
+                &state
+            ),
+            1.0
+        );
+        assert_eq!(
+            eval.eval_expr(
+                &Expr::Calc(CalcOp::Sign(Box::new(Expr::Literal(-5.0)))),
+                &state
+            ),
+            -1.0
+        );
+        assert_eq!(
+            eval.eval_expr(
+                &Expr::Calc(CalcOp::Sign(Box::new(Expr::Literal(0.0)))),
+                &state
+            ),
+            0.0
+        );
+        assert_eq!(
+            eval.eval_expr(
+                &Expr::Calc(CalcOp::Abs(Box::new(Expr::Literal(-99.0)))),
+                &state
+            ),
+            99.0
+        );
+    }
+
+    #[test]
+    fn eval_clamp() {
+        let mut eval = test_evaluator(HashMap::new(), HashMap::new());
+        let state = State::default();
+
+        // Value within range
+        let expr = Expr::Calc(CalcOp::Clamp(
+            Box::new(Expr::Literal(0.0)),
+            Box::new(Expr::Literal(50.0)),
+            Box::new(Expr::Literal(100.0)),
+        ));
+        assert_eq!(eval.eval_expr(&expr, &state), 50.0);
+
+        // Value below min
+        let expr = Expr::Calc(CalcOp::Clamp(
+            Box::new(Expr::Literal(10.0)),
+            Box::new(Expr::Literal(5.0)),
+            Box::new(Expr::Literal(100.0)),
+        ));
+        assert_eq!(eval.eval_expr(&expr, &state), 10.0);
+
+        // Value above max
+        let expr = Expr::Calc(CalcOp::Clamp(
+            Box::new(Expr::Literal(0.0)),
+            Box::new(Expr::Literal(200.0)),
+            Box::new(Expr::Literal(100.0)),
+        ));
+        assert_eq!(eval.eval_expr(&expr, &state), 100.0);
+    }
+
+    #[test]
+    fn eval_max_call_depth() {
+        // Create a function that calls itself (infinite recursion)
+        let mut functions = HashMap::new();
+        functions.insert(
+            "--recurse".to_string(),
+            FunctionDef {
+                name: "--recurse".to_string(),
+                parameters: vec![],
+                locals: vec![],
+                result: Expr::FunctionCall {
+                    name: "--recurse".to_string(),
+                    args: vec![],
+                },
+            },
+        );
+
+        let mut eval = test_evaluator(functions, HashMap::new());
+        let state = State::default();
+
+        // Should not panic — returns 0 when depth exceeded
+        let expr = Expr::FunctionCall {
+            name: "--recurse".to_string(),
+            args: vec![],
+        };
+        assert_eq!(eval.eval_expr(&expr, &state), 0.0);
+    }
 }
