@@ -14,5 +14,5 @@ pub mod state;
 pub mod types;
 
 pub use error::{CalcifyError, Result};
-pub use eval::Evaluator;
+pub use eval::{property_to_address, Evaluator};
 pub use state::State;

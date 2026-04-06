@@ -38,11 +38,10 @@ impl CalcifyEngine {
         );
 
         let evaluator = calcify_core::Evaluator::from_parsed(&parsed);
+        let mut state = calcify_core::State::default();
+        state.load_properties(&parsed.properties);
 
-        Ok(CalcifyEngine {
-            state: calcify_core::State::default(),
-            evaluator,
-        })
+        Ok(CalcifyEngine { state, evaluator })
     }
 
     /// Run a batch of ticks and return the property changes as a JSON string.

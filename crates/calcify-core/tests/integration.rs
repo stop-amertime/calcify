@@ -10,7 +10,8 @@ use calcify_core::state::{self, State};
 fn setup(css: &str) -> (Evaluator, State) {
     let parsed = parse_css(css).expect("CSS should parse");
     let evaluator = Evaluator::from_parsed(&parsed);
-    let state = State::default();
+    let mut state = State::default();
+    state.load_properties(&parsed.properties);
     (evaluator, state)
 }
 

@@ -180,6 +180,29 @@ impl Default for State {
     }
 }
 
+impl State {
+    /// Initialize state from `@property` initial values.
+    ///
+    /// This loads the program binary and register defaults from the CSS —
+    /// without it, the engine runs against empty memory.
+    pub fn load_properties(&mut self, properties: &[crate::types::PropertyDef]) {
+        use crate::types::CssValue;
+
+        for prop in properties {
+            let value = match &prop.initial_value {
+                Some(CssValue::Integer(v)) => *v as i32,
+                Some(CssValue::Number(v)) => *v as i32,
+                _ => continue,
+            };
+
+            let name = &prop.name;
+            if let Some(addr) = super::eval::property_to_address(name) {
+                self.write_mem(addr, value);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

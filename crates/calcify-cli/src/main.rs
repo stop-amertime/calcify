@@ -58,16 +58,24 @@ fn main() {
 
             let evaluator = calcify_core::Evaluator::from_parsed(&parsed);
             let mut state = calcify_core::State::default();
+            state.load_properties(&parsed.properties);
 
             for tick in 0..cli.ticks {
                 let result = evaluator.tick(&mut state);
                 if cli.verbose {
                     println!(
-                        "Tick {tick}: {} changes | AX={} CX={} IP={}",
+                        "Tick {tick}: {} changes | AX={} CX={} DX={} BX={} SP={} BP={} SI={} DI={} IP={} flags={}",
                         result.changes.len(),
                         state.registers[calcify_core::state::reg::AX],
                         state.registers[calcify_core::state::reg::CX],
+                        state.registers[calcify_core::state::reg::DX],
+                        state.registers[calcify_core::state::reg::BX],
+                        state.registers[calcify_core::state::reg::SP],
+                        state.registers[calcify_core::state::reg::BP],
+                        state.registers[calcify_core::state::reg::SI],
+                        state.registers[calcify_core::state::reg::DI],
                         state.registers[calcify_core::state::reg::IP],
+                        state.registers[calcify_core::state::reg::FLAGS],
                     );
                 }
             }

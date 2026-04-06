@@ -152,29 +152,57 @@ impl Evaluator {
     }
 }
 
+/// Strip x86CSS triple-buffer prefixes (`--__0`, `--__1`, `--__2`) from a property name.
+///
+/// x86CSS uses a 4-phase triple buffer where each variable exists as:
+/// - `--{name}` — computed new value
+/// - `--__0{name}` — captured by execute keyframe
+/// - `--__1{name}` — current read value
+/// - `--__2{name}` — captured by store keyframe
+///
+/// Since the engine uses mutable state (no triple buffering needed),
+/// all buffer variants resolve to the canonical name.
+fn strip_buffer_prefix(name: &str) -> &str {
+    let after_dashes = &name[2..]; // skip leading "--"
+    if let Some(_rest) = after_dashes.strip_prefix("__0") {
+        // "--__0AX" → "--AX": reconstruct by returning slice starting 3 chars earlier
+        // We need to return a slice of the original, so use byte offset
+        &name[5..]
+    } else if let Some(_rest) = after_dashes.strip_prefix("__1") {
+        &name[5..]
+    } else if let Some(_rest) = after_dashes.strip_prefix("__2") {
+        &name[5..]
+    } else {
+        after_dashes
+    }
+}
+
 /// Map a CSS custom property name to a state address.
 ///
 /// Uses x86CSS's naming convention:
 /// - `--AX`, `--CX`, ..., `--flags` → register addresses
 /// - `--m0`, `--m1`, ... → memory addresses
-fn property_to_address(name: &str) -> Option<i32> {
+///
+/// Automatically strips triple-buffer prefixes (`--__0`, `--__1`, `--__2`).
+pub fn property_to_address(name: &str) -> Option<i32> {
     use crate::state::addr;
-    match name {
-        "--AX" => Some(addr::AX),
-        "--CX" => Some(addr::CX),
-        "--DX" => Some(addr::DX),
-        "--BX" => Some(addr::BX),
-        "--SP" => Some(addr::SP),
-        "--BP" => Some(addr::BP),
-        "--SI" => Some(addr::SI),
-        "--DI" => Some(addr::DI),
-        "--IP" => Some(addr::IP),
-        "--ES" => Some(addr::ES),
-        "--CS" => Some(addr::CS),
-        "--SS" => Some(addr::SS),
-        "--DS" => Some(addr::DS),
-        "--flags" => Some(addr::FLAGS),
-        _ if name.starts_with("--m") => name[3..].parse::<i32>().ok(),
+    let canonical = strip_buffer_prefix(name);
+    match canonical {
+        "AX" => Some(addr::AX),
+        "CX" => Some(addr::CX),
+        "DX" => Some(addr::DX),
+        "BX" => Some(addr::BX),
+        "SP" => Some(addr::SP),
+        "BP" => Some(addr::BP),
+        "SI" => Some(addr::SI),
+        "DI" => Some(addr::DI),
+        "IP" => Some(addr::IP),
+        "ES" => Some(addr::ES),
+        "CS" => Some(addr::CS),
+        "SS" => Some(addr::SS),
+        "DS" => Some(addr::DS),
+        "flags" => Some(addr::FLAGS),
+        _ if canonical.starts_with("m") => canonical[1..].parse::<i32>().ok(),
         _ => None,
     }
 }
@@ -212,15 +240,27 @@ impl<'a> EvalEnv<'a> {
             Expr::Literal(v) => *v,
 
             Expr::Var { name, fallback } => {
-                // Check current tick's computed properties first
-                if let Some(&v) = self.properties.get(name.as_str()) {
+                let v = self.resolve_property(name, state);
+                // If we got 0.0 and there's a fallback, check if the property
+                // actually exists or if 0.0 is just the default for "not found"
+                if v != 0.0 {
                     return v;
                 }
-                // Then check state
-                if let Some(addr) = property_to_address(name) {
-                    return state.read_mem(addr) as f64;
+                // Property might genuinely be 0, or might not exist.
+                // Check if it exists in properties or state before using fallback.
+                if self.properties.contains_key(name.as_str()) {
+                    return v;
                 }
-                // Fallback
+                if name.starts_with("--__") && name.len() > 5 {
+                    let canonical = format!("--{}", &name[5..]);
+                    if self.properties.contains_key(&canonical) {
+                        return v;
+                    }
+                }
+                if property_to_address(name).is_some() {
+                    return v;
+                }
+                // Not found anywhere — use fallback
                 if let Some(fb) = fallback {
                     return self.eval_expr(fb, state);
                 }
@@ -312,9 +352,19 @@ impl<'a> EvalEnv<'a> {
     }
 
     /// Resolve a property value: check computed properties, then state.
+    ///
+    /// For buffer-prefixed names (`--__1AX`), also checks the canonical name (`--AX`)
+    /// in computed properties before falling back to state.
     fn resolve_property(&self, name: &str, state: &State) -> f64 {
         if let Some(&v) = self.properties.get(name) {
             return v;
+        }
+        // Try canonical name (strip buffer prefix) in computed properties
+        if name.starts_with("--__") && name.len() > 5 {
+            let canonical = format!("--{}", &name[5..]);
+            if let Some(&v) = self.properties.get(&canonical) {
+                return v;
+            }
         }
         if let Some(addr) = property_to_address(name) {
             return state.read_mem(addr) as f64;
@@ -343,8 +393,8 @@ impl<'a> EvalEnv<'a> {
         }
 
         // Check for a dispatch table optimisation
-        if let Some(table) = self.dispatch_tables.get(name) {
-            return self.eval_dispatch(table, args, state);
+        if let Some(table) = self.dispatch_tables.get(name).cloned() {
+            return self.eval_dispatch(name, &table, args, state);
         }
 
         let func = match self.functions.get(name) {
@@ -402,18 +452,48 @@ impl<'a> EvalEnv<'a> {
     }
 
     /// Evaluate using a dispatch table — O(1) lookup.
-    fn eval_dispatch(&mut self, table: &DispatchTable, args: &[Expr], state: &State) -> f64 {
-        // The key is the first argument (the dispatched property)
-        let key = args
-            .first()
-            .map(|a| self.eval_expr(a, state))
-            .unwrap_or(0.0) as i64;
+    fn eval_dispatch(
+        &mut self,
+        name: &str,
+        table: &DispatchTable,
+        args: &[Expr],
+        state: &State,
+    ) -> f64 {
+        // Bind function parameters first — the key property may be a parameter
+        let func = self.functions.get(name).cloned();
+        let old_props: Vec<(String, Option<f64>)> = if let Some(ref func) = func {
+            func.parameters
+                .iter()
+                .enumerate()
+                .map(|(i, param)| {
+                    let old = self.properties.get(&param.name).copied();
+                    let val = args.get(i).map(|a| self.eval_expr(a, state)).unwrap_or(0.0);
+                    self.properties.insert(param.name.clone(), val);
+                    (param.name.clone(), old)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
-        if let Some(result_expr) = table.entries.get(&key) {
+        // Resolve the dispatch key after parameter binding
+        let key = self.resolve_property(&table.key_property, state) as i64;
+
+        let result = if let Some(result_expr) = table.entries.get(&key) {
             self.eval_expr(result_expr, state)
         } else {
             self.eval_expr(&table.fallback, state)
+        };
+
+        // Restore parameter bindings
+        for (name, old) in old_props {
+            match old {
+                Some(v) => { self.properties.insert(name, v); }
+                None => { self.properties.remove(&name); }
+            }
         }
+
+        result
     }
 }
 
@@ -568,7 +648,22 @@ mod tests {
 
     #[test]
     fn eval_dispatch_table() {
-        let functions = HashMap::new();
+        let mut functions = HashMap::new();
+        // The dispatch table's key_property is "--key", which is a function parameter.
+        // We need the function definition so parameter binding works.
+        functions.insert(
+            "--lookup".to_string(),
+            FunctionDef {
+                name: "--lookup".to_string(),
+                parameters: vec![FunctionParam {
+                    name: "--key".to_string(),
+                    syntax: PropertySyntax::Integer,
+                }],
+                locals: vec![],
+                result: Expr::Literal(0.0), // unused — dispatch table replaces it
+            },
+        );
+
         let mut dispatch = HashMap::new();
 
         let mut entries = HashMap::new();
