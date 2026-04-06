@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>calc(ify) — JIT Compiler for Computational CSS</title>
+  <style>
+    body { font-family: monospace; background: #1a1a1a; color: #e0e0e0; padding: 2em; }
+    #status { color: #88ff88; margin-bottom: 1em; }
+    #controls { margin-bottom: 1em; }
+    #controls button { font-family: monospace; padding: 0.5em 1em; margin-right: 0.5em; }
+    #output { border: 1px solid #333; padding: 1em; min-height: 200px; white-space: pre; }
+    #stats { color: #888; margin-top: 1em; font-size: 0.9em; }
+  </style>
+</head>
+<body>
+  <h1>calc(ify)</h1>
+  <div id="status">Loading...</div>
+
+  <div id="controls">
+    <button id="btn-start" disabled>Start</button>
+    <button id="btn-stop" disabled>Stop</button>
+    <label>
+      Batch size:
+      <input id="batch-size" type="number" value="10" min="1" max="10000" style="width: 5em; font-family: monospace;">
+    </label>
+  </div>
+
+  <div id="output"></div>
+  <div id="stats"></div>
+
+  <script>
+    const worker = new Worker('calcify-worker.js', { type: 'module' });
+    const status = document.getElementById('status');
+    const output = document.getElementById('output');
+    const stats = document.getElementById('stats');
+    const btnStart = document.getElementById('btn-start');
+    const btnStop = document.getElementById('btn-stop');
+    const batchInput = document.getElementById('batch-size');
+
+    let running = false;
+    let totalTicks = 0;
+    let startTime = 0;
+
+    // The target element whose properties the engine drives.
+    // In x86CSS this is .cpu — adjust selector as needed.
+    let targetElement = null;
+
+    worker.onmessage = ({ data }) => {
+      switch (data.type) {
+        case 'ready':
+          status.textContent = 'Engine ready.';
+          btnStart.disabled = false;
+          break;
+
+        case 'tick-result':
+          totalTicks += data.ticks;
+          const elapsed = (performance.now() - startTime) / 1000;
+          stats.textContent = `${totalTicks} ticks | ${(totalTicks / elapsed).toFixed(1)} ticks/sec`;
+
+          // Apply property changes to the DOM
+          if (targetElement && data.changes) {
+            for (const [name, value] of data.changes) {
+              targetElement.style.setProperty(name, value);
+            }
+          }
+
+          if (running) {
+            worker.postMessage({ type: 'tick', count: parseInt(batchInput.value, 10) || 10 });
+          }
+          break;
+
+        case 'error':
+          status.textContent = `Error: ${data.message}`;
+          running = false;
+          btnStart.disabled = false;
+          btnStop.disabled = true;
+          break;
+      }
+    };
+
+    btnStart.addEventListener('click', () => {
+      running = true;
+      startTime = performance.now();
+      totalTicks = 0;
+      btnStart.disabled = true;
+      btnStop.disabled = false;
+      status.textContent = 'Running...';
+      worker.postMessage({ type: 'tick', count: parseInt(batchInput.value, 10) || 10 });
+    });
+
+    btnStop.addEventListener('click', () => {
+      running = false;
+      btnStart.disabled = false;
+      btnStop.disabled = true;
+      status.textContent = 'Stopped.';
+    });
+
+    // Initialise: extract CSS from the page and send to the worker.
+    // For standalone use, load a CSS file via fetch instead.
+    async function init() {
+      status.textContent = 'Initialising...';
+
+      targetElement = document.querySelector('.cpu');
+
+      // Collect CSS from all stylesheets
+      const cssText = [...document.styleSheets]
+        .flatMap(s => {
+          try { return [...s.cssRules].map(r => r.cssText); }
+          catch { return []; }
+        })
+        .join('\n');
+
+      if (cssText.length === 0) {
+        status.textContent = 'No CSS found. Load a computational CSS page to use calc(ify).';
+        return;
+      }
+
+      worker.postMessage({ type: 'init', css: cssText });
+    }
+
+    init();
+  </script>
+</body>
+</html>

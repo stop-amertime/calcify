@@ -1,0 +1,16 @@
+[package]
+name = "calcify-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "JIT compiler for computational CSS — core engine"
+
+[dependencies]
+cssparser = { workspace = true }
+log = { workspace = true }
+thiserror = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+env_logger = "0.11"
