@@ -62,8 +62,8 @@ impl Evaluator {
         }
 
         // Recognise broadcast write patterns in assignments
-        let broadcast_writes = broadcast_write::recognise_broadcast(&program.assignments);
-        for bw in &broadcast_writes {
+        let broadcast_result = broadcast_write::recognise_broadcast(&program.assignments);
+        for bw in &broadcast_result.writes {
             log::info!(
                 "Recognised broadcast write: {} → {} targets",
                 bw.dest_property,
@@ -71,11 +71,27 @@ impl Evaluator {
             );
         }
 
+        // Filter out assignments absorbed into broadcast writes —
+        // they must not execute in the normal loop or they'll overwrite
+        // the broadcast result with stale "keep" values.
+        let assignments: Vec<Assignment> = program
+            .assignments
+            .iter()
+            .filter(|a| !broadcast_result.absorbed_properties.contains(&a.property))
+            .cloned()
+            .collect();
+
+        log::info!(
+            "Assignments: {} kept, {} absorbed into broadcast writes",
+            assignments.len(),
+            broadcast_result.absorbed_properties.len(),
+        );
+
         Evaluator {
             functions,
-            assignments: program.assignments.clone(),
+            assignments,
             dispatch_tables,
-            broadcast_writes,
+            broadcast_writes: broadcast_result.writes,
         }
     }
 
@@ -90,18 +106,14 @@ impl Evaluator {
             env.properties.insert(assignment.property.clone(), value);
         }
 
-        // Apply broadcast writes efficiently
+        // Apply broadcast writes: O(1) HashMap lookup per write
         for bw in &self.broadcast_writes {
             let dest = env.resolve_property(&bw.dest_property, state);
             let dest_i64 = dest as i64;
-            // Find the matching target and write directly
-            for (addr, var_name) in &bw.address_map {
-                if *addr == dest_i64 {
-                    let value = env.eval_expr(&bw.value_expr, state);
-                    state.write_mem(*addr as i32, value as i32);
-                    env.properties.insert(var_name.clone(), value);
-                    break;
-                }
+            if let Some(var_name) = bw.address_map.get(&dest_i64) {
+                let value = env.eval_expr(&bw.value_expr, state);
+                state.write_mem(dest_i64 as i32, value as i32);
+                env.properties.insert(var_name.clone(), value);
             }
         }
 
@@ -129,6 +141,11 @@ impl Evaluator {
     }
 
     /// Apply computed property values to state and return the changes.
+    ///
+    /// Only writes canonical (non-prefixed) properties to state.
+    /// Buffer copies (`--__0AX`, `--__1AX`, `--__2AX`) are skipped —
+    /// they exist for x86CSS's triple-buffer pipeline but carry stale values
+    /// that would nondeterministically overwrite the current tick's result.
     fn apply_state(
         &self,
         properties: &HashMap<String, f64>,
@@ -137,6 +154,10 @@ impl Evaluator {
         let mut changes = Vec::new();
 
         for (name, &value) in properties {
+            // Skip buffer copies — only the canonical name should write to state
+            if name.starts_with("--__0") || name.starts_with("--__1") || name.starts_with("--__2") {
+                continue;
+            }
             let int_val = value as i32;
             // Map well-known property names to state addresses
             if let Some(addr) = property_to_address(name) {
@@ -488,8 +509,12 @@ impl<'a> EvalEnv<'a> {
         // Restore parameter bindings
         for (name, old) in old_props {
             match old {
-                Some(v) => { self.properties.insert(name, v); }
-                None => { self.properties.remove(&name); }
+                Some(v) => {
+                    self.properties.insert(name, v);
+                }
+                None => {
+                    self.properties.remove(&name);
+                }
             }
         }
 

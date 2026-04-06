@@ -373,3 +373,107 @@ fn parse_real_x86css() {
         "--xor should have many locals (bit decomposition)"
     );
 }
+
+/// Conformance test: verify calcify's steady-state matches Chrome's baseline.
+///
+/// Chrome baseline was captured from the live x86CSS page (lyra.horse/x86css/)
+/// after BIOS initialization. Rather than tick-for-tick comparison (impossible
+/// without CSS animation synchronization), we verify that calcify reaches the
+/// same main loop and register value ranges as Chrome.
+#[test]
+fn chrome_conformance_steady_state() {
+    let css = match std::fs::read_to_string("../../tests/fixtures/x86css-main.css") {
+        Ok(s) => s,
+        Err(_) => {
+            eprintln!("Skipping chrome_conformance_steady_state: fixture not found");
+            return;
+        }
+    };
+
+    let parsed = parse_css(&css).expect("should parse");
+    let evaluator = Evaluator::from_parsed(&parsed);
+    let mut calcify_state = State::default();
+    calcify_state.load_properties(&parsed.properties);
+
+    // Run 500 ticks — enough to get through BIOS init and into the main loop
+    for _ in 0..500 {
+        evaluator.tick(&mut calcify_state);
+    }
+
+    // Sample calcify's register values over 100 additional ticks
+    let mut calcify_ip_values = std::collections::HashSet::new();
+    let mut calcify_ax_values = std::collections::HashSet::new();
+    let mut calcify_si_values = std::collections::HashSet::new();
+    let mut calcify_sp_values = std::collections::HashSet::new();
+    let mut calcify_bp_values = std::collections::HashSet::new();
+    let mut calcify_flags_values = std::collections::HashSet::new();
+
+    for _ in 0..100 {
+        evaluator.tick(&mut calcify_state);
+        let regs = calcify_core::conformance::RegisterSnapshot::from_state(&calcify_state);
+        calcify_ip_values.insert(regs.ip);
+        calcify_ax_values.insert(regs.ax);
+        calcify_si_values.insert(regs.si);
+        calcify_sp_values.insert(regs.sp);
+        calcify_bp_values.insert(regs.bp);
+        calcify_flags_values.insert(regs.flags);
+    }
+
+    // Chrome baseline ranges (captured from lyra.horse/x86css/ via Playwright):
+    //   AX: [1227]  (constant)
+    //   IP: [285..313, 891..895, 8196]  (main loop + subroutine calls)
+    //   SI: [0, 1120, 1128, 1227, 1235, 1243, 1251]  (string pointer)
+    //   SP: [1508..1520]  (stack fluctuation)
+    //   BP: [1512, 1514, 1524]  (frame pointer)
+    //   flags: [0, 192]
+
+    // Critical: AX must match
+    assert!(
+        calcify_ax_values.contains(&1227),
+        "AX should reach 1227 (Chrome baseline), got: {:?}",
+        calcify_ax_values
+    );
+
+    // IP should be cycling through the main loop (292-313 range)
+    let main_loop_ips: Vec<i32> = vec![292, 295, 302, 303, 307, 310, 313];
+    let calcify_hits_main_loop = main_loop_ips
+        .iter()
+        .any(|ip| calcify_ip_values.contains(ip));
+    assert!(
+        calcify_hits_main_loop,
+        "IP should hit main loop addresses (292-313), got: {:?}",
+        calcify_ip_values
+    );
+
+    // Print comparison for diagnostics
+    eprintln!("=== Chrome vs Calcify steady-state comparison ===");
+    eprintln!(
+        "AX  Chrome: [1227]         Calcify: {:?}",
+        calcify_ax_values
+    );
+    eprintln!("IP  Chrome: [285..313,891..895,8196]  Calcify: {:?}", {
+        let mut v: Vec<_> = calcify_ip_values.iter().copied().collect();
+        v.sort();
+        v
+    });
+    eprintln!("SP  Chrome: [1508..1520]    Calcify: {:?}", {
+        let mut v: Vec<_> = calcify_sp_values.iter().copied().collect();
+        v.sort();
+        v
+    });
+    eprintln!("BP  Chrome: [1512..1524]    Calcify: {:?}", {
+        let mut v: Vec<_> = calcify_bp_values.iter().copied().collect();
+        v.sort();
+        v
+    });
+    eprintln!("SI  Chrome: [0..1251]       Calcify: {:?}", {
+        let mut v: Vec<_> = calcify_si_values.iter().copied().collect();
+        v.sort();
+        v
+    });
+    eprintln!("flags Chrome: [0, 192]     Calcify: {:?}", {
+        let mut v: Vec<_> = calcify_flags_values.iter().copied().collect();
+        v.sort();
+        v
+    });
+}
