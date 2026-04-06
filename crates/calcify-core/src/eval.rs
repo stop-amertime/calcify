@@ -193,8 +193,8 @@ impl Evaluator {
         // Diff registers
         let mut changes = Vec::new();
         let reg_names = [
-            "--AX", "--CX", "--DX", "--BX", "--SP", "--BP", "--SI", "--DI",
-            "--IP", "--ES", "--CS", "--SS", "--DS", "--flags",
+            "--AX", "--CX", "--DX", "--BX", "--SP", "--BP", "--SI", "--DI", "--IP", "--ES", "--CS",
+            "--SS", "--DS", "--flags",
         ];
         for (i, name) in reg_names.iter().enumerate() {
             if state.registers[i] != snapshot.registers[i] {

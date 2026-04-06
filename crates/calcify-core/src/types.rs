@@ -117,14 +117,8 @@ impl PartialEq for Expr {
                 },
             ) => b1 == b2 && f1 == f2,
             (
-                Expr::FunctionCall {
-                    name: n1,
-                    args: a1,
-                },
-                Expr::FunctionCall {
-                    name: n2,
-                    args: a2,
-                },
+                Expr::FunctionCall { name: n1, args: a1 },
+                Expr::FunctionCall { name: n2, args: a2 },
             ) => n1 == n2 && a1 == a2,
             _ => false,
         }
