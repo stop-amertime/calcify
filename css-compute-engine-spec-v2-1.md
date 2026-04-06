@@ -266,41 +266,84 @@ Replaces: inline the function body at the call site, eliminating function call o
 
 ### Evaluator
 
-The evaluator runs a compiled tick function against a flat state representation:
+The evaluator doesn't know what the CSS *means* — it doesn't know it's an x86 emulator, a Game of Life, or a counter. It walks the compiled property dependency graph and evaluates each property in declaration order, using the optimised pattern replacements from the compiler.
 
 ```rust
 struct State {
-    registers: [i32; 14],    // AX, CX, DX, BX, SP, BP, SI, DI, IP, ES, CS, SS, DS, flags
-    memory: [u8; MEM_SIZE],  // flat byte array
-    text_buffer: String,     // display output
-    keyboard: u8,            // current key input
+    properties: HashMap<PropertyId, Value>,  // all custom property values
+    flat_stores: Vec<FlatStore>,             // backing arrays for dispatch-optimised patterns
+}
+
+/// A flat array backing a set of properties that were compiled from
+/// a broadcast-write or large-dispatch pattern.
+struct FlatStore {
+    values: Vec<i32>,            // the actual data (indexed by address)
+    property_map: Vec<PropertyId>, // which CSS property each slot corresponds to
 }
 
 fn tick(state: &mut State, program: &CompiledProgram) {
-    // 1. Decode
-    let opcode = state.read_mem(state.registers[IP]);
-    let inst_id = program.decode_table[opcode];
+    // Evaluate every property declaration on the target element, in declaration order.
+    // This is exactly what Chrome's style resolver does — walk the declarations,
+    // resolve var() references, evaluate calc()/if()/function calls, assign values.
+    // The only difference is that pattern-compiled expressions use efficient lookups
+    // instead of linear scans.
 
-    // 2. Parse ModRM if needed
-    let modrm = if program.instructions[inst_id].has_modrm {
-        state.read_mem(state.registers[IP] + 1)
-    } else { 0 };
+    for decl in &program.declarations {
+        let value = evaluate_expression(state, &decl.expression, program);
+        state.set(decl.property, value);
+    }
+}
 
-    // 3. Resolve arguments
-    let (arg1, arg2) = resolve_args(state, program, inst_id, modrm);
+fn evaluate_expression(state: &State, expr: &Expression, program: &CompiledProgram) -> Value {
+    match expr {
+        // calc(), mod(), round(), min(), max(), etc. — arithmetic as normal
+        Expression::Calc(op, a, b) => {
+            let a = evaluate_expression(state, a, program);
+            let b = evaluate_expression(state, b, program);
+            apply_math(op, a, b)
+        }
 
-    // 4. Execute instruction (calls compiled D-xxx and V-xxx functions)
-    let (dest, value) = program.instructions[inst_id].execute(state, arg1, arg2);
+        // var(--name) — resolve from current state
+        Expression::Var(prop) => state.get(prop),
 
-    // 5. Write result
-    state.write(dest, value);
+        // if(style(--prop: val): a; ...; else: b)
+        // Small chains: evaluate conditions linearly (same as Chrome)
+        // Large chains: the pattern compiler already replaced this with a
+        // hash/array dispatch — one lookup instead of N comparisons
+        Expression::If(branches) => evaluate_dispatch(state, branches),
 
-    // 6. Advance IP (unless jump)
-    if !jumped { state.registers[IP] += inst_len; }
+        // @function call — evaluate the function body with bound parameters
+        // (or run the inlined version if the compiler inlined it)
+        Expression::FunctionCall(func, args) => {
+            let bound_args: Vec<Value> = args.iter()
+                .map(|a| evaluate_expression(state, a, program))
+                .collect();
+            evaluate_expression(state, &func.body, &program.with_bindings(func, &bound_args))
+        }
+
+        // Pattern-compiled: broadcast write was replaced with direct store
+        // The compiler turned 1,583 if(style(--dest: N)) declarations into
+        // a single "evaluate dest, write to flat_store[dest]" operation
+        Expression::DirectStore(store_id, addr_expr, val_expr) => {
+            let addr = evaluate_expression(state, addr_expr, program);
+            let val = evaluate_expression(state, val_expr, program);
+            state.flat_stores[store_id].values[addr.as_index()] = val.as_i32();
+            val
+        }
+
+        // Pattern-compiled: bit decomposition was replaced with native bitwise op
+        Expression::NativeBitwise(op, a, b) => {
+            let a = evaluate_expression(state, a, program);
+            let b = evaluate_expression(state, b, program);
+            apply_bitwise(op, a, b)
+        }
+    }
 }
 ```
 
-This is what the CSS *does*, expressed as what it *means*. Every line corresponds to a section of the CSS evaluation pipeline. The engine isn't bypassing the CSS — it's evaluating it efficiently.
+The evaluator is generic. It doesn't contain fetch-decode-execute logic, instruction tables, or any concept of a "CPU." When run on x86CSS, the property evaluation *happens to trace a path* that decodes an opcode, resolves operands, and writes a result — because that's what the CSS property declarations describe. When run on a CSS Game of Life, it would trace a neighbour-count-and-update path instead. The evaluator doesn't know or care.
+
+The key insight: the optimisations are at the CSS pattern level (large dispatch → hash lookup, broadcast write → direct store, bit decomposition → native bitwise), not at the application level. The engine never asks "what is this CSS computing?" It only asks "can this expression be evaluated more efficiently?"
 
 ### Browser Integration (Primary Deliverable)
 
