@@ -45,39 +45,41 @@ fn main() {
 
     match calcify_core::parser::parse_css(&css) {
         Ok(parsed) => {
-            log::info!(
-                "Parsed: {} properties, {} functions, {} assignments",
+            println!(
+                "Parsed: {} @property, {} @function, {} assignments",
                 parsed.properties.len(),
                 parsed.functions.len(),
                 parsed.assignments.len(),
             );
 
             if cli.parse_only {
-                println!(
-                    "Parsed: {} @property, {} @function, {} assignments",
-                    parsed.properties.len(),
-                    parsed.functions.len(),
-                    parsed.assignments.len(),
-                );
                 return;
             }
 
-            match calcify_core::pattern::compile(&parsed) {
-                Ok(program) => {
-                    let evaluator = calcify_core::Evaluator::new(program);
-                    let mut state = calcify_core::State::default();
+            let evaluator = calcify_core::Evaluator::from_parsed(&parsed);
+            let mut state = calcify_core::State::default();
 
-                    for tick in 0..cli.ticks {
-                        let result = evaluator.tick(&mut state);
-                        if cli.verbose {
-                            println!("Tick {tick}: {} changes", result.changes.len());
-                        }
-                    }
+            for tick in 0..cli.ticks {
+                let result = evaluator.tick(&mut state);
+                if cli.verbose {
+                    println!(
+                        "Tick {tick}: {} changes | AX={} CX={} IP={}",
+                        result.changes.len(),
+                        state.registers[calcify_core::state::reg::AX],
+                        state.registers[calcify_core::state::reg::CX],
+                        state.registers[calcify_core::state::reg::IP],
+                    );
                 }
-                Err(e) => {
-                    eprintln!("Compilation error: {e}");
-                    std::process::exit(1);
-                }
+            }
+
+            if !cli.verbose {
+                println!(
+                    "Ran {} ticks | AX={} CX={} IP={}",
+                    cli.ticks,
+                    state.registers[calcify_core::state::reg::AX],
+                    state.registers[calcify_core::state::reg::CX],
+                    state.registers[calcify_core::state::reg::IP],
+                );
             }
         }
         Err(e) => {

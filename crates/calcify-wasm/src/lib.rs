@@ -17,7 +17,7 @@ pub fn init() {
 #[wasm_bindgen]
 pub struct CalcifyEngine {
     state: calcify_core::State,
-    // evaluator will be added once parsing/compilation is implemented
+    evaluator: calcify_core::Evaluator,
 }
 
 #[wasm_bindgen]
@@ -27,24 +27,37 @@ impl CalcifyEngine {
     pub fn new(css: &str) -> Result<CalcifyEngine, JsError> {
         log::info!("Parsing {} bytes of CSS", css.len());
 
-        let _parsed =
+        let parsed =
             calcify_core::parser::parse_css(css).map_err(|e| JsError::new(&e.to_string()))?;
 
-        // TODO(phase-3): compile and create evaluator
-        // let program = calcify_core::pattern::compile(&parsed)
-        //     .map_err(|e| JsError::new(&e.to_string()))?;
+        log::info!(
+            "Parsed: {} @property, {} @function, {} assignments",
+            parsed.properties.len(),
+            parsed.functions.len(),
+            parsed.assignments.len(),
+        );
+
+        let evaluator = calcify_core::Evaluator::from_parsed(&parsed);
 
         Ok(CalcifyEngine {
             state: calcify_core::State::default(),
+            evaluator,
         })
     }
 
-    /// Run a batch of ticks and return the property changes as a JS object.
+    /// Run a batch of ticks and return the property changes as a JSON string.
     ///
-    /// Returns a JSON string of `[[name, value], ...]` pairs.
-    pub fn tick_batch(&mut self, _count: u32) -> Result<String, JsError> {
-        // TODO(phase-3): run batch, collect changes, serialise
-        Ok("[]".to_string())
+    /// Returns `[[name, value], ...]` pairs.
+    pub fn tick_batch(&mut self, count: u32) -> Result<String, JsError> {
+        let result = self.evaluator.run_batch(&mut self.state, count);
+
+        // Serialize changes as JSON array of [name, value] pairs
+        let json_parts: Vec<String> = result
+            .changes
+            .iter()
+            .map(|(name, value)| format!("[\"{name}\",\"{value}\"]"))
+            .collect();
+        Ok(format!("[{}]", json_parts.join(",")))
     }
 
     /// Set the keyboard input state.
