@@ -21,6 +21,47 @@ pub mod reg {
     pub const COUNT: usize = 14;
 }
 
+/// x86CSS unified address space mapping.
+///
+/// x86CSS uses negative addresses for registers and split register halves.
+/// These constants match the convention used in `base_template.html`.
+pub mod addr {
+    // Full 16-bit registers (negative addresses used by readMem/broadcast write)
+    pub const AX: i32 = -1;
+    pub const CX: i32 = -2;
+    pub const DX: i32 = -3;
+    pub const BX: i32 = -4;
+    pub const SP: i32 = -5;
+    pub const BP: i32 = -6;
+    pub const SI: i32 = -7;
+    pub const DI: i32 = -8;
+    pub const IP: i32 = -9;
+    pub const ES: i32 = -10;
+    pub const CS: i32 = -11;
+    pub const SS: i32 = -12;
+    pub const DS: i32 = -13;
+    pub const FLAGS: i32 = -14;
+
+    // High byte halves (AH, CH, DH, BH) — address = -(reg_index + 20)
+    pub const AH: i32 = -21;
+    pub const CH: i32 = -22;
+    pub const DH: i32 = -23;
+    pub const BH: i32 = -24;
+
+    // Low byte halves (AL, CL, DL, BL) — address = -(reg_index + 30)
+    pub const AL: i32 = -31;
+    pub const CL: i32 = -32;
+    pub const DL: i32 = -33;
+    pub const BL: i32 = -34;
+
+    // External function addresses (0x2000–0x200F)
+    pub const EXT_BASE: i32 = 0x2000;
+    pub const EXT_WRITE_CHAR: i32 = 0x2006;
+
+    // External I/O addresses (0x2100–0x210F)
+    pub const EXT_IO_BASE: i32 = 0x2100;
+}
+
 /// Default memory size for x86CSS (0x600 bytes = 1,536).
 pub const DEFAULT_MEM_SIZE: usize = 0x600;
 
@@ -46,23 +87,37 @@ impl State {
         }
     }
 
-    /// Read a byte from the unified address space.
+    /// Read from the unified address space.
     ///
-    /// Negative addresses map to registers (the same convention x86CSS uses):
-    /// -1 = AX, -2 = CX, ..., -14 = flags.
+    /// Address conventions (matching x86CSS's `readMem` / `base_template.html`):
+    /// - `-1..-14`: full 16-bit registers (AX, CX, ..., FLAGS)
+    /// - `-21..-24`: high byte halves (AH, CH, DH, BH)
+    /// - `-31..-34`: low byte halves (AL, CL, DL, BL)
+    /// - `0..`: memory bytes
     pub fn read_mem(&self, addr: i32) -> i32 {
-        if addr < 0 {
-            let reg_idx = (-addr - 1) as usize;
-            if reg_idx < reg::COUNT {
-                return self.registers[reg_idx];
+        match addr {
+            // Low byte halves: AL=-31, CL=-32, DL=-33, BL=-34
+            -34..=-31 => {
+                let reg_idx = (-addr - 31) as usize;
+                Self::lo8(self.registers[reg_idx])
             }
-            0
-        } else {
-            let addr = addr as usize;
-            if addr < self.memory.len() {
-                self.memory[addr] as i32
-            } else {
-                0
+            // High byte halves: AH=-21, CH=-22, DH=-23, BH=-24
+            -24..=-21 => {
+                let reg_idx = (-addr - 21) as usize;
+                Self::hi8(self.registers[reg_idx])
+            }
+            // Full 16-bit registers: AX=-1, CX=-2, ..., FLAGS=-14
+            -14..=-1 => {
+                let reg_idx = (-addr - 1) as usize;
+                self.registers[reg_idx]
+            }
+            _ => {
+                let addr = addr as usize;
+                if addr < self.memory.len() {
+                    self.memory[addr] as i32
+                } else {
+                    0
+                }
             }
         }
     }
@@ -75,16 +130,35 @@ impl State {
     }
 
     /// Write a value to the unified address space.
+    ///
+    /// Handles split register writes (AH/AL merge into AX, etc.) matching
+    /// x86CSS's broadcast write pattern for split registers.
     pub fn write_mem(&mut self, addr: i32, value: i32) {
-        if addr < 0 {
-            let reg_idx = (-addr - 1) as usize;
-            if reg_idx < reg::COUNT {
+        match addr {
+            // Write to low byte: AL=-31, CL=-32, DL=-33, BL=-34
+            // Merges: keep high byte, replace low byte
+            -34..=-31 => {
+                let reg_idx = (-addr - 31) as usize;
+                let hi = Self::hi8(self.registers[reg_idx]);
+                self.registers[reg_idx] = hi * 256 + (value & 0xFF);
+            }
+            // Write to high byte: AH=-21, CH=-22, DH=-23, BH=-24
+            // Merges: replace high byte, keep low byte
+            -24..=-21 => {
+                let reg_idx = (-addr - 21) as usize;
+                let lo = Self::lo8(self.registers[reg_idx]);
+                self.registers[reg_idx] = (value & 0xFF) * 256 + lo;
+            }
+            // Write to full register
+            -14..=-1 => {
+                let reg_idx = (-addr - 1) as usize;
                 self.registers[reg_idx] = value;
             }
-        } else {
-            let addr = addr as usize;
-            if addr < self.memory.len() {
-                self.memory[addr] = (value & 0xFF) as u8;
+            _ => {
+                let addr = addr as usize;
+                if addr < self.memory.len() {
+                    self.memory[addr] = (value & 0xFF) as u8;
+                }
             }
         }
     }
@@ -139,5 +213,53 @@ mod tests {
     fn byte_extraction() {
         assert_eq!(State::lo8(0x1234), 0x34);
         assert_eq!(State::hi8(0x1234), 0x12);
+    }
+
+    #[test]
+    fn split_register_read() {
+        let mut state = State::default();
+        state.registers[reg::AX] = 0x1234;
+
+        // AL (low byte) at address -31
+        assert_eq!(state.read_mem(addr::AL), 0x34);
+        // AH (high byte) at address -21
+        assert_eq!(state.read_mem(addr::AH), 0x12);
+        // Full AX at address -1
+        assert_eq!(state.read_mem(addr::AX), 0x1234);
+    }
+
+    #[test]
+    fn split_register_write_low() {
+        let mut state = State::default();
+        state.registers[reg::AX] = 0x1200;
+
+        // Write 0x34 to AL — should merge to 0x1234
+        state.write_mem(addr::AL, 0x34);
+        assert_eq!(state.registers[reg::AX], 0x1234);
+    }
+
+    #[test]
+    fn split_register_write_high() {
+        let mut state = State::default();
+        state.registers[reg::AX] = 0x0034;
+
+        // Write 0x12 to AH — should merge to 0x1234
+        state.write_mem(addr::AH, 0x12);
+        assert_eq!(state.registers[reg::AX], 0x1234);
+    }
+
+    #[test]
+    fn all_split_registers() {
+        let mut state = State::default();
+        state.registers[reg::BX] = 0xABCD;
+
+        assert_eq!(state.read_mem(addr::BH), 0xAB);
+        assert_eq!(state.read_mem(addr::BL), 0xCD);
+
+        state.write_mem(addr::BL, 0xEF);
+        assert_eq!(state.registers[reg::BX], 0xABEF);
+
+        state.write_mem(addr::BH, 0x00);
+        assert_eq!(state.registers[reg::BX], 0x00EF);
     }
 }

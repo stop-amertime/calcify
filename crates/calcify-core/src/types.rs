@@ -2,8 +2,6 @@
 //!
 //! These types represent the parsed and compiled forms of computational CSS constructs.
 
-use std::collections::HashMap;
-
 /// A raw CSS value (before expression parsing).
 #[derive(Debug, Clone)]
 pub enum CssValue {
@@ -134,7 +132,7 @@ pub struct Assignment {
 #[derive(Debug)]
 pub struct CompiledProgram {
     /// Opcode → instruction handler index.
-    pub decode_table: HashMap<u16, usize>,
+    pub decode_table: std::collections::HashMap<u16, usize>,
     /// Compiled instruction handlers.
     pub instructions: Vec<CompiledInstruction>,
 }
