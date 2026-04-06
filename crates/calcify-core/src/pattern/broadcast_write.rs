@@ -159,13 +159,24 @@ enum BroadcastPort {
 
 /// Extract all broadcast write ports from an assignment.
 ///
-/// Returns `None` if any branch tests a non-`--addrDest*` property (meaning
-/// the assignment has execution logic mixed in and is not a pure broadcast target).
+/// Returns `None` if:
+/// - Any branch tests a non-`--addrDest*` property (execution logic mixed in)
+/// - The fallback (else branch) is not a simple keep of the previous value
+///
+/// Registers like SP, SI, DI have side-channel deltas in their else branches
+/// (e.g., `else: calc(var(--__1SP) + var(--moveStack))`) and must NOT be absorbed.
 ///
 /// Returns `Some(vec of BroadcastPort)` — one per branch.
 fn extract_broadcast_ports(assignment: &Assignment) -> Option<Vec<BroadcastPort>> {
     match &assignment.value {
-        Expr::StyleCondition { branches, .. } => {
+        Expr::StyleCondition { branches, fallback } => {
+            // Check the fallback: only absorb if it's a simple keep (var(--__1X) or var(--X)).
+            // If the fallback has computation (calc, function call, etc.), this register
+            // has side-channel logic that must be evaluated on every tick.
+            if !is_simple_keep(fallback, &assignment.property) {
+                return None;
+            }
+
             let mut ports = Vec::with_capacity(branches.len());
             for branch in branches {
                 match &branch.condition {
@@ -225,6 +236,31 @@ fn extract_broadcast_ports(assignment: &Assignment) -> Option<Vec<BroadcastPort>
             }
         }
         _ => None,
+    }
+}
+
+/// Check if a fallback expression is a simple "keep previous value" pattern.
+///
+/// Pure broadcast targets use `var(--__1X)` as their fallback — just keeping the
+/// previous tick's value when no write port targets them. Registers with side channels
+/// (SP, SI, DI, CS, flags) have computation in their else branches and must not be
+/// absorbed into the broadcast write optimization.
+fn is_simple_keep(fallback: &Expr, property_name: &str) -> bool {
+    match fallback {
+        Expr::Var { name, .. } => {
+            // Accept var(--__1X) or var(--__0X) or var(--X) as simple keeps
+            let bare = if let Some(rest) = name.strip_prefix("--__") {
+                // --__0X, --__1X, --__2X → X
+                &rest[1..]
+            } else if let Some(rest) = name.strip_prefix("--") {
+                rest
+            } else {
+                return false;
+            };
+            let prop_bare = property_name.strip_prefix("--").unwrap_or(property_name);
+            bare == prop_bare
+        }
+        _ => false,
     }
 }
 
