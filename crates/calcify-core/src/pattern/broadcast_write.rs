@@ -407,4 +407,118 @@ mod tests {
         // All 20 should be absorbed
         assert_eq!(result.absorbed_properties.len(), 20);
     }
+
+    /// Build an assignment with a side-channel delta in the else branch:
+    /// `--SP: if(style(--addrDestA:-5):val; else: calc(var(--__1SP) + var(--moveStack)))`
+    fn make_side_channel_assignment(
+        name: &str,
+        addr: i64,
+        side_channel: &str,
+    ) -> Assignment {
+        Assignment {
+            property: format!("--{name}"),
+            value: Expr::StyleCondition {
+                branches: vec![StyleBranch {
+                    condition: StyleTest::Single {
+                        property: "--addrDestA".to_string(),
+                        value: Expr::Literal(addr as f64),
+                    },
+                    then: Expr::Var {
+                        name: "--addrValA".to_string(),
+                        fallback: None,
+                    },
+                }],
+                fallback: Box::new(Expr::Calc(CalcOp::Add(
+                    Box::new(Expr::Var {
+                        name: format!("--__1{name}"),
+                        fallback: None,
+                    }),
+                    Box::new(Expr::Var {
+                        name: format!("--{side_channel}"),
+                        fallback: None,
+                    }),
+                ))),
+            },
+        }
+    }
+
+    #[test]
+    fn excludes_side_channel_registers() {
+        // Mix of pure broadcast cells and side-channel registers
+        let mut assignments: Vec<_> = (0..20)
+            .map(|i| make_broadcast_assignment(&format!("m{i}"), i))
+            .collect();
+        // SP has a --moveStack side channel
+        assignments.push(make_side_channel_assignment("SP", -5, "moveStack"));
+
+        let result = recognise_broadcast(&assignments);
+
+        // Memory cells should be absorbed
+        assert!(result.absorbed_properties.contains("--m0"));
+        assert!(result.absorbed_properties.contains("--m19"));
+
+        // SP should NOT be absorbed (has side-channel logic)
+        assert!(
+            !result.absorbed_properties.contains("--SP"),
+            "SP should not be absorbed — it has --moveStack side channel"
+        );
+    }
+
+    #[test]
+    fn is_simple_keep_accepts_buffer_var() {
+        // var(--__1AX) is a simple keep for --AX
+        assert!(is_simple_keep(
+            &Expr::Var {
+                name: "--__1AX".to_string(),
+                fallback: None,
+            },
+            "--AX"
+        ));
+        // var(--__0m5) is a simple keep for --m5
+        assert!(is_simple_keep(
+            &Expr::Var {
+                name: "--__0m5".to_string(),
+                fallback: None,
+            },
+            "--m5"
+        ));
+    }
+
+    #[test]
+    fn is_simple_keep_rejects_calc() {
+        // calc(var(--__1SP) + var(--moveStack)) is NOT a simple keep
+        assert!(!is_simple_keep(
+            &Expr::Calc(CalcOp::Add(
+                Box::new(Expr::Var {
+                    name: "--__1SP".to_string(),
+                    fallback: None,
+                }),
+                Box::new(Expr::Var {
+                    name: "--moveStack".to_string(),
+                    fallback: None,
+                }),
+            )),
+            "--SP"
+        ));
+    }
+
+    #[test]
+    fn is_simple_keep_rejects_different_var() {
+        // var(--jumpCS) is NOT a simple keep for --CS (it references a different property)
+        assert!(!is_simple_keep(
+            &Expr::Var {
+                name: "--jumpCS".to_string(),
+                fallback: None,
+            },
+            "--CS"
+        ));
+        // var(--newFlags) is NOT a simple keep for --flags
+        assert!(!is_simple_keep(
+            &Expr::Var {
+                name: "--newFlags".to_string(),
+                fallback: None,
+            },
+            "--flags"
+        ));
+    }
 }
