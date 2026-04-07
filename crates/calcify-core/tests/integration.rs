@@ -488,15 +488,13 @@ fn chrome_conformance_steady_state() {
     );
 }
 
-/// Fibonacci benchmark test: load the x86CSS demo program, send keyboard "1"
-/// to trigger the Fibonacci demo, and verify the output is correct.
+/// Execution trace diagnostic: dumps tick-by-tick instruction decode signals
+/// to understand what the CPU is actually doing.
 ///
-/// This tests both correctness (register values, text output) and serves as
-/// a meaningful benchmark target — running actual x86 computation through the
-/// CSS instruction decoder, not just a BIOS idle loop.
+/// Run with: cargo test --ignored execution_trace -- --nocapture
 #[test]
 #[ignore = "requires x86css-demo.css fixture"]
-fn fibonacci_demo() {
+fn execution_trace() {
     let css = std::fs::read_to_string("../../tests/fixtures/x86css-demo.css")
         .expect("fixture not found at tests/fixtures/x86css-demo.css");
 
@@ -505,70 +503,104 @@ fn fibonacci_demo() {
     let mut state = State::default();
     state.load_properties(&parsed.properties);
 
-    // Phase 1: Run BIOS init until the demo menu is displayed.
-    // The menu waits for keyboard input at IP=8198 (INT 16h handler).
-    // We detect steady state when IP stays at the menu input loop.
-    let mut menu_reached = false;
-    let mut ip_values = std::collections::HashSet::new();
-    for tick in 0..10000 {
-        evaluator.tick(&mut state);
-        let ip = state.registers[state::reg::IP];
-        ip_values.insert(ip);
-        // IP 8198 (0x2006) = keyboard read handler; AX will be set from --keyboard
-        if ip == 8198 {
-            menu_reached = true;
-            eprintln!("Menu reached at tick {tick}, pressing '1' for Fibonacci");
-            break;
+    eprintln!("tick | IP   | instId | instLen | destA | destB | valA  | valB  | jump  | mvStk | AX   | SP   | CX   | flags");
+    eprintln!("-----|------|--------|---------|-------|-------|-------|-------|-------|-------|------|------|------|------");
+
+    let _ = env_logger::builder()
+        .filter_level(log::LevelFilter::Warn)
+        .try_init();
+
+    // First: verify that style(--addrDestB:-9) parses correctly
+    // by testing a minimal CSS with a negative style test
+    {
+        let test_css = r#"
+            @property --x { syntax: "<integer>"; initial-value: 0; inherits: true; }
+            .cpu {
+                --x: if(style(--addrDestB:-9): 42; else: 0);
+            }
+        "#;
+        let test_parsed = parse_css(test_css).expect("should parse negative style test");
+        let test_assign = &test_parsed.assignments[0];
+        eprintln!("Parsed negative style test: {:?}", test_assign.value);
+        // Check that the branch condition has value Literal(-9.0)
+        if let calcify_core::types::Expr::StyleCondition { branches, .. } = &test_assign.value {
+            if let calcify_core::types::StyleTest::Single { property, value } =
+                &branches[0].condition
+            {
+                eprintln!("  property={property}, value={:?}", value);
+                match value {
+                    calcify_core::types::Expr::Literal(v) => eprintln!("  Literal value: {v}"),
+                    calcify_core::types::Expr::Calc(calcify_core::types::CalcOp::Negate(inner)) => {
+                        eprintln!("  NEGATE({:?}) — parser wrapped in Negate!", inner);
+                    }
+                    other => eprintln!("  Unexpected: {:?}", other),
+                }
+            }
         }
     }
-    if !menu_reached {
-        let mut ips: Vec<_> = ip_values.iter().copied().collect();
-        ips.sort();
-        eprintln!("IP values seen in 2000 ticks: {:?}", ips);
-        eprintln!("Final IP={} AX={} SP={}",
-            state.registers[state::reg::IP],
+
+    // Check how many --addrJump assignments exist
+    let jump_assignments: Vec<_> = evaluator
+        .assignments
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| a.property == "--addrJump")
+        .map(|(i, a)| format!("pos={i} expr={:?}", a.value))
+        .collect();
+    // Show ALL assignments with --addrJump
+    let all_jump: Vec<_> = evaluator
+        .assignments
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| a.property == "--addrJump")
+        .collect();
+    eprintln!("--addrJump assignments ({}):", all_jump.len());
+    for (i, a) in &all_jump {
+        let s = format!("{:?}", a.value);
+        let short: String = s.chars().take(200).collect();
+        eprintln!("  pos={i} {short}");
+    }
+
+    // Also check the parsed program BEFORE evaluator construction
+    let jump_in_parsed: Vec<_> = parsed
+        .assignments
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| a.property == "--addrJump")
+        .collect();
+    eprintln!("--addrJump in parsed program: {}", jump_in_parsed.len());
+    for (i, a) in &jump_in_parsed {
+        let s = format!("{:?}", a.value);
+        let short: String = s.chars().take(200).collect();
+        eprintln!("  parsed pos={i} {short}");
+    }
+
+    evaluator.tick(&mut state);
+
+    eprintln!("\ntick | IP   | instId | instLen | destA | destB | valA  | valB  | jump  | mvStk | AX   | SP   | CX   | flags");
+    eprintln!("-----|------|--------|---------|-------|-------|-------|-------|-------|-------|------|------|------|------");
+
+    for tick in 1..50 {
+        evaluator.tick(&mut state);
+
+        let ip = state.registers[state::reg::IP];
+        let inst_id = evaluator.get_property("--instId").unwrap_or(-1.0) as i32;
+        let inst_len = evaluator.get_property("--instLen").unwrap_or(0.0) as i32;
+        let dest_a = evaluator.get_property("--addrDestA").unwrap_or(-100.0) as i32;
+        let dest_b = evaluator.get_property("--addrDestB").unwrap_or(-100.0) as i32;
+        let val_a = evaluator.get_property("--addrValA").unwrap_or(0.0) as i32;
+        let val_b = evaluator.get_property("--addrValB").unwrap_or(0.0) as i32;
+        let addr_jump = evaluator.get_property("--addrJump").unwrap_or(-1.0) as i32;
+        let move_stack = evaluator.get_property("--moveStack").unwrap_or(0.0) as i32;
+        let inst_arg1 = evaluator.get_property("--instArg1").unwrap_or(0.0) as i32;
+
+        eprintln!(
+            "{:4} | {:4} | {:6} | {:7} | {:5} | {:5} | {:5} | {:5} | {:5} | {:5} | {:5} | {:4} | {:4}",
+            tick, ip, inst_id, inst_len, dest_a, dest_b, val_a, val_b, addr_jump, move_stack, inst_arg1,
             state.registers[state::reg::AX],
             state.registers[state::reg::SP],
         );
     }
-    assert!(menu_reached, "should reach keyboard input handler (IP=8198)");
-
-    // Phase 2: Send keyboard input "1" (ASCII 49) to select Fibonacci demo
-    state.keyboard = 49; // '1'
-
-    // Run a few ticks to let the keyboard value be read
-    for _ in 0..10 {
-        evaluator.tick(&mut state);
-    }
-
-    // Clear keyboard after it's been consumed
-    state.keyboard = 0;
-
-    // Phase 3: Run Fibonacci computation
-    // The demo computes fib(3)..fib(12): 1 1 2 3 5 8 13 21 34 55 89 144
-    // Each iteration is a handful of x86 instructions, but rendering each
-    // character requires many ticks through the BIOS print routine.
-    for _ in 0..5000 {
-        evaluator.tick(&mut state);
-    }
-
-    // Phase 4: Verify results
-    eprintln!("After Fibonacci:");
-    eprintln!("  AX={} CX={} IP={} SP={} BP={}",
-        state.registers[state::reg::AX],
-        state.registers[state::reg::CX],
-        state.registers[state::reg::IP],
-        state.registers[state::reg::SP],
-        state.registers[state::reg::BP],
-    );
-
-    // The Fibonacci function should have completed and returned to the menu.
-    // After completion, the program goes back to waiting for keyboard input (IP=8198).
-    // AX should have been set during the computation.
-
-    // IP should be back in the main loop or input handler after Fibonacci completes
-    let ip = state.registers[state::reg::IP];
-    eprintln!("  Final IP: {ip}");
 }
 
 // --- Parser negative / error path tests ---

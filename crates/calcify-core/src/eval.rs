@@ -182,6 +182,14 @@ impl Evaluator {
         }
     }
 
+    /// Read a computed property value from the most recent tick.
+    ///
+    /// Returns the value of the named property as computed during the last
+    /// `tick()` call, or `None` if the property wasn't computed.
+    pub fn get_property(&self, name: &str) -> Option<f64> {
+        self.properties.get(name).copied()
+    }
+
     /// Run a batch of ticks, returning the net state diff across all ticks.
     ///
     /// Takes a snapshot before the batch and diffs at the end, so callers
