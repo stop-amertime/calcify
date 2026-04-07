@@ -1,4 +1,4 @@
-# calc(ify)
+# calc(ite)
 
 A JIT compiler for computational CSS. Parses real CSS, recognises computational
 patterns, and compiles them into efficient native operations.
@@ -12,10 +12,10 @@ x86CSS encodes an entire x86 8088 CPU in CSS custom properties. Each "tick" of
 the CPU is one recalculation of ~3000 CSS properties. Chrome's style engine
 treats these as opaque strings and evaluates them via O(n) pattern matching.
 
-Calcify parses the CSS once, recognises the computational patterns, and replaces
+Calcite parses the CSS once, recognises the computational patterns, and replaces
 them with efficient native operations:
 
-| Pattern | CSS cost | Calcify cost |
+| Pattern | CSS cost | Calcite cost |
 |---|---|---|
 | `if(style(--key: 0): ...; style(--key: 1): ...; ...)` (1500+ branches) | O(n) linear scan | O(1) HashMap lookup |
 | Per-cell memory writes (`--m0: if(style(--dest: 0): val; else: keep)`) | O(cells) per tick | O(1) direct store |
@@ -25,12 +25,12 @@ them with efficient native operations:
 
 ```
 crates/
-  calcify-core/    Core engine: parser, pattern compiler, evaluator, state
-  calcify-cli/     CLI tool for running CSS through the engine
-  calcify-wasm/    WASM bindings for browser Web Worker
+  calcite-core/    Core engine: parser, pattern compiler, evaluator, state
+  calcite-cli/     CLI tool for running CSS through the engine
+  calcite-wasm/    WASM bindings for browser Web Worker
 web/
   index.html           Browser UI
-  calcify-worker.js    JS Web Worker bridge
+  calcite-worker.js    JS Web Worker bridge
 ```
 
 ## Building and testing
@@ -45,7 +45,7 @@ cargo fmt --all                 # format
 ### WASM build (requires wasm-pack)
 
 ```sh
-wasm-pack build crates/calcify-wasm --target web --out-dir ../../web/pkg
+wasm-pack build crates/calcite-wasm --target web --out-dir ../../web/pkg
 ```
 
 ### Benchmarks (requires fixture file)

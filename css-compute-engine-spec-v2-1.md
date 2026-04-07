@@ -1,4 +1,4 @@
-# calc(ify): A JIT Compiler for Computational CSS
+# calc(ite): A JIT Compiler for Computational CSS
 
 ## Project Summary
 
@@ -29,36 +29,36 @@ The line we draw: **the input is real CSS, the output is computed property value
 
 ## The Cardinal Rule: No Psychic Knowledge
 
-**Calcify must never do anything the CSS couldn't.** It is a JIT compiler that optimises the evaluation of CSS — it is not a co-processor that secretly fixes things the CSS got wrong.
+**Calcite must never do anything the CSS couldn't.** It is a JIT compiler that optimises the evaluation of CSS — it is not a co-processor that secretly fixes things the CSS got wrong.
 
-If the CSS can't express an instruction correctly (e.g. because of x86CSS's 2-write-slot limitation), that is a bug in the CSS, and the fix belongs in the CSS. Calcify's job is to evaluate whatever CSS it's given, faster. If the CSS says MOVSB is a no-op, calcify says MOVSB is a no-op. If x86CSS is extended to handle MOVSB correctly (multi-tick decomposition, a third write slot, or any other CSS-level solution), calcify will evaluate that new CSS correctly and fast.
+If the CSS can't express an instruction correctly (e.g. because of x86CSS's 2-write-slot limitation), that is a bug in the CSS, and the fix belongs in the CSS. Calcite's job is to evaluate whatever CSS it's given, faster. If the CSS says MOVSB is a no-op, calcite says MOVSB is a no-op. If x86CSS is extended to handle MOVSB correctly (multi-tick decomposition, a third write slot, or any other CSS-level solution), calcite will evaluate that new CSS correctly and fast.
 
-The reason is non-negotiable: **this is Doom running in CSS, not Doom running in a compiler that papers over broken CSS.** The moment calcify silently compensates for limitations in the CSS source, the project stops being "Doom in CSS" and becomes "Doom in a Rust emulator with CSS as a config format." That defeats the entire point.
+The reason is non-negotiable: **this is Doom running in CSS, not Doom running in a compiler that papers over broken CSS.** The moment calcite silently compensates for limitations in the CSS source, the project stops being "Doom in CSS" and becomes "Doom in a Rust emulator with CSS as a config format." That defeats the entire point.
 
 Concretely:
-- Calcify **must not** inspect `--instId` and branch on known instruction semantics
-- Calcify **must not** add extra writes that the CSS evaluation wouldn't produce
-- Calcify **must not** have any x86-specific logic — it doesn't know what x86 is
+- Calcite **must not** inspect `--instId` and branch on known instruction semantics
+- Calcite **must not** add extra writes that the CSS evaluation wouldn't produce
+- Calcite **must not** have any x86-specific logic — it doesn't know what x86 is
 - Pattern recognition (dispatch tables, broadcast writes, etc.) is fine because it produces the same result the CSS would, just faster
 - If a CSS pattern is too slow or can't express what's needed, the CSS must be changed
 
 ## The Execution Model
 
-Calcify is to CSS what V8 is to JavaScript. The CSS is a complete, self-contained program. It runs (slowly) in Chrome with no external help. Calcify is an optimising evaluator that produces the same results faster.
+Calcite is to CSS what V8 is to JavaScript. The CSS is a complete, self-contained program. It runs (slowly) in Chrome with no external help. Calcite is an optimising evaluator that produces the same results faster.
 
 This means:
 
-**The CSS is the single source of truth.** Every behaviour of the program — instruction decoding, arithmetic, control flow, memory access, I/O signalling — is defined by CSS expressions. There is no separate spec that the CSS and calcify both implement. The CSS *is* the spec. If the CSS is wrong, the program is wrong, and the fix goes in the CSS.
+**The CSS is the single source of truth.** Every behaviour of the program — instruction decoding, arithmetic, control flow, memory access, I/O signalling — is defined by CSS expressions. There is no separate spec that the CSS and calcite both implement. The CSS *is* the spec. If the CSS is wrong, the program is wrong, and the fix goes in the CSS.
 
-**Calcify observes CSS, it does not collaborate with it.** There is no contract between the CSS author and the calcify developer. No agreed-upon memory addresses, no signal ports, no shared conventions beyond what is expressed in the CSS itself. A calcify developer should be able to evaluate *any* computational CSS — not just x86css — without knowing what it computes. A CSS author should be able to change any internal convention (register addresses, memory layout, I/O mechanisms) without coordinating with calcify.
+**Calcite observes CSS, it does not collaborate with it.** There is no contract between the CSS author and the calcite developer. No agreed-upon memory addresses, no signal ports, no shared conventions beyond what is expressed in the CSS itself. A calcite developer should be able to evaluate *any* computational CSS — not just x86css — without knowing what it computes. A CSS author should be able to change any internal convention (register addresses, memory layout, I/O mechanisms) without coordinating with calcite.
 
-**All output is CSS property values.** Text output, screen contents, debug state — everything the program produces is the computed value of a CSS custom property. For numeric properties, this is an `<integer>`. For display output, this is a `<string>` property (like `--textBuffer`) rendered via `content:`. Calcify's job is to evaluate these properties correctly. How the host environment (browser, CLI, WASM) presents those values to the user is a rendering concern, not an evaluation concern.
+**All output is CSS property values.** Text output, screen contents, debug state — everything the program produces is the computed value of a CSS custom property. For numeric properties, this is an `<integer>`. For display output, this is a `<string>` property (like `--textBuffer`) rendered via `content:`. Calcite's job is to evaluate these properties correctly. How the host environment (browser, CLI, WASM) presents those values to the user is a rendering concern, not an evaluation concern.
 
-**Input is the CSS runtime environment.** Keyboard input, timing signals, and other external state enter through CSS custom properties (`var(--keyboard)`, animation-driven clocks). Calcify provides these the same way a browser does: by setting the initial values of properties that the CSS reads. This is not a side channel — it is the CSS runtime environment.
+**Input is the CSS runtime environment.** Keyboard input, timing signals, and other external state enter through CSS custom properties (`var(--keyboard)`, animation-driven clocks). Calcite provides these the same way a browser does: by setting the initial values of properties that the CSS reads. This is not a side channel — it is the CSS runtime environment.
 
-**Optimisations are invisible.** Dispatch table recognition, broadcast write elimination, bytecode compilation, and any future optimisations must produce identical results to naive CSS evaluation. The CSS author cannot observe whether calcify is optimising. The optimisations are implementation details of the evaluator, not features of the platform.
+**Optimisations are invisible.** Dispatch table recognition, broadcast write elimination, bytecode compilation, and any future optimisations must produce identical results to naive CSS evaluation. The CSS author cannot observe whether calcite is optimising. The optimisations are implementation details of the evaluator, not features of the platform.
 
-**String property evaluation is required for completeness.** The CSS uses `<string>` properties for text output (concatenating characters into `--textBuffer` via `content:`-style expressions). A complete calcify implementation evaluates both `<integer>` and `<string>` properties. Without string evaluation, text output requires workarounds outside the model.
+**String property evaluation is required for completeness.** The CSS uses `<string>` properties for text output (concatenating characters into `--textBuffer` via `content:`-style expressions). A complete calcite implementation evaluates both `<integer>` and `<string>` properties. Without string evaluation, text output requires workarounds outside the model.
 
 ## How x86CSS Actually Works (Source Analysis)
 
@@ -213,7 +213,7 @@ Browser (Chrome)
 ├── JS extracts CSS text, sends to Worker
 │
 Web Worker (WASM)
-├── calc(ify) — JIT Compiler (Rust → WASM)
+├── calc(ite) — JIT Compiler (Rust → WASM)
 │   ├── Parser: extract @function, @property, if(), calc() from CSS
 │   ├── Compiler: recognise patterns, build optimised evaluator
 │   │   ├── if(style()) chains → hash-map dispatch tables
@@ -339,7 +339,7 @@ This is what the CSS *does*, expressed as what it *means*. Every line correspond
 
 ```javascript
 // Main thread
-const worker = new Worker('calcify-worker.js');
+const worker = new Worker('calcite-worker.js');
 const cpu = document.querySelector('.cpu');
 
 // Extract CSS from the page
@@ -422,11 +422,11 @@ No REP/REPZ/REPNZ prefixes appear anywhere in the Doom8088 disassembly — this 
 
 **Far CALL/RET — the critical fix:** x86CSS implements CALL as a near call (pushes only IP, 2 bytes). Doom8088 has 1,195 far calls (`lcall`) which push CS:IP (4 bytes), and 370 far returns (RETF) which pop both. This is the most impactful missing feature — every function call in Doom8088 is a far call. x86CSS's CALL implementation must be extended to detect far vs near calls and handle CS accordingly.
 
-### Why calc(ify) Is Essential for doom.css
+### Why calc(ite) Is Essential for doom.css
 
-Without calc(ify), doom.css is purely theoretical. Chrome would need to evaluate a `readMem()` with ~573,000 branches, ~10 times per tick. Even if Chrome short-circuits, that's millions of `style()` evaluations per tick. A single frame of Doom might take hours.
+Without calc(ite), doom.css is purely theoretical. Chrome would need to evaluate a `readMem()` with ~573,000 branches, ~10 times per tick. Even if Chrome short-circuits, that's millions of `style()` evaluations per tick. A single frame of Doom might take hours.
 
-With calc(ify): `memory[addr]` is a single array index lookup regardless of memory size. calc(ify) makes doom.css go from "provably possible but never observable" to "here's a video of me playing it."
+With calc(ite): `memory[addr]` is a single array index lookup regardless of memory size. calc(ite) makes doom.css go from "provably possible but never observable" to "here's a video of me playing it."
 
 ### Estimated Framerate
 
@@ -444,7 +444,7 @@ The text mode display helps enormously — 40×25 characters is trivial to rende
 
 ## Development Phases
 
-The project has two parallel tracks that converge: the **calc(ify) track** (make x86CSS fast) and the **doom.css track** (get Doom running in x86CSS). calc(ify) is the technical contribution. doom.css is the demo that makes people care.
+The project has two parallel tracks that converge: the **calc(ite) track** (make x86CSS fast) and the **doom.css track** (get Doom running in x86CSS). calc(ite) is the technical contribution. doom.css is the demo that makes people care.
 
 ### Phase 0: Baselines
 
@@ -578,7 +578,7 @@ No REP MOVSB/STOSB appears in the Doom8088 disassembly, so the originally planne
 - Package as a standalone webpage — one URL, no install, Doom plays in CSS in Chrome
 - Write-up explaining the full pipeline (Doom → gcc-ia16 → CSS → compute engine → browser)
 - Performance comparison: Chrome native vs WASM engine vs native engine
-- Open-source calc(ify), doom.css (the Doom8088 fork), and the generated CSS
+- Open-source calc(ite), doom.css (the Doom8088 fork), and the generated CSS
 
 **Deployment options:**
 
@@ -628,11 +628,11 @@ Option A is the demo. Option B is for anyone who actually wants to use it.
 
 ## Success Criteria
 
-1. **Correctness:** calc(ify) produces identical computed property values to Chrome for x86CSS, verified by automated comparison over 1000+ ticks
+1. **Correctness:** calc(ite) produces identical computed property values to Chrome for x86CSS, verified by automated comparison over 1000+ ticks
 2. **Speed:** At least 10x faster than Chrome's native style resolver, measured in-browser (WASM Worker vs Chrome's `getComputedStyle()` loop)
-3. **In-browser:** The demo runs as a normal webpage — CSS renders visually, keyboard input works, calc(ify) is invisible to the user except for speed
+3. **In-browser:** The demo runs as a normal webpage — CSS renders visually, keyboard input works, calc(ite) is invisible to the user except for speed
 4. **Generality:** The parser and pattern compiler are not hardcoded to x86CSS — they would work on other computational CSS using the same feature set
-5. **doom.css:** Doom8088 runs in CSS via calc(ify), playable at ≥1fps with keyboard input, rendering recognisable 3D gameplay in text mode
+5. **doom.css:** Doom8088 runs in CSS via calc(ite), playable at ≥1fps with keyboard input, rendering recognisable 3D gameplay in text mode
 
 ## Prior Art and References
 

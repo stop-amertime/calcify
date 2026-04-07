@@ -1,19 +1,19 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/calcify-core",
-    "crates/calcify-cli",
-    "crates/calcify-wasm",
+    "crates/calcite-core",
+    "crates/calcite-cli",
+    "crates/calcite-wasm",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/stop-amertime/calcify"
+repository = "https://github.com/stop-amertime/calcite"
 
 [workspace.dependencies]
-calcify-core = { path = "crates/calcify-core" }
+calcite-core = { path = "crates/calcite-core" }
 cssparser = "0.37"
 log = "0.4"
 thiserror = "2"

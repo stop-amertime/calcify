@@ -49,4 +49,4 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build WASM
-        run: cargo build --target wasm32-unknown-unknown -p calcify-wasm
+        run: cargo build --target wasm32-unknown-unknown -p calcite-wasm

@@ -2,7 +2,7 @@
 
 A complete CSS-only 8086 emulator. Transpiles x86 binaries into CSS custom
 properties and `@function` definitions that execute in a browser — or via
-[calcify](https://github.com/nicholasgasior/calcify), a JIT compiler for
+[calcite](https://github.com/nicholasgasior/calcite), a JIT compiler for
 computational CSS.
 
 Forked from [rebane2001/x86css](https://github.com/rebane2001/x86css) with
@@ -73,7 +73,7 @@ file access), additional stubs are needed.
 ### REP prefixes
 
 REP/REPZ/REPNZ are recognised as instructions in the CSS but execute as
-no-ops. The [calcify evaluator](../crates/calcify-core/) handles REP
+no-ops. The [calcite evaluator](../crates/calcite-core/) handles REP
 natively, decrementing CX and repeating the following string instruction in a
 loop within a single tick.
 
@@ -120,17 +120,17 @@ property, so large memory = large CSS output.
 | 0x2006 | readInput — read keyboard input |
 | 0x2100 | SHOW_KEYBOARD — toggle on-screen keyboard (0=off, 1=numeric, 2=alpha) |
 
-## Running with calcify
+## Running with calcite
 
-The generated CSS can be executed directly by calcify for much higher
+The generated CSS can be executed directly by calcite for much higher
 throughput than browser rendering:
 
 ```sh
 # Parse and run the CSS
-cargo run -p calcify-cli -- path/to/x86css.html --ticks 1000000
+cargo run -p calcite-cli -- path/to/x86css.html --ticks 1000000
 ```
 
-calcify compiles the CSS expressions to bytecode, achieving ~230K ticks/sec
+calcite compiles the CSS expressions to bytecode, achieving ~230K ticks/sec
 with pattern recognition for dispatch tables, broadcast writes, and bitwise
 operations.
 

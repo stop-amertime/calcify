@@ -1491,22 +1491,12 @@ SUB, ADD
 /* INT dispatch: handle DOS services, skip unsupported interrupts.
    INT 3: no-op (breakpoint, just advance IP)
    INT 21h (instArg1=33):
-     AH=01h (1):  Read char with echo → AL = keyboard, signal 0x2200
-     AH=02h (2):  Write char in DL → signal 0x2200
-     AH=06h (6):  Direct console I/O → AL = keyboard, signal 0x2200
-     AH=08h (8):  Read char without echo → AL = keyboard, signal 0x2200
-     AH=09h (9):  Write $-terminated string → signal 0x2200
-     AH=0Ah (10): Buffered input → signal 0x2200
-     AH=1Ah (26): Set DTA address → signal 0x2200
-     AH=25h (37): Set interrupt vector → signal 0x2200
-     AH=2Ch (44): Get system time → signal 0x2200
+     AH=01h (1):  Read char with echo → AL = keyboard input
+     AH=06h (6):  Direct console I/O: DL=FF reads → AL, else writes DL
+     AH=08h (8):  Read char without echo → AL = keyboard input
      AH=30h (48): Get DOS version → AX = 5
-     AH=35h (53): Get interrupt vector → signal 0x2200
      AH=4Ch (76): Exit → halt (IP = IP)
-
-   Write slot 0: register/memory write for the service result
-   Write slot 1: signal AH value to address 0x2200 for calcify hook
-     (calcify reads 0x2200 each tick — nonzero means "DOS service requested")
+   Text output (AH=02h, 06h, 09h) is handled by --textBuffer below.
    All others: no-op (advance IP normally) */
 @function --D-INT(--w <integer>) returns <integer> {
   result: if(
@@ -1515,7 +1505,6 @@ SUB, ADD
     style(--w:0) and style(--instArg1:33) and style(--AH:8):-31;
     style(--w:0) and style(--instArg1:33) and style(--AH:48):-1;
     style(--w:0) and style(--instArg1:33) and style(--AH:76):-9;
-    style(--w:1) and style(--instArg1:33):#dosSignal;
   else:-100);
 }
 
@@ -1526,7 +1515,6 @@ SUB, ADD
     style(--w:0) and style(--instArg1:33) and style(--AH:8):var(--keyboard, 0);
     style(--w:0) and style(--instArg1:33) and style(--AH:48):5;
     style(--w:0) and style(--instArg1:33) and style(--AH:76):var(--__1IP);
-    style(--w:1) and style(--instArg1:33):var(--AH);
   else:0);
 }
 
@@ -1962,7 +1950,7 @@ SUB, ADD
 /* --- REP PREFIXES --- */
 /* REP/REPZ/REPNZ are prefixes that modify the following string instruction. */
 /* In CSS, these can't easily modify the next instruction. Stub as no-ops. */
-/* calcify handles these natively in the evaluator. */
+/* calcite handles these natively in the evaluator. */
 
 @function --D-REPZ(--w <integer>) returns <integer> { result: -100; }
 @function --V-REPZ(--w <integer>) returns <integer> { result: -100; }
@@ -2143,11 +2131,20 @@ SUB, ADD
 
   --strPointer: --read2(calc(var(--__1SP) + 2));
   --textBuffer: if(
+      /* Custom I/O stubs (CALL-based) */
       style(--__1IP:#writeChar1):var(--__1textBuffer) --i2char(--readMem(calc(var(--__1SP) + 2)));
 /*      style(--__1IP:#writeChar4):var(--__1textBuffer) --i2char(--readMem(calc(var(--__1SP) + 2))) --i2char(--readMem(calc(var(--__1SP) + 4))) --i2char(--readMem(calc(var(--__1SP) + 6))) --i2char(--readMem(calc(var(--__1SP) + 8)));*/
       style(--__1IP:#writeChar4):var(--__1textBuffer) --i2char(--readMem(var(--strPointer))) --i2char(--readMem(calc(var(--strPointer) + 1))) --i2char(--readMem(calc(var(--strPointer) + 2))) --i2char(--readMem(calc(var(--strPointer) + 3)));
       style(--__1IP:#writeChar8):var(--__1textBuffer) --i2char(--readMem(var(--strPointer))) --i2char(--readMem(calc(var(--strPointer) + 1))) --i2char(--readMem(calc(var(--strPointer) + 2))) --i2char(--readMem(calc(var(--strPointer) + 3))) --i2char(--readMem(calc(var(--strPointer) + 4))) --i2char(--readMem(calc(var(--strPointer) + 5))) --i2char(--readMem(calc(var(--strPointer) + 6))) --i2char(--readMem(calc(var(--strPointer) + 7)));
 /*      style(--__1IP:#writeStr):var(--__1textBuffer) --readString(--read2(calc(var(--__1SP) + 2)));*/
+      /* DOS INT 21h AH=02h: write character in DL */
+      style(--instId:212) and style(--instArg1:33) and style(--AH:2):var(--__1textBuffer) --i2char(var(--DL));
+      /* DOS INT 21h AH=06h: direct console output (DL != 0xFF) */
+      style(--instId:212) and style(--instArg1:33) and style(--AH:6):var(--__1textBuffer) --i2char(var(--DL));
+      /* DOS INT 21h AH=09h: write string at DS:DX (first 8 chars per tick) */
+      style(--instId:212) and style(--instArg1:33) and style(--AH:9):var(--__1textBuffer) --readString(calc(var(--__1DS) * 16 + var(--__1DX)));
+      /* DOS INT 21h AH=01h: echo keyboard input */
+      style(--instId:212) and style(--instArg1:33) and style(--AH:1):var(--__1textBuffer) --i2char(var(--keyboard, 0));
       else:var(--__1textBuffer)
     );
   --clock2: --int(calc(var(--clock)));

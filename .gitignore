@@ -21,3 +21,13 @@ Thumbs.db
 
 # Test fixtures (downloaded from x86CSS repo, not checked in)
 tests/fixtures/
+
+# Playwright MCP logs
+.playwright-mcp/
+
+# Claude memory (auto-generated, local)
+memory/
+MEMORY.md
+
+# Screenshots and images (not source)
+*.png

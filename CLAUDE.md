@@ -1,4 +1,4 @@
-# calc(ify)
+# calc(ite)
 
 A JIT compiler for computational CSS. Parses real CSS, recognises computational
 patterns, and compiles them into efficient native operations via WASM.
@@ -7,11 +7,11 @@ patterns, and compiles them into efficient native operations via WASM.
 
 ```
 crates/
-  calcify-core/    Core engine: parser, pattern compiler, evaluator, state
-  calcify-cli/     CLI tool for running CSS through the engine
-  calcify-wasm/    WASM bindings (wasm-bindgen) for browser Web Worker
+  calcite-core/    Core engine: parser, pattern compiler, evaluator, state
+  calcite-cli/     CLI tool for running CSS through the engine
+  calcite-wasm/    WASM bindings (wasm-bindgen) for browser Web Worker
 web/
-  calcify-worker.js   JS Web Worker bridge
+  calcite-worker.js   JS Web Worker bridge
 ```
 
 ## Development
@@ -23,7 +23,7 @@ cargo clippy --workspace        # lint
 cargo fmt --all                 # format
 
 # Build WASM (requires wasm-pack)
-wasm-pack build crates/calcify-wasm --target web --out-dir ../../web/pkg
+wasm-pack build crates/calcite-wasm --target web --out-dir ../../web/pkg
 ```
 
 ## Architecture

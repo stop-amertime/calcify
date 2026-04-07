@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>calc(ify) — JIT Compiler for Computational CSS</title>
+  <title>calc(ite) — JIT Compiler for Computational CSS</title>
   <style>
     body { font-family: monospace; background: #1a1a1a; color: #e0e0e0; padding: 2em; }
     #status { color: #88ff88; margin-bottom: 1em; }
@@ -14,7 +14,7 @@
   </style>
 </head>
 <body>
-  <h1>calc(ify)</h1>
+  <h1>calc(ite)</h1>
   <div id="status">Loading...</div>
 
   <div id="controls">
@@ -30,7 +30,7 @@
   <div id="stats"></div>
 
   <script>
-    const worker = new Worker('calcify-worker.js', { type: 'module' });
+    const worker = new Worker('calcite-worker.js', { type: 'module' });
     const status = document.getElementById('status');
     const output = document.getElementById('output');
     const stats = document.getElementById('stats');
@@ -112,7 +112,7 @@
         .join('\n');
 
       if (cssText.length === 0) {
-        status.textContent = 'No CSS found. Load a computational CSS page to use calc(ify).';
+        status.textContent = 'No CSS found. Load a computational CSS page to use calc(ite).';
         return;
       }
 

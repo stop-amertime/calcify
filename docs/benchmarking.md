@@ -3,7 +3,7 @@
 ## Running benchmarks
 
 ```bash
-cargo bench -p calcify-core
+cargo bench -p calcite-core
 ```
 
 This runs [criterion](https://github.com/bhavsec/criterion.rs) benchmarks against the x86CSS fixture (`tests/fixtures/x86css-main.css`). Results are saved to `target/criterion/` with HTML reports. Subsequent runs automatically show percentage change from the previous baseline.
@@ -32,7 +32,7 @@ Measured on Windows 11, release build (`cargo bench`):
 
 ## Chrome comparison
 
-Chrome's x86CSS runs as CSS animations at [lyra.horse/x86css](https://lyra.horse/x86css/). The two engines are not directly comparable per-tick because Chrome uses a triple-buffer animation pipeline where most ticks cycle through buffer phases without advancing the CPU state. Calcify eliminates the triple buffer and directly mutates state, so each calcify tick does real work.
+Chrome's x86CSS runs as CSS animations at [lyra.horse/x86css](https://lyra.horse/x86css/). The two engines are not directly comparable per-tick because Chrome uses a triple-buffer animation pipeline where most ticks cycle through buffer phases without advancing the CPU state. Calcite eliminates the triple buffer and directly mutates state, so each calcite tick does real work.
 
 The fair comparison is **observable instruction throughput** — how fast each engine executes actual x86 instructions as measured by register changes.
 
@@ -40,24 +40,24 @@ The fair comparison is **observable instruction throughput** — how fast each e
 
 **Chrome**: Playwright captures SI register transitions over 60 seconds via `setInterval` sampling at 50ms. SI increments by 8 each time the main loop completes one iteration (one x86 instruction batch). Timestamps on each transition give wall-clock time per instruction.
 
-**Calcify**: `--verbose` output shows SI changing every 7 ticks. Criterion measures 2.85ms/tick, giving wall-clock time per instruction.
+**Calcite**: `--verbose` output shows SI changing every 7 ticks. Criterion measures 2.85ms/tick, giving wall-clock time per instruction.
 
 ### Results (2026-04-06)
 
 Chrome 146, lyra.horse/x86css, headless via Playwright:
 
-| Metric | Chrome | Calcify |
+| Metric | Chrome | Calcite |
 |---|---|---|
 | Wall time per x86 instruction cycle | ~2.0 s | ~20 ms |
 | Instruction cycles per second | ~0.5 | ~50 |
 
-**Calcify is ~100x faster than Chrome at executing x86 instructions.**
+**Calcite is ~100x faster than Chrome at executing x86 instructions.**
 
 ### Why the gap
 
 Chrome does ~1,000 CSS animation iterations per second (1ms animation duration), but only ~0.5 of those produce an observable state change. The triple-buffer pipeline (`--__0`, `--__1`, `--__2` prefixes) means each value takes multiple animation cycles to propagate from the write buffer through to the read buffer. Chrome's style engine recalculates all ~3,200 custom properties on every animation iteration regardless.
 
-Calcify skips the triple buffer entirely — one tick = one style recalculation = one state change. It evaluates ~3,200 assignments per tick at 2.85ms/tick, where Chrome's style engine takes ~1ms per recalc but needs ~4,000 recalcs to achieve the same result.
+Calcite skips the triple buffer entirely — one tick = one style recalculation = one state change. It evaluates ~3,200 assignments per tick at 2.85ms/tick, where Chrome's style engine takes ~1ms per recalc but needs ~4,000 recalcs to achieve the same result.
 
 ### Raw Chrome data
 

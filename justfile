@@ -1,4 +1,4 @@
-# calc(ify) development commands
+# calc(ite) development commands
 
 # Run all checks (test, clippy, fmt)
 check:
@@ -24,12 +24,12 @@ fmt:
 
 # Build WASM (requires wasm-pack: cargo install wasm-pack)
 wasm:
-    wasm-pack build crates/calcify-wasm --target web --out-dir ../../web/pkg
+    wasm-pack build crates/calcite-wasm --target web --out-dir ../../web/pkg
 
 # Run CLI against a CSS file
 run file ticks="1":
-    cargo run -p calcify-cli -- --input {{file}} --ticks {{ticks}}
+    cargo run -p calcite-cli -- --input {{file}} --ticks {{ticks}}
 
 # Run CLI in parse-only mode
 parse file:
-    cargo run -p calcify-cli -- --input {{file}} --parse-only
+    cargo run -p calcite-cli -- --input {{file}} --parse-only
