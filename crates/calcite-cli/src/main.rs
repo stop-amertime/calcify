@@ -110,9 +110,9 @@ fn main() {
 
             let t2 = std::time::Instant::now();
             if cli.verbose {
-                // In verbose mode, use run_batch for the first 90% of ticks,
-                // then switch to per-tick output for the last 10%.
-                let batch_count = cli.ticks.saturating_sub(20);
+                // In verbose mode, batch the early ticks, then show
+                // per-tick output for the tail. Small counts show all.
+                let batch_count = if cli.ticks <= 100 { 0 } else { cli.ticks.saturating_sub(20) };
                 if batch_count > 0 {
                     evaluator.run_batch(&mut state, batch_count);
                     eprintln!(
