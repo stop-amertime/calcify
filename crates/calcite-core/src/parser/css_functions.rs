@@ -47,6 +47,54 @@ pub fn parse_expr<'i, 't>(input: &mut Parser<'i, 't>) -> Result<Expr> {
     parse_additive(input, left)
 }
 
+/// Parse one or more space-separated expressions (for string concatenation).
+///
+/// Returns `Expr::Concat` if multiple tokens found, otherwise the single `Expr`.
+/// Used in contexts where CSS values can be space-separated token lists
+/// (property declarations, if() branches, function results).
+pub fn parse_expr_list<'i, 't>(input: &mut Parser<'i, 't>) -> Result<Expr> {
+    let first = parse_expr(input)?;
+    let mut parts = vec![first];
+
+    loop {
+        // Try to parse another expression after whitespace.
+        // Stop if we hit a delimiter or keyword that ends the list.
+        let state = input.state();
+        let next = input.try_parse(|i: &mut Parser<'i, 't>| -> std::result::Result<Expr, CssParseError<'i>> {
+            // peek: is the next non-whitespace token a new expression?
+            let inner_state = i.state();
+            match i.next() {
+                Ok(Token::Ident(ref s)) if &**s == "else" || &**s == "and" || &**s == "or" => {
+                    i.reset(&inner_state);
+                    Err(i.new_custom_error(crate::CalciteError::Parse("end of expr list".into())))
+                }
+                Ok(Token::Function(ref s)) if &**s == "style" => {
+                    i.reset(&inner_state);
+                    Err(i.new_custom_error(crate::CalciteError::Parse("end of expr list".into())))
+                }
+                Ok(_) => {
+                    i.reset(&inner_state);
+                    parse_expr(i).map_err(|e| wrap_err(e, i.current_source_location()))
+                }
+                Err(e) => Err(e.into()),
+            }
+        });
+        match next {
+            Ok(expr) => parts.push(expr),
+            Err(_) => {
+                input.reset(&state);
+                break;
+            }
+        }
+    }
+
+    if parts.len() == 1 {
+        Ok(parts.pop().unwrap())
+    } else {
+        Ok(Expr::Concat(parts))
+    }
+}
+
 /// Same as parse_expr but returns CssParseError — for use inside parse_nested_block.
 fn parse_expr_css<'i, 't>(
     input: &mut Parser<'i, 't>,
@@ -217,7 +265,7 @@ fn parse_if<'i, 't>(input: &mut Parser<'i, 't>) -> Result<Expr> {
         // Check for `else:` — ends the branch list
         if input.try_parse(|i| i.expect_ident_matching("else")).is_ok() {
             input.expect_colon().map_err(basic_err)?;
-            let fallback = parse_expr(input)?;
+            let fallback = parse_expr_list(input)?;
             return Ok(Expr::StyleCondition {
                 branches,
                 fallback: Box::new(fallback),
@@ -228,7 +276,7 @@ fn parse_if<'i, 't>(input: &mut Parser<'i, 't>) -> Result<Expr> {
         match parse_style_condition(input) {
             Ok(condition) => {
                 input.expect_colon().map_err(basic_err)?;
-                let then = parse_expr(input)?;
+                let then = parse_expr_list(input)?;
                 branches.push(StyleBranch { condition, then });
                 let _ = input.try_parse(|i| i.expect_semicolon());
             }

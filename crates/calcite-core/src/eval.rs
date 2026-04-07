@@ -6,7 +6,7 @@
 //! 2. **Compiled**: Uses pattern-recognised structures (dispatch tables,
 //!    direct writes) for O(1) operations. (Phase 2+)
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::compile::{self, CompiledProgram,
     is_var_ref, is_mod_pow2, is_right_shift, is_left_shift,
@@ -16,6 +16,31 @@ use crate::pattern::broadcast_write::{self, BroadcastWrite};
 use crate::pattern::dispatch_table::{self, DispatchTable};
 use crate::state::State;
 use crate::types::*;
+
+/// A value produced by expression evaluation — either numeric or string.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Value {
+    Number(f64),
+    Str(String),
+}
+
+impl Value {
+    /// Coerce to f64. Strings become 0.0.
+    pub fn as_number(&self) -> f64 {
+        match self {
+            Value::Number(n) => *n,
+            Value::Str(_) => 0.0,
+        }
+    }
+
+    /// Coerce to String. Numbers become empty string.
+    pub fn as_string(&self) -> String {
+        match self {
+            Value::Str(s) => s.clone(),
+            Value::Number(_) => String::new(),
+        }
+    }
+}
 
 /// A precomputed function body pattern for the interpreter fast-path.
 ///
@@ -58,9 +83,13 @@ pub struct Evaluator {
     /// Precomputed function body patterns for the interpreter fast-path.
     function_patterns: HashMap<String, FunctionPattern>,
     /// Property values computed during the current tick. Reused across ticks.
-    properties: HashMap<String, f64>,
+    properties: HashMap<String, Value>,
     /// Call depth for recursion protection.
     call_depth: usize,
+    /// String property assignments (evaluated via interpreter after compiled pass).
+    string_assignments: Vec<Assignment>,
+    /// Bare names of properties with string syntax (e.g., "textBuffer").
+    string_property_names: HashSet<String>,
     /// Pre-tick hooks: called before each tick to handle external side effects.
     /// The evaluator has no knowledge of what hooks do — they are registered
     /// by the caller (CLI, WASM, etc.).
@@ -127,10 +156,23 @@ impl Evaluator {
             );
         }
 
+        // Identify string properties from @property syntax
+        let mut string_property_names: HashSet<String> = HashSet::new();
+        for prop in &program.properties {
+            if matches!(&prop.syntax, PropertySyntax::Custom(s) if
+                s.contains("content-list") || s.contains("string")) ||
+               matches!(&prop.syntax, PropertySyntax::Any) && matches!(&prop.initial_value, Some(CssValue::String(_)))
+            {
+                let bare = to_bare_name(&prop.name);
+                string_property_names.insert(bare.to_string());
+                log::info!("Detected string property: {} (bare: {})", prop.name, bare);
+            }
+        }
+
         // Filter out:
         // 1. Assignments absorbed into broadcast writes (would overwrite with stale values)
         // 2. Triple-buffer copies (--__0*, --__1*, --__2*) which are no-ops in mutable state
-        let assignments: Vec<Assignment> = program
+        let all_assignments: Vec<Assignment> = program
             .assignments
             .iter()
             .filter(|a| {
@@ -140,11 +182,21 @@ impl Evaluator {
             .cloned()
             .collect();
 
+        // Partition: string properties go to interpreter, rest to compiler
+        let (string_assignments, numeric_assignments): (Vec<_>, Vec<_>) = all_assignments
+            .into_iter()
+            .partition(|a| string_property_names.contains(to_bare_name(&a.property)));
+
+        if !string_assignments.is_empty() {
+            log::info!("String assignments (interpreter path): {}",
+                string_assignments.iter().map(|a| a.property.as_str()).collect::<Vec<_>>().join(", "));
+        }
+
         // Topological sort: reorder assignments by data dependencies.
         // CSS evaluates all properties simultaneously, but our sequential evaluator
         // must process them in dependency order. Only style() test references
         // (non-buffer-prefixed) create ordering constraints.
-        let assignments = topological_sort_assignments(assignments, &functions);
+        let assignments = topological_sort_assignments(numeric_assignments, &functions);
 
         let buffer_copies = program
             .assignments
@@ -153,8 +205,9 @@ impl Evaluator {
             .count();
 
         log::info!(
-            "Assignments: {} kept, {} absorbed into broadcast writes, {} buffer copies skipped",
+            "Assignments: {} numeric, {} string, {} absorbed into broadcast writes, {} buffer copies skipped",
             assignments.len(),
+            string_assignments.len(),
             broadcast_result.absorbed_properties.len(),
             buffer_copies,
         );
@@ -196,6 +249,8 @@ impl Evaluator {
             pre_tick_hooks: Vec::new(),
             properties: HashMap::with_capacity(properties_capacity),
             call_depth: 0,
+            string_assignments,
+            string_property_names,
             compiled,
             slots: Vec::with_capacity(slot_count),
         }
@@ -213,9 +268,6 @@ impl Evaluator {
     /// Run a single tick: evaluate all assignments against the state.
     pub fn tick(&mut self, state: &mut State) -> TickResult {
         // Run pre-tick hooks (e.g., external function dispatch).
-        // Hooks are registered by the caller and inspect state to perform
-        // side effects like text output. The evaluator itself has no knowledge
-        // of what the hooks do.
         for hook in &self.pre_tick_hooks {
             hook(state);
         }
@@ -223,8 +275,33 @@ impl Evaluator {
         // Snapshot registers for change detection
         let prev_regs = state.registers;
 
-        // Execute via compiled bytecode
+        // Execute numeric assignments via compiled bytecode
         compile::execute(&self.compiled, state, &mut self.slots);
+
+        // Evaluate string assignments via interpreter (after compiled pass,
+        // so state is up-to-date for var() references).
+        if !self.string_assignments.is_empty() {
+            self.properties.clear();
+            self.call_depth = 0;
+            // Populate properties from compiled slot values so string eval
+            // can read intermediate computed values (e.g., --instId, --instArg1).
+            for (name, &slot) in &self.compiled.property_slots {
+                if (slot as usize) < self.slots.len() {
+                    self.properties.insert(name.clone(), Value::Number(self.slots[slot as usize]));
+                }
+            }
+            for i in 0..self.string_assignments.len() {
+                let assignment = &self.string_assignments[i] as *const Assignment;
+                let assignment = unsafe { &*assignment };
+                let value = self.eval_expr(&assignment.value, state);
+                let bare = to_bare_name(&assignment.property);
+                log::trace!("String property {}: {:?}", assignment.property, value);
+                if let Value::Str(ref s) = value {
+                    state.string_properties.insert(bare.to_string(), s.clone());
+                }
+                self.properties.insert(assignment.property.clone(), value);
+            }
+        }
 
         // Detect register changes
         let mut changes = Vec::new();
@@ -268,23 +345,35 @@ impl Evaluator {
         let bw_len = self.broadcast_writes.len();
         for i in 0..bw_len {
             let bw = unsafe { &*bw_ptr.add(i) };
-            let dest = self.resolve_property(&bw.dest_property, state);
+            let dest = self.resolve_property(&bw.dest_property, state).as_number();
             let dest_i64 = dest as i64;
             if bw.address_map.contains_key(&dest_i64) {
-                let value = self.eval_expr(&bw.value_expr, state);
+                let value = self.eval_expr(&bw.value_expr, state).as_number();
                 state.write_mem(dest_i64 as i32, value as i32);
             }
             if !bw.spillover_map.is_empty() {
                 if let Some(ref guard) = bw.spillover_guard {
-                    let guard_val = self.resolve_property(guard, state);
+                    let guard_val = self.resolve_property(guard, state).as_number();
                     if (guard_val as i64) == 1 {
                         if let Some((_var_name, val_expr)) = bw.spillover_map.get(&dest_i64) {
-                            let value = self.eval_expr(val_expr, state);
+                            let value = self.eval_expr(val_expr, state).as_number();
                             state.write_mem(dest_i64 as i32 + 1, value as i32);
                         }
                     }
                 }
             }
+        }
+
+        // Evaluate string assignments
+        for i in 0..self.string_assignments.len() {
+            let assignment = &self.string_assignments[i] as *const Assignment;
+            let assignment = unsafe { &*assignment };
+            let value = self.eval_expr(&assignment.value, state);
+            let bare = to_bare_name(&assignment.property);
+            if let Value::Str(ref s) = value {
+                state.string_properties.insert(bare.to_string(), s.clone());
+            }
+            self.properties.insert(assignment.property.clone(), value);
         }
 
         let changes = self.apply_state(state);
@@ -297,11 +386,8 @@ impl Evaluator {
     }
 
     /// Read a computed property value from the most recent tick.
-    ///
-    /// Returns the value of the named property as computed during the last
-    /// `tick()` call, or `None` if the property wasn't computed.
     pub fn get_property(&self, name: &str) -> Option<f64> {
-        self.properties.get(name).copied()
+        self.properties.get(name).map(|v| v.as_number())
     }
 
     /// Run a batch of ticks, returning the net state diff across all ticks.
@@ -341,30 +427,28 @@ impl Evaluator {
     fn apply_state(&self, state: &mut State) -> Vec<(String, String)> {
         let mut changes = Vec::new();
 
-        for (name, &value) in &self.properties {
+        for (name, value) in &self.properties {
             // Skip buffer copies — only the canonical name should write to state
             if name.starts_with("--__0") || name.starts_with("--__1") || name.starts_with("--__2") {
                 continue;
             }
-            // Skip byte-half properties (AL/AH/BL/BH/CL/CH/DL/DH).
-            // In CSS, these are read-only views of the full register: e.g.
-            //   --AL: --lowerBytes(var(--__1AX), 8)
-            //   --AH: --rightShift(var(--__1AX), 8)
-            // The full register formulas (--AX, etc.) already handle byte
-            // merging when a byte write occurs: e.g. destA==-31 (AL) triggers
-            //   --AX: floor(AX/256)*256 + lowerBytes(valA, 8)
-            // Writing the byte halves back would clobber the updated full
-            // register with stale values from the OLD tick.
+            // Skip byte-half properties
             if is_byte_half(name) {
                 continue;
             }
-            let int_val = value as i32;
-            // Map well-known property names to state addresses
-            if let Some(addr) = property_to_address(name) {
-                let old = state.read_mem(addr);
-                if old != int_val {
-                    state.write_mem(addr, int_val);
-                    changes.push((name.clone(), int_val.to_string()));
+            match value {
+                Value::Number(n) => {
+                    let int_val = *n as i32;
+                    if let Some(addr) = property_to_address(name) {
+                        let old = state.read_mem(addr);
+                        if old != int_val {
+                            state.write_mem(addr, int_val);
+                            changes.push((name.clone(), int_val.to_string()));
+                        }
+                    }
+                }
+                Value::Str(_) => {
+                    // String properties are written to state in the tick loop directly
                 }
             }
         }
@@ -504,6 +588,11 @@ fn collect_style_deps(
             }
         }
         Expr::Literal(_) | Expr::StringLiteral(_) => {}
+        Expr::Concat(parts) => {
+            for part in parts {
+                collect_style_deps(part, defined, functions, out);
+            }
+        }
         Expr::Calc(op) => {
             match op {
                 CalcOp::Add(a, b) | CalcOp::Sub(a, b) | CalcOp::Mul(a, b)
@@ -902,6 +991,13 @@ fn calls_identity_read(expr: &Expr, identity_read_names: &[String]) -> bool {
                 }
             }
         }
+        Expr::Concat(parts) => {
+            for part in parts {
+                if calls_identity_read(part, identity_read_names) {
+                    return true;
+                }
+            }
+        }
         _ => {}
     }
     false
@@ -918,17 +1014,19 @@ const MAX_CALL_DEPTH: usize = 64;
 // during evaluation.
 
 impl Evaluator {
-    /// Evaluate an expression to a numeric value.
-    fn eval_expr(&mut self, expr: &Expr, state: &State) -> f64 {
+    /// Evaluate an expression to a `Value` (number or string).
+    fn eval_expr(&mut self, expr: &Expr, state: &State) -> Value {
         match expr {
-            Expr::Literal(v) => *v,
+            Expr::Literal(v) => Value::Number(*v),
 
             Expr::Var { name, fallback } => {
                 let v = self.resolve_property(name, state);
-                if v != 0.0 {
-                    return v;
+                match &v {
+                    Value::Number(n) if *n != 0.0 => return v,
+                    Value::Str(s) if !s.is_empty() => return v,
+                    _ => {}
                 }
-                // Property might genuinely be 0, or might not exist.
+                // Property might genuinely be 0/empty, or might not exist.
                 if self.properties.contains_key(name.as_str()) {
                     return v;
                 }
@@ -945,12 +1043,12 @@ impl Evaluator {
                     return self.eval_expr(fb, state);
                 }
                 log::debug!("undefined variable: {name}");
-                0.0
+                v
             }
 
-            Expr::StringLiteral(_) => 0.0,
+            Expr::StringLiteral(s) => Value::Str(s.clone()),
 
-            Expr::Calc(op) => self.eval_calc(op, state),
+            Expr::Calc(op) => Value::Number(self.eval_calc(op, state)),
 
             Expr::StyleCondition {
                 branches, fallback, ..
@@ -964,48 +1062,59 @@ impl Evaluator {
             }
 
             Expr::FunctionCall { name, args } => self.eval_function_call(name, args, state),
+
+            Expr::Concat(parts) => {
+                let mut result = String::new();
+                for part in parts {
+                    match self.eval_expr(part, state) {
+                        Value::Str(s) => result.push_str(&s),
+                        Value::Number(_) => {}
+                    }
+                }
+                Value::Str(result)
+            }
         }
     }
 
-    /// Evaluate a `CalcOp`.
+    /// Evaluate a `CalcOp` (always numeric).
     fn eval_calc(&mut self, op: &CalcOp, state: &State) -> f64 {
         match op {
-            CalcOp::Add(a, b) => self.eval_expr(a, state) + self.eval_expr(b, state),
-            CalcOp::Sub(a, b) => self.eval_expr(a, state) - self.eval_expr(b, state),
-            CalcOp::Mul(a, b) => self.eval_expr(a, state) * self.eval_expr(b, state),
+            CalcOp::Add(a, b) => self.eval_expr(a, state).as_number() + self.eval_expr(b, state).as_number(),
+            CalcOp::Sub(a, b) => self.eval_expr(a, state).as_number() - self.eval_expr(b, state).as_number(),
+            CalcOp::Mul(a, b) => self.eval_expr(a, state).as_number() * self.eval_expr(b, state).as_number(),
             CalcOp::Div(a, b) => {
-                let divisor = self.eval_expr(b, state);
+                let divisor = self.eval_expr(b, state).as_number();
                 if divisor == 0.0 {
                     0.0
                 } else {
-                    self.eval_expr(a, state) / divisor
+                    self.eval_expr(a, state).as_number() / divisor
                 }
             }
             CalcOp::Mod(a, b) => {
-                let divisor = self.eval_expr(b, state);
+                let divisor = self.eval_expr(b, state).as_number();
                 if divisor == 0.0 {
                     0.0
                 } else {
-                    self.eval_expr(a, state) % divisor
+                    self.eval_expr(a, state).as_number() % divisor
                 }
             }
             CalcOp::Min(args) => args
                 .iter()
-                .map(|a| self.eval_expr(a, state))
+                .map(|a| self.eval_expr(a, state).as_number())
                 .fold(f64::INFINITY, f64::min),
             CalcOp::Max(args) => args
                 .iter()
-                .map(|a| self.eval_expr(a, state))
+                .map(|a| self.eval_expr(a, state).as_number())
                 .fold(f64::NEG_INFINITY, f64::max),
             CalcOp::Clamp(min, val, max) => {
-                let min_v = self.eval_expr(min, state);
-                let val_v = self.eval_expr(val, state);
-                let max_v = self.eval_expr(max, state);
+                let min_v = self.eval_expr(min, state).as_number();
+                let val_v = self.eval_expr(val, state).as_number();
+                let max_v = self.eval_expr(max, state).as_number();
                 val_v.clamp(min_v, max_v)
             }
             CalcOp::Round(strategy, val, interval) => {
-                let v = self.eval_expr(val, state);
-                let i = self.eval_expr(interval, state);
+                let v = self.eval_expr(val, state).as_number();
+                let i = self.eval_expr(interval, state).as_number();
                 if i == 0.0 {
                     return v;
                 }
@@ -1016,9 +1125,9 @@ impl Evaluator {
                     RoundStrategy::ToZero => (v / i).trunc() * i,
                 }
             }
-            CalcOp::Pow(base, exp) => self.eval_expr(base, state).powf(self.eval_expr(exp, state)),
+            CalcOp::Pow(base, exp) => self.eval_expr(base, state).as_number().powf(self.eval_expr(exp, state).as_number()),
             CalcOp::Sign(val) => {
-                let v = self.eval_expr(val, state);
+                let v = self.eval_expr(val, state).as_number();
                 if v > 0.0 {
                     1.0
                 } else if v < 0.0 {
@@ -1027,8 +1136,8 @@ impl Evaluator {
                     0.0
                 }
             }
-            CalcOp::Abs(val) => self.eval_expr(val, state).abs(),
-            CalcOp::Negate(val) => -self.eval_expr(val, state),
+            CalcOp::Abs(val) => self.eval_expr(val, state).as_number().abs(),
+            CalcOp::Negate(val) => -self.eval_expr(val, state).as_number(),
         }
     }
 
@@ -1036,35 +1145,48 @@ impl Evaluator {
     ///
     /// For buffer-prefixed names (`--__1AX`), also checks the canonical name (`--AX`)
     /// in computed properties before falling back to state.
-    fn resolve_property(&self, name: &str, state: &State) -> f64 {
-        if let Some(&v) = self.properties.get(name) {
-            return v;
+    fn resolve_property(&self, name: &str, state: &State) -> Value {
+        if let Some(v) = self.properties.get(name) {
+            return v.clone();
         }
         if name.starts_with("--__") && name.len() > 5 {
             let suffix = &name[5..];
             if !self.properties.is_empty() {
                 let canonical = format!("--{suffix}");
-                if let Some(&v) = self.properties.get(&canonical) {
-                    return v;
+                if let Some(v) = self.properties.get(&canonical) {
+                    return v.clone();
                 }
             }
+            // Check string properties on state (for buffer-prefixed string vars)
+            if let Some(s) = state.string_properties.get(suffix) {
+                return Value::Str(s.clone());
+            }
+        }
+        // Check string properties on state by bare name
+        let bare = to_bare_name(name);
+        if let Some(s) = state.string_properties.get(bare) {
+            return Value::Str(s.clone());
         }
         if let Some(addr) = property_to_address(name) {
-            return state.read_mem(addr) as f64;
+            return Value::Number(state.read_mem(addr) as f64);
         }
         // Special I/O properties not mapped to the register/memory address space
         if name == "--keyboard" || name == "--__1keyboard" || name == "--__2keyboard" {
-            return state.keyboard as f64;
+            return Value::Number(state.keyboard as f64);
         }
-        0.0
+        // Default: empty string for string properties, 0 for numeric
+        if self.string_property_names.contains(bare) {
+            return Value::Str(String::new());
+        }
+        Value::Number(0.0)
     }
 
     /// Evaluate a style test (condition inside an `if()` branch).
     fn eval_style_test(&mut self, test: &StyleTest, state: &State) -> bool {
         match test {
             StyleTest::Single { property, value } => {
-                let prop_val = self.resolve_property(property, state) as i64;
-                let test_val = self.eval_expr(value, state) as i64;
+                let prop_val = self.resolve_property(property, state).as_number() as i64;
+                let test_val = self.eval_expr(value, state).as_number() as i64;
                 prop_val == test_val
             }
             StyleTest::And(tests) => tests.iter().all(|t| self.eval_style_test(t, state)),
@@ -1073,10 +1195,10 @@ impl Evaluator {
     }
 
     /// Evaluate a @function call.
-    fn eval_function_call(&mut self, name: &str, args: &[Expr], state: &State) -> f64 {
+    fn eval_function_call(&mut self, name: &str, args: &[Expr], state: &State) -> Value {
         if self.call_depth >= MAX_CALL_DEPTH {
             log::warn!("max call depth exceeded calling {name}");
-            return 0.0;
+            return Value::Number(0.0);
         }
 
         // Fast paths based on precomputed body-pattern analysis.
@@ -1087,60 +1209,60 @@ impl Evaluator {
                     if let Some(arg) = args.first() {
                         return self.eval_expr(arg, state);
                     }
-                    return 0.0;
+                    return Value::Number(0.0);
                 }
                 FunctionPattern::IdentityRead => {
                     if let Some(arg) = args.first() {
-                        let addr = self.eval_expr(arg, state) as i32;
-                        return state.read_mem(addr) as f64;
+                        let addr = self.eval_expr(arg, state).as_number() as i32;
+                        return Value::Number(state.read_mem(addr) as f64);
                     }
-                    return 0.0;
+                    return Value::Number(0.0);
                 }
                 FunctionPattern::IdentityRead16 => {
                     if let Some(arg) = args.first() {
-                        let addr = self.eval_expr(arg, state) as i32;
+                        let addr = self.eval_expr(arg, state).as_number() as i32;
                         if addr < 0 {
-                            return state.read_mem(addr) as f64;
+                            return Value::Number(state.read_mem(addr) as f64);
                         }
-                        return state.read_mem16(addr) as f64;
+                        return Value::Number(state.read_mem16(addr) as f64);
                     }
-                    return 0.0;
+                    return Value::Number(0.0);
                 }
                 FunctionPattern::Bitmask => {
                     if args.len() >= 2 {
-                        let a = self.eval_expr(&args[0], state) as i64;
-                        let b = self.eval_expr(&args[1], state) as u32;
-                        if b >= 64 { return a as f64; }
-                        return (a & ((1i64 << b) - 1)) as f64;
+                        let a = self.eval_expr(&args[0], state).as_number() as i64;
+                        let b = self.eval_expr(&args[1], state).as_number() as u32;
+                        if b >= 64 { return Value::Number(a as f64); }
+                        return Value::Number((a & ((1i64 << b) - 1)) as f64);
                     }
-                    return 0.0;
+                    return Value::Number(0.0);
                 }
                 FunctionPattern::RightShift => {
                     if args.len() >= 2 {
-                        let a = self.eval_expr(&args[0], state) as i64;
-                        let b = self.eval_expr(&args[1], state) as u32;
-                        if b >= 64 { return 0.0; }
-                        return (a >> b) as f64;
+                        let a = self.eval_expr(&args[0], state).as_number() as i64;
+                        let b = self.eval_expr(&args[1], state).as_number() as u32;
+                        if b >= 64 { return Value::Number(0.0); }
+                        return Value::Number((a >> b) as f64);
                     }
-                    return 0.0;
+                    return Value::Number(0.0);
                 }
                 FunctionPattern::LeftShift => {
                     if args.len() >= 2 {
-                        let a = self.eval_expr(&args[0], state) as i64;
-                        let b = self.eval_expr(&args[1], state) as u32;
-                        if b >= 64 { return 0.0; }
-                        return (a << b) as f64;
+                        let a = self.eval_expr(&args[0], state).as_number() as i64;
+                        let b = self.eval_expr(&args[1], state).as_number() as u32;
+                        if b >= 64 { return Value::Number(0.0); }
+                        return Value::Number((a << b) as f64);
                     }
-                    return 0.0;
+                    return Value::Number(0.0);
                 }
                 FunctionPattern::BitExtract => {
                     if args.len() >= 2 {
-                        let val = self.eval_expr(&args[0], state) as i64;
-                        let idx = self.eval_expr(&args[1], state) as u32;
-                        if idx >= 64 { return 0.0; }
-                        return ((val >> idx) & 1) as f64;
+                        let val = self.eval_expr(&args[0], state).as_number() as i64;
+                        let idx = self.eval_expr(&args[1], state).as_number() as u32;
+                        if idx >= 64 { return Value::Number(0.0); }
+                        return Value::Number(((val >> idx) & 1) as f64);
                     }
-                    return 0.0;
+                    return Value::Number(0.0);
                 }
             }
         }
@@ -1167,7 +1289,7 @@ impl Evaluator {
             Some(f) => f as *const FunctionDef,
             None => {
                 log::debug!("undefined function: {name}");
-                return 0.0;
+                return Value::Number(0.0);
             }
         };
         // SAFETY: functions is not modified during evaluation.
@@ -1176,24 +1298,24 @@ impl Evaluator {
         self.call_depth += 1;
 
         // Bind arguments to parameter names
-        let old_props: Vec<(String, Option<f64>)> = func
+        let old_props: Vec<(String, Option<Value>)> = func
             .parameters
             .iter()
             .enumerate()
             .map(|(i, param)| {
-                let old = self.properties.get(&param.name).copied();
-                let val = args.get(i).map(|a| self.eval_expr(a, state)).unwrap_or(0.0);
+                let old = self.properties.get(&param.name).cloned();
+                let val = args.get(i).map(|a| self.eval_expr(a, state)).unwrap_or(Value::Number(0.0));
                 self.properties.insert(param.name.clone(), val);
                 (param.name.clone(), old)
             })
             .collect();
 
         // Evaluate local variables
-        let old_locals: Vec<(String, Option<f64>)> = func
+        let old_locals: Vec<(String, Option<Value>)> = func
             .locals
             .iter()
             .map(|local| {
-                let old = self.properties.get(&local.name).copied();
+                let old = self.properties.get(&local.name).cloned();
                 let val = self.eval_expr(&local.value, state);
                 self.properties.insert(local.name.clone(), val);
                 (local.name.clone(), old)
@@ -1201,7 +1323,6 @@ impl Evaluator {
             .collect();
 
         let result = self.eval_expr(&func.result, state);
-
 
         // Restore previous property values
         for (name, old) in old_props.into_iter().chain(old_locals) {
@@ -1231,16 +1352,16 @@ impl Evaluator {
         fallback: &Expr,
         args: &[Expr],
         state: &State,
-    ) -> f64 {
+    ) -> Value {
         let func = self.functions.get(name).map(|f| f as *const FunctionDef);
-        let old_props: Vec<(String, Option<f64>)> = if let Some(func_ptr) = func {
+        let old_props: Vec<(String, Option<Value>)> = if let Some(func_ptr) = func {
             let func = &*func_ptr;
             func.parameters
                 .iter()
                 .enumerate()
                 .map(|(i, param)| {
-                    let old = self.properties.get(&param.name).copied();
-                    let val = args.get(i).map(|a| self.eval_expr(a, state)).unwrap_or(0.0);
+                    let old = self.properties.get(&param.name).cloned();
+                    let val = args.get(i).map(|a| self.eval_expr(a, state)).unwrap_or(Value::Number(0.0));
                     self.properties.insert(param.name.clone(), val);
                     (param.name.clone(), old)
                 })
@@ -1249,7 +1370,7 @@ impl Evaluator {
             Vec::new()
         };
 
-        let key = self.resolve_property(key_property, state) as i64;
+        let key = self.resolve_property(key_property, state).as_number() as i64;
 
         let result = if let Some(result_expr) = entries.get(&key) {
             self.eval_expr(result_expr, state)
@@ -1326,6 +1447,8 @@ mod tests {
             pre_tick_hooks: Vec::new(),
             properties: HashMap::with_capacity(16),
             call_depth: 0,
+            string_assignments: vec![],
+            string_property_names: HashSet::new(),
             compiled,
             slots: Vec::new(),
         }
@@ -1335,7 +1458,7 @@ mod tests {
     fn eval_literal() {
         let mut eval = test_evaluator(HashMap::new(), HashMap::new());
         let state = State::default();
-        assert_eq!(eval.eval_expr(&Expr::Literal(42.0), &state), 42.0);
+        assert_eq!(eval.eval_expr(&Expr::Literal(42.0), &state).as_number(), 42.0);
     }
 
     #[test]
@@ -1347,19 +1470,19 @@ mod tests {
             Box::new(Expr::Literal(10.0)),
             Box::new(Expr::Literal(20.0)),
         ));
-        assert_eq!(eval.eval_expr(&expr, &state), 30.0);
+        assert_eq!(eval.eval_expr(&expr, &state).as_number(), 30.0);
 
         let expr = Expr::Calc(CalcOp::Mul(
             Box::new(Expr::Literal(3.0)),
             Box::new(Expr::Literal(7.0)),
         ));
-        assert_eq!(eval.eval_expr(&expr, &state), 21.0);
+        assert_eq!(eval.eval_expr(&expr, &state).as_number(), 21.0);
 
         let expr = Expr::Calc(CalcOp::Mod(
             Box::new(Expr::Literal(17.0)),
             Box::new(Expr::Literal(5.0)),
         ));
-        assert_eq!(eval.eval_expr(&expr, &state), 2.0);
+        assert_eq!(eval.eval_expr(&expr, &state).as_number(), 2.0);
     }
 
     #[test]
@@ -1372,7 +1495,7 @@ mod tests {
             name: "--AX".to_string(),
             fallback: None,
         };
-        assert_eq!(eval.eval_expr(&expr, &state), 0x1234 as f64);
+        assert_eq!(eval.eval_expr(&expr, &state).as_number(), 0x1234 as f64);
     }
 
     #[test]
@@ -1384,7 +1507,7 @@ mod tests {
             name: "--nonexistent".to_string(),
             fallback: Some(Box::new(Expr::Literal(99.0))),
         };
-        assert_eq!(eval.eval_expr(&expr, &state), 99.0);
+        assert_eq!(eval.eval_expr(&expr, &state).as_number(), 99.0);
     }
 
     #[test]
@@ -1413,7 +1536,7 @@ mod tests {
             fallback: Box::new(Expr::Literal(0.0)),
         };
 
-        assert_eq!(eval.eval_expr(&expr, &state), 200.0);
+        assert_eq!(eval.eval_expr(&expr, &state).as_number(), 200.0);
     }
 
     #[test]
@@ -1426,7 +1549,7 @@ mod tests {
             Box::new(Expr::Literal(7.8)),
             Box::new(Expr::Literal(1.0)),
         ));
-        assert_eq!(eval.eval_expr(&expr, &state), 7.0);
+        assert_eq!(eval.eval_expr(&expr, &state).as_number(), 7.0);
     }
 
     #[test]
@@ -1458,7 +1581,7 @@ mod tests {
             name: "--double".to_string(),
             args: vec![Expr::Literal(21.0)],
         };
-        assert_eq!(eval.eval_expr(&expr, &state), 42.0);
+        assert_eq!(eval.eval_expr(&expr, &state).as_number(), 42.0);
     }
 
     #[test]
@@ -1500,13 +1623,13 @@ mod tests {
             name: "--lookup".to_string(),
             args: vec![Expr::Literal(42.0)],
         };
-        assert_eq!(eval.eval_expr(&expr, &state), 999.0);
+        assert_eq!(eval.eval_expr(&expr, &state).as_number(), 999.0);
 
         let expr = Expr::FunctionCall {
             name: "--lookup".to_string(),
             args: vec![Expr::Literal(99.0)],
         };
-        assert_eq!(eval.eval_expr(&expr, &state), 0.0);
+        assert_eq!(eval.eval_expr(&expr, &state).as_number(), 0.0);
     }
 
     #[test]
@@ -1561,7 +1684,7 @@ mod tests {
             Box::new(Expr::Literal(100.0)),
             Box::new(Expr::Literal(0.0)),
         ));
-        assert_eq!(eval.eval_expr(&expr, &state), 0.0);
+        assert_eq!(eval.eval_expr(&expr, &state).as_number(), 0.0);
     }
 
     #[test]
@@ -1573,7 +1696,7 @@ mod tests {
             Box::new(Expr::Literal(17.0)),
             Box::new(Expr::Literal(0.0)),
         ));
-        assert_eq!(eval.eval_expr(&expr, &state), 0.0);
+        assert_eq!(eval.eval_expr(&expr, &state).as_number(), 0.0);
     }
 
     #[test]
@@ -1582,10 +1705,10 @@ mod tests {
         let state = State::default();
 
         let expr = Expr::Calc(CalcOp::Negate(Box::new(Expr::Literal(42.0))));
-        assert_eq!(eval.eval_expr(&expr, &state), -42.0);
+        assert_eq!(eval.eval_expr(&expr, &state).as_number(), -42.0);
 
         let expr = Expr::Calc(CalcOp::Negate(Box::new(Expr::Literal(-7.0))));
-        assert_eq!(eval.eval_expr(&expr, &state), 7.0);
+        assert_eq!(eval.eval_expr(&expr, &state).as_number(), 7.0);
     }
 
     #[test]
@@ -1597,28 +1720,28 @@ mod tests {
             eval.eval_expr(
                 &Expr::Calc(CalcOp::Sign(Box::new(Expr::Literal(42.0)))),
                 &state
-            ),
+            ).as_number(),
             1.0
         );
         assert_eq!(
             eval.eval_expr(
                 &Expr::Calc(CalcOp::Sign(Box::new(Expr::Literal(-5.0)))),
                 &state
-            ),
+            ).as_number(),
             -1.0
         );
         assert_eq!(
             eval.eval_expr(
                 &Expr::Calc(CalcOp::Sign(Box::new(Expr::Literal(0.0)))),
                 &state
-            ),
+            ).as_number(),
             0.0
         );
         assert_eq!(
             eval.eval_expr(
                 &Expr::Calc(CalcOp::Abs(Box::new(Expr::Literal(-99.0)))),
                 &state
-            ),
+            ).as_number(),
             99.0
         );
     }
@@ -1634,7 +1757,7 @@ mod tests {
             Box::new(Expr::Literal(50.0)),
             Box::new(Expr::Literal(100.0)),
         ));
-        assert_eq!(eval.eval_expr(&expr, &state), 50.0);
+        assert_eq!(eval.eval_expr(&expr, &state).as_number(), 50.0);
 
         // Value below min
         let expr = Expr::Calc(CalcOp::Clamp(
@@ -1642,7 +1765,7 @@ mod tests {
             Box::new(Expr::Literal(5.0)),
             Box::new(Expr::Literal(100.0)),
         ));
-        assert_eq!(eval.eval_expr(&expr, &state), 10.0);
+        assert_eq!(eval.eval_expr(&expr, &state).as_number(), 10.0);
 
         // Value above max
         let expr = Expr::Calc(CalcOp::Clamp(
@@ -1650,7 +1773,7 @@ mod tests {
             Box::new(Expr::Literal(200.0)),
             Box::new(Expr::Literal(100.0)),
         ));
-        assert_eq!(eval.eval_expr(&expr, &state), 100.0);
+        assert_eq!(eval.eval_expr(&expr, &state).as_number(), 100.0);
     }
 
     #[test]
@@ -1678,6 +1801,6 @@ mod tests {
             name: "--recurse".to_string(),
             args: vec![],
         };
-        assert_eq!(eval.eval_expr(&expr, &state), 0.0);
+        assert_eq!(eval.eval_expr(&expr, &state).as_number(), 0.0);
     }
 }

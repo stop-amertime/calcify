@@ -107,6 +107,8 @@ pub struct CompiledProgram {
     pub broadcast_writes: Vec<CompiledBroadcastWrite>,
     /// Dispatch table data (kept for Dispatch op lookups at runtime).
     pub dispatch_tables: Vec<CompiledDispatchTable>,
+    /// Mapping from property name → slot index (for reading computed values after execution).
+    pub property_slots: HashMap<String, u16>,
 }
 
 /// A compiled broadcast write.
@@ -348,7 +350,7 @@ impl Compiler {
                 dst
             }
 
-            Expr::StringLiteral(_) => {
+            Expr::StringLiteral(_) | Expr::Concat(_) => {
                 let dst = self.alloc();
                 ops.push(Op::LoadLit { dst, val: 0.0 });
                 dst
@@ -908,6 +910,7 @@ pub fn compile(
         writeback,
         broadcast_writes: compiled_bw,
         dispatch_tables: compiler.compiled_dispatches,
+        property_slots: compiler.property_slots,
     }
 }
 

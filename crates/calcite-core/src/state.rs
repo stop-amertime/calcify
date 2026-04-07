@@ -100,8 +100,8 @@ pub struct State {
     pub registers: [i32; reg::COUNT],
     /// Flat memory (byte-addressable, default 1,536 bytes).
     pub memory: Vec<u8>,
-    /// Text display buffer for BIOS INT 10h output.
-    pub text_buffer: String,
+    /// String property values (e.g., `--textBuffer` for text output).
+    pub string_properties: std::collections::HashMap<String, String>,
     /// Last keyboard input (for INT 16h emulation).
     pub keyboard: u8,
     /// Tick counter (incremented each evaluation cycle).
@@ -114,7 +114,7 @@ impl State {
         Self {
             registers: [0; reg::COUNT],
             memory: vec![0; mem_size],
-            text_buffer: String::new(),
+            string_properties: std::collections::HashMap::new(),
             keyboard: 0,
             frame_counter: 0,
         }

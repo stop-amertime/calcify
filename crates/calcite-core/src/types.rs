@@ -116,6 +116,10 @@ pub enum Expr {
         /// Argument expressions.
         args: Vec<Expr>,
     },
+
+    /// Space-separated concatenation of expressions (string concatenation).
+    /// E.g., `var(--textBuffer) --i2char(var(--DL))` → Concat([Var, FunctionCall]).
+    Concat(Vec<Expr>),
 }
 
 impl PartialEq for Expr {
@@ -148,6 +152,7 @@ impl PartialEq for Expr {
                 Expr::FunctionCall { name: n1, args: a1 },
                 Expr::FunctionCall { name: n2, args: a2 },
             ) => n1 == n2 && a1 == a2,
+            (Expr::Concat(a), Expr::Concat(b)) => a == b,
             _ => false,
         }
     }
@@ -174,6 +179,7 @@ impl Hash for Expr {
                 name.hash(state);
                 args.hash(state);
             }
+            Expr::Concat(parts) => parts.hash(state),
         }
     }
 }

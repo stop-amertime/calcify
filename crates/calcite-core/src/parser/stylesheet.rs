@@ -10,7 +10,7 @@ use cssparser::{
 use crate::error::Result;
 use crate::types::*;
 
-use super::css_functions::parse_expr;
+use super::css_functions::parse_expr_list;
 use super::property::parse_property_body;
 
 /// A top-level CSS rule we care about.
@@ -226,14 +226,14 @@ fn parse_function_body<'i, 't>(
         }
 
         if ident == "result" {
-            match parse_expr(input) {
+            match parse_expr_list(input) {
                 Ok(expr) => result_expr = Some(expr),
                 Err(e) => {
                     log::warn!("failed to parse result in @function {name}: {e}");
                 }
             }
         } else if ident.starts_with("--") {
-            match parse_expr(input) {
+            match parse_expr_list(input) {
                 Ok(expr) => {
                     locals.push(LocalVarDef {
                         name: ident,
@@ -291,7 +291,7 @@ fn parse_declarations<'i, 't>(input: &mut Parser<'i, 't>) -> Vec<Assignment> {
 
         // Only capture custom property declarations (--name)
         if name.starts_with("--") {
-            match parse_expr(input) {
+            match parse_expr_list(input) {
                 Ok(expr) => {
                     assignments.push(Assignment {
                         property: name,

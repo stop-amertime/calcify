@@ -156,6 +156,13 @@ fn main() {
                 cli.ticks as f64 / tick_time.as_secs_f64(),
             );
 
+            // Display string property output (e.g., --textBuffer)
+            for (name, value) in &state.string_properties {
+                if !value.is_empty() {
+                    println!("\n--{name}:\n{value}");
+                }
+            }
+
             if let Some(ref args) = cli.screen {
                 let (addr, width, height) = parse_screen_args(args);
                 let screen = state.render_screen(addr as usize, width, height);

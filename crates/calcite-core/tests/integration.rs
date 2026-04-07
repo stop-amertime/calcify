@@ -627,16 +627,16 @@ fn fibonacci_benchmark() {
         evaluator.tick(&mut state);
 
         // Check if text output contains the full Fibonacci sequence
-        if keyboard_set && state.text_buffer.contains("89") {
+        if keyboard_set && state.string_properties.get("textBuffer").cloned().unwrap_or_default().contains("89") {
             let elapsed = start.elapsed();
             eprintln!("Fibonacci completed: {} ticks in {elapsed:?} ({:.0} ticks/sec)",
                 tick + 1, (tick + 1) as f64 / elapsed.as_secs_f64());
-            eprintln!("Output: {:?}", state.text_buffer);
+            eprintln!("Output: {:?}", state.string_properties.get("textBuffer").cloned().unwrap_or_default());
 
             assert!(
-                state.text_buffer.contains("Fibonacci sequence:\n0 1 1 2 3 5 8 13 21 34 55 89"),
+                state.string_properties.get("textBuffer").cloned().unwrap_or_default().contains("Fibonacci sequence:\n0 1 1 2 3 5 8 13 21 34 55 89"),
                 "Expected Fibonacci sequence in output, got: {:?}",
-                state.text_buffer
+                state.string_properties.get("textBuffer").cloned().unwrap_or_default()
             );
             return;
         }
@@ -644,7 +644,7 @@ fn fibonacci_benchmark() {
 
     panic!(
         "Fibonacci did not complete in {max_ticks} ticks. Output so far: {:?}",
-        state.text_buffer
+        state.string_properties.get("textBuffer").cloned().unwrap_or_default()
     );
 }
 

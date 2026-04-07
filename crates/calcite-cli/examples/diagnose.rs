@@ -60,6 +60,7 @@ fn main() {
             calcite_core::types::Expr::Literal(_) => literal_count += 1,
             calcite_core::types::Expr::Calc(_) => calc_count += 1,
             calcite_core::types::Expr::FunctionCall { .. } => func_call_count += 1,
+            calcite_core::types::Expr::Concat(_) => {}
         }
     }
 
