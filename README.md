@@ -3,12 +3,13 @@
 A JIT compiler for computational CSS. Parses real CSS, recognises computational
 patterns, and compiles them into efficient native operations.
 
-Primary target: running [x86CSS](https://lyra.horse/x86css/) (a CSS-based x86
-8088 emulator that runs Doom) faster than Chrome's native style resolver.
+Primary target: running [i8086-css](../i8086-css) (a static binary translator
+that converts Intel 8086 machine code to CSS) faster than Chrome's native style
+resolver. Based on the original [x86CSS](https://lyra.horse/x86css/) by rebane2001.
 
 ## How it works
 
-x86CSS encodes an entire x86 8088 CPU in CSS custom properties. Each "tick" of
+i8086-css encodes an entire 8086 CPU in CSS custom properties. Each "tick" of
 the CPU is one recalculation of ~3000 CSS properties. Chrome's style engine
 treats these as opaque strings and evaluates them via O(n) pattern matching.
 
@@ -54,7 +55,7 @@ wasm-pack build crates/calcite-wasm --target web --out-dir ../../web/pkg
 cargo bench --bench x86css
 ```
 
-Benchmarks require `tests/fixtures/x86css-main.css` (the compiled x86CSS
+Benchmarks require `tests/fixtures/x86css-main.css` (a compiled i8086-css
 stylesheet). See `docs/benchmarking.md` for details on Chrome comparison
 methodology.
 
@@ -83,7 +84,7 @@ Reuses allocations across ticks for minimal overhead.
 ### State (`state.rs`)
 
 Flat machine state replacing CSS's triple-buffered custom properties.
-Uses x86CSS's unified address space: negative addresses = registers,
+Uses i8086-css's unified address space: negative addresses = registers,
 positive addresses = memory bytes.
 
 ## License

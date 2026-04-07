@@ -36,5 +36,5 @@ See `css-compute-engine-spec-v2-1.md` for the full spec. Key modules:
   broadcast writes → direct stores, bit decomposition → native bitwise ops).
 - **eval**: The tick loop — runs compiled programs against flat state.
 - **state**: Flat machine state replacing CSS's triple-buffered custom properties.
-  Uses x86CSS's address conventions (negative = registers, positive = memory).
+  Uses i8086-css's address conventions (negative = registers, positive = memory).
 - **types**: IR type definitions (Expr tree, parsed/compiled program structs).
