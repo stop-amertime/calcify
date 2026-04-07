@@ -88,4 +88,4 @@ positive addresses = memory bytes.
 
 ## License
 
-MIT
+GNU GPLv3
