@@ -217,6 +217,58 @@ impl State {
         (value >> 8) & 0xFF
     }
 
+    /// Render text-mode video memory as a string.
+    ///
+    /// Reads `width * height` character cells from `base_addr` in text-mode
+    /// format (2 bytes per cell: character byte + attribute byte). Returns
+    /// the screen contents as a string with newline-separated rows.
+    ///
+    /// For DOS text mode at 0xB8000, call:
+    /// `state.render_screen(0xB8000, 40, 25)`
+    pub fn render_screen(&self, base_addr: usize, width: usize, height: usize) -> String {
+        let mut lines = Vec::with_capacity(height);
+        for y in 0..height {
+            let mut row = String::with_capacity(width);
+            for x in 0..width {
+                let addr = base_addr + (y * width + x) * 2;
+                let ch = if addr < self.memory.len() {
+                    self.memory[addr]
+                } else {
+                    b' '
+                };
+                // Map printable ASCII; replace control chars with '.'
+                row.push(if (0x20..0x7F).contains(&ch) {
+                    ch as char
+                } else if ch == 0 {
+                    ' '
+                } else {
+                    '.'
+                });
+            }
+            lines.push(row);
+        }
+        lines.join("\n")
+    }
+
+    /// Read raw video memory bytes (character bytes only, no attributes).
+    ///
+    /// Returns `width * height` bytes from text-mode video memory.
+    /// Useful for WASM/browser rendering where JS handles display.
+    pub fn read_video_memory(&self, base_addr: usize, width: usize, height: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                let addr = base_addr + (y * width + x) * 2;
+                buf[y * width + x] = if addr < self.memory.len() {
+                    self.memory[addr]
+                } else {
+                    0
+                };
+            }
+        }
+        buf
+    }
+
     /// Initialize state from `@property` initial values.
     ///
     /// This loads the program binary and register defaults from the CSS —

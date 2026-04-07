@@ -72,4 +72,17 @@ impl CalcifyEngine {
             0
         }
     }
+
+    /// Read text-mode video memory (character bytes only).
+    ///
+    /// Returns `width * height` bytes from video memory at `base_addr`.
+    /// Default for DOS text mode: `read_video_memory(0xB8000, 40, 25)`.
+    pub fn read_video_memory(&self, base_addr: usize, width: usize, height: usize) -> Vec<u8> {
+        self.state.read_video_memory(base_addr, width, height)
+    }
+
+    /// Render text-mode video memory as a string (for debugging).
+    pub fn render_screen(&self, base_addr: usize, width: usize, height: usize) -> String {
+        self.state.render_screen(base_addr, width, height)
+    }
 }

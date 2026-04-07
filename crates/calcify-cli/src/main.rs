@@ -23,6 +23,23 @@ struct Cli {
     /// Only parse and analyse patterns (don't evaluate).
     #[arg(long)]
     parse_only: bool,
+
+    /// Render video memory after execution.
+    ///
+    /// Format: WIDTHxHEIGHT (e.g. "40x25" for text mode, "320x200" for VGA).
+    /// Video memory is read from 0xB8000 in text-mode format (char+attr pairs).
+    #[arg(long, value_name = "WxH")]
+    screen: Option<String>,
+}
+
+fn parse_screen_dims(s: &str) -> (usize, usize) {
+    if let Some((w, h)) = s.split_once('x') {
+        if let (Ok(w), Ok(h)) = (w.parse(), h.parse()) {
+            return (w, h);
+        }
+    }
+    eprintln!("Invalid screen dimensions '{s}', expected WxH (e.g. 40x25)");
+    std::process::exit(1);
 }
 
 fn main() {
@@ -122,6 +139,16 @@ fn main() {
                 tick_time.as_secs_f64(),
                 cli.ticks as f64 / tick_time.as_secs_f64(),
             );
+
+            if let Some(ref dims) = cli.screen {
+                let (width, height) = parse_screen_dims(dims);
+                let screen = state.render_screen(0xB8000, width, height);
+                println!("\n┌{}┐", "─".repeat(width));
+                for line in screen.lines() {
+                    println!("│{line}│");
+                }
+                println!("└{}┘", "─".repeat(width));
+            }
         }
         Err(e) => {
             eprintln!("Parse error: {e}");
