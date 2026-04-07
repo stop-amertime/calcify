@@ -42,6 +42,24 @@ Concretely:
 - Pattern recognition (dispatch tables, broadcast writes, etc.) is fine because it produces the same result the CSS would, just faster
 - If a CSS pattern is too slow or can't express what's needed, the CSS must be changed
 
+## The Execution Model
+
+Calcify is to CSS what V8 is to JavaScript. The CSS is a complete, self-contained program. It runs (slowly) in Chrome with no external help. Calcify is an optimising evaluator that produces the same results faster.
+
+This means:
+
+**The CSS is the single source of truth.** Every behaviour of the program — instruction decoding, arithmetic, control flow, memory access, I/O signalling — is defined by CSS expressions. There is no separate spec that the CSS and calcify both implement. The CSS *is* the spec. If the CSS is wrong, the program is wrong, and the fix goes in the CSS.
+
+**Calcify observes CSS, it does not collaborate with it.** There is no contract between the CSS author and the calcify developer. No agreed-upon memory addresses, no signal ports, no shared conventions beyond what is expressed in the CSS itself. A calcify developer should be able to evaluate *any* computational CSS — not just x86css — without knowing what it computes. A CSS author should be able to change any internal convention (register addresses, memory layout, I/O mechanisms) without coordinating with calcify.
+
+**All output is CSS property values.** Text output, screen contents, debug state — everything the program produces is the computed value of a CSS custom property. For numeric properties, this is an `<integer>`. For display output, this is a `<string>` property (like `--textBuffer`) rendered via `content:`. Calcify's job is to evaluate these properties correctly. How the host environment (browser, CLI, WASM) presents those values to the user is a rendering concern, not an evaluation concern.
+
+**Input is the CSS runtime environment.** Keyboard input, timing signals, and other external state enter through CSS custom properties (`var(--keyboard)`, animation-driven clocks). Calcify provides these the same way a browser does: by setting the initial values of properties that the CSS reads. This is not a side channel — it is the CSS runtime environment.
+
+**Optimisations are invisible.** Dispatch table recognition, broadcast write elimination, bytecode compilation, and any future optimisations must produce identical results to naive CSS evaluation. The CSS author cannot observe whether calcify is optimising. The optimisations are implementation details of the evaluator, not features of the platform.
+
+**String property evaluation is required for completeness.** The CSS uses `<string>` properties for text output (concatenating characters into `--textBuffer` via `content:`-style expressions). A complete calcify implementation evaluates both `<integer>` and `<string>` properties. Without string evaluation, text output requires workarounds outside the model.
+
 ## How x86CSS Actually Works (Source Analysis)
 
 *This section is based on reading `base_template.html`, `build_css.py`, and `x86css.html` from the x86CSS repository.*
