@@ -1,4 +1,4 @@
-# calc(ify)
+# **calc**()**ite**
 
 A JIT compiler for computational CSS. Parses real CSS, recognises computational
 patterns, and compiles them into efficient native operations.
