@@ -44,7 +44,7 @@ The fair comparison is **observable instruction throughput** — how fast each e
 
 ### Results (2026-04-06)
 
-Chrome 146, lyra.horse/x86css, headless via Playwright:
+Chrome 146, lyra.horse/x86css, headless via Playwright (2026-04-06):
 
 | Metric | Chrome | Calcite |
 |---|---|---|
@@ -84,4 +84,4 @@ Calcite skips the triple buffer entirely — one tick = one style recalculation 
  35497  1224 → 1120   (loop restart)
 ```
 
-Chrome baseline captured from `lyra.horse/x86css/` — steady-state register snapshots are in `tests/fixtures/chrome-baseline.json`.
+Chrome baseline captured from lyra.horse/x86css/ — snapshots in `tests/fixtures/chrome-baseline.json`.
