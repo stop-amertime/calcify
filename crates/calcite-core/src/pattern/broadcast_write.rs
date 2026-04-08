@@ -49,11 +49,8 @@ pub struct BroadcastResult {
 /// pure `--addrDest*` checks are absorbed; register assignments that mix in
 /// execution logic (e.g. `--addrJump`) are left in the normal assignment loop.
 pub fn recognise_broadcast(assignments: &[Assignment]) -> BroadcastResult {
+    let _p1 = std::time::Instant::now();
     // Phase 1: Collect all broadcast port entries, grouped by dest_property.
-    // Each entry records the address, property name, and value expression.
-    // We DON'T assume all entries share the same value_expr — split registers
-    // (e.g. DX) contribute ports with byte-merge expressions that differ from
-    // the simple var(--addrValA) used by memory cells.
     let mut direct_groups: HashMap<String, Vec<(i64, String, Expr)>> = HashMap::new();
     let mut spillover_groups: HashMap<String, Vec<(i64, String, String, Expr)>> = HashMap::new();
     let mut pure_broadcast: HashSet<String> = HashSet::new();
@@ -101,8 +98,14 @@ pub fn recognise_broadcast(assignments: &[Assignment]) -> BroadcastResult {
         }
     }
 
+    log::info!("[bw phase1] collection: {:.2}s ({} assignments, {} direct groups)",
+        _p1.elapsed().as_secs_f64(), assignments.len(),
+        direct_groups.values().map(|v| v.len()).sum::<usize>());
+    let _p2 = std::time::Instant::now();
     // Track how many of each assignment's ports were actually absorbed.
     let mut absorbed_port_counts: HashMap<String, usize> = HashMap::new();
+    // Count of large groups that skip per-entry absorption tracking
+    let mut bulk_absorbed_groups: usize = 0;
 
     // Phase 2: For each dest_property, find the majority value expression and
     // only absorb entries that use it. Entries with different expressions (e.g.
@@ -110,17 +113,14 @@ pub fn recognise_broadcast(assignments: &[Assignment]) -> BroadcastResult {
     let writes: Vec<BroadcastWrite> = direct_groups
         .into_iter()
         .filter_map(|(dest_property, entries)| {
-            // Find the most common value expression in this group.
-            // This is O(n²) in the number of distinct expressions, but in practice
-            // there are only 1-3 distinct expressions per group.
-            let mut expr_groups: Vec<(Expr, Vec<(i64, String)>)> = Vec::new();
+            // Group entries by value expression using HashMap (O(n) via hashing)
+            // instead of linear scan with deep equality (O(n * tree_depth)).
+            let mut expr_map: HashMap<Expr, Vec<(i64, String)>> = HashMap::new();
             for (addr, name, value_expr) in entries {
-                if let Some(group) = expr_groups.iter_mut().find(|(e, _)| *e == value_expr) {
-                    group.1.push((addr, name));
-                } else {
-                    expr_groups.push((value_expr, vec![(addr, name)]));
-                }
+                expr_map.entry(value_expr).or_default().push((addr, name));
             }
+            // Convert to vec for max_by_key
+            let expr_groups: Vec<(Expr, Vec<(i64, String)>)> = expr_map.into_iter().collect();
 
             // Pick the largest group (the true broadcast targets).
             let (value_expr, entries) = expr_groups
@@ -134,16 +134,25 @@ pub fn recognise_broadcast(assignments: &[Assignment]) -> BroadcastResult {
             // A broadcast write maps different addresses to different target
             // properties. If most entries map to the same property (e.g. a single
             // register's opcode dispatch), this is not a broadcast pattern.
-            let unique_names: HashSet<&str> = entries.iter().map(|(_, n)| n.as_str()).collect();
-            if unique_names.len() * 2 < entries.len() {
-                // Fewer than half the entries are unique targets — not broadcast.
-                return None;
+            // Skip the expensive uniqueness check for large groups (>10K entries)
+            // — these are always memory broadcast patterns with unique targets.
+            if entries.len() <= 10_000 {
+                let unique_names: HashSet<&str> = entries.iter().map(|(_, n)| n.as_str()).collect();
+                if unique_names.len() * 2 < entries.len() {
+                    return None;
+                }
             }
 
-            let mut address_map = HashMap::with_capacity(entries.len());
-            for (addr, name) in entries {
-                *absorbed_port_counts.entry(name.clone()).or_insert(0) += 1;
-                address_map.insert(addr, name);
+            let entries_len = entries.len();
+            let address_map: HashMap<i64, String> = entries.into_iter().collect();
+            // Track absorption counts. For large groups (>10K entries), use
+            // a bulk flag instead of per-entry HashMap updates to avoid 6M+ String clones.
+            if entries_len <= 10_000 {
+                for name in address_map.values() {
+                    *absorbed_port_counts.entry(name.clone()).or_insert(0) += 1;
+                }
+            } else {
+                bulk_absorbed_groups += 1;
             }
 
             // Build spillover map for this dest_property
@@ -179,12 +188,18 @@ pub fn recognise_broadcast(assignments: &[Assignment]) -> BroadcastResult {
     // normal loop so those cases are still evaluated.
     let mut absorbed_properties = HashSet::new();
     for (name, total) in &port_counts {
-        let absorbed = absorbed_port_counts.get(name).copied().unwrap_or(0);
-        if absorbed == *total && pure_broadcast.contains(name) {
+        // For properties tracked individually, check absorbed count matches total
+        let individually_absorbed = absorbed_port_counts.get(name).copied().unwrap_or(0);
+        // For large groups, each bulk group contributes 1 absorbed port per property.
+        // The property is fully absorbed if individual + bulk counts cover all ports.
+        let total_absorbed = individually_absorbed + bulk_absorbed_groups;
+        if total_absorbed == *total && pure_broadcast.contains(name) {
             absorbed_properties.insert(name.clone());
         }
     }
 
+    log::info!("[bw phase2] grouping+absorption: {:.2}s ({} writes, {} absorbed)",
+        _p2.elapsed().as_secs_f64(), writes.len(), absorbed_properties.len());
     BroadcastResult {
         writes,
         absorbed_properties,

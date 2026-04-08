@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/calcite-core",
     "crates/calcite-cli",
+    "crates/calcite-debugger",
     "crates/calcite-wasm",
 ]
 

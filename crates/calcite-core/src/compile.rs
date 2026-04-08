@@ -264,6 +264,32 @@ pub(crate) fn is_var_ref(expr: &Expr, param_name: &str) -> bool {
     matches!(expr, Expr::Var { name, .. } if name == param_name)
 }
 
+/// Check if an expression is `calc(readMem(var(param)) + readMem(calc(var(param) + 1)) * 256)`
+/// — a 16-bit word read pattern (little-endian).
+fn is_word_read_pattern(expr: &Expr, param: &str) -> bool {
+    // Top level: calc(A + B)
+    let Expr::Calc(CalcOp::Add(lhs, rhs)) = expr else { return false };
+
+    // LHS: FunctionCall("--readMem", [Var(param)])
+    let Expr::FunctionCall { name: name_lo, args: args_lo } = lhs.as_ref() else { return false };
+    if !name_lo.ends_with("readMem") || args_lo.len() != 1 || !is_var_ref(&args_lo[0], param) {
+        return false;
+    }
+
+    // RHS: calc(FunctionCall("--readMem", [calc(Var(param) + 1)]) * 256)
+    let Expr::Calc(CalcOp::Mul(hi_call, multiplier)) = rhs.as_ref() else { return false };
+    if !matches!(multiplier.as_ref(), Expr::Literal(v) if (*v - 256.0).abs() < f64::EPSILON) {
+        return false;
+    }
+    let Expr::FunctionCall { name: name_hi, args: args_hi } = hi_call.as_ref() else { return false };
+    if !name_hi.ends_with("readMem") || args_hi.len() != 1 { return false }
+
+    // The argument should be calc(Var(param) + 1)
+    let Expr::Calc(CalcOp::Add(inner_var, one)) = &args_hi[0] else { return false };
+    if !is_var_ref(inner_var, param) { return false }
+    matches!(one.as_ref(), Expr::Literal(v) if (*v - 1.0).abs() < f64::EPSILON)
+}
+
 /// Check if an expression is `mod(var(a), pow(2, var(b)))` — bitmask pattern.
 pub(crate) fn is_mod_pow2(expr: &Expr, a: &str, b: &str) -> bool {
     if let Expr::Calc(CalcOp::Mod(lhs, rhs)) = expr {
@@ -649,35 +675,44 @@ fn fold_calc(op: &CalcOp) -> Expr {
 // ---------------------------------------------------------------------------
 
 /// Compiler state — tracks slot allocation and property→slot mapping.
-struct Compiler {
+///
+/// Functions are borrowed to avoid cloning large ASTs (e.g., readMem's
+/// 1M-node result expression). Dispatch tables remain owned because the
+/// compile_dispatch_call method uses a remove/insert pattern for borrow
+/// splitting.
+struct Compiler<'a> {
     /// Next available slot index.
     next_slot: Slot,
     /// Map from property name → slot index.
     property_slots: HashMap<String, Slot>,
-    /// Functions available for inlining.
-    functions: HashMap<String, FunctionDef>,
-    /// Recognised dispatch tables.
+    /// Functions available for inlining (borrowed — avoids cloning 1M-node ASTs).
+    functions: &'a HashMap<String, FunctionDef>,
+    /// Recognised dispatch tables (owned — remove/insert pattern needs ownership).
     dispatch_tables: HashMap<String, DispatchTable>,
     /// Compiled dispatch table data (populated during compilation).
     compiled_dispatches: Vec<CompiledDispatchTable>,
     /// Cache: dispatch table name → compiled table_id.
-    /// Tables with context-independent entries (no parameter refs in entry ops)
-    /// can be compiled once and reused across call sites.
     dispatch_cache: HashMap<String, Slot>,
+    /// Cache: dispatch table name → identity-read classification result.
+    identity_read_cache: HashMap<String, bool>,
+    /// Cache: dispatch table name → near-identity exception keys (or None).
+    near_identity_cache: HashMap<String, Option<Vec<i64>>>,
 }
 
-impl Compiler {
+impl<'a> Compiler<'a> {
     fn new(
-        functions: &HashMap<String, FunctionDef>,
+        functions: &'a HashMap<String, FunctionDef>,
         dispatch_tables: &HashMap<String, DispatchTable>,
     ) -> Self {
         Compiler {
             next_slot: 0,
             property_slots: HashMap::new(),
-            functions: functions.clone(),
+            functions,
             dispatch_tables: dispatch_tables.clone(),
             compiled_dispatches: Vec::new(),
             dispatch_cache: HashMap::new(),
+            identity_read_cache: HashMap::new(),
+            near_identity_cache: HashMap::new(),
         }
     }
 
@@ -890,6 +925,7 @@ impl Compiler {
         table: &DispatchTable,
         ops: &mut Vec<Op>,
     ) -> Slot {
+        let _dt = std::time::Instant::now();
         let key_slot = self.compile_var(&table.key_property, None, ops);
 
         let mut compiled_entries = HashMap::new();
@@ -903,6 +939,10 @@ impl Compiler {
         let fallback_slot = self.compile_expr(&table.fallback, &mut fallback_ops);
 
         let table_id = self.compiled_dispatches.len() as Slot;
+        if compiled_entries.len() >= 100 {
+            log::info!("[compile detail] inline dispatch on {}: {} entries, {:.2}s",
+                table.key_property, compiled_entries.len(), _dt.elapsed().as_secs_f64());
+        }
         self.compiled_dispatches.push(CompiledDispatchTable {
             entries: compiled_entries,
             fallback_ops,
@@ -1075,8 +1115,10 @@ impl Compiler {
     /// any CSS function with the right shape.
     fn compile_function_call(&mut self, name: &str, args: &[Expr], ops: &mut Vec<Op>) -> Slot {
         // Try body-pattern analysis on the function definition.
-        if let Some(func) = self.functions.get(name).cloned() {
-            if let Some(slot) = self.try_compile_by_body_pattern(&func, args, ops) {
+        // Since self.functions is &'a (external borrow), this reference doesn't
+        // conflict with &mut self for compile_expr calls.
+        if let Some(func) = self.functions.get(name) {
+            if let Some(slot) = self.try_compile_by_body_pattern(func, args, ops) {
                 return slot;
             }
         }
@@ -1094,7 +1136,7 @@ impl Compiler {
             // Near-identity-read: mostly identity with a few exception entries.
             // Compile as LoadMem + small exception dispatch instead of full 116K-entry table.
             if args.len() == 1 {
-                if let Some(exception_keys) = self.dispatch_tables.get(name).and_then(classify_near_identity_read) {
+                if let Some(exception_keys) = self.check_near_identity_read(name) {
                     return self.compile_near_identity_dispatch(name, args, &exception_keys, ops);
                 }
             }
@@ -1121,6 +1163,17 @@ impl Compiler {
         if params.len() == 1 && func.locals.is_empty() && is_var_ref(&func.result, &params[0].name)
         {
             return args.first().map(|a| self.compile_expr(a, ops));
+        }
+
+        // Word read: 1 param, body = calc(readMem(param) + readMem(param+1) * 256)
+        // Compile as LoadMem16 instead of two separate readMem calls.
+        if params.len() == 1 && func.locals.is_empty() {
+            if is_word_read_pattern(&func.result, &params[0].name) {
+                let addr_slot = self.compile_expr(&args[0], ops);
+                let dst = self.alloc();
+                ops.push(Op::LoadMem16 { dst, addr_slot });
+                return Some(dst);
+            }
         }
 
         // 2-param patterns with no locals
@@ -1189,11 +1242,28 @@ impl Compiler {
         None
     }
 
-    /// Check if a dispatch table is an identity-read pattern.
-    fn check_dispatch_identity_read(&self, name: &str) -> bool {
-        self.dispatch_tables
+    /// Check if a dispatch table is an identity-read pattern (cached).
+    fn check_dispatch_identity_read(&mut self, name: &str) -> bool {
+        if let Some(&cached) = self.identity_read_cache.get(name) {
+            return cached;
+        }
+        let result = self.dispatch_tables
             .get(name)
-            .is_some_and(is_dispatch_identity_read)
+            .is_some_and(is_dispatch_identity_read);
+        self.identity_read_cache.insert(name.to_string(), result);
+        result
+    }
+
+    /// Classify a dispatch table as near-identity-read (cached).
+    fn check_near_identity_read(&mut self, name: &str) -> Option<Vec<i64>> {
+        if let Some(cached) = self.near_identity_cache.get(name) {
+            return cached.clone();
+        }
+        let result = self.dispatch_tables
+            .get(name)
+            .and_then(classify_near_identity_read);
+        self.near_identity_cache.insert(name.to_string(), result.clone());
+        result
     }
 
     /// Compile a near-identity-read dispatch table.
@@ -1209,7 +1279,7 @@ impl Compiler {
         ops: &mut Vec<Op>,
     ) -> Slot {
         let table = self.dispatch_tables.remove(name).unwrap();
-        let func = self.functions.get(name).cloned();
+        let func = self.functions.get(name);
 
         // Bind arguments to parameter slots
         let saved: Vec<(String, Option<Slot>)> = if let Some(ref f) = func {
@@ -1303,8 +1373,9 @@ impl Compiler {
     /// are keyed by the dispatch value (the parameter), not by parameter slots. The
     /// parameter only appears as the key; entry bodies are context-independent.
     fn compile_dispatch_call(&mut self, name: &str, args: &[Expr], ops: &mut Vec<Op>) -> Slot {
+        let _dt = std::time::Instant::now();
         let table = self.dispatch_tables.remove(name).unwrap();
-        let func = self.functions.get(name).cloned();
+        let func = self.functions.get(name);
 
         // Bind arguments to parameter slots, then evaluate locals
         // (the dispatch key may reference a local, e.g. --parity dispatches on --low8)
@@ -1341,10 +1412,22 @@ impl Compiler {
         // Compile the key lookup
         let key_slot = self.compile_var(&table.key_property, None, ops);
 
-        // Check cache for large tables — compile entries only once
-        let table_id = if let Some(&cached_id) = self.dispatch_cache.get(name) {
-            cached_id
+        // Check cache for large tables — compile entries only once.
+        // IMPORTANT: Only use cache for parameterless functions. If the function
+        // has parameters, the compiled entries bake in the parameter values from
+        // the first call site, producing wrong results for subsequent calls with
+        // different arguments (e.g., getDest(0) vs getDest(1)).
+        let cacheable = func.map_or(true, |f| f.parameters.is_empty());
+        let table_id = if cacheable {
+            if let Some(&cached_id) = self.dispatch_cache.get(name) {
+                Some(cached_id)
+            } else {
+                None
+            }
         } else {
+            None
+        };
+        let table_id = if let Some(id) = table_id { id } else {
             // Compile each dispatch entry into its own op sequence
             let mut compiled_entries = HashMap::new();
             for (&key_val, entry_expr) in &table.entries {
@@ -1364,8 +1447,12 @@ impl Compiler {
                 fallback_slot,
             });
 
-            // Cache large tables for reuse
             if table.entries.len() >= 100 {
+                log::info!("[compile detail] dispatch_call {} compiled: {} entries, {:.2}s",
+                    name, table.entries.len(), _dt.elapsed().as_secs_f64());
+            }
+            // Cache large parameterless tables for reuse
+            if cacheable && table.entries.len() >= 100 {
                 self.dispatch_cache.insert(name.to_string(), id);
             }
 
@@ -1397,7 +1484,9 @@ impl Compiler {
 
     /// Compile a general function call by inlining its body.
     fn compile_general_function(&mut self, name: &str, args: &[Expr], ops: &mut Vec<Op>) -> Slot {
-        let func = match self.functions.get(name).cloned() {
+        // Since self.functions is &'a (external borrow), holding a reference
+        // doesn't conflict with &mut self for compile_expr/property_slots calls.
+        let func = match self.functions.get(name) {
             Some(f) => f,
             None => {
                 let dst = self.alloc();
@@ -1407,42 +1496,36 @@ impl Compiler {
         };
 
         // Bind arguments to parameter slots
-        let saved_params: Vec<(String, Option<Slot>)> = func
-            .parameters
-            .iter()
-            .enumerate()
-            .map(|(i, param)| {
-                let old = self.property_slots.get(&param.name).copied();
-                let val_slot = args
-                    .get(i)
-                    .map(|a| self.compile_expr(a, ops))
-                    .unwrap_or_else(|| {
-                        let s = self.alloc();
-                        ops.push(Op::LoadLit { dst: s, val: 0 });
-                        s
-                    });
-                self.property_slots.insert(param.name.clone(), val_slot);
-                (param.name.clone(), old)
-            })
-            .collect();
+        let mut saved: Vec<(String, Option<Slot>)> = Vec::with_capacity(
+            func.parameters.len() + func.locals.len(),
+        );
+        for (i, param) in func.parameters.iter().enumerate() {
+            let old = self.property_slots.get(&param.name).copied();
+            let val_slot = args
+                .get(i)
+                .map(|a| self.compile_expr(a, ops))
+                .unwrap_or_else(|| {
+                    let s = self.alloc();
+                    ops.push(Op::LoadLit { dst: s, val: 0 });
+                    s
+                });
+            self.property_slots.insert(param.name.clone(), val_slot);
+            saved.push((param.name.clone(), old));
+        }
 
         // Evaluate local variables
-        let saved_locals: Vec<(String, Option<Slot>)> = func
-            .locals
-            .iter()
-            .map(|local| {
-                let old = self.property_slots.get(&local.name).copied();
-                let val_slot = self.compile_expr(&local.value, ops);
-                self.property_slots.insert(local.name.clone(), val_slot);
-                (local.name.clone(), old)
-            })
-            .collect();
+        for local in &func.locals {
+            let old = self.property_slots.get(&local.name).copied();
+            let val_slot = self.compile_expr(&local.value, ops);
+            self.property_slots.insert(local.name.clone(), val_slot);
+            saved.push((local.name.clone(), old));
+        }
 
         // Compile the result expression
         let result_slot = self.compile_expr(&func.result, ops);
 
         // Restore previous bindings
-        for (param_name, old) in saved_params.into_iter().chain(saved_locals) {
+        for (param_name, old) in saved {
             match old {
                 Some(s) => {
                     self.property_slots.insert(param_name, s);
@@ -1468,13 +1551,21 @@ pub fn compile(
     functions: &HashMap<String, FunctionDef>,
     dispatch_tables: &HashMap<String, DispatchTable>,
 ) -> CompiledProgram {
+    let _ct = std::time::Instant::now();
     let mut compiler = Compiler::new(functions, dispatch_tables);
+    log::info!("[compile detail] Compiler::new clone: {:.2}s", _ct.elapsed().as_secs_f64());
     let mut ops = Vec::new();
     let mut writeback = Vec::new();
 
+    let _ct = std::time::Instant::now();
     // Compile each assignment
     for assignment in assignments {
+        let _at = std::time::Instant::now();
         let result_slot = compiler.compile_expr(&assignment.value, &mut ops);
+        let elapsed = _at.elapsed();
+        if elapsed.as_millis() >= 100 {
+            log::info!("[compile detail] assignment {} took {:.2}s", assignment.property, elapsed.as_secs_f64());
+        }
         // Register this property slot so later assignments can reference it
         compiler
             .property_slots
@@ -1487,12 +1578,24 @@ pub fn compile(
             }
         }
     }
+    log::info!("[compile detail] assignments ({} items): {:.2}s, {} ops, {} dispatch tables",
+        assignments.len(), _ct.elapsed().as_secs_f64(), ops.len(), compiler.compiled_dispatches.len());
 
+    let _ct = std::time::Instant::now();
     // Compile broadcast writes
-    let compiled_bw = broadcast_writes
+    let compiled_bw: Vec<_> = broadcast_writes
         .iter()
-        .map(|bw| compile_broadcast_write(bw, &mut compiler))
+        .map(|bw| {
+            let _bt = std::time::Instant::now();
+            let result = compile_broadcast_write(bw, &mut compiler);
+            log::info!("[compile detail] broadcast write {}: {:.2}s ({} addrs, {} spillover)",
+                bw.dest_property, _bt.elapsed().as_secs_f64(),
+                bw.address_map.len(), bw.spillover_map.len());
+            result
+        })
         .collect();
+    log::info!("[compile detail] broadcast writes total ({} items): {:.2}s",
+        broadcast_writes.len(), _ct.elapsed().as_secs_f64());
 
     let mut program = CompiledProgram {
         ops,
@@ -1503,7 +1606,9 @@ pub fn compile(
         property_slots: compiler.property_slots,
     };
 
+    let _ct = std::time::Instant::now();
     compact_slots(&mut program);
+    log::info!("[compile detail] slot compaction: {:.2}s", _ct.elapsed().as_secs_f64());
 
     program
 }
@@ -1575,40 +1680,101 @@ fn compact_slots(program: &mut CompiledProgram) {
     // Reusable scratch buffers — avoids repeated HashMap allocations
     let mut scratch = SubOpScratch::new();
 
-    // Phase 2: compact dispatch table entries
-    // Each table's entries share slots starting from main_high (they never
-    // execute simultaneously). Fallback ops are also compacted per-table.
-    for table in &mut program.dispatch_tables {
-        let mut table_high: Slot = 0;
+    // Phase 2: compact dispatch table entries with nesting-depth awareness.
+    //
+    // Dispatch entries overlay from main_high (since only one entry executes per
+    // dispatch op). BUT if an entry contains a nested Dispatch op, the inner
+    // dispatch's entries also overlay from main_high — clobbering the outer
+    // entry's local slots.
+    //
+    // Fix: compute nesting depth for each table. Tables at depth 0 (leaf — no
+    // nested Dispatch ops) overlay from main_high. Tables at depth N overlay
+    // from a progressively higher base, so each nesting level gets its own
+    // non-overlapping slot range.
 
-        // Compact fallback
-        let fb_high = compact_sub_ops(
-            &mut table.fallback_ops,
-            &mut table.fallback_slot,
-            main_high,
-            &slot_map,
-            &mut scratch,
-        );
-        table_high = table_high.max(fb_high);
-
-        // Compact each entry — all overlay from main_high
-        for (entry_ops, result_slot) in table.entries.values_mut() {
-            let entry_high = compact_sub_ops(entry_ops, result_slot, main_high, &slot_map, &mut scratch);
-            table_high = table_high.max(entry_high);
+    // Compute nesting depth: which table IDs does each table reference?
+    let num_tables = program.dispatch_tables.len();
+    let mut refs_tables: Vec<Vec<usize>> = Vec::with_capacity(num_tables);
+    for table in &program.dispatch_tables {
+        let mut refs = Vec::new();
+        let collect_refs = |ops: &[Op], out: &mut Vec<usize>| {
+            for op in ops {
+                if let Op::Dispatch { table_id, .. } = op {
+                    out.push(*table_id as usize);
+                }
+            }
+        };
+        let mut entry_refs = Vec::new();
+        collect_refs(&table.fallback_ops, &mut entry_refs);
+        for (entry_ops, _) in table.entries.values() {
+            collect_refs(entry_ops, &mut entry_refs);
         }
-
-        // table_high is the max slots any single entry needs beyond main_high
-        // (captured implicitly in the final slot_count)
-        alloc.high_water = alloc.high_water.max(table_high);
+        refs.extend(entry_refs);
+        refs_tables.push(refs);
     }
 
-    // Phase 3: compact broadcast write sub-ops
+    // Compute depth via iterative fixed-point (handles cycles gracefully)
+    let mut depth: Vec<u32> = vec![0; num_tables];
+    for _ in 0..num_tables {
+        let mut changed = false;
+        for i in 0..num_tables {
+            for &child in &refs_tables[i] {
+                if child < num_tables {
+                    let new_depth = depth[child] + 1;
+                    if new_depth > depth[i] {
+                        depth[i] = new_depth;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let max_depth = depth.iter().copied().max().unwrap_or(0);
+
+    // Compact layer by layer: depth 0 first (leaf tables), then depth 1, etc.
+    // Each layer's base = previous layer's high-water mark, so nested dispatch
+    // entries at different depths never share slot ranges.
+    let mut layer_base = main_high;
+    for d in 0..=max_depth {
+        let mut layer_high: Slot = layer_base;
+        for (idx, table) in program.dispatch_tables.iter_mut().enumerate() {
+            if depth[idx] != d {
+                continue;
+            }
+            let mut table_high: Slot = 0;
+            let fb_high = compact_sub_ops(
+                &mut table.fallback_ops,
+                &mut table.fallback_slot,
+                layer_base,
+                &slot_map,
+                &mut scratch,
+            );
+            table_high = table_high.max(fb_high);
+            for (entry_ops, result_slot) in table.entries.values_mut() {
+                let entry_high = compact_sub_ops(entry_ops, result_slot, layer_base, &slot_map, &mut scratch);
+                table_high = table_high.max(entry_high);
+            }
+            layer_high = layer_high.max(table_high);
+            alloc.high_water = alloc.high_water.max(table_high);
+        }
+        layer_base = layer_high;
+    }
+
+    // Phase 3: compact broadcast write sub-ops.
+    // Broadcast writes execute after the main ops and all dispatches have
+    // completed, but their value_ops run `exec_ops` which can trigger nested
+    // Dispatch ops. Use layer_base (above all dispatch layers) to avoid
+    // colliding with any dispatch entry slots.
     for bw in &mut program.broadcast_writes {
         // dest_slot is in main scope — already mapped
         bw.dest_slot = slot_map.get(&bw.dest_slot).copied().unwrap_or(bw.dest_slot);
 
-        // value_ops get their own compact range starting from main_high
-        let bw_high = compact_sub_ops(&mut bw.value_ops, &mut bw.value_slot, main_high, &slot_map, &mut scratch);
+        // value_ops get their own compact range starting from layer_base
+        let bw_high = compact_sub_ops(&mut bw.value_ops, &mut bw.value_slot, layer_base, &slot_map, &mut scratch);
         alloc.high_water = alloc.high_water.max(bw_high);
 
         // Spillover entries
@@ -1618,7 +1784,7 @@ fn compact_slots(program: &mut CompiledProgram) {
                 .copied()
                 .unwrap_or(spillover.guard_slot);
             for (spill_ops, spill_slot) in spillover.entries.values_mut() {
-                let sp_high = compact_sub_ops(spill_ops, spill_slot, main_high, &slot_map, &mut scratch);
+                let sp_high = compact_sub_ops(spill_ops, spill_slot, layer_base, &slot_map, &mut scratch);
                 alloc.high_water = alloc.high_water.max(sp_high);
             }
         }
@@ -2101,8 +2267,14 @@ fn map_op_slots(op: &mut Op, slot_map: &mut HashMap<Slot, Slot>, alloc: &mut Slo
     }
 }
 
-/// Seed a local slot map from a parent map for all slots referenced by an op.
+/// Seed a local slot map from a parent map for **read-only** slots referenced by an op.
 /// This avoids cloning the entire parent map — only slots actually used get copied.
+///
+/// IMPORTANT: We must NOT seed `dst` slots. A sub-op's `dst` is always a local
+/// temporary that should get a fresh slot allocation. If we seed it from the parent
+/// map, a local temp whose original slot number coincidentally matches a parent-scope
+/// slot will be aliased to the parent slot — corrupting the parent's value when the
+/// sub-op writes to it.
 fn seed_from_parent(
     op: &Op,
     local_map: &mut HashMap<Slot, Slot>,
@@ -2116,25 +2288,25 @@ fn seed_from_parent(
         }
     };
     match op {
-        Op::LoadLit { dst, .. } => { seed(*dst); }
-        Op::LoadSlot { dst, src } => { seed(*dst); seed(*src); }
-        Op::LoadState { dst, .. } => { seed(*dst); }
-        Op::LoadMem { dst, addr_slot } | Op::LoadMem16 { dst, addr_slot } => { seed(*dst); seed(*addr_slot); }
-        Op::LoadKeyboard { dst } => { seed(*dst); }
-        Op::Add { dst, a, b } | Op::Sub { dst, a, b } | Op::Mul { dst, a, b }
-        | Op::Div { dst, a, b } | Op::Mod { dst, a, b } | Op::And { dst, a, b }
-        | Op::Shr { dst, a, b } | Op::Shl { dst, a, b } => { seed(*dst); seed(*a); seed(*b); }
-        Op::Neg { dst, src } | Op::Abs { dst, src } | Op::Sign { dst, src }
-        | Op::Floor { dst, src } => { seed(*dst); seed(*src); }
-        Op::Pow { dst, base, exp } => { seed(*dst); seed(*base); seed(*exp); }
-        Op::Bit { dst, val, idx } => { seed(*dst); seed(*val); seed(*idx); }
-        Op::CmpEq { dst, a, b } => { seed(*dst); seed(*a); seed(*b); }
-        Op::Min { dst, args } | Op::Max { dst, args } => { seed(*dst); for a in args { seed(*a); } }
-        Op::Clamp { dst, min, val, max } => { seed(*dst); seed(*min); seed(*val); seed(*max); }
-        Op::Round { dst, val, interval, .. } => { seed(*dst); seed(*val); seed(*interval); }
+        Op::LoadLit { .. } => {}
+        Op::LoadSlot { src, .. } => { seed(*src); }
+        Op::LoadState { .. } => {}
+        Op::LoadMem { addr_slot, .. } | Op::LoadMem16 { addr_slot, .. } => { seed(*addr_slot); }
+        Op::LoadKeyboard { .. } => {}
+        Op::Add { a, b, .. } | Op::Sub { a, b, .. } | Op::Mul { a, b, .. }
+        | Op::Div { a, b, .. } | Op::Mod { a, b, .. } | Op::And { a, b, .. }
+        | Op::Shr { a, b, .. } | Op::Shl { a, b, .. } => { seed(*a); seed(*b); }
+        Op::Neg { src, .. } | Op::Abs { src, .. } | Op::Sign { src, .. }
+        | Op::Floor { src, .. } => { seed(*src); }
+        Op::Pow { base, exp, .. } => { seed(*base); seed(*exp); }
+        Op::Bit { val, idx, .. } => { seed(*val); seed(*idx); }
+        Op::CmpEq { a, b, .. } => { seed(*a); seed(*b); }
+        Op::Min { args, .. } | Op::Max { args, .. } => { for a in args { seed(*a); } }
+        Op::Clamp { min, val, max, .. } => { seed(*min); seed(*val); seed(*max); }
+        Op::Round { val, interval, .. } => { seed(*val); seed(*interval); }
         Op::BranchIfZero { cond, .. } => { seed(*cond); }
         Op::Jump { .. } => {}
-        Op::Dispatch { dst, key, .. } => { seed(*dst); seed(*key); }
+        Op::Dispatch { key, .. } => { seed(*key); }
         Op::StoreState { src, .. } => { seed(*src); }
         Op::StoreMem { addr_slot, src } => { seed(*addr_slot); seed(*src); }
     }
@@ -2142,22 +2314,34 @@ fn seed_from_parent(
 
 /// Compile a single broadcast write.
 fn compile_broadcast_write(bw: &BroadcastWrite, compiler: &mut Compiler) -> CompiledBroadcastWrite {
+    let _t0 = std::time::Instant::now();
     // Compile dest property resolution
     let dest_slot = compiler.compile_var(&bw.dest_property, None, &mut Vec::new());
 
     // Compile value expression
     let mut value_ops = Vec::new();
     let value_slot = compiler.compile_expr(&bw.value_expr, &mut value_ops);
+    let _t1 = std::time::Instant::now();
 
     // Build address map: address → state address (for direct write_mem)
-    let mut address_map = HashMap::new();
+    // Optimised: broadcast entries are bare names like "m12345" or "AX".
+    // Parse directly instead of allocating format!("--{name}") for each of 1M entries.
+    let mut address_map = HashMap::with_capacity(bw.address_map.len());
     for (&addr, var_name) in &bw.address_map {
-        if let Some(state_addr) = property_to_address(&format!("--{var_name}")) {
-            address_map.insert(addr, state_addr);
-        } else if let Some(state_addr) = property_to_address(var_name) {
-            address_map.insert(addr, state_addr);
+        let state_addr = if let Some(rest) = var_name.strip_prefix('m') {
+            rest.parse::<i32>().ok()
+        } else {
+            // Register or other named property — fall back to full resolution
+            property_to_address(var_name)
+                .or_else(|| property_to_address(&format!("--{var_name}")))
+        };
+        if let Some(sa) = state_addr {
+            address_map.insert(addr, sa);
         }
     }
+    log::info!("[bw detail] {} address_map ({} entries): {:.2}s",
+        bw.dest_property, bw.address_map.len(), _t1.elapsed().as_secs_f64());
+    let _t2 = std::time::Instant::now();
 
     // Compile spillover
     let spillover = if !bw.spillover_map.is_empty() {
@@ -2483,7 +2667,9 @@ mod tests {
     #[test]
     fn compile_literal() {
         let expr = Expr::Literal(42.0);
-        let mut compiler = Compiler::new(&HashMap::new(), &HashMap::new());
+        let empty_fns = HashMap::new();
+        let empty_dt = HashMap::new();
+        let mut compiler = Compiler::new(&empty_fns, &empty_dt);
         let mut ops = Vec::new();
         let slot = compiler.compile_expr(&expr, &mut ops);
         assert_eq!(ops.len(), 1);
@@ -2500,7 +2686,9 @@ mod tests {
             Box::new(Expr::Literal(10.0)),
             Box::new(Expr::Literal(20.0)),
         ));
-        let mut compiler = Compiler::new(&HashMap::new(), &HashMap::new());
+        let empty_fns = HashMap::new();
+        let empty_dt = HashMap::new();
+        let mut compiler = Compiler::new(&empty_fns, &empty_dt);
         let mut ops = Vec::new();
         let slot = compiler.compile_expr(&expr, &mut ops);
 
@@ -2517,7 +2705,9 @@ mod tests {
             name: "--AX".to_string(),
             fallback: None,
         };
-        let mut compiler = Compiler::new(&HashMap::new(), &HashMap::new());
+        let empty_fns = HashMap::new();
+        let empty_dt = HashMap::new();
+        let mut compiler = Compiler::new(&empty_fns, &empty_dt);
         let mut ops = Vec::new();
         let slot = compiler.compile_expr(&expr, &mut ops);
 
@@ -2550,7 +2740,9 @@ mod tests {
             ],
             fallback: Box::new(Expr::Literal(0.0)),
         };
-        let mut compiler = Compiler::new(&HashMap::new(), &HashMap::new());
+        let empty_fns = HashMap::new();
+        let empty_dt = HashMap::new();
+        let mut compiler = Compiler::new(&empty_fns, &empty_dt);
         let mut ops = Vec::new();
         let slot = compiler.compile_expr(&expr, &mut ops);
 
@@ -2669,7 +2861,8 @@ mod tests {
             name: "--lowerBytes".to_string(),
             args: vec![Expr::Literal(0xFF as f64), Expr::Literal(4.0)],
         };
-        let mut compiler = Compiler::new(&functions, &HashMap::new());
+        let empty_dt = HashMap::new();
+        let mut compiler = Compiler::new(&functions, &empty_dt);
         let mut ops = Vec::new();
         let slot = compiler.compile_expr(&expr, &mut ops);
 
@@ -2729,7 +2922,8 @@ mod tests {
             name: "--double".to_string(),
             args: vec![Expr::Literal(21.0)],
         };
-        let mut compiler = Compiler::new(&functions, &HashMap::new());
+        let empty_dt = HashMap::new();
+        let mut compiler = Compiler::new(&functions, &empty_dt);
         let mut ops = Vec::new();
         let slot = compiler.compile_expr(&expr, &mut ops);
 

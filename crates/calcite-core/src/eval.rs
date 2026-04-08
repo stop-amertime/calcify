@@ -113,6 +113,7 @@ pub struct TickResult {
 impl Evaluator {
     /// Build an evaluator from a `ParsedProgram`.
     pub fn from_parsed(program: &ParsedProgram) -> Self {
+        let _t = std::time::Instant::now();
         let functions: HashMap<String, FunctionDef> = program
             .functions
             .iter()
@@ -149,6 +150,8 @@ impl Evaluator {
             set_address_map(address_map);
         }
 
+        log::info!("[compile phase] dispatch tables: {:.2}s", _t.elapsed().as_secs_f64());
+        let _t = std::time::Instant::now();
         // Recognise broadcast write patterns in assignments
         let broadcast_result = broadcast_write::recognise_broadcast(&program.assignments);
         for bw in &broadcast_result.writes {
@@ -159,6 +162,8 @@ impl Evaluator {
             );
         }
 
+        log::info!("[compile phase] broadcast recognition: {:.2}s", _t.elapsed().as_secs_f64());
+        let _t = std::time::Instant::now();
         // Identify string properties from @property syntax
         let mut string_property_names: HashSet<String> = HashSet::new();
         for prop in &program.properties {
@@ -202,12 +207,16 @@ impl Evaluator {
             );
         }
 
+        log::info!("[compile phase] filter+partition: {:.2}s ({} numeric, {} string)", _t.elapsed().as_secs_f64(), numeric_assignments.len(), string_assignments.len());
+        let _t = std::time::Instant::now();
         // Topological sort: reorder assignments by data dependencies.
         // CSS evaluates all properties simultaneously, but our sequential evaluator
         // must process them in dependency order. Only style() test references
         // (non-buffer-prefixed) create ordering constraints.
         let assignments = topological_sort_assignments(numeric_assignments, &functions);
 
+        log::info!("[compile phase] topological sort: {:.2}s", _t.elapsed().as_secs_f64());
+        let _t = std::time::Instant::now();
         let buffer_copies = program
             .assignments
             .iter()
@@ -227,6 +236,8 @@ impl Evaluator {
             }
         }
 
+        log::info!("[compile phase] logging: {:.2}s", _t.elapsed().as_secs_f64());
+        let _t = std::time::Instant::now();
         let compiled = compile::compile(
             &assignments,
             &broadcast_result.writes,
@@ -234,6 +245,7 @@ impl Evaluator {
             &dispatch_tables,
         );
 
+        log::info!("[compile phase] compile::compile: {:.2}s", _t.elapsed().as_secs_f64());
         log::info!(
             "Compiled: {} ops, {} slots, {} dispatch tables, {} broadcast writes",
             compiled.ops.len(),
@@ -317,7 +329,6 @@ impl Evaluator {
             }
         }
 
-        // Debug: print IVT-related slot values
         // Detect register changes
         let mut changes = Vec::new();
         let reg_names = [
@@ -499,6 +510,7 @@ fn topological_sort_assignments(
         return assignments;
     }
 
+    let _ts = std::time::Instant::now();
     // Build a set of properties defined in this tick
     let defined: HashMap<String, usize> = assignments
         .iter()
@@ -508,9 +520,10 @@ fn topological_sort_assignments(
 
     // For each assignment, collect which defined properties it references
     let mut deps: Vec<Vec<usize>> = Vec::with_capacity(assignments.len());
+    let mut fn_cache: HashMap<String, Vec<usize>> = HashMap::new();
     for a in &assignments {
         let mut refs = Vec::new();
-        collect_style_deps(&a.value, &defined, functions, &mut refs);
+        collect_style_deps(&a.value, &defined, functions, &mut fn_cache, &mut refs);
         refs.sort_unstable();
         refs.dedup();
         // Remove self-references (e.g., --IP: calc(var(--IP) + 1))
@@ -518,6 +531,8 @@ fn topological_sort_assignments(
         refs.retain(|&idx| idx != self_idx);
         deps.push(refs);
     }
+    log::info!("[topo detail] dep collection ({} assignments): {:.2}s", assignments.len(), _ts.elapsed().as_secs_f64());
+    let _ts = std::time::Instant::now();
 
     // Topological sort via Kahn's algorithm, breaking ties by original order.
     // We track ALL dependency edges — even those that are already in the right
@@ -542,6 +557,8 @@ fn topological_sort_assignments(
         }
     }
 
+    log::info!("[topo detail] graph build: {:.2}s", _ts.elapsed().as_secs_f64());
+    let _ts = std::time::Instant::now();
     let mut result = Vec::with_capacity(n);
     while let Some(std::cmp::Reverse(idx)) = ready.pop() {
         result.push(idx);
@@ -613,18 +630,19 @@ fn collect_style_deps(
     expr: &Expr,
     defined: &HashMap<String, usize>,
     functions: &HashMap<String, FunctionDef>,
+    fn_cache: &mut HashMap<String, Vec<usize>>,
     out: &mut Vec<usize>,
 ) {
     match expr {
         Expr::Var { fallback, .. } => {
             if let Some(fb) = fallback {
-                collect_style_deps(fb, defined, functions, out);
+                collect_style_deps(fb, defined, functions, fn_cache, out);
             }
         }
         Expr::Literal(_) | Expr::StringLiteral(_) => {}
         Expr::Concat(parts) => {
             for part in parts {
-                collect_style_deps(part, defined, functions, out);
+                collect_style_deps(part, defined, functions, fn_cache, out);
             }
         }
         Expr::Calc(op) => match op {
@@ -634,43 +652,51 @@ fn collect_style_deps(
             | CalcOp::Div(a, b)
             | CalcOp::Mod(a, b)
             | CalcOp::Pow(a, b) => {
-                collect_style_deps(a, defined, functions, out);
-                collect_style_deps(b, defined, functions, out);
+                collect_style_deps(a, defined, functions, fn_cache, out);
+                collect_style_deps(b, defined, functions, fn_cache, out);
             }
             CalcOp::Negate(a) | CalcOp::Abs(a) | CalcOp::Sign(a) => {
-                collect_style_deps(a, defined, functions, out);
+                collect_style_deps(a, defined, functions, fn_cache, out);
             }
             CalcOp::Clamp(a, b, c) => {
-                collect_style_deps(a, defined, functions, out);
-                collect_style_deps(b, defined, functions, out);
-                collect_style_deps(c, defined, functions, out);
+                collect_style_deps(a, defined, functions, fn_cache, out);
+                collect_style_deps(b, defined, functions, fn_cache, out);
+                collect_style_deps(c, defined, functions, fn_cache, out);
             }
             CalcOp::Round(_, a, b) => {
-                collect_style_deps(a, defined, functions, out);
-                collect_style_deps(b, defined, functions, out);
+                collect_style_deps(a, defined, functions, fn_cache, out);
+                collect_style_deps(b, defined, functions, fn_cache, out);
             }
             CalcOp::Min(args) | CalcOp::Max(args) => {
                 for a in args {
-                    collect_style_deps(a, defined, functions, out);
+                    collect_style_deps(a, defined, functions, fn_cache, out);
                 }
             }
         },
         Expr::StyleCondition { branches, fallback } => {
             for branch in branches {
-                collect_style_test_deps(&branch.condition, defined, functions, out);
-                collect_style_deps(&branch.then, defined, functions, out);
+                collect_style_test_deps(&branch.condition, defined, functions, fn_cache, out);
+                collect_style_deps(&branch.then, defined, functions, fn_cache, out);
             }
-            collect_style_deps(fallback, defined, functions, out);
+            collect_style_deps(fallback, defined, functions, fn_cache, out);
         }
         Expr::FunctionCall { name, args } => {
             for a in args {
-                collect_style_deps(a, defined, functions, out);
+                collect_style_deps(a, defined, functions, fn_cache, out);
             }
-            // Recurse into function body to find style() test dependencies
-            if let Some(func) = functions.get(name) {
-                collect_style_deps(&func.result, defined, functions, out);
-                for local in &func.locals {
-                    collect_style_deps(&local.value, defined, functions, out);
+            // Recurse into function body — cached to avoid walking 1M-node ASTs repeatedly
+            if functions.contains_key(name) {
+                if let Some(cached) = fn_cache.get(name) {
+                    out.extend_from_slice(cached);
+                } else {
+                    let func = &functions[name];
+                    let mut body_deps = Vec::new();
+                    collect_style_deps(&func.result, defined, functions, fn_cache, &mut body_deps);
+                    for local in &func.locals {
+                        collect_style_deps(&local.value, defined, functions, fn_cache, &mut body_deps);
+                    }
+                    fn_cache.insert(name.clone(), body_deps.clone());
+                    out.extend_from_slice(&body_deps);
                 }
             }
         }
@@ -685,23 +711,21 @@ fn collect_style_test_deps(
     test: &StyleTest,
     defined: &HashMap<String, usize>,
     functions: &HashMap<String, FunctionDef>,
+    fn_cache: &mut HashMap<String, Vec<usize>>,
     out: &mut Vec<usize>,
 ) {
     match test {
         StyleTest::Single { property, value } => {
-            // Only track dependencies on non-buffer-prefixed properties.
-            // Buffer-prefixed names (--__0*, --__1*, --__2*) explicitly read
-            // from previous frames and are NOT same-tick dependencies.
             if !property.starts_with("--__") {
                 if let Some(&idx) = defined.get(property) {
                     out.push(idx);
                 }
             }
-            collect_style_deps(value, defined, functions, out);
+            collect_style_deps(value, defined, functions, fn_cache, out);
         }
         StyleTest::And(tests) | StyleTest::Or(tests) => {
             for t in tests {
-                collect_style_test_deps(t, defined, functions, out);
+                collect_style_test_deps(t, defined, functions, fn_cache, out);
             }
         }
     }

@@ -26,10 +26,17 @@ struct Cli {
 
     /// Render a region of memory as a text-mode screen after execution.
     ///
-    /// Format: ADDR WIDTHxHEIGHT (e.g. "0xB8000 40x25").
+    /// Format: ADDR WIDTHxHEIGHT (e.g. "0xB8000 80x25").
     /// Memory is read in text-mode format (char+attribute byte pairs).
     #[arg(long, value_name = "ADDR WxH", num_args = 2)]
     screen: Option<Vec<String>>,
+
+    /// Render the screen every N ticks (requires --screen).
+    ///
+    /// Uses ANSI cursor movement to update in-place. Without this flag,
+    /// the screen is only rendered once after execution completes.
+    #[arg(long, value_name = "N")]
+    screen_interval: Option<u32>,
 
     /// Dump all computed slot values at a specific tick for debugging.
     ///
@@ -103,13 +110,17 @@ fn main() {
     match calcite_core::parser::parse_css(&css) {
         Ok(parsed) => {
             let parse_time = t0.elapsed();
-            println!(
-                "Parsed: {} @property, {} @function, {} assignments ({:.2}s)",
-                parsed.properties.len(),
-                parsed.functions.len(),
-                parsed.assignments.len(),
-                parse_time.as_secs_f64(),
-            );
+            // Only print parse stats when not in screen mode (screen takes over the terminal)
+            let has_screen = cli.screen.is_some();
+            if !has_screen {
+                println!(
+                    "Parsed: {} @property, {} @function, {} assignments ({:.2}s)",
+                    parsed.properties.len(),
+                    parsed.functions.len(),
+                    parsed.assignments.len(),
+                    parse_time.as_secs_f64(),
+                );
+            }
 
             if cli.parse_only {
                 return;
@@ -122,12 +133,14 @@ fn main() {
             let mut state = calcite_core::State::default();
             state.load_properties(&parsed.properties);
 
-            eprintln!(
-                "Compiled: {:.2}s (parse {:.2}s + compile {:.2}s)",
-                (parse_time + compile_time).as_secs_f64(),
-                parse_time.as_secs_f64(),
-                compile_time.as_secs_f64(),
-            );
+            if !has_screen {
+                eprintln!(
+                    "Compiled: {:.2}s (parse {:.2}s + compile {:.2}s)",
+                    (parse_time + compile_time).as_secs_f64(),
+                    parse_time.as_secs_f64(),
+                    compile_time.as_secs_f64(),
+                );
+            }
 
             let halt_addr: Option<i32> = cli.halt.as_ref().map(|s| {
                 if s.starts_with("0x") || s.starts_with("0X") {
@@ -178,7 +191,7 @@ fn main() {
                     "--addrValA", "--addrValA1", "--addrValA2", "--addrValB", "--addrValC",
                     "--isWordWrite", "--instId", "--instLen",
                     "--modRm", "--modRm_mod", "--modRm_reg", "--modRm_rm",
-                    "--moveStack", "--moveSI", "--moveDI", "--jumpCS",
+                    "--moveStack", "--moveSI", "--moveDI", "--jumpCS", "--addrJump",
                     // registers
                     "--AX", "--CX", "--DX", "--BX",
                     "--AL", "--CL", "--DL", "--BL",
@@ -224,55 +237,88 @@ fn main() {
                 return;
             }
 
-            let mut ticks_run: u32 = 0;
-            if cli.verbose {
-                // In verbose mode, batch the early ticks, then show
-                // per-tick output for the tail. Small counts show all.
-                let batch_count = if cli.ticks <= 100 { 0 } else { cli.ticks.saturating_sub(20) };
-                if batch_count > 0 {
-                    evaluator.run_batch(&mut state, batch_count);
-                    ticks_run = batch_count;
-                    eprintln!(
-                        "(batch: {} ticks, IP={})",
-                        batch_count,
-                        state.registers[calcite_core::state::reg::IP]
-                    );
+            // Parse screen args once if present
+            let screen_cfg = cli.screen.as_ref().map(|args| parse_screen_args(args));
+            let screen_interval = cli.screen_interval.unwrap_or(0);
+
+            // Helper: render screen with ANSI in-place update
+            let render_screen = |state: &calcite_core::State, cfg: (i32, usize, usize), tick: u32, first: bool| {
+                let (addr, width, height) = cfg;
+                if first {
+                    // Clear screen and hide cursor on first frame
+                    eprint!("\x1b[2J\x1b[H\x1b[?25l");
+                } else {
+                    // Move cursor to top-left to overwrite previous frame
+                    eprint!("\x1b[H");
                 }
-                for tick in batch_count..cli.ticks {
-                    let result = evaluator.tick(&mut state);
-                    ticks_run = tick + 1;
-                    println!(
-                        "Tick {tick}: {} changes | AX={} CX={} DX={} BX={} SP={} BP={} SI={} DI={} IP={} ES={} CS={} SS={} DS={} flags={}",
-                        result.changes.len(),
-                        state.registers[calcite_core::state::reg::AX],
-                        state.registers[calcite_core::state::reg::CX],
-                        state.registers[calcite_core::state::reg::DX],
-                        state.registers[calcite_core::state::reg::BX],
-                        state.registers[calcite_core::state::reg::SP],
-                        state.registers[calcite_core::state::reg::BP],
-                        state.registers[calcite_core::state::reg::SI],
-                        state.registers[calcite_core::state::reg::DI],
-                        state.registers[calcite_core::state::reg::IP],
-                        state.registers[calcite_core::state::reg::ES],
-                        state.registers[calcite_core::state::reg::CS],
-                        state.registers[calcite_core::state::reg::SS],
-                        state.registers[calcite_core::state::reg::DS],
-                        state.registers[calcite_core::state::reg::FLAGS],
-                    );
-                    if let Some(addr) = halt_addr {
-                        if state.read_mem(addr) != 0 {
-                            eprintln!("Halt: memory 0x{:X} set at tick {}", addr, tick);
-                            break;
-                        }
+                let screen = state.render_screen(addr as usize, width, height);
+                eprintln!("┌{}┐", "─".repeat(width));
+                for line in screen.lines() {
+                    eprintln!("│{line}│");
+                }
+                eprintln!("└{}┘", "─".repeat(width));
+                eprintln!(" tick {} ", tick);
+            };
+
+            let mut ticks_run: u32 = 0;
+            let mut first_frame = true;
+            let needs_per_tick = cli.verbose || halt_addr.is_some() || (screen_cfg.is_some() && screen_interval > 0);
+
+            if needs_per_tick {
+                // When verbose, batch early ticks then show tail
+                let batch_skip = if cli.verbose && cli.ticks > 100 {
+                    cli.ticks.saturating_sub(20)
+                } else {
+                    0
+                };
+                if batch_skip > 0 {
+                    evaluator.run_batch(&mut state, batch_skip);
+                    ticks_run = batch_skip;
+                    if cli.verbose {
+                        eprintln!(
+                            "(batch: {} ticks, IP={})",
+                            batch_skip,
+                            state.registers[calcite_core::state::reg::IP]
+                        );
                     }
                 }
-            } else if let Some(addr) = halt_addr {
-                for tick in 0..cli.ticks {
+                for tick in batch_skip..cli.ticks {
                     evaluator.tick(&mut state);
                     ticks_run = tick + 1;
-                    if state.read_mem(addr) != 0 {
-                        eprintln!("Halt: memory 0x{:X} set at tick {}", addr, tick);
-                        break;
+
+                    if cli.verbose {
+                        println!(
+                            "Tick {tick}: AX={} CX={} DX={} BX={} SP={} BP={} SI={} DI={} IP={} ES={} CS={} SS={} DS={} flags={}",
+                            state.registers[calcite_core::state::reg::AX],
+                            state.registers[calcite_core::state::reg::CX],
+                            state.registers[calcite_core::state::reg::DX],
+                            state.registers[calcite_core::state::reg::BX],
+                            state.registers[calcite_core::state::reg::SP],
+                            state.registers[calcite_core::state::reg::BP],
+                            state.registers[calcite_core::state::reg::SI],
+                            state.registers[calcite_core::state::reg::DI],
+                            state.registers[calcite_core::state::reg::IP],
+                            state.registers[calcite_core::state::reg::ES],
+                            state.registers[calcite_core::state::reg::CS],
+                            state.registers[calcite_core::state::reg::SS],
+                            state.registers[calcite_core::state::reg::DS],
+                            state.registers[calcite_core::state::reg::FLAGS],
+                        );
+                    }
+
+                    // Periodic screen rendering
+                    if let Some(cfg) = screen_cfg {
+                        if screen_interval > 0 && ticks_run % screen_interval == 0 {
+                            render_screen(&state, cfg, ticks_run, first_frame);
+                            first_frame = false;
+                        }
+                    }
+
+                    if let Some(addr) = halt_addr {
+                        if state.read_mem(addr) != 0 {
+                            eprintln!("Halt: memory 0x{:X} set at tick {}", addr, ticks_run);
+                            break;
+                        }
                     }
                 }
             } else {
@@ -281,7 +327,7 @@ fn main() {
             }
             let tick_time = t2.elapsed();
 
-            if !cli.verbose && cli.dump_tick.is_none() && !cli.trace_json {
+            if !cli.verbose && cli.dump_tick.is_none() && !cli.trace_json && !has_screen {
                 println!(
                     "Ran {} ticks | AX={} CX={} IP={}",
                     ticks_run,
@@ -290,11 +336,13 @@ fn main() {
                     state.registers[calcite_core::state::reg::IP],
                 );
             }
-            eprintln!(
-                "Ticks: {:.3}s ({:.0} ticks/sec)",
-                tick_time.as_secs_f64(),
-                ticks_run as f64 / tick_time.as_secs_f64(),
-            );
+            if !has_screen {
+                eprintln!(
+                    "Ticks: {:.3}s ({:.0} ticks/sec)",
+                    tick_time.as_secs_f64(),
+                    ticks_run as f64 / tick_time.as_secs_f64(),
+                );
+            }
 
             // Display string property output (e.g., --textBuffer)
             for (name, value) in &state.string_properties {
@@ -303,14 +351,14 @@ fn main() {
                 }
             }
 
-            if let Some(ref args) = cli.screen {
-                let (addr, width, height) = parse_screen_args(args);
-                let screen = state.render_screen(addr as usize, width, height);
-                println!("\n┌{}┐", "─".repeat(width));
-                for line in screen.lines() {
-                    println!("│{line}│");
+            // Final screen render (always, unless we just rendered this exact tick)
+            if let Some(cfg) = screen_cfg {
+                let just_rendered = screen_interval > 0 && ticks_run % screen_interval == 0;
+                if !just_rendered {
+                    render_screen(&state, cfg, ticks_run, first_frame);
                 }
-                println!("└{}┘", "─".repeat(width));
+                // Restore cursor visibility
+                eprint!("\x1b[?25h");
             }
         }
         Err(e) => {
