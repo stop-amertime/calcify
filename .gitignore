@@ -5,6 +5,7 @@ Cargo.lock
 
 # WASM build output
 web/pkg/
+site/pkg/
 
 # IDE
 .idea/
@@ -22,8 +23,9 @@ Thumbs.db
 # Test fixtures (downloaded from x86CSS repo, not checked in)
 tests/fixtures/
 
-# Playwright MCP logs
+# Tool state
 .playwright-mcp/
+.serena/
 
 # Claude memory (auto-generated, local)
 memory/

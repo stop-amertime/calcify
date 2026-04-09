@@ -4,8 +4,8 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>CSS-DOS</title>
+  <link rel="icon" href="favicon.ico">
   <link rel="stylesheet" href="style.css">
-  <link rel="stylesheet" href="css-screen.css">
 </head>
 <body>
   <div class="desktop">
@@ -149,20 +149,7 @@
           </div>
 
           <div class="actions-row">
-            <button id="btn-run" class="btn-primary">&#9654; Run in Calcite</button>
-          </div>
-        </div>
-
-        <!-- Runner (hidden initially) -->
-        <div id="runner-panel" class="group" style="display:none;">
-          <span class="group-label">Calcite</span>
-          <div class="runner-controls">
-            <button id="btn-runner-stop" class="btn" disabled>&#9632; Stop</button>
-            <span class="runner-stats" id="runner-stats"></span>
-          </div>
-          <div id="runner-screen" class="css-screen"></div>
-          <div class="status-bar" style="margin-top:4px;">
-            <span id="runner-status">Loading CSS...</span>
+            <a id="btn-run-link" class="btn-primary" style="text-decoration:none; display:inline-block;">&#9654; Run in Calcite</a>
           </div>
         </div>
 
@@ -275,6 +262,7 @@ if (!prog) {
   document.getElementById('window-title').innerHTML = `CSS-DOS &mdash; ${programId}.css`;
   document.getElementById('program-title').textContent = prog.title;
   document.getElementById('program-desc').innerHTML = prog.desc;
+  document.getElementById('btn-run-link').href = `run.html?p=${programId}`;
 
   // Stats
   document.getElementById('stat-css-size').textContent = prog.cssSize;
@@ -503,73 +491,8 @@ async function loadCssViewer() {
 // Auto-load viewer on page load
 if (prog) loadCssViewer();
 
-// ============================================================
-// Runner — CSS-rendered screen
-//
-// The WASM engine runs the CPU. It sends back raw video memory
-// bytes. We set --val on each .cell element. CSS renders the
-// characters. The last mile is pure CSS — no JS touches screen
-// content.
-// ============================================================
-
-// Create the 2000 cell elements (80x25 grid)
-// Structure: <span class="cell"><span class="cv"><i></i></span></span>
-// .cell is the container (--val set here by JS)
-// .cv > i::after reads from the container via @container style()
-const screenEl = document.getElementById('runner-screen');
-const cells = [];
-for (let i = 0; i < 80 * 25; i++) {
-  const cell = document.createElement('span');
-  cell.className = 'cell';
-  cell.innerHTML = '<span class="cv"><i></i></span>';
-  screenEl.appendChild(cell);
-  cells.push(cell);
-}
-
-// Update screen from raw video memory bytes — sets CSS variables only.
-// JS sets --val. CSS renders the character via @container style() rules.
-// The last mile is pure CSS — no JS writes text content to the DOM.
-function updateScreen(videoBytes) {
-  for (let i = 0; i < cells.length && i < videoBytes.length; i++) {
-    const val = videoBytes[i];
-    if (cells[i]._lastVal !== val) {
-      cells[i].style.setProperty('--val', String(val));
-      cells[i]._lastVal = val;
-    }
-  }
-}
-
-document.getElementById('btn-run').addEventListener('click', () => {
-  const panel = document.getElementById('runner-panel');
-  panel.style.display = '';
-  const status = document.getElementById('runner-status');
-
-  status.textContent = 'Loading CSS-DOS engine (calcite-wasm)...';
-
-  // TODO: integrate calcite-worker.js + WASM
-  // The flow:
-  // 1. Fetch the .css.gz, decompress to string
-  // 2. Send to calcite-wasm worker for parsing + compilation
-  // 3. Worker runs tick batches, sends back raw video memory bytes
-  // 4. Main thread calls updateScreen(bytes) — sets --val on cells
-  // 5. CSS renders the characters via if(style(--val: N)) rules
-  //
-  // The JS never writes text content. CSS does the rendering.
-  //
-  // For now, show a demo pattern.
-  // Container style queries need a frame between creation and first --val set.
-  const demo = 'CSS-DOS: Screen rendered by pure CSS.  Each character is a @container style() rule.';
-  const bytes = new Uint8Array(80 * 25).fill(32);
-  for (let i = 0; i < demo.length; i++) bytes[i] = demo.charCodeAt(i);
-  // Second line
-  const line2 = 'No JavaScript touches the screen content. CSS does the rendering.';
-  for (let i = 0; i < line2.length; i++) bytes[80 + i] = line2.charCodeAt(i);
-
-  requestAnimationFrame(() => {
-    updateScreen(bytes);
-    status.textContent = 'Demo mode (WASM not loaded) \u2014 screen rendered by CSS';
-  });
-});
+// "Run in Calcite" navigates to the dedicated runner page
+document.getElementById('btn-run-link').href = `run.html?p=${programId}`;
 </script>
 </body>
 </html>

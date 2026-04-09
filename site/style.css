@@ -608,14 +608,6 @@ hr.groove {
   border-left: 1px solid #808080;
   border-right: 1px solid #fff;
   border-bottom: 1px solid #fff;
-  background: #000;
-  color: #aaa;
-  font-family: inherit;
-  font-size: 14px;
-  white-space: pre;
-  line-height: 1.15;
-  padding: 8px;
-  min-height: 200px;
   overflow: hidden;
 }
 
@@ -631,6 +623,30 @@ hr.groove {
   color: #808080;
   margin-left: auto;
 }
+
+.runner-screen:focus {
+  outline: 2px solid #000080;
+  outline-offset: -2px;
+}
+
+.runner-text-output {
+  border-top: 1px solid #808080;
+  border-left: 1px solid #808080;
+  border-right: 1px solid #fff;
+  border-bottom: 1px solid #fff;
+  background: #000;
+  color: #33ff33;
+  font-family: inherit;
+  font-size: 14px;
+  white-space: pre;
+  line-height: 1.15;
+  padding: 8px;
+  min-height: 200px;
+  max-height: 400px;
+  overflow-y: auto;
+}
+
+.spacer { flex: 1; }
 
 /* Back link */
 .back-link {
