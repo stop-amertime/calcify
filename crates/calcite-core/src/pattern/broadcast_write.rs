@@ -49,7 +49,7 @@ pub struct BroadcastResult {
 /// pure `--addrDest*` checks are absorbed; register assignments that mix in
 /// execution logic (e.g. `--addrJump`) are left in the normal assignment loop.
 pub fn recognise_broadcast(assignments: &[Assignment]) -> BroadcastResult {
-    let _p1 = std::time::Instant::now();
+    let _p1 = crate::timer::Timer::now();
     // Phase 1: Collect all broadcast port entries, grouped by dest_property.
     let mut direct_groups: HashMap<String, Vec<(i64, String, Expr)>> = HashMap::new();
     let mut spillover_groups: HashMap<String, Vec<(i64, String, String, Expr)>> = HashMap::new();
@@ -99,9 +99,9 @@ pub fn recognise_broadcast(assignments: &[Assignment]) -> BroadcastResult {
     }
 
     log::info!("[bw phase1] collection: {:.2}s ({} assignments, {} direct groups)",
-        _p1.elapsed().as_secs_f64(), assignments.len(),
+        _p1.elapsed_secs(), assignments.len(),
         direct_groups.values().map(|v| v.len()).sum::<usize>());
-    let _p2 = std::time::Instant::now();
+    let _p2 = crate::timer::Timer::now();
     // Track how many of each assignment's ports were actually absorbed.
     let mut absorbed_port_counts: HashMap<String, usize> = HashMap::new();
     // Count of large groups that skip per-entry absorption tracking
@@ -199,7 +199,7 @@ pub fn recognise_broadcast(assignments: &[Assignment]) -> BroadcastResult {
     }
 
     log::info!("[bw phase2] grouping+absorption: {:.2}s ({} writes, {} absorbed)",
-        _p2.elapsed().as_secs_f64(), writes.len(), absorbed_properties.len());
+        _p2.elapsed_secs(), writes.len(), absorbed_properties.len());
     BroadcastResult {
         writes,
         absorbed_properties,

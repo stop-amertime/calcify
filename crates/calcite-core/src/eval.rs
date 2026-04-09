@@ -113,7 +113,7 @@ pub struct TickResult {
 impl Evaluator {
     /// Build an evaluator from a `ParsedProgram`.
     pub fn from_parsed(program: &ParsedProgram) -> Self {
-        let _t = std::time::Instant::now();
+        let _t = crate::timer::Timer::now();
         let functions: HashMap<String, FunctionDef> = program
             .functions
             .iter()
@@ -150,8 +150,8 @@ impl Evaluator {
             set_address_map(address_map);
         }
 
-        log::info!("[compile phase] dispatch tables: {:.2}s", _t.elapsed().as_secs_f64());
-        let _t = std::time::Instant::now();
+        log::info!("[compile phase] dispatch tables: {:.2}s", _t.elapsed_secs());
+        let _t = crate::timer::Timer::now();
         // Recognise broadcast write patterns in assignments
         let broadcast_result = broadcast_write::recognise_broadcast(&program.assignments);
         for bw in &broadcast_result.writes {
@@ -162,8 +162,8 @@ impl Evaluator {
             );
         }
 
-        log::info!("[compile phase] broadcast recognition: {:.2}s", _t.elapsed().as_secs_f64());
-        let _t = std::time::Instant::now();
+        log::info!("[compile phase] broadcast recognition: {:.2}s", _t.elapsed_secs());
+        let _t = crate::timer::Timer::now();
         // Identify string properties from @property syntax
         let mut string_property_names: HashSet<String> = HashSet::new();
         for prop in &program.properties {
@@ -207,16 +207,16 @@ impl Evaluator {
             );
         }
 
-        log::info!("[compile phase] filter+partition: {:.2}s ({} numeric, {} string)", _t.elapsed().as_secs_f64(), numeric_assignments.len(), string_assignments.len());
-        let _t = std::time::Instant::now();
+        log::info!("[compile phase] filter+partition: {:.2}s ({} numeric, {} string)", _t.elapsed_secs(), numeric_assignments.len(), string_assignments.len());
+        let _t = crate::timer::Timer::now();
         // Topological sort: reorder assignments by data dependencies.
         // CSS evaluates all properties simultaneously, but our sequential evaluator
         // must process them in dependency order. Only style() test references
         // (non-buffer-prefixed) create ordering constraints.
         let assignments = topological_sort_assignments(numeric_assignments, &functions);
 
-        log::info!("[compile phase] topological sort: {:.2}s", _t.elapsed().as_secs_f64());
-        let _t = std::time::Instant::now();
+        log::info!("[compile phase] topological sort: {:.2}s", _t.elapsed_secs());
+        let _t = crate::timer::Timer::now();
         let buffer_copies = program
             .assignments
             .iter()
@@ -236,8 +236,8 @@ impl Evaluator {
             }
         }
 
-        log::info!("[compile phase] logging: {:.2}s", _t.elapsed().as_secs_f64());
-        let _t = std::time::Instant::now();
+        log::info!("[compile phase] logging: {:.2}s", _t.elapsed_secs());
+        let _t = crate::timer::Timer::now();
         let compiled = compile::compile(
             &assignments,
             &broadcast_result.writes,
@@ -245,7 +245,7 @@ impl Evaluator {
             &dispatch_tables,
         );
 
-        log::info!("[compile phase] compile::compile: {:.2}s", _t.elapsed().as_secs_f64());
+        log::info!("[compile phase] compile::compile: {:.2}s", _t.elapsed_secs());
         log::info!(
             "Compiled: {} ops, {} slots, {} dispatch tables, {} broadcast writes",
             compiled.ops.len(),
@@ -510,7 +510,7 @@ fn topological_sort_assignments(
         return assignments;
     }
 
-    let _ts = std::time::Instant::now();
+    let _ts = crate::timer::Timer::now();
     // Build a set of properties defined in this tick
     let defined: HashMap<String, usize> = assignments
         .iter()
@@ -531,8 +531,8 @@ fn topological_sort_assignments(
         refs.retain(|&idx| idx != self_idx);
         deps.push(refs);
     }
-    log::info!("[topo detail] dep collection ({} assignments): {:.2}s", assignments.len(), _ts.elapsed().as_secs_f64());
-    let _ts = std::time::Instant::now();
+    log::info!("[topo detail] dep collection ({} assignments): {:.2}s", assignments.len(), _ts.elapsed_secs());
+    let _ts = crate::timer::Timer::now();
 
     // Topological sort via Kahn's algorithm, breaking ties by original order.
     // We track ALL dependency edges — even those that are already in the right
@@ -557,8 +557,8 @@ fn topological_sort_assignments(
         }
     }
 
-    log::info!("[topo detail] graph build: {:.2}s", _ts.elapsed().as_secs_f64());
-    let _ts = std::time::Instant::now();
+    log::info!("[topo detail] graph build: {:.2}s", _ts.elapsed_secs());
+    let _ts = crate::timer::Timer::now();
     let mut result = Vec::with_capacity(n);
     while let Some(std::cmp::Reverse(idx)) = ready.pop() {
         result.push(idx);

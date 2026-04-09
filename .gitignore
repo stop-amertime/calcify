@@ -3,8 +3,8 @@
 **/*.rs.bk
 Cargo.lock
 
-# WASM build output (tracked so the web UI works without a build step)
-# web/pkg/
+# WASM build output
+web/pkg/
 
 # IDE
 .idea/

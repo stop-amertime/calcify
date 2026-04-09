@@ -106,15 +106,26 @@ impl CalciteEngine {
     /// Returns a JSON string like `{"addr":753664,"size":4000,"width":80,"height":25}`
     /// if video memory is detected, or `"null"` otherwise.
     pub fn detect_video(&self) -> String {
-        match calcite_core::detect_video_memory() {
-            Some((addr, size)) => {
-                // Infer dimensions: size/2 cells (char+attr pairs)
-                // 80x25 = 4000 bytes is standard DOS text mode
-                let cells = size / 2;
-                let (w, h) = if cells == 2000 { (80, 25) } else if cells == 1000 { (40, 25) } else { (80, cells / 80) };
-                format!("{{\"addr\":{addr},\"size\":{size},\"width\":{w},\"height\":{h}}}")
-            }
-            None => "null".to_string(),
+        // Try the address-map-based detection first (from identity-read dispatch tables)
+        if let Some((addr, size)) = calcite_core::detect_video_memory() {
+            let cells = size / 2;
+            let (w, h) = if cells == 2000 { (80, 25) } else if cells == 1000 { (40, 25) } else { (80, cells / 80) };
+            return format!("{{\"addr\":{addr},\"size\":{size},\"width\":{w},\"height\":{h}}}");
+        }
+        // Fallback: if state memory covers the VGA text-mode region, video properties
+        // exist (they just weren't in a dispatch table — e.g. write-only via broadcast).
+        // The CLI uses explicit --screen; for the web we infer from memory size.
+        let vga_base: usize = 0xB8000;
+        let vga_80x25 = vga_base + 80 * 25 * 2;
+        let vga_40x25 = vga_base + 40 * 25 * 2;
+        if self.state.memory.len() >= vga_80x25 {
+            let size = 80 * 25 * 2;
+            format!("{{\"addr\":{vga_base},\"size\":{size},\"width\":80,\"height\":25}}")
+        } else if self.state.memory.len() >= vga_40x25 {
+            let size = 40 * 25 * 2;
+            format!("{{\"addr\":{vga_base},\"size\":{size},\"width\":40,\"height\":25}}")
+        } else {
+            "null".to_string()
         }
     }
 

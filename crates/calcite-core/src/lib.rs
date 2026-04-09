@@ -20,6 +20,8 @@ pub mod parser;
 pub mod pattern;
 /// Machine state — registers and memory.
 pub mod state;
+/// WASM-safe timing for compile/eval logging.
+pub(crate) mod timer;
 /// IR type definitions — expressions, assignments, programs.
 pub mod types;
 

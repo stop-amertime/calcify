@@ -925,7 +925,7 @@ impl<'a> Compiler<'a> {
         table: &DispatchTable,
         ops: &mut Vec<Op>,
     ) -> Slot {
-        let _dt = std::time::Instant::now();
+        let _dt = crate::timer::Timer::now();
         let key_slot = self.compile_var(&table.key_property, None, ops);
 
         let mut compiled_entries = HashMap::new();
@@ -941,7 +941,7 @@ impl<'a> Compiler<'a> {
         let table_id = self.compiled_dispatches.len() as Slot;
         if compiled_entries.len() >= 100 {
             log::info!("[compile detail] inline dispatch on {}: {} entries, {:.2}s",
-                table.key_property, compiled_entries.len(), _dt.elapsed().as_secs_f64());
+                table.key_property, compiled_entries.len(), _dt.elapsed_secs());
         }
         self.compiled_dispatches.push(CompiledDispatchTable {
             entries: compiled_entries,
@@ -1373,7 +1373,7 @@ impl<'a> Compiler<'a> {
     /// are keyed by the dispatch value (the parameter), not by parameter slots. The
     /// parameter only appears as the key; entry bodies are context-independent.
     fn compile_dispatch_call(&mut self, name: &str, args: &[Expr], ops: &mut Vec<Op>) -> Slot {
-        let _dt = std::time::Instant::now();
+        let _dt = crate::timer::Timer::now();
         let table = self.dispatch_tables.remove(name).unwrap();
         let func = self.functions.get(name);
 
@@ -1449,7 +1449,7 @@ impl<'a> Compiler<'a> {
 
             if table.entries.len() >= 100 {
                 log::info!("[compile detail] dispatch_call {} compiled: {} entries, {:.2}s",
-                    name, table.entries.len(), _dt.elapsed().as_secs_f64());
+                    name, table.entries.len(), _dt.elapsed_secs());
             }
             // Cache large parameterless tables for reuse
             if cacheable && table.entries.len() >= 100 {
@@ -1551,20 +1551,20 @@ pub fn compile(
     functions: &HashMap<String, FunctionDef>,
     dispatch_tables: &HashMap<String, DispatchTable>,
 ) -> CompiledProgram {
-    let _ct = std::time::Instant::now();
+    let _ct = crate::timer::Timer::now();
     let mut compiler = Compiler::new(functions, dispatch_tables);
-    log::info!("[compile detail] Compiler::new clone: {:.2}s", _ct.elapsed().as_secs_f64());
+    log::info!("[compile detail] Compiler::new clone: {:.2}s", _ct.elapsed_secs());
     let mut ops = Vec::new();
     let mut writeback = Vec::new();
 
-    let _ct = std::time::Instant::now();
+    let _ct = crate::timer::Timer::now();
     // Compile each assignment
     for assignment in assignments {
-        let _at = std::time::Instant::now();
+        let _at = crate::timer::Timer::now();
         let result_slot = compiler.compile_expr(&assignment.value, &mut ops);
-        let elapsed = _at.elapsed();
-        if elapsed.as_millis() >= 100 {
-            log::info!("[compile detail] assignment {} took {:.2}s", assignment.property, elapsed.as_secs_f64());
+        let elapsed_s = _at.elapsed_secs();
+        if elapsed_s >= 0.1 {
+            log::info!("[compile detail] assignment {} took {:.2}s", assignment.property, elapsed_s);
         }
         // Register this property slot so later assignments can reference it
         compiler
@@ -1579,23 +1579,23 @@ pub fn compile(
         }
     }
     log::info!("[compile detail] assignments ({} items): {:.2}s, {} ops, {} dispatch tables",
-        assignments.len(), _ct.elapsed().as_secs_f64(), ops.len(), compiler.compiled_dispatches.len());
+        assignments.len(), _ct.elapsed_secs(), ops.len(), compiler.compiled_dispatches.len());
 
-    let _ct = std::time::Instant::now();
+    let _ct = crate::timer::Timer::now();
     // Compile broadcast writes
     let compiled_bw: Vec<_> = broadcast_writes
         .iter()
         .map(|bw| {
-            let _bt = std::time::Instant::now();
+            let _bt = crate::timer::Timer::now();
             let result = compile_broadcast_write(bw, &mut compiler);
             log::info!("[compile detail] broadcast write {}: {:.2}s ({} addrs, {} spillover)",
-                bw.dest_property, _bt.elapsed().as_secs_f64(),
+                bw.dest_property, _bt.elapsed_secs(),
                 bw.address_map.len(), bw.spillover_map.len());
             result
         })
         .collect();
     log::info!("[compile detail] broadcast writes total ({} items): {:.2}s",
-        broadcast_writes.len(), _ct.elapsed().as_secs_f64());
+        broadcast_writes.len(), _ct.elapsed_secs());
 
     let mut program = CompiledProgram {
         ops,
@@ -1606,9 +1606,9 @@ pub fn compile(
         property_slots: compiler.property_slots,
     };
 
-    let _ct = std::time::Instant::now();
+    let _ct = crate::timer::Timer::now();
     compact_slots(&mut program);
-    log::info!("[compile detail] slot compaction: {:.2}s", _ct.elapsed().as_secs_f64());
+    log::info!("[compile detail] slot compaction: {:.2}s", _ct.elapsed_secs());
 
     program
 }
@@ -1628,7 +1628,7 @@ pub fn compile(
 /// same slot range.
 fn compact_slots(program: &mut CompiledProgram) {
     #[cfg(not(target_arch = "wasm32"))]
-    let compact_start = std::time::Instant::now();
+    let compact_start = crate::timer::Timer::now();
     let before = program.slot_count;
 
     // Phase 1: compact main op stream
@@ -1798,7 +1798,7 @@ fn compact_slots(program: &mut CompiledProgram) {
         before,
         program.slot_count,
         (1.0 - program.slot_count as f64 / before.max(1) as f64) * 100.0,
-        compact_start.elapsed().as_secs_f64(),
+        compact_start.elapsed_secs(),
     );
     #[cfg(target_arch = "wasm32")]
     log::info!(
@@ -2314,14 +2314,14 @@ fn seed_from_parent(
 
 /// Compile a single broadcast write.
 fn compile_broadcast_write(bw: &BroadcastWrite, compiler: &mut Compiler) -> CompiledBroadcastWrite {
-    let _t0 = std::time::Instant::now();
+    let _t0 = crate::timer::Timer::now();
     // Compile dest property resolution
     let dest_slot = compiler.compile_var(&bw.dest_property, None, &mut Vec::new());
 
     // Compile value expression
     let mut value_ops = Vec::new();
     let value_slot = compiler.compile_expr(&bw.value_expr, &mut value_ops);
-    let _t1 = std::time::Instant::now();
+    let _t1 = crate::timer::Timer::now();
 
     // Build address map: address → state address (for direct write_mem)
     // Optimised: broadcast entries are bare names like "m12345" or "AX".
@@ -2340,8 +2340,8 @@ fn compile_broadcast_write(bw: &BroadcastWrite, compiler: &mut Compiler) -> Comp
         }
     }
     log::info!("[bw detail] {} address_map ({} entries): {:.2}s",
-        bw.dest_property, bw.address_map.len(), _t1.elapsed().as_secs_f64());
-    let _t2 = std::time::Instant::now();
+        bw.dest_property, bw.address_map.len(), _t1.elapsed_secs());
+    let _t2 = crate::timer::Timer::now();
 
     // Compile spillover
     let spillover = if !bw.spillover_map.is_empty() {
