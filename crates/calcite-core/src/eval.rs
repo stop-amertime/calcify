@@ -7,6 +7,7 @@
 //!    direct writes) for O(1) operations. (Phase 2+)
 
 use std::collections::{HashMap, HashSet};
+use web_time::Instant;
 
 use crate::compile::{
     self, is_bit_extract, is_dispatch_identity_read, is_left_shift, is_mod_pow2, is_mul_refs,
@@ -113,7 +114,7 @@ pub struct TickResult {
 impl Evaluator {
     /// Build an evaluator from a `ParsedProgram`.
     pub fn from_parsed(program: &ParsedProgram) -> Self {
-        let _t = std::time::Instant::now();
+        let _t = Instant::now();
         let functions: HashMap<String, FunctionDef> = program
             .functions
             .iter()
@@ -151,7 +152,7 @@ impl Evaluator {
         }
 
         log::info!("[compile phase] dispatch tables: {:.2}s", _t.elapsed().as_secs_f64());
-        let _t = std::time::Instant::now();
+        let _t = Instant::now();
         // Recognise broadcast write patterns in assignments
         let broadcast_result = broadcast_write::recognise_broadcast(&program.assignments);
         for bw in &broadcast_result.writes {
@@ -163,7 +164,7 @@ impl Evaluator {
         }
 
         log::info!("[compile phase] broadcast recognition: {:.2}s", _t.elapsed().as_secs_f64());
-        let _t = std::time::Instant::now();
+        let _t = Instant::now();
         // Identify string properties from @property syntax
         let mut string_property_names: HashSet<String> = HashSet::new();
         for prop in &program.properties {
@@ -208,7 +209,7 @@ impl Evaluator {
         }
 
         log::info!("[compile phase] filter+partition: {:.2}s ({} numeric, {} string)", _t.elapsed().as_secs_f64(), numeric_assignments.len(), string_assignments.len());
-        let _t = std::time::Instant::now();
+        let _t = Instant::now();
         // Topological sort: reorder assignments by data dependencies.
         // CSS evaluates all properties simultaneously, but our sequential evaluator
         // must process them in dependency order. Only style() test references
@@ -216,7 +217,7 @@ impl Evaluator {
         let assignments = topological_sort_assignments(numeric_assignments, &functions);
 
         log::info!("[compile phase] topological sort: {:.2}s", _t.elapsed().as_secs_f64());
-        let _t = std::time::Instant::now();
+        let _t = Instant::now();
         let buffer_copies = program
             .assignments
             .iter()
@@ -237,7 +238,7 @@ impl Evaluator {
         }
 
         log::info!("[compile phase] logging: {:.2}s", _t.elapsed().as_secs_f64());
-        let _t = std::time::Instant::now();
+        let _t = Instant::now();
         let compiled = compile::compile(
             &assignments,
             &broadcast_result.writes,
@@ -510,7 +511,7 @@ fn topological_sort_assignments(
         return assignments;
     }
 
-    let _ts = std::time::Instant::now();
+    let _ts = Instant::now();
     // Build a set of properties defined in this tick
     let defined: HashMap<String, usize> = assignments
         .iter()
@@ -532,7 +533,7 @@ fn topological_sort_assignments(
         deps.push(refs);
     }
     log::info!("[topo detail] dep collection ({} assignments): {:.2}s", assignments.len(), _ts.elapsed().as_secs_f64());
-    let _ts = std::time::Instant::now();
+    let _ts = Instant::now();
 
     // Topological sort via Kahn's algorithm, breaking ties by original order.
     // We track ALL dependency edges — even those that are already in the right
@@ -558,7 +559,7 @@ fn topological_sort_assignments(
     }
 
     log::info!("[topo detail] graph build: {:.2}s", _ts.elapsed().as_secs_f64());
-    let _ts = std::time::Instant::now();
+    let _ts = Instant::now();
     let mut result = Vec::with_capacity(n);
     while let Some(std::cmp::Reverse(idx)) = ready.pop() {
         result.push(idx);

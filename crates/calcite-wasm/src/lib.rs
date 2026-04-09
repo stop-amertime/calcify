@@ -33,6 +33,14 @@ pub struct CalciteEngine {
 
 #[wasm_bindgen]
 impl CalciteEngine {
+    /// Create a new engine instance from CSS source as raw UTF-8 bytes.
+    /// Use this for large files that exceed JS string limits.
+    pub fn new_from_bytes(css_bytes: &[u8]) -> Result<CalciteEngine, JsError> {
+        let css = std::str::from_utf8(css_bytes)
+            .map_err(|e| JsError::new(&format!("Invalid UTF-8: {e}")))?;
+        Self::new(css)
+    }
+
     /// Create a new engine instance from CSS source text.
     #[wasm_bindgen(constructor)]
     pub fn new(css: &str) -> Result<CalciteEngine, JsError> {

@@ -925,7 +925,7 @@ impl<'a> Compiler<'a> {
         table: &DispatchTable,
         ops: &mut Vec<Op>,
     ) -> Slot {
-        let _dt = std::time::Instant::now();
+        let _dt = web_time::Instant::now();
         let key_slot = self.compile_var(&table.key_property, None, ops);
 
         let mut compiled_entries = HashMap::new();
@@ -1373,7 +1373,7 @@ impl<'a> Compiler<'a> {
     /// are keyed by the dispatch value (the parameter), not by parameter slots. The
     /// parameter only appears as the key; entry bodies are context-independent.
     fn compile_dispatch_call(&mut self, name: &str, args: &[Expr], ops: &mut Vec<Op>) -> Slot {
-        let _dt = std::time::Instant::now();
+        let _dt = web_time::Instant::now();
         let table = self.dispatch_tables.remove(name).unwrap();
         let func = self.functions.get(name);
 
@@ -1551,16 +1551,16 @@ pub fn compile(
     functions: &HashMap<String, FunctionDef>,
     dispatch_tables: &HashMap<String, DispatchTable>,
 ) -> CompiledProgram {
-    let _ct = std::time::Instant::now();
+    let _ct = web_time::Instant::now();
     let mut compiler = Compiler::new(functions, dispatch_tables);
     log::info!("[compile detail] Compiler::new clone: {:.2}s", _ct.elapsed().as_secs_f64());
     let mut ops = Vec::new();
     let mut writeback = Vec::new();
 
-    let _ct = std::time::Instant::now();
+    let _ct = web_time::Instant::now();
     // Compile each assignment
     for assignment in assignments {
-        let _at = std::time::Instant::now();
+        let _at = web_time::Instant::now();
         let result_slot = compiler.compile_expr(&assignment.value, &mut ops);
         let elapsed = _at.elapsed();
         if elapsed.as_millis() >= 100 {
@@ -1581,12 +1581,12 @@ pub fn compile(
     log::info!("[compile detail] assignments ({} items): {:.2}s, {} ops, {} dispatch tables",
         assignments.len(), _ct.elapsed().as_secs_f64(), ops.len(), compiler.compiled_dispatches.len());
 
-    let _ct = std::time::Instant::now();
+    let _ct = web_time::Instant::now();
     // Compile broadcast writes
     let compiled_bw: Vec<_> = broadcast_writes
         .iter()
         .map(|bw| {
-            let _bt = std::time::Instant::now();
+            let _bt = web_time::Instant::now();
             let result = compile_broadcast_write(bw, &mut compiler);
             log::info!("[compile detail] broadcast write {}: {:.2}s ({} addrs, {} spillover)",
                 bw.dest_property, _bt.elapsed().as_secs_f64(),
@@ -1606,7 +1606,7 @@ pub fn compile(
         property_slots: compiler.property_slots,
     };
 
-    let _ct = std::time::Instant::now();
+    let _ct = web_time::Instant::now();
     compact_slots(&mut program);
     log::info!("[compile detail] slot compaction: {:.2}s", _ct.elapsed().as_secs_f64());
 
@@ -1628,7 +1628,7 @@ pub fn compile(
 /// same slot range.
 fn compact_slots(program: &mut CompiledProgram) {
     #[cfg(not(target_arch = "wasm32"))]
-    let compact_start = std::time::Instant::now();
+    let compact_start = web_time::Instant::now();
     let before = program.slot_count;
 
     // Phase 1: compact main op stream
@@ -2314,14 +2314,14 @@ fn seed_from_parent(
 
 /// Compile a single broadcast write.
 fn compile_broadcast_write(bw: &BroadcastWrite, compiler: &mut Compiler) -> CompiledBroadcastWrite {
-    let _t0 = std::time::Instant::now();
+    let _t0 = web_time::Instant::now();
     // Compile dest property resolution
     let dest_slot = compiler.compile_var(&bw.dest_property, None, &mut Vec::new());
 
     // Compile value expression
     let mut value_ops = Vec::new();
     let value_slot = compiler.compile_expr(&bw.value_expr, &mut value_ops);
-    let _t1 = std::time::Instant::now();
+    let _t1 = web_time::Instant::now();
 
     // Build address map: address → state address (for direct write_mem)
     // Optimised: broadcast entries are bare names like "m12345" or "AX".
@@ -2341,7 +2341,7 @@ fn compile_broadcast_write(bw: &BroadcastWrite, compiler: &mut Compiler) -> Comp
     }
     log::info!("[bw detail] {} address_map ({} entries): {:.2}s",
         bw.dest_property, bw.address_map.len(), _t1.elapsed().as_secs_f64());
-    let _t2 = std::time::Instant::now();
+    let _t2 = web_time::Instant::now();
 
     // Compile spillover
     let spillover = if !bw.spillover_map.is_empty() {

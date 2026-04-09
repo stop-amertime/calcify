@@ -10,7 +10,7 @@
 //                    Response: streams the generated .css file
 
 import { createServer } from 'http';
-import { readFileSync, existsSync, statSync, createReadStream, writeFileSync, mkdirSync, unlinkSync } from 'fs';
+import { readFileSync, readdirSync, existsSync, statSync, createReadStream, createWriteStream, writeFileSync, mkdirSync, unlinkSync } from 'fs';
 import { resolve, dirname, extname, join, basename } from 'path';
 import { fileURLToPath } from 'url';
 import { execSync } from 'child_process';
@@ -19,7 +19,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const SITE_DIR = resolve(__dirname, 'site');
 const CSS_DOS_DIR = resolve(__dirname, '..', 'CSS-DOS');
 const GENERATOR = resolve(CSS_DOS_DIR, 'transpiler', 'generate-dos.mjs');
-const CACHE_DIR = resolve(__dirname, 'site', 'programs', '.cache');
+const OUTPUT_DIR = resolve(__dirname, 'output');
 
 const PORT = parseInt(process.argv.find((_, i, a) => a[i - 1] === '--port') || '8080');
 
@@ -36,7 +36,7 @@ const MIME = {
   '.svg': 'image/svg+xml',
 };
 
-if (!existsSync(CACHE_DIR)) mkdirSync(CACHE_DIR, { recursive: true });
+if (!existsSync(OUTPUT_DIR)) mkdirSync(OUTPUT_DIR, { recursive: true });
 
 const server = createServer(async (req, res) => {
   // CORS for local dev
@@ -45,20 +45,67 @@ const server = createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
+  // GET /list — list available CSS files in output/ and .com/.exe in programs/
+  if (req.method === 'GET' && req.url === '/list') {
+    const css = readdirSync(OUTPUT_DIR).filter(f => f.endsWith('.css') || f.endsWith('.css.gz')).map(f => ({
+      name: f, size: statSync(resolve(OUTPUT_DIR, f)).size, type: 'css',
+    }));
+    const PROG_DIR = resolve(__dirname, 'programs');
+    let programs = [];
+    if (existsSync(PROG_DIR)) {
+      programs = readdirSync(PROG_DIR).filter(f => /\.(com|exe)$/i.test(f)).map(f => ({
+        name: f, size: statSync(resolve(PROG_DIR, f)).size, type: 'program',
+      }));
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ css, programs }));
+    return;
+  }
+
   // POST /generate — upload .com/.exe, generate CSS
   if (req.method === 'POST' && req.url === '/generate') {
     return handleGenerate(req, res);
+  }
+
+  // POST /upload — save a file to output/ (for large .css files)
+  if (req.method === 'POST' && req.url === '/upload') {
+    const filename = req.headers['x-filename'] || 'upload.css';
+    const outPath = resolve(OUTPUT_DIR, basename(filename));
+    const ws = createWriteStream(outPath);
+    req.pipe(ws);
+    ws.on('finish', () => {
+      const size = statSync(outPath).size;
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ file: basename(filename), size }));
+    });
+    ws.on('error', (err) => {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message }));
+    });
+    return;
   }
 
   // Static file serving
   let urlPath = new URL(req.url, 'http://localhost').pathname;
   if (urlPath === '/') urlPath = '/index.html';
 
-  const filePath = resolve(SITE_DIR, '.' + urlPath);
-
-  // Security: don't serve outside site/
-  if (!filePath.startsWith(SITE_DIR)) {
-    res.writeHead(403); res.end('Forbidden'); return;
+  // /output/ serves from the output directory (generated CSS files)
+  // /programs/ serves from the programs directory (.com/.exe binaries)
+  let filePath;
+  const PROG_DIR = resolve(__dirname, 'programs');
+  if (urlPath.startsWith('/output/')) {
+    filePath = resolve(OUTPUT_DIR, urlPath.slice('/output/'.length));
+    if (!filePath.startsWith(OUTPUT_DIR)) { res.writeHead(403); res.end('Forbidden'); return; }
+  } else if (urlPath.startsWith('/programs/')) {
+    filePath = resolve(PROG_DIR, urlPath.slice('/programs/'.length));
+    if (!filePath.startsWith(PROG_DIR)) { res.writeHead(403); res.end('Forbidden'); return; }
+  } else if (urlPath.startsWith('/web/')) {
+    const WEB_DIR = resolve(__dirname, 'web');
+    filePath = resolve(WEB_DIR, urlPath.slice('/web/'.length));
+    if (!filePath.startsWith(WEB_DIR)) { res.writeHead(403); res.end('Forbidden'); return; }
+  } else {
+    filePath = resolve(SITE_DIR, '.' + urlPath);
+    if (!filePath.startsWith(SITE_DIR)) { res.writeHead(403); res.end('Forbidden'); return; }
   }
 
   if (!existsSync(filePath) || statSync(filePath).isDirectory()) {
@@ -101,8 +148,8 @@ async function handleGenerate(req, res) {
     }
 
     const base = basename(programName, extname(programName));
-    const tmpPath = resolve(CACHE_DIR, programName);
-    const cssPath = resolve(CACHE_DIR, base + '.css');
+    const tmpPath = resolve(OUTPUT_DIR, programName);
+    const cssPath = resolve(OUTPUT_DIR, base + '.css');
 
     // Write the uploaded binary
     writeFileSync(tmpPath, programBytes);
@@ -133,14 +180,13 @@ async function handleGenerate(req, res) {
     // Clean up the uploaded binary
     try { unlinkSync(tmpPath); } catch (_) {}
 
-    // Stream the CSS back
-    res.writeHead(200, {
-      'Content-Type': 'text/css',
-      'Content-Length': size,
-      'X-Filename': base + '.css',
-      'X-Generate-Time': elapsed,
-    });
-    createReadStream(cssPath).pipe(res);
+    // Return the filename — browser will fetch from /output/ to stream to WASM
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      file: base + '.css',
+      size,
+      elapsed,
+    }));
 
   } catch (err) {
     console.error('Generate error:', err);
@@ -185,7 +231,7 @@ server.listen(PORT, () => {
   console.log(`CSS-DOS dev server running at http://localhost:${PORT}/`);
   console.log(`  Site:     ${SITE_DIR}`);
   console.log(`  CSS-DOS:  ${CSS_DOS_DIR}`);
-  console.log(`  Cache:    ${CACHE_DIR}`);
+  console.log(`  Output:   ${OUTPUT_DIR}`);
   console.log(`\n  Open http://localhost:${PORT}/run.html to get started`);
   console.log(`  Drop a .com/.exe file to generate + run it\n`);
 });

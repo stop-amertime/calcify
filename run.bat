@@ -17,12 +17,12 @@ set CALCITE=target\release\calcite-cli.exe
 set DEBUGGER=target\release\calcite-debugger.exe
 set CSSDIR=..\CSS-DOS
 set GENERATOR=%CSSDIR%\transpiler\generate-dos.mjs
-set BIOSBIN=%CSSDIR%\gossamer-dos.bin
+set BIOSBIN=%CSSDIR%\build\gossamer-dos.bin
 set PROGDIR=programs
-set CACHEDIR=programs\.cache
+set OUTPUTDIR=output
 
 if not exist "%PROGDIR%" mkdir "%PROGDIR%"
-if not exist "%CACHEDIR%" mkdir "%CACHEDIR%"
+if not exist "%OUTPUTDIR%" mkdir "%OUTPUTDIR%"
 
 if /i "%~1"=="diagnose" goto :diagnose_menu
 
@@ -36,6 +36,21 @@ echo.
 
 REM Build numbered list: standalone .com/.exe files + subdirectory programs
 set COUNT=0
+
+REM Pre-built CSS files in output/ (run directly, no generation needed)
+for %%f in (%OUTPUTDIR%\*.css) do (
+    set /a COUNT+=1
+    set "NAME_!COUNT!=%%~nf"
+    set "EXEC_!COUNT!="
+    set "TYPE_!COUNT!=css"
+    set "CSS_!COUNT!=%%f"
+    set N=!COUNT!
+    for %%a in ("%%f") do set "_SZ=%%~za"
+    set /a _MB=!_SZ! / 1048576
+    echo     !N!. [CSS] %%~nf	(!_MB! MB^)
+)
+
+if !COUNT! GTR 0 echo.
 
 REM Standalone .com files
 for %%f in (%PROGDIR%\*.com) do (
@@ -132,10 +147,18 @@ if not exist "%CALCITE%" (
     if errorlevel 1 (pause & goto :menu)
 )
 
+REM For pre-built CSS, skip generation
+if "!PTYPE!"=="css" (
+    set "CSS=!CSS_%CHOICE%!"
+    goto :run_program
+)
+
 REM Generate CSS
-set CSS=%CACHEDIR%\%NAME%.css
+set CSS=%OUTPUTDIR%\%NAME%.css
 call :generate "%EXEC%" "%CSS%" "%PTYPE%" "!DIR_%CHOICE%!"
 if errorlevel 1 (pause & goto :menu)
+
+:run_program
 
 title CSS-DOS: %NAME%
 cls
@@ -250,7 +273,7 @@ if not exist "%DEBUGGER%" (
 )
 
 REM Generate CSS
-set CSS=%CACHEDIR%\%NAME%.css
+set CSS=%OUTPUTDIR%\%NAME%.css
 call :generate "%EXEC%" "%CSS%" "%PTYPE%" "!DIR_%CHOICE%!"
 if errorlevel 1 (pause & goto :diagnose_menu)
 
@@ -303,7 +326,11 @@ if "%_TYPE%"=="dir" (
     )
 )
 
-node --max-old-space-size=8192 "%GENERATOR%" "%_EXEC%" -o "%_CSS%" !_DATAFLAGS!
+REM Calculate appropriate --mem value for this program
+for /f %%m in ('node tools\calc-mem.mjs "%_EXEC%"') do set _MEM=%%m
+echo   Memory: !_MEM!
+
+node --max-old-space-size=8192 "%GENERATOR%" "%_EXEC%" -o "%_CSS%" --mem !_MEM! !_DATAFLAGS!
 if errorlevel 1 (
     echo   FAILED: CSS generation
     del "%_CSS%" 2>nul

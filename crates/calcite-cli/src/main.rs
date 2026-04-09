@@ -1,4 +1,5 @@
 use clap::Parser;
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use std::path::PathBuf;
 
 /// calc(ite) — JIT compiler for computational CSS.
@@ -86,6 +87,115 @@ fn parse_screen_args(args: &[String]) -> (i32, usize, usize) {
         args[1]
     );
     std::process::exit(1);
+}
+
+/// Map a crossterm key event to DOS keyboard value: (scancode << 8) | ascii.
+/// Returns 0 for unmapped keys.
+fn key_to_dos(key: &KeyEvent) -> i32 {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+    let (scan, ascii): (u8, u8) = match key.code {
+        KeyCode::Esc => (0x01, 0x1B),
+        KeyCode::Char('1') | KeyCode::Char('!') => (0x02, key.code.into_ascii()),
+        KeyCode::Char('2') | KeyCode::Char('@') => (0x03, key.code.into_ascii()),
+        KeyCode::Char('3') | KeyCode::Char('#') => (0x04, key.code.into_ascii()),
+        KeyCode::Char('4') | KeyCode::Char('$') => (0x05, key.code.into_ascii()),
+        KeyCode::Char('5') | KeyCode::Char('%') => (0x06, key.code.into_ascii()),
+        KeyCode::Char('6') | KeyCode::Char('^') => (0x07, key.code.into_ascii()),
+        KeyCode::Char('7') | KeyCode::Char('&') => (0x08, key.code.into_ascii()),
+        KeyCode::Char('8') | KeyCode::Char('*') => (0x09, key.code.into_ascii()),
+        KeyCode::Char('9') | KeyCode::Char('(') => (0x0A, key.code.into_ascii()),
+        KeyCode::Char('0') | KeyCode::Char(')') => (0x0B, key.code.into_ascii()),
+        KeyCode::Char('-') | KeyCode::Char('_') => (0x0C, key.code.into_ascii()),
+        KeyCode::Char('=') | KeyCode::Char('+') => (0x0D, key.code.into_ascii()),
+        KeyCode::Backspace => (0x0E, 0x08),
+        KeyCode::Tab => (0x0F, 0x09),
+        KeyCode::Char('q') | KeyCode::Char('Q') => (0x10, key.code.into_ascii()),
+        KeyCode::Char('w') | KeyCode::Char('W') => (0x11, key.code.into_ascii()),
+        KeyCode::Char('e') | KeyCode::Char('E') => (0x12, key.code.into_ascii()),
+        KeyCode::Char('r') | KeyCode::Char('R') => (0x13, key.code.into_ascii()),
+        KeyCode::Char('t') | KeyCode::Char('T') => (0x14, key.code.into_ascii()),
+        KeyCode::Char('y') | KeyCode::Char('Y') => (0x15, key.code.into_ascii()),
+        KeyCode::Char('u') | KeyCode::Char('U') => (0x16, key.code.into_ascii()),
+        KeyCode::Char('i') | KeyCode::Char('I') => (0x17, key.code.into_ascii()),
+        KeyCode::Char('o') | KeyCode::Char('O') => (0x18, key.code.into_ascii()),
+        KeyCode::Char('p') | KeyCode::Char('P') => (0x19, key.code.into_ascii()),
+        KeyCode::Char('[') | KeyCode::Char('{') => (0x1A, key.code.into_ascii()),
+        KeyCode::Char(']') | KeyCode::Char('}') => (0x1B, key.code.into_ascii()),
+        KeyCode::Enter => (0x1C, 0x0D),
+        KeyCode::Char('a') | KeyCode::Char('A') => (0x1E, key.code.into_ascii()),
+        KeyCode::Char('s') | KeyCode::Char('S') => (0x1F, key.code.into_ascii()),
+        KeyCode::Char('d') | KeyCode::Char('D') => (0x20, key.code.into_ascii()),
+        KeyCode::Char('f') | KeyCode::Char('F') => (0x21, key.code.into_ascii()),
+        KeyCode::Char('g') | KeyCode::Char('G') => (0x22, key.code.into_ascii()),
+        KeyCode::Char('h') | KeyCode::Char('H') => (0x23, key.code.into_ascii()),
+        KeyCode::Char('j') | KeyCode::Char('J') => (0x24, key.code.into_ascii()),
+        KeyCode::Char('k') | KeyCode::Char('K') => (0x25, key.code.into_ascii()),
+        KeyCode::Char('l') | KeyCode::Char('L') => (0x26, key.code.into_ascii()),
+        KeyCode::Char(';') | KeyCode::Char(':') => (0x27, key.code.into_ascii()),
+        KeyCode::Char('\'') | KeyCode::Char('"') => (0x28, key.code.into_ascii()),
+        KeyCode::Char('`') | KeyCode::Char('~') => (0x29, key.code.into_ascii()),
+        KeyCode::Char('\\') | KeyCode::Char('|') => (0x2B, key.code.into_ascii()),
+        KeyCode::Char('z') | KeyCode::Char('Z') => (0x2C, key.code.into_ascii()),
+        KeyCode::Char('x') | KeyCode::Char('X') => (0x2D, key.code.into_ascii()),
+        KeyCode::Char('c') | KeyCode::Char('C') => (0x2E, key.code.into_ascii()),
+        KeyCode::Char('v') | KeyCode::Char('V') => (0x2F, key.code.into_ascii()),
+        KeyCode::Char('b') | KeyCode::Char('B') => (0x30, key.code.into_ascii()),
+        KeyCode::Char('n') | KeyCode::Char('N') => (0x31, key.code.into_ascii()),
+        KeyCode::Char('m') | KeyCode::Char('M') => (0x32, key.code.into_ascii()),
+        KeyCode::Char(',') | KeyCode::Char('<') => (0x33, key.code.into_ascii()),
+        KeyCode::Char('.') | KeyCode::Char('>') => (0x34, key.code.into_ascii()),
+        KeyCode::Char('/') | KeyCode::Char('?') => (0x35, key.code.into_ascii()),
+        KeyCode::Char(' ') => (0x39, 0x20),
+        // Extended keys: ascii=0
+        KeyCode::Up => (0x48, 0),
+        KeyCode::Down => (0x50, 0),
+        KeyCode::Left => (0x4B, 0),
+        KeyCode::Right => (0x4D, 0),
+        KeyCode::Home => (0x47, 0),
+        KeyCode::End => (0x4F, 0),
+        KeyCode::PageUp => (0x49, 0),
+        KeyCode::PageDown => (0x51, 0),
+        KeyCode::Insert => (0x52, 0),
+        KeyCode::Delete => (0x53, 0),
+        KeyCode::F(1) => (0x3B, 0),
+        KeyCode::F(2) => (0x3C, 0),
+        KeyCode::F(3) => (0x3D, 0),
+        KeyCode::F(4) => (0x3E, 0),
+        KeyCode::F(5) => (0x3F, 0),
+        KeyCode::F(6) => (0x40, 0),
+        KeyCode::F(7) => (0x41, 0),
+        KeyCode::F(8) => (0x42, 0),
+        KeyCode::F(9) => (0x43, 0),
+        KeyCode::F(10) => (0x44, 0),
+        _ => return 0,
+    };
+
+    // Ctrl+letter: ascii becomes 1-26
+    let ascii = if ctrl {
+        match key.code {
+            KeyCode::Char(c) if c.is_ascii_alphabetic() => (c.to_ascii_lowercase() as u8) - b'a' + 1,
+            _ => ascii,
+        }
+    } else {
+        ascii
+    };
+
+    ((scan as i32) << 8) | (ascii as i32)
+}
+
+/// Helper trait to extract ASCII value from KeyCode.
+trait KeyCodeAscii {
+    fn into_ascii(self) -> u8;
+}
+
+impl KeyCodeAscii for KeyCode {
+    fn into_ascii(self) -> u8 {
+        match self {
+            KeyCode::Char(c) => c as u8,
+            _ => 0,
+        }
+    }
 }
 
 fn main() {
@@ -241,7 +351,8 @@ fn main() {
             let screen_cfg = cli.screen.as_ref().map(|args| parse_screen_args(args));
             let screen_interval = cli.screen_interval.unwrap_or(0);
 
-            // Helper: render screen with ANSI in-place update
+            // Helper: render screen with ANSI in-place update.
+            // Uses \r\n line endings because raw terminal mode doesn't translate \n.
             let render_screen = |state: &calcite_core::State, cfg: (i32, usize, usize), tick: u32, first: bool| {
                 let (addr, width, height) = cfg;
                 if first {
@@ -252,17 +363,23 @@ fn main() {
                     eprint!("\x1b[H");
                 }
                 let screen = state.render_screen(addr as usize, width, height);
-                eprintln!("┌{}┐", "─".repeat(width));
+                eprint!("┌{}┐\r\n", "─".repeat(width));
                 for line in screen.lines() {
-                    eprintln!("│{line}│");
+                    eprint!("│{line}│\r\n");
                 }
-                eprintln!("└{}┘", "─".repeat(width));
-                eprintln!(" tick {} ", tick);
+                eprint!("└{}┘\r\n", "─".repeat(width));
+                eprint!(" tick {} \r\n", tick);
             };
 
             let mut ticks_run: u32 = 0;
             let mut first_frame = true;
+            let interactive = has_screen;
             let needs_per_tick = cli.verbose || halt_addr.is_some() || (screen_cfg.is_some() && screen_interval > 0);
+
+            // Enable raw terminal mode for keyboard input in screen mode
+            if interactive {
+                crossterm::terminal::enable_raw_mode().ok();
+            }
 
             if needs_per_tick {
                 // When verbose, batch early ticks then show tail
@@ -282,7 +399,35 @@ fn main() {
                         );
                     }
                 }
+                let mut quit = false;
                 for tick in batch_skip..cli.ticks {
+                    // Poll keyboard (non-blocking) in interactive mode
+                    if interactive {
+                        while event::poll(std::time::Duration::ZERO).unwrap_or(false) {
+                            match event::read() {
+                                Ok(Event::Key(key_event)) => {
+                                    if key_event.kind == crossterm::event::KeyEventKind::Press {
+                                        // Ctrl+C to quit
+                                        if key_event.modifiers.contains(KeyModifiers::CONTROL)
+                                            && key_event.code == KeyCode::Char('c')
+                                        {
+                                            quit = true;
+                                            break;
+                                        }
+                                        let dos_key = key_to_dos(&key_event);
+                                        if dos_key != 0 {
+                                            state.keyboard = dos_key;
+                                        }
+                                    } else if key_event.kind == crossterm::event::KeyEventKind::Release {
+                                        state.keyboard = 0;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        if quit { break; }
+                    }
+
                     evaluator.tick(&mut state);
                     ticks_run = tick + 1;
 
@@ -324,6 +469,11 @@ fn main() {
             } else {
                 evaluator.run_batch(&mut state, cli.ticks);
                 ticks_run = cli.ticks;
+            }
+
+            // Restore terminal
+            if interactive {
+                crossterm::terminal::disable_raw_mode().ok();
             }
             let tick_time = t2.elapsed();
 

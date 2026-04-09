@@ -88,14 +88,11 @@ Loading...</div>
     </div>
   </div>
 
-<script type="module">
+<script>
 // ============================================================
-// CSS-DOS Browser Runner — Calcite WASM
+// CSS-DOS Browser Runner — Calcite WASM via Web Worker
 // ============================================================
 
-import initWasm, { CalciteEngine } from './pkg/calcite_wasm.js';
-
-// Program catalog (matches index.html / program.html)
 const PROGRAMS = {
   zork1:    { title: 'Zork I',           cssFile: 'zork1.css.gz' },
   tetris2k: { title: 'SmallTetris',      cssFile: 'tetris2k.css.gz' },
@@ -121,12 +118,9 @@ const btnStep = document.getElementById('btn-step');
 
 if (!prog) {
   document.getElementById('window-title').textContent = 'CSS-DOS';
-  if (programId) {
-    loaderEl.textContent = `Unknown program: "${programId}"\n\nAvailable: ${Object.keys(PROGRAMS).join(', ')}`;
-  } else {
-    loaderEl.textContent = `CSS-DOS v0.1\n\nNo program selected.\nPick a .css file below, or go to index.html to choose a program.`;
-  }
+  loaderEl.textContent = 'CSS-DOS v0.1\n\nLoading file list...\n';
   statusEl.textContent = 'Ready';
+  showFileList();
 } else {
   document.title = `CSS-DOS — ${prog.title}`;
   document.getElementById('window-title').textContent = `CSS-DOS — ${prog.title}`;
@@ -147,13 +141,20 @@ for (let i = 0; i < 80 * 25; i++) {
 }
 screenEl.style.display = 'none'; // hidden until loaded
 
+let _screenUpdateCount = 0;
 function updateScreen(videoBytes) {
+  let changed = 0;
   for (let i = 0; i < cells.length && i < videoBytes.length; i++) {
     const val = videoBytes[i];
     if (cells[i]._v !== val) {
       cells[i].style.setProperty('--val', val);
       cells[i]._v = val;
+      changed++;
     }
+  }
+  _screenUpdateCount++;
+  if (_screenUpdateCount <= 3 || changed > 0 && _screenUpdateCount % 100 === 0) {
+    console.log(`[screen] update #${_screenUpdateCount}: ${changed} cells changed, bytes[0..5]=[${Array.from(videoBytes.slice(0,5))}], cells.length=${cells.length}`);
   }
 }
 
@@ -207,143 +208,197 @@ function keyToDos(e) {
 }
 
 // ============================================================
-// Boot sequence
+// Worker — all WASM runs off the main thread
 // ============================================================
-let engine = null;
+const worker = new Worker('calcite-worker.js');
 let running = false;
 let paused = false;
 let totalTicks = 0;
-let videoAddr = 0xB8000;
-let videoW = 80, videoH = 25;
-
-async function bootWithCss(css) {
-  try {
-    // 1. Init WASM
-    loaderEl.textContent += 'Initialising Calcite WASM engine...\n';
-    statusEl.textContent = 'Loading WASM...';
-    await initWasm();
-
-    loaderEl.textContent += `CSS: ${(css.length / 1024 / 1024).toFixed(0)} MB\n`;
-
-    // 2. Create engine
-    loaderEl.textContent += 'Compiling CSS...\n';
-    statusEl.textContent = 'Compiling CSS (this may take a moment)...';
-    const t0 = performance.now();
-    engine = new CalciteEngine(css);
-    const compileMs = performance.now() - t0;
-    loaderEl.textContent += `Compiled in ${(compileMs / 1000).toFixed(1)}s\n`;
-
-    // 3. Detect video
-    const videoInfo = JSON.parse(engine.detect_video());
-    if (videoInfo) {
-      videoAddr = videoInfo.addr;
-      videoW = videoInfo.width;
-      videoH = videoInfo.height;
-    }
-
-    // 4. Start
-    loaderEl.textContent += '\nStarting...\n';
-    statusEl.textContent = 'Running';
-    loaderEl.style.display = 'none';
-    screenEl.style.display = '';
-    screenEl.focus();
-
-    btnPause.disabled = false;
-    running = true;
-    requestAnimationFrame(runLoop);
-
-  } catch (err) {
-    loaderEl.textContent += `\nERROR: ${err.message}\n`;
-    statusEl.textContent = 'Error';
-    console.error(err);
-  }
-}
-
-async function boot() {
-  try {
-    loaderEl.textContent += `Fetching programs/${prog.cssFile}...\n`;
-    statusEl.textContent = `Downloading ${prog.cssFile}...`;
-    const resp = await fetch(`programs/${prog.cssFile}`);
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${prog.cssFile}`);
-
-    loaderEl.textContent += 'Decompressing...\n';
-    statusEl.textContent = 'Decompressing CSS...';
-    const ds = new DecompressionStream('gzip');
-    const decompressed = resp.body.pipeThrough(ds);
-    const reader = decompressed.getReader();
-    const chunks = [];
-    let totalBytes = 0;
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      chunks.push(value);
-      totalBytes += value.length;
-      statusEl.textContent = `Decompressing... ${(totalBytes / 1024 / 1024).toFixed(0)} MB`;
-    }
-    statusEl.textContent = 'Decoding CSS text...';
-    const decoder = new TextDecoder();
-    let css = '';
-    for (const chunk of chunks) {
-      css += decoder.decode(chunk, { stream: true });
-    }
-    css += decoder.decode();
-
-    await bootWithCss(css);
-  } catch (err) {
-    loaderEl.textContent += `\nERROR: ${err.message}\n`;
-    statusEl.textContent = 'Error';
-    console.error(err);
-  }
-}
-
-// ============================================================
-// Main loop
-// ============================================================
-const TICKS_PER_FRAME = 500;
 let lastPerfTime = performance.now();
 let lastPerfTicks = 0;
 
-function runLoop() {
-  if (!running || paused) return;
+worker.onmessage = (e) => {
+  const msg = e.data;
+  switch (msg.type) {
+    case 'progress':
+      loaderEl.textContent += msg.detail + '\n';
+      statusEl.textContent = msg.detail;
+      break;
 
-  engine.tick_batch(TICKS_PER_FRAME);
-  totalTicks += TICKS_PER_FRAME;
+    case 'ready':
+      loaderEl.textContent += '\nStarting...\n';
+      statusEl.textContent = 'Running';
+      loaderEl.style.display = 'none';
+      screenEl.style.display = '';
+      screenEl.focus();
+      btnPause.disabled = false;
+      running = true;
+      lastPerfTime = performance.now();
+      lastPerfTicks = 0;
+      totalTicks = 0;
+      // Kick off the tick loop
+      worker.postMessage({ type: 'tick', count: 500 });
+      break;
 
-  // Read video memory and update screen
-  const videoBytes = engine.read_video_memory(videoAddr, videoW, videoH);
-  updateScreen(videoBytes);
+    case 'tick-result': {
+      const bytes = msg.videoBytes ? new Uint8Array(msg.videoBytes) : null;
+      if (bytes) {
+        if (totalTicks === 0) {
+          // First tick result — log diagnostics
+          console.log('[tick-result] bytes type:', typeof msg.videoBytes, 'constructor:', msg.videoBytes?.constructor?.name);
+          console.log('[tick-result] wrapped type:', bytes.constructor.name, 'length:', bytes.length);
+          console.log('[tick-result] first 20 values:', Array.from(bytes.slice(0, 20)));
+          console.log('[tick-result] non-zero count:', bytes.filter(b => b !== 0).length, '/', bytes.length);
+        }
+        updateScreen(bytes);
+      } else if (totalTicks === 0) {
+        console.warn('[tick-result] no videoBytes received');
+      }
+      totalTicks += msg.ticks;
+      // Perf counter
+      const now = performance.now();
+      if (now - lastPerfTime > 500) {
+        const elapsed = (now - lastPerfTime) / 1000;
+        const tps = (totalTicks - lastPerfTicks) / elapsed;
+        perfEl.textContent = `${(tps / 1000).toFixed(0)}k ticks/s | ${totalTicks.toLocaleString()} total`;
+        lastPerfTime = now;
+        lastPerfTicks = totalTicks;
+      }
+      // Request next batch
+      if (running && !paused) {
+        worker.postMessage({ type: 'tick', count: 500 });
+      }
+      break;
 
-  // Perf counter (update every 500ms)
-  const now = performance.now();
-  if (now - lastPerfTime > 500) {
-    const elapsed = (now - lastPerfTime) / 1000;
-    const tps = (totalTicks - lastPerfTicks) / elapsed;
-    perfEl.textContent = `${(tps / 1000).toFixed(0)}k ticks/s | ${totalTicks.toLocaleString()} total`;
-    lastPerfTime = now;
-    lastPerfTicks = totalTicks;
+    case 'error':
+      loaderEl.textContent += `\nERROR: ${msg.message}\n`;
+      loaderEl.style.display = '';
+      statusEl.textContent = 'Error';
+      running = false;
+      break;
   }
+};
 
-  requestAnimationFrame(runLoop);
+// ============================================================
+// Boot helpers
+// ============================================================
+function bootFromUrl(url) {
+  running = false;
+  loaderEl.style.display = '';
+  screenEl.style.display = 'none';
+  loaderEl.textContent = `CSS-DOS v0.1\n\n`;
+  worker.postMessage({ type: 'load-url', url });
+}
+
+function boot() {
+  bootFromUrl(`/output/${prog.cssFile}`);
+}
+
+async function showFileList() {
+  try {
+    const resp = await fetch('/list');
+    if (!resp.ok) throw new Error('Could not fetch file list');
+    const { css, programs } = await resp.json();
+
+    const raw = css.filter(f => f.name.endsWith('.css') && !f.name.endsWith('.css.gz'));
+
+    loaderEl.textContent = '';
+    const header = document.createElement('span');
+    header.textContent = 'CSS-DOS v0.1\n\n';
+    loaderEl.appendChild(header);
+
+    if (raw.length > 0) {
+      const label = document.createElement('span');
+      label.textContent = 'Ready to run:\n';
+      loaderEl.appendChild(label);
+      for (const f of raw) {
+        const link = document.createElement('a');
+        link.href = '#';
+        link.textContent = `  ▶ ${f.name}  (${(f.size / 1024 / 1024).toFixed(0)} MB)\n`;
+        link.style.cssText = 'color:#4fc3f7; cursor:pointer; text-decoration:underline;';
+        link.onclick = (e) => { e.preventDefault(); launchCss(f.name); };
+        loaderEl.appendChild(link);
+      }
+    }
+
+    if (programs.length > 0) {
+      const sep = document.createElement('span');
+      sep.textContent = '\nPrograms (generate CSS first):\n';
+      loaderEl.appendChild(sep);
+      for (const f of programs) {
+        const link = document.createElement('a');
+        link.href = '#';
+        link.textContent = `  ⚙ ${f.name}  (${f.size} bytes)\n`;
+        link.style.cssText = 'color:#aaa; cursor:pointer; text-decoration:underline;';
+        link.onclick = (e) => { e.preventDefault(); launchProgram(f.name); };
+        loaderEl.appendChild(link);
+      }
+    }
+
+    if (raw.length === 0 && programs.length === 0) {
+      const msg = document.createElement('span');
+      msg.textContent = 'No files found.\nDrop a .com, .exe, or .css file onto the page.';
+      loaderEl.appendChild(msg);
+    }
+
+    const hint = document.createElement('span');
+    hint.textContent = '\n\nOr drop a file onto the page.';
+    loaderEl.appendChild(hint);
+  } catch (err) {
+    loaderEl.textContent = 'CSS-DOS v0.1\n\nCould not reach server.\nStart it with: node serve.mjs';
+  }
+}
+
+function launchCss(filename) {
+  document.getElementById('window-title').textContent = `CSS-DOS — ${filename}`;
+  document.title = `CSS-DOS — ${filename}`;
+  bootFromUrl(`/output/${filename}`);
+}
+
+async function launchProgram(filename) {
+  running = false;
+  document.getElementById('window-title').textContent = `CSS-DOS — ${filename}`;
+  document.title = `CSS-DOS — ${filename}`;
+  loaderEl.style.display = '';
+  screenEl.style.display = 'none';
+  loaderEl.textContent = `CSS-DOS v0.1\n\nGenerating CSS for ${filename}...\n`;
+  statusEl.textContent = 'Generating CSS (this takes a while)...';
+  try {
+    const binResp = await fetch(`/programs/${filename}`);
+    if (!binResp.ok) throw new Error(`Could not fetch ${filename}`);
+    const blob = await binResp.blob();
+    const form = new FormData();
+    form.append('program', new File([blob], filename));
+    const genResp = await fetch('/generate', { method: 'POST', body: form });
+    if (!genResp.ok) {
+      const err = await genResp.json().catch(() => ({ error: genResp.statusText }));
+      throw new Error(err.details || err.error);
+    }
+    const result = await genResp.json();
+    loaderEl.textContent += `CSS generated in ${result.elapsed}s (${(result.size / 1024 / 1024).toFixed(0)} MB)\n`;
+    bootFromUrl(`/output/${result.file}`);
+  } catch (err) {
+    loaderEl.textContent += `\nERROR: ${err.message}\n`;
+    statusEl.textContent = 'Error';
+  }
 }
 
 // ============================================================
-// Keyboard input
+// Keyboard input — sent to worker
 // ============================================================
 screenEl.addEventListener('keydown', (e) => {
-  if (!engine) return;
+  if (!running) return;
   const dosKey = keyToDos(e);
   if (dosKey) {
-    engine.set_keyboard(dosKey);
+    worker.postMessage({ type: 'keyboard', key: dosKey });
     e.preventDefault();
   }
 });
 
-screenEl.addEventListener('keyup', (e) => {
-  if (!engine) return;
-  engine.set_keyboard(0);
+screenEl.addEventListener('keyup', () => {
+  if (running) worker.postMessage({ type: 'keyboard', key: 0 });
 });
 
-// Keep focus on screen when clicking anywhere in the window body
 document.querySelector('.window-body').addEventListener('mousedown', (e) => {
   if (e.target.tagName !== 'BUTTON' && e.target.tagName !== 'A') {
     setTimeout(() => screenEl.focus(), 0);
@@ -358,85 +413,65 @@ btnPause.addEventListener('click', () => {
   btnPause.innerHTML = paused ? '&#9654; Resume' : '&#9646;&#9646; Pause';
   btnStep.style.display = paused ? '' : 'none';
   statusEl.textContent = paused ? 'Paused' : 'Running';
-  if (!paused && running) requestAnimationFrame(runLoop);
+  if (!paused && running) worker.postMessage({ type: 'tick', count: 500 });
 });
 
 btnStep.addEventListener('click', () => {
-  if (!engine || !paused) return;
-  engine.tick_batch(1);
-  totalTicks += 1;
-  const videoBytes = engine.read_video_memory(videoAddr, videoW, videoH);
-  updateScreen(videoBytes);
+  if (!running || !paused) return;
+  worker.postMessage({ type: 'tick', count: 1 });
 });
 
 // ============================================================
 // File picker + drag-and-drop
 // ============================================================
 async function loadFile(file) {
-  // Stop any running program
   running = false;
-  engine?.free();
-  engine = null;
-  totalTicks = 0;
-
   loaderEl.style.display = '';
   screenEl.style.display = 'none';
   loaderEl.textContent = `CSS-DOS v0.1\n\nLoading ${file.name}...\n`;
-  statusEl.textContent = `Reading ${file.name}...`;
+  statusEl.textContent = `Loading ${file.name}...`;
   document.getElementById('window-title').textContent = `CSS-DOS — ${file.name}`;
   document.title = `CSS-DOS — ${file.name}`;
 
   const ext = file.name.split('.').pop().toLowerCase();
 
-  if (ext === 'com' || ext === 'exe') {
-    // Upload to server for CSS generation
-    loaderEl.textContent += `Uploading ${file.name} to transpiler...\n`;
-    statusEl.textContent = 'Generating CSS (this takes a while)...';
-    try {
+  try {
+    if (ext === 'com' || ext === 'exe') {
+      loaderEl.textContent += `Uploading to transpiler...\n`;
+      statusEl.textContent = 'Generating CSS...';
       const form = new FormData();
       form.append('program', file);
       const resp = await fetch('/generate', { method: 'POST', body: form });
       if (!resp.ok) {
         const err = await resp.json().catch(() => ({ error: resp.statusText }));
-        throw new Error(err.details || err.error || `HTTP ${resp.status}`);
+        throw new Error(err.details || err.error);
       }
-      const genTime = resp.headers.get('X-Generate-Time');
-      loaderEl.textContent += `CSS generated in ${genTime}s\n`;
-      statusEl.textContent = 'Reading generated CSS...';
-      const css = await resp.text();
-      loaderEl.textContent += `CSS: ${(css.length / 1024 / 1024).toFixed(0)} MB\n`;
-      await bootWithCss(css);
-    } catch (err) {
-      loaderEl.textContent += `\nERROR: ${err.message}\n`;
-      if (err.message.includes('Failed to fetch')) {
-        loaderEl.textContent += '\nIs the dev server running? Start it with:\n  node serve.mjs\n';
-      }
-      statusEl.textContent = 'Error';
+      const result = await resp.json();
+      loaderEl.textContent += `CSS generated in ${result.elapsed}s\n`;
+      bootFromUrl(`/output/${result.file}`);
+    } else if (ext === 'css') {
+      loaderEl.textContent += `Uploading to server...\n`;
+      const resp = await fetch('/upload', { method: 'POST', body: file, headers: { 'X-Filename': file.name } });
+      if (!resp.ok) throw new Error(`Upload failed: ${resp.statusText}`);
+      const result = await resp.json();
+      bootFromUrl(`/output/${result.file}`);
+    } else {
+      throw new Error(`Unsupported file type: .${ext}`);
     }
-    return;
+  } catch (err) {
+    loaderEl.textContent += `\nERROR: ${err.message}\n`;
+    if (err.message.includes('Failed to fetch')) {
+      loaderEl.textContent += '\nIs the dev server running?\n  node serve.mjs\n';
+    }
+    statusEl.textContent = 'Error';
   }
-
-  // CSS or HTML file — read directly
-  const text = await file.text();
-  let css = text;
-  if (ext === 'html' || ext === 'htm') {
-    const doc = new DOMParser().parseFromString(css, 'text/html');
-    css = Array.from(doc.querySelectorAll('style')).map(s => s.textContent).join('\n');
-  }
-  await bootWithCss(css);
 }
 
 document.getElementById('file-input').addEventListener('change', (e) => {
-  const file = e.target.files[0];
-  if (file) loadFile(file);
+  if (e.target.files[0]) loadFile(e.target.files[0]);
 });
-
 document.body.addEventListener('dragover', (e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; });
-document.body.addEventListener('drop', (e) => {
-  e.preventDefault();
-  const file = e.dataTransfer.files[0];
-  if (file) loadFile(file);
-});
+document.body.addEventListener('drop', (e) => { e.preventDefault(); if (e.dataTransfer.files[0]) loadFile(e.dataTransfer.files[0]); });
 
 </script>
 </body>

@@ -34,7 +34,7 @@ const Intel8086 = new Function(evalSource + '\nreturn Intel8086;')();
 
 const refMem = new Uint8Array(1024 * 1024);
 
-const biosBin = readFileSync(resolve(cssDir, 'gossamer-dos.bin'));
+const biosBin = readFileSync(resolve(cssDir, 'build', 'gossamer-dos.bin'));
 const kernelBin = readFileSync(resolve(cssDir, 'dos', 'bin', 'kernel.sys'));
 const diskBin = readFileSync(resolve(cssDir, 'dos', 'disk.img'));
 
@@ -44,7 +44,7 @@ for (let i = 0; i < biosBin.length; i++) refMem[0xF0000 + i] = biosBin[i];
 
 let biosInitOffset = 0x385;
 try {
-  const lst = readFileSync(resolve(cssDir, 'gossamer-dos.lst'), 'utf-8');
+  const lst = readFileSync(resolve(cssDir, 'build', 'gossamer-dos.lst'), 'utf-8');
   for (const line of lst.split('\n')) {
     if (line.includes('bios_init:')) {
       const idx = lst.split('\n').indexOf(line);

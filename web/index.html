@@ -411,6 +411,24 @@
       if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
       worker.postMessage({ type: 'keyboard', key: 0 });
     });
+
+    // Auto-load from ?css=filename URL param
+    const cssParam = new URLSearchParams(location.search).get('css');
+    if (cssParam) {
+      fileName.textContent = cssParam;
+      status.textContent = `Fetching ${cssParam}...`;
+      fetch(`/output/${cssParam}`)
+        .then(r => {
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          status.textContent = `Downloading ${cssParam}...`;
+          return r.text();
+        })
+        .then(css => {
+          status.textContent = `Loaded ${(css.length / 1024 / 1024).toFixed(0)} MB`;
+          loadCss(css);
+        })
+        .catch(e => { status.textContent = `Error: ${e.message}`; });
+    }
   </script>
 </body>
 </html>

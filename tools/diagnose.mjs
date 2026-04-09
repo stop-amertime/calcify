@@ -56,7 +56,7 @@ let initialRegs;
 if (dosMode) {
   // DOS boot mode: kernel at 0x600, disk at 0xD0000, BIOS at 0xF0000
   const cssDir = resolve(__dirname, '..', '..', 'CSS-DOS');
-  const biosBin = readFileSync(resolve(cssDir, 'gossamer-dos.bin'));
+  const biosBin = readFileSync(resolve(cssDir, 'build', 'gossamer-dos.bin'));
   const kernelBin = readFileSync(resolve(cssDir, 'dos', 'bin', 'kernel.sys'));
   const diskBin = readFileSync(resolve(cssDir, 'dos', 'disk.img'));
 
@@ -67,7 +67,7 @@ if (dosMode) {
   // Get bios_init offset from listing
   let biosInitOffset = 0x37c;
   try {
-    const lst = readFileSync(resolve(cssDir, 'gossamer-dos.lst'), 'utf-8');
+    const lst = readFileSync(resolve(cssDir, 'build', 'gossamer-dos.lst'), 'utf-8');
     const lines = lst.split('\n');
     for (let i = 0; i < lines.length; i++) {
       if (lines[i].includes('bios_init:')) {

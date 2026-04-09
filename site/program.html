@@ -290,7 +290,7 @@ if (!prog) {
     `<br>&bull; Every single line is valid CSS that Chrome can evaluate`;
 
   // Download link
-  document.getElementById('btn-download').href = `programs/${prog.cssFile}`;
+  document.getElementById('btn-download').href = `/output/${prog.cssFile}`;
   document.getElementById('btn-download').download = `${programId}.css.gz`;
 }
 
@@ -416,7 +416,7 @@ async function loadCssViewer() {
   totalInfo.textContent = 'Connecting...';
 
   try {
-    const resp = await fetch(`programs/${prog.cssFile}`);
+    const resp = await fetch(`/output/${prog.cssFile}`);
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
 
     const ds = new DecompressionStream('gzip');

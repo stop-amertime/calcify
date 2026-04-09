@@ -42,7 +42,7 @@ const Intel8086 = new Function(evalSource + '\nreturn Intel8086;')();
 
 // --- Load binaries ---
 const cssDir = resolve(__dirname, '..', '..', 'CSS-DOS');
-const biosBin = readFileSync(resolve(cssDir, 'gossamer-dos.bin'));
+const biosBin = readFileSync(resolve(cssDir, 'build', 'gossamer-dos.bin'));
 const kernelBin = readFileSync(resolve(cssDir, 'dos', 'bin', 'kernel.sys'));
 const diskBin = readFileSync(resolve(cssDir, 'dos', 'disk.img'));
 
@@ -86,7 +86,7 @@ cpu.reset();
 // Read bios_init offset from listing file
 let biosInitOffset = 0x038A;
 try {
-  const lst = readFileSync(resolve(cssDir, 'gossamer-dos.lst'), 'utf-8');
+  const lst = readFileSync(resolve(cssDir, 'build', 'gossamer-dos.lst'), 'utf-8');
   for (const line of lst.split('\n')) {
     if (line.includes('bios_init:')) {
       const idx = lst.split('\n').indexOf(line);
