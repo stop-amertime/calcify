@@ -411,6 +411,21 @@
       if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
       worker.postMessage({ type: 'keyboard', key: 0 });
     });
+
+    // Auto-load demo.css on startup if available
+    (async () => {
+      try {
+        const resp = await fetch('demo.css');
+        if (resp.ok) {
+          const css = await resp.text();
+          fileName.textContent = 'demo.css';
+          status.textContent = 'Loading demo.css...';
+          loadCss(css);
+        }
+      } catch (e) {
+        // demo.css not available — user can still drop a file
+      }
+    })();
   </script>
 </body>
 </html>
