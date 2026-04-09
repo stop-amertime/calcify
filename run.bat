@@ -15,9 +15,9 @@ cd /d "%~dp0"
 
 set CALCITE=target\release\calcite-cli.exe
 set DEBUGGER=target\release\calcite-debugger.exe
-set CSSDIR=..\i8086-css
+set CSSDIR=..\CSS-DOS
 set GENERATOR=%CSSDIR%\transpiler\generate-dos.mjs
-set BIOSBIN=%CSSDIR%\bios-dos.bin
+set BIOSBIN=%CSSDIR%\gossamer-dos.bin
 set PROGDIR=programs
 set CACHEDIR=programs\.cache
 

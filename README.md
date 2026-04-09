@@ -3,15 +3,15 @@
 A JIT compiler for computational CSS. Parses real CSS, recognises computational
 patterns, and compiles them into efficient native operations.
 
-Primary target: running [i8086-css](https://github.com/stop-amertime/i8086-css)
-(a static binary translator that converts Intel 8086 machine code to CSS) faster
+Primary target: running [CSS-DOS](https://github.com/stop-amertime/css-dos)
+(a DOS 8086 machine running in CSS) faster
 than Chrome's native style resolver. Ultimate goal:
 [doom.css](https://github.com/stop-amertime/doom.css) — Doom running in CSS at
 playable speed.
 
 ## How it works
 
-i8086-css encodes an entire 8086 CPU in CSS custom properties. Each "tick" is
+CSS-DOS encodes an entire 8086 CPU in CSS custom properties. Each "tick" is
 one recalculation of ~3,000 CSS properties. Chrome's style engine evaluates
 these via brute-force pattern matching. Calcite replaces that with efficient
 native operations:
@@ -34,7 +34,7 @@ opcode inspection, no instruction-specific logic.
 
 Pattern recognition (dispatch tables, broadcast writes) is fine because it
 produces the same result the CSS would, just faster. If the CSS is wrong, the
-fix goes in the CSS.
+fix goes in the CSS. 
 
 ## Project layout
 
@@ -54,7 +54,7 @@ web/
   index.html          Browser UI
   calcite-worker.js   Web Worker bridge
 tests/
-  fixtures/           Pre-compiled CSS from i8086-css (test inputs)
+  fixtures/           Pre-compiled CSS from CSS-DOS (test inputs)
 ```
 
 ## Building
