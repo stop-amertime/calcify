@@ -60,6 +60,43 @@ struct CompareRequest {
     stop_at_first: Option<bool>,
 }
 
+#[derive(Deserialize)]
+struct KeyRequest {
+    /// Packed DOS key: (scancode << 8) | ascii. 0 clears the buffer.
+    value: i32,
+}
+
+#[derive(Deserialize)]
+struct CompareStateRequest {
+    /// Register values to diff against, keyed by name ("AX", "IP", ...).
+    registers: Option<HashMap<String, i64>>,
+    /// Memory ranges to diff. Each entry is {addr, len, bytes}.
+    memory: Option<Vec<CompareMemEntry>>,
+}
+
+#[derive(Deserialize)]
+struct CompareMemEntry {
+    addr: i32,
+    len: usize,
+    /// Expected bytes (from the reference side) as an array of u8 values.
+    bytes: Vec<u8>,
+}
+
+#[derive(Serialize)]
+struct CompareStateResponse {
+    tick: u32,
+    register_diffs: Vec<DiffEntry>,
+    memory_diffs: Vec<MemDiffEntry>,
+    total_diffs: usize,
+}
+
+#[derive(Serialize)]
+struct MemDiffEntry {
+    addr: i32,
+    expected: u8,
+    actual: u8,
+}
+
 #[derive(Deserialize, Clone)]
 struct RefTick {
     tick: u32,
@@ -512,6 +549,8 @@ fn main() {
     eprintln!("  POST /memory            — read memory: {{\"addr\": N, \"len\": N}}");
     eprintln!("  POST /screen            — render screen: {{\"addr\": 0xB8000, \"width\": 80, \"height\": 25}}");
     eprintln!("  POST /compare           — compare vs reference: {{\"reference\": [...]}}");
+    eprintln!("  POST /compare-state     — diff current state vs supplied registers/memory");
+    eprintln!("  POST /key               — set keyboard buffer: {{\"value\": (scancode<<8)|ascii}}");
     eprintln!("  GET  /compare-paths     — diff compiled vs interpreted for current tick");
     eprintln!("  POST /snapshot          — create snapshot at current tick");
     eprintln!("  GET  /snapshots         — list all snapshots");
@@ -538,6 +577,8 @@ fn main() {
                         "POST /memory {addr, len}",
                         "POST /screen {addr, width, height}",
                         "POST /compare {reference}",
+                        "POST /compare-state {registers, memory}",
+                        "POST /key {value}",
                         "GET /compare-paths",
                         "POST /snapshot",
                         "GET /snapshots",
@@ -719,6 +760,92 @@ fn main() {
                 let mut s = session.lock().unwrap();
                 let resp = s.compare_paths();
                 json_response(&resp)
+            }
+
+            (Method::Post, "/key") => {
+                let body = read_body(&mut request);
+                match serde_json::from_str::<KeyRequest>(&body) {
+                    Ok(r) => {
+                        let mut s = session.lock().unwrap();
+                        s.state.keyboard = r.value;
+                        json_response(&serde_json::json!({
+                            "keyboard": s.state.keyboard,
+                            "tick": s.current_tick(),
+                        }))
+                    }
+                    Err(e) => error_response(400, &format!("Bad JSON: {e}")),
+                }
+            }
+
+            (Method::Post, "/compare-state") => {
+                let body = read_body(&mut request);
+                match serde_json::from_str::<CompareStateRequest>(&body) {
+                    Ok(r) => {
+                        let s = session.lock().unwrap();
+                        let mut register_diffs = Vec::new();
+                        let mut memory_diffs = Vec::new();
+
+                        if let Some(regs) = r.registers {
+                            let reg_keys = [
+                                ("AX", state::reg::AX),
+                                ("CX", state::reg::CX),
+                                ("DX", state::reg::DX),
+                                ("BX", state::reg::BX),
+                                ("SP", state::reg::SP),
+                                ("BP", state::reg::BP),
+                                ("SI", state::reg::SI),
+                                ("DI", state::reg::DI),
+                                ("IP", state::reg::IP),
+                                ("ES", state::reg::ES),
+                                ("CS", state::reg::CS),
+                                ("SS", state::reg::SS),
+                                ("DS", state::reg::DS),
+                                ("FLAGS", state::reg::FLAGS),
+                            ];
+                            for (name, idx) in &reg_keys {
+                                if let Some(expected) = regs.get(*name) {
+                                    let actual = s.state.registers[*idx] as i64;
+                                    if actual != *expected {
+                                        register_diffs.push(DiffEntry {
+                                            property: name.to_string(),
+                                            compiled: actual,
+                                            interpreted: *expected,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+
+                        if let Some(ranges) = r.memory {
+                            for range in ranges {
+                                for i in 0..range.len {
+                                    if i >= range.bytes.len() {
+                                        break;
+                                    }
+                                    let addr = range.addr + i as i32;
+                                    let actual = s.state.read_mem(addr) as u8;
+                                    let expected = range.bytes[i];
+                                    if actual != expected {
+                                        memory_diffs.push(MemDiffEntry {
+                                            addr,
+                                            expected,
+                                            actual,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+
+                        let total_diffs = register_diffs.len() + memory_diffs.len();
+                        json_response(&CompareStateResponse {
+                            tick: s.current_tick(),
+                            register_diffs,
+                            memory_diffs,
+                            total_diffs,
+                        })
+                    }
+                    Err(e) => error_response(400, &format!("Bad JSON: {e}")),
+                }
             }
 
             (Method::Post, "/snapshot") => {

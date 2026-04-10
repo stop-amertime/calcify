@@ -4,17 +4,20 @@
  * Protocol:
  *   Main → Worker:
  *     { type: 'init', css: string }       — parse and compile CSS
- *     { type: 'tick', count: number }      — run N ticks, return changes
+ *     { type: 'tick', count: number }      — run N ticks, return output
  *     { type: 'keyboard', key: number }    — update keyboard state
  *
  *   Worker → Main:
- *     { type: 'ready', video: {addr,size,width,height}|null }
- *     { type: 'tick-result', changes, stringProperties, screen, ticks }
+ *     { type: 'ready', video: { text, gfx } }
+ *         text/gfx: {addr,size,width,height}|null
+ *     { type: 'tick-result', stringProperties, screen, gfxBytes, ticks }
+ *         screen  : text-mode rendered string (if text mode detected)
+ *         gfxBytes: Uint8ClampedArray.buffer of RGBA pixels (if gfx mode)
  *     { type: 'error', message: string }
  */
 
 let engine = null;
-let videoConfig = null;
+let videoRegions = { text: null, gfx: null };
 
 async function loadWasm() {
   const wasm = await import('./pkg/calcite_wasm.js');
@@ -35,11 +38,20 @@ self.onmessage = async function (event) {
         }
         engine = new wasmModule.CalciteEngine(data.css);
 
-        // Auto-detect video memory from CSS structure
+        // Detect video regions. The new JSON shape is {text, gfx}; either
+        // can be null. If neither is present, fall back to assuming
+        // standard DOS text mode at 0xB8000 so simple programs still work.
         const videoJson = engine.detect_video();
-        videoConfig = JSON.parse(videoJson);
+        const parsed = JSON.parse(videoJson) || {};
+        videoRegions = {
+          text: parsed.text || null,
+          gfx: parsed.gfx || null,
+        };
+        if (!videoRegions.text && !videoRegions.gfx) {
+          videoRegions.text = { addr: 0xB8000, size: 4000, width: 80, height: 25 };
+        }
 
-        self.postMessage({ type: 'ready', video: videoConfig });
+        self.postMessage({ type: 'ready', video: videoRegions });
         break;
       }
 
@@ -47,23 +59,41 @@ self.onmessage = async function (event) {
         if (!engine) {
           throw new Error('Engine not initialised — send "init" first');
         }
-        const changesJson = engine.tick_batch(data.count || 1);
-        const changes = JSON.parse(changesJson);
+        engine.tick_batch(data.count || 1);
         const stringProps = JSON.parse(engine.get_string_properties());
 
-        // Render video screen if video memory was detected
+        // Text-mode screen (if present): rendered as a string.
         let screen = null;
-        if (videoConfig) {
-          screen = engine.render_screen(videoConfig.addr, videoConfig.width, videoConfig.height);
+        if (videoRegions.text) {
+          const t = videoRegions.text;
+          screen = engine.render_screen(t.addr, t.width, t.height);
         }
 
-        self.postMessage({
-          type: 'tick-result',
-          changes,
-          stringProperties: stringProps,
-          screen,
-          ticks: data.count || 1,
-        });
+        // Graphics-mode framebuffer (if present): raw RGBA bytes, posted
+        // as a transferable so the main thread can blit to a canvas.
+        let gfxBytes = null;
+        const transfer = [];
+        if (videoRegions.gfx) {
+          const g = videoRegions.gfx;
+          // read_framebuffer_rgba returns a Uint8Array backed by wasm
+          // memory — copy into a new ArrayBuffer we can transfer.
+          const wasmView = engine.read_framebuffer_rgba(g.addr, g.width, g.height);
+          const buf = new ArrayBuffer(wasmView.length);
+          new Uint8Array(buf).set(wasmView);
+          gfxBytes = buf;
+          transfer.push(buf);
+        }
+
+        self.postMessage(
+          {
+            type: 'tick-result',
+            stringProperties: stringProps,
+            screen,
+            gfxBytes,
+            ticks: data.count || 1,
+          },
+          transfer,
+        );
         break;
       }
 

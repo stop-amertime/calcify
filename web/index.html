@@ -215,8 +215,14 @@
 
       <hr class="groove">
 
-      <!-- Output area — switches between screen and text automatically -->
+      <!-- Output area — switches between canvas (graphics), screen text, and string props -->
       <div id="output" class="field-dark"></div>
+      <canvas
+        id="screen-canvas"
+        width="320"
+        height="200"
+        style="display:none; width: 640px; height: 400px; background:#000; image-rendering: pixelated; border-top: 1px solid #808080; border-left: 1px solid #808080; border-right: 1px solid #fff; border-bottom: 1px solid #fff;"
+      ></canvas>
 
       <!-- Status bar -->
       <div class="status-bar">
@@ -231,6 +237,8 @@
     const worker = new Worker('calcite-worker.js', { type: 'module' });
     const status = document.getElementById('status');
     const output = document.getElementById('output');
+    const canvas = document.getElementById('screen-canvas');
+    const ctx = canvas.getContext('2d');
     const stats = document.getElementById('stats');
     const btnStart = document.getElementById('btn-start');
     const btnStop = document.getElementById('btn-stop');
@@ -243,43 +251,80 @@
     let totalTicks = 0;
     let startTime = 0;
     let engineReady = false;
-    let hasVideo = false;
+    // Detected video regions: { text: {...}|null, gfx: {...}|null }
+    let video = { text: null, gfx: null };
+    // Cached ImageData for the gfx canvas, sized on first use.
+    let gfxImageData = null;
 
     worker.onmessage = ({ data }) => {
       switch (data.type) {
-        case 'ready':
+        case 'ready': {
           engineReady = true;
           btnStart.disabled = false;
+          video = data.video || { text: null, gfx: null };
 
-          if (data.video) {
-            hasVideo = true;
-            modeBadge.textContent = `VIDEO ${data.video.width}x${data.video.height}`;
-            modeBadge.style.display = '';
-            output.style.minHeight = '0';
-            status.textContent = 'Ready — press Run (keyboard active when running)';
+          // Mode badge: "GFX 320x200", "TEXT 80x25", or "GFX+TEXT".
+          const labels = [];
+          if (video.gfx)  labels.push(`GFX ${video.gfx.width}x${video.gfx.height}`);
+          if (video.text) labels.push(`TEXT ${video.text.width}x${video.text.height}`);
+          modeBadge.textContent = labels.join(' + ') || 'NO VIDEO';
+          modeBadge.style.display = '';
+
+          // If there's a gfx region, show the canvas and size its ImageData
+          // to match. Otherwise hide the canvas and let the text output
+          // element take over.
+          if (video.gfx) {
+            canvas.width = video.gfx.width;
+            canvas.height = video.gfx.height;
+            // Scale up via CSS so 320x200 is viewable on modern monitors.
+            canvas.style.width = (video.gfx.width * 2) + 'px';
+            canvas.style.height = (video.gfx.height * 2) + 'px';
+            canvas.style.display = '';
+            gfxImageData = ctx.createImageData(video.gfx.width, video.gfx.height);
+            // If there's no text region, hide the text output entirely.
+            if (!video.text) {
+              output.style.display = 'none';
+            } else {
+              output.style.display = '';
+              output.style.minHeight = '0';
+            }
           } else {
-            hasVideo = false;
-            modeBadge.textContent = 'TEXT';
-            modeBadge.style.display = '';
-            status.textContent = 'Ready — press Run';
+            canvas.style.display = 'none';
+            output.style.display = '';
+            output.style.minHeight = '0';
           }
-          break;
 
-        case 'tick-result':
+          // Auto-run as soon as the engine is ready. The Run/Stop buttons
+          // still work as pause/resume; they just aren't required to see
+          // any output in the first place.
+          startRunning();
+          break;
+        }
+
+        case 'tick-result': {
           totalTicks += data.ticks;
           const elapsed = (performance.now() - startTime) / 1000;
           stats.textContent = `${totalTicks.toLocaleString()} ticks | ${(totalTicks / elapsed).toFixed(0)} t/s`;
 
-          if (hasVideo && data.screen != null) {
+          // Graphics: blit RGBA bytes straight to the canvas.
+          if (data.gfxBytes && gfxImageData) {
+            const src = new Uint8Array(data.gfxBytes);
+            gfxImageData.data.set(src);
+            ctx.putImageData(gfxImageData, 0, 0);
+          }
+
+          // Text mode: write the rendered screen string.
+          if (video.text && data.screen != null) {
             output.textContent = data.screen;
-          } else if (data.stringProperties) {
+          } else if (!video.gfx && data.stringProperties) {
+            // Legacy path: string-property output (only used when neither
+            // text nor gfx regions were detected).
             const parts = [];
             for (const [key, value] of Object.entries(data.stringProperties)) {
               if (value) parts.push(value);
             }
             if (parts.length > 0) {
               const text = parts.join('\n');
-              // Only show the last 50 lines to prevent unbounded growth
               const lines = text.split('\n');
               output.textContent = lines.length > 50 ? lines.slice(-50).join('\n') : text;
               output.scrollTop = output.scrollHeight;
@@ -290,6 +335,7 @@
             worker.postMessage({ type: 'tick', count: parseInt(batchInput.value, 10) || 100 });
           }
           break;
+        }
 
         case 'error':
           status.textContent = `Error: ${data.message}`;
@@ -300,7 +346,8 @@
       }
     };
 
-    btnStart.addEventListener('click', () => {
+    function startRunning() {
+      if (!engineReady || running) return;
       running = true;
       startTime = performance.now();
       totalTicks = 0;
@@ -308,7 +355,9 @@
       btnStop.disabled = false;
       status.textContent = 'Running...';
       worker.postMessage({ type: 'tick', count: parseInt(batchInput.value, 10) || 100 });
-    });
+    }
+
+    btnStart.addEventListener('click', startRunning);
 
     btnStop.addEventListener('click', () => {
       running = false;
@@ -327,35 +376,49 @@
     window.loadCss = loadCss;
     function loadCss(cssText) {
       if (!cssText || cssText.trim().length === 0) {
-        status.textContent = 'No CSS found in file';
+        status.textContent = 'Loaded file has no CSS content (empty or whitespace only)';
         return;
       }
       running = false;
       engineReady = false;
-      hasVideo = false;
+      video = { text: null, gfx: null };
+      gfxImageData = null;
       totalTicks = 0;
       btnStart.disabled = true;
       btnStop.disabled = true;
       output.textContent = '';
+      canvas.style.display = 'none';
       stats.textContent = '';
       modeBadge.style.display = 'none';
       status.textContent = `Compiling ${(cssText.length / 1024).toFixed(0)} KB...`;
       worker.postMessage({ type: 'init', css: cssText });
     }
 
-    fileInput.addEventListener('change', (e) => {
-      const file = e.target.files[0];
-      if (!file) return;
+    function readFileAndLoad(file) {
       fileName.textContent = file.name;
+      const sizeMb = file.size / 1024 / 1024;
+      status.textContent = `Reading ${sizeMb.toFixed(1)} MB…`;
       const reader = new FileReader();
       reader.onload = () => {
         let text = reader.result;
+        if (text == null || text.length === 0) {
+          status.textContent = `Error: FileReader returned empty for ${file.name} (${sizeMb.toFixed(1)} MB). Files over ~500 MB cannot be loaded via the file picker on most browsers.`;
+          return;
+        }
         if (file.name.endsWith('.html') || file.name.endsWith('.htm')) {
           text = extractCssFromHtml(text);
         }
         loadCss(text);
       };
+      reader.onerror = () => {
+        status.textContent = `FileReader error: ${reader.error?.message || 'unknown'}`;
+      };
       reader.readAsText(file);
+    }
+
+    fileInput.addEventListener('change', (e) => {
+      const file = e.target.files[0];
+      if (file) readFileAndLoad(file);
     });
 
     // ── Drag and drop ──
@@ -367,17 +430,7 @@
     document.body.addEventListener('drop', (e) => {
       e.preventDefault();
       const file = e.dataTransfer.files[0];
-      if (!file) return;
-      fileName.textContent = file.name;
-      const reader = new FileReader();
-      reader.onload = () => {
-        let text = reader.result;
-        if (file.name.endsWith('.html') || file.name.endsWith('.htm')) {
-          text = extractCssFromHtml(text);
-        }
-        loadCss(text);
-      };
-      reader.readAsText(file);
+      if (file) readFileAndLoad(file);
     });
 
     // ── Keyboard input ──

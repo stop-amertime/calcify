@@ -24,5 +24,7 @@ pub mod state;
 pub mod types;
 
 pub use error::{CalciteError, Result};
-pub use eval::{detect_video_memory, property_to_address, Evaluator};
+pub use eval::{
+    detect_video_memory, detect_video_regions, property_to_address, Evaluator, VideoRegions,
+};
 pub use state::State;

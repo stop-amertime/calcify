@@ -59,6 +59,14 @@ struct Cli {
     /// written by BIOS/DOS exit handlers.
     #[arg(long, value_name = "ADDR")]
     halt: Option<String>,
+
+    /// Dump a graphics-mode framebuffer to a PPM file after execution.
+    ///
+    /// Format: ADDR WIDTHxHEIGHT PATH (e.g. "0xA0000 320x200 out.ppm").
+    /// Each byte at ADDR+i is treated as a palette index (VGA Mode 13h style).
+    /// Output is a PPM P6 image suitable for viewing in any image viewer.
+    #[arg(long, value_name = "ADDR WxH PATH", num_args = 3)]
+    framebuffer: Option<Vec<String>>,
 }
 
 fn parse_screen_args(args: &[String]) -> (i32, usize, usize) {
@@ -220,17 +228,14 @@ fn main() {
     match calcite_core::parser::parse_css(&css) {
         Ok(parsed) => {
             let parse_time = t0.elapsed();
-            // Only print parse stats when not in screen mode (screen takes over the terminal)
             let has_screen = cli.screen.is_some();
-            if !has_screen {
-                println!(
-                    "Parsed: {} @property, {} @function, {} assignments ({:.2}s)",
-                    parsed.properties.len(),
-                    parsed.functions.len(),
-                    parsed.assignments.len(),
-                    parse_time.as_secs_f64(),
-                );
-            }
+            eprintln!(
+                "Parsed: {} @property, {} @function, {} assignments ({:.2}s)",
+                parsed.properties.len(),
+                parsed.functions.len(),
+                parsed.assignments.len(),
+                parse_time.as_secs_f64(),
+            );
 
             if cli.parse_only {
                 return;
@@ -243,13 +248,15 @@ fn main() {
             let mut state = calcite_core::State::default();
             state.load_properties(&parsed.properties);
 
-            if !has_screen {
-                eprintln!(
-                    "Compiled: {:.2}s (parse {:.2}s + compile {:.2}s)",
-                    (parse_time + compile_time).as_secs_f64(),
-                    parse_time.as_secs_f64(),
-                    compile_time.as_secs_f64(),
-                );
+            eprintln!(
+                "Compiled: {:.2}s (parse {:.2}s + compile {:.2}s), memory: {} KB",
+                (parse_time + compile_time).as_secs_f64(),
+                parse_time.as_secs_f64(),
+                compile_time.as_secs_f64(),
+                state.memory.len() / 1024,
+            );
+            if has_screen {
+                eprintln!("Starting... (Ctrl+C to quit)");
             }
 
             let halt_addr: Option<i32> = cli.halt.as_ref().map(|s| {
@@ -381,6 +388,11 @@ fn main() {
                 crossterm::terminal::enable_raw_mode().ok();
             }
 
+            // Keyboard state: hold each key for at least KEY_HOLD_TICKS so the
+            // CPU (which takes many ticks per instruction) has time to read it.
+            const KEY_HOLD_TICKS: u32 = 50;
+            let mut key_hold_remaining: u32 = 0;
+
             if needs_per_tick {
                 // When verbose, batch early ticks then show tail
                 let batch_skip = if cli.verbose && cli.ticks > 100 {
@@ -403,6 +415,14 @@ fn main() {
                 for tick in batch_skip..cli.ticks {
                     // Poll keyboard (non-blocking) in interactive mode
                     if interactive {
+                        // Count down hold timer; clear key when expired
+                        if key_hold_remaining > 0 {
+                            key_hold_remaining -= 1;
+                            if key_hold_remaining == 0 {
+                                state.keyboard = 0;
+                            }
+                        }
+
                         while event::poll(std::time::Duration::ZERO).unwrap_or(false) {
                             match event::read() {
                                 Ok(Event::Key(key_event)) => {
@@ -417,10 +437,10 @@ fn main() {
                                         let dos_key = key_to_dos(&key_event);
                                         if dos_key != 0 {
                                             state.keyboard = dos_key;
+                                            key_hold_remaining = KEY_HOLD_TICKS;
                                         }
-                                    } else if key_event.kind == crossterm::event::KeyEventKind::Release {
-                                        state.keyboard = 0;
                                     }
+                                    // Release events are ignored — we use the hold timer instead
                                 }
                                 _ => {}
                             }
@@ -509,6 +529,31 @@ fn main() {
                 }
                 // Restore cursor visibility
                 eprint!("\x1b[?25h");
+            }
+
+            // Dump framebuffer as PPM if requested.
+            if let Some(args) = cli.framebuffer.as_ref() {
+                if args.len() != 3 {
+                    eprintln!("--framebuffer requires ADDR WxH PATH (e.g. --framebuffer 0xA0000 320x200 out.ppm)");
+                    std::process::exit(1);
+                }
+                let (addr, width, height) = parse_screen_args(&args[0..2]);
+                let path = &args[2];
+                let ppm = state.render_framebuffer(addr as usize, width, height);
+                match std::fs::write(path, &ppm) {
+                    Ok(()) => eprintln!(
+                        "Framebuffer: wrote {} bytes to {} ({}x{} from 0x{:X})",
+                        ppm.len(),
+                        path,
+                        width,
+                        height,
+                        addr,
+                    ),
+                    Err(e) => {
+                        eprintln!("Failed to write framebuffer to {}: {}", path, e);
+                        std::process::exit(1);
+                    }
+                }
             }
         }
         Err(e) => {

@@ -863,30 +863,78 @@ pub fn set_address_map(map: HashMap<String, i32>) {
     });
 }
 
-/// Detect video memory region from the address map.
+/// Detect the VGA text-mode region at 0xB8000.
 ///
-/// Returns `Some((base_addr, size))` if contiguous addresses starting at
-/// a VGA text-mode base (0xB8000) are found. Returns `None` otherwise.
+/// Returns `Some((base_addr, size))` if a contiguous block of addresses
+/// anchored at 0xB8000 exists in the address map. Returns `None`
+/// otherwise. Retained for backwards compatibility; new code should
+/// prefer [`detect_video_regions`].
 pub fn detect_video_memory() -> Option<(usize, usize)> {
+    detect_video_regions().text
+}
+
+/// Result of scanning the address map for VGA regions.
+///
+/// Each region is `Some((base, size))` if found, `None` otherwise. Both
+/// regions can be present simultaneously — e.g. a program that boots in
+/// text mode and later switches to Mode 13h.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct VideoRegions {
+    /// VGA text mode at 0xB8000 (char + attribute pairs).
+    pub text: Option<(usize, usize)>,
+    /// VGA Mode 13h graphics framebuffer at 0xA0000 (byte per pixel).
+    pub gfx: Option<(usize, usize)>,
+}
+
+/// Detect VGA memory regions (text and/or graphics) from the address map.
+///
+/// - The text region is anchored at 0xB8000 (VGA text-mode segment).
+/// - The graphics region is anchored at 0xA0000 (VGA Mode 13h framebuffer).
+///
+/// Both regions are detected independently; a single CSS can contain one,
+/// the other, or both.
+pub fn detect_video_regions() -> VideoRegions {
     ADDRESS_MAP.with(|m| {
         let map = m.borrow();
-        // Find all addresses >= 0xB8000 (VGA text-mode segment)
-        let vga_base = 0xB8000i32;
-        let mut min_addr = i32::MAX;
-        let mut max_addr = i32::MIN;
-        let mut count = 0usize;
+        let text_base = 0xB8000i32;
+        let gfx_base = 0xA0000i32;
+        // Graphics upper bound: just below text base, so we don't accidentally
+        // pick up the text region when scanning the gfx range.
+        let gfx_upper = text_base;
+
+        let mut text_min = i32::MAX;
+        let mut text_max = i32::MIN;
+        let mut text_count = 0usize;
+
+        let mut gfx_min = i32::MAX;
+        let mut gfx_max = i32::MIN;
+        let mut gfx_count = 0usize;
+
         for &addr in map.values() {
-            if addr >= vga_base {
-                min_addr = min_addr.min(addr);
-                max_addr = max_addr.max(addr);
-                count += 1;
+            if addr >= text_base {
+                text_min = text_min.min(addr);
+                text_max = text_max.max(addr);
+                text_count += 1;
+            } else if addr >= gfx_base && addr < gfx_upper {
+                gfx_min = gfx_min.min(addr);
+                gfx_max = gfx_max.max(addr);
+                gfx_count += 1;
             }
         }
-        if count >= 100 && min_addr == vga_base {
-            Some((min_addr as usize, (max_addr - min_addr + 1) as usize))
+
+        // Require >= 100 addresses in a region and anchoring at the known
+        // base so we don't mis-detect stray memory writes in high RAM.
+        let text = if text_count >= 100 && text_min == text_base {
+            Some((text_min as usize, (text_max - text_min + 1) as usize))
         } else {
             None
-        }
+        };
+        let gfx = if gfx_count >= 100 && gfx_min == gfx_base {
+            Some((gfx_min as usize, (gfx_max - gfx_min + 1) as usize))
+        } else {
+            None
+        };
+        VideoRegions { text, gfx }
     })
 }
 
@@ -896,31 +944,26 @@ pub fn detect_video_memory() -> Option<(usize, usize)> {
 /// An identity-read dispatch table maps key K → `Var("--{name}")` where
 /// the property at `--{name}` is at address K. Reversing this gives us
 /// the property→address mapping without any hardcoded knowledge.
+///
+/// Tables do NOT need to be pure identity mappings — individual entries
+/// with literal values or non-Var expressions (e.g. BIOS ROM constants,
+/// helper function calls for memory-mapped devices) are skipped, but the
+/// identity entries in the same table are still recorded. This matters
+/// for x86-CSS's `--readMem` function which mixes identity reads of
+/// writable memory with literal reads of the BIOS ROM.
 pub fn build_address_map(dispatch_tables: &HashMap<String, DispatchTable>) -> HashMap<String, i32> {
     let mut map = HashMap::new();
     for table in dispatch_tables.values() {
-        // We need to check identity-read without recursing into property_to_address
-        // (which depends on this map). Do a structural check: each entry's Var name
-        // should parse to a bare name, and we record the key→bare_name association.
         if table.entries.len() < 4 {
             continue;
         }
-        // Verify this is an identity-read table by checking consistency:
-        // Each entry maps an integer key to a Var whose bare name is unique.
-        let mut is_identity = true;
-        let mut candidates: Vec<(String, i32)> = Vec::new();
+        // Walk every entry and record those that are identity-form
+        // (Var("--name") with parseable bare name). Non-identity entries
+        // don't disqualify the rest of the table.
         for (&key, expr) in &table.entries {
             if let Expr::Var { name, .. } = expr {
                 let bare = to_bare_name(name).to_string();
-                candidates.push((bare, key as i32));
-            } else {
-                is_identity = false;
-                break;
-            }
-        }
-        if is_identity {
-            for (bare, addr) in candidates {
-                map.insert(bare, addr);
+                map.insert(bare, key as i32);
             }
         }
     }

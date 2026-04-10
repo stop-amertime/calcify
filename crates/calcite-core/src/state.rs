@@ -92,6 +92,31 @@ pub mod addr {
 /// Default memory size for x86CSS (0x600 bytes = 1,536).
 pub const DEFAULT_MEM_SIZE: usize = 0x600;
 
+/// 16-color CGA palette used by [`State::render_framebuffer`].
+///
+/// Standard IRGB CGA colors: the low 8 entries are the dark variants,
+/// the high 8 are the bright variants. These also form the first 16
+/// entries of the full VGA palette, so a future 256-entry upgrade is
+/// backward-compatible with programs that only use indices 0-15.
+pub const CGA_PALETTE: [(u8, u8, u8); 16] = [
+    (0x00, 0x00, 0x00), // 0  black
+    (0x00, 0x00, 0xAA), // 1  blue
+    (0x00, 0xAA, 0x00), // 2  green
+    (0x00, 0xAA, 0xAA), // 3  cyan
+    (0xAA, 0x00, 0x00), // 4  red
+    (0xAA, 0x00, 0xAA), // 5  magenta
+    (0xAA, 0x55, 0x00), // 6  brown
+    (0xAA, 0xAA, 0xAA), // 7  light gray
+    (0x55, 0x55, 0x55), // 8  dark gray
+    (0x55, 0x55, 0xFF), // 9  light blue
+    (0x55, 0xFF, 0x55), // 10 light green
+    (0x55, 0xFF, 0xFF), // 11 light cyan
+    (0xFF, 0x55, 0x55), // 12 light red
+    (0xFF, 0x55, 0xFF), // 13 light magenta
+    (0xFF, 0xFF, 0x55), // 14 yellow
+    (0xFF, 0xFF, 0xFF), // 15 white
+];
+
 /// The flat machine state that replaces CSS's triple-buffered custom properties.
 #[derive(Debug, Clone)]
 pub struct State {
@@ -150,13 +175,22 @@ impl State {
                 self.registers[reg_idx]
             }
             _ => {
-                let addr = addr as usize;
-                // High addresses (>= 0xF0000) use extended map for full-width i32 storage
-                if addr >= 0xF0000 {
-                    return self.extended.get(&(addr as i32)).copied().unwrap_or(0);
+                let addr_u = addr as usize;
+                // Keyboard I/O: 0x500 = ASCII byte, 0x501 = scancode byte
+                // These are mapped to state.keyboard in the CSS but LoadMem/LoadMem16
+                // bypass the CSS dispatch, so we handle them here too.
+                if addr_u == 0x500 {
+                    return self.keyboard & 0xFF;
                 }
-                if addr < self.memory.len() {
-                    self.memory[addr] as i32
+                if addr_u == 0x501 {
+                    return (self.keyboard >> 8) & 0xFF;
+                }
+                // High addresses (>= 0xF0000) use extended map for full-width i32 storage
+                if addr_u >= 0xF0000 {
+                    return self.extended.get(&addr).copied().unwrap_or(0);
+                }
+                if addr_u < self.memory.len() {
+                    self.memory[addr_u] as i32
                 } else {
                     0
                 }
@@ -203,6 +237,13 @@ impl State {
             }
             _ => {
                 let addr_u = addr as usize;
+                // Keyboard consume: writing to 0x500 clears the keyboard state.
+                // The BIOS writes 0 here after reading a key via INT 16h.
+                // Reads from 0x500/0x501 come from state.keyboard (via CSS dispatch),
+                // so we must clear that too, not just the memory cell.
+                if addr_u == 0x500 && value == 0 {
+                    self.keyboard = 0;
+                }
                 // High addresses (>= 0xF0000) use extended map for full-width i32 storage
                 if addr_u >= 0xF0000 {
                     self.extended.insert(addr, value);
@@ -249,6 +290,68 @@ impl State {
             lines.push(row);
         }
         lines.join("\n")
+    }
+
+    /// Render a graphics-mode framebuffer as a PPM P6 image.
+    ///
+    /// Reads `width * height` bytes from `base_addr` where each byte is a
+    /// palette index (byte-per-pixel, like VGA Mode 13h). Indices are looked
+    /// up in [`CGA_PALETTE`] modulo 16 (palette is 16 colors for now; upgrade
+    /// to a 256-entry VGA palette is a drop-in change). Returns a complete
+    /// PPM P6 byte buffer that can be written to a file.
+    ///
+    /// For Mode 13h at 0xA0000, call:
+    /// `state.render_framebuffer(0xA0000, 320, 200)`
+    pub fn render_framebuffer(&self, base_addr: usize, width: usize, height: usize) -> Vec<u8> {
+        let header = format!("P6\n{} {}\n255\n", width, height);
+        let mut out = Vec::with_capacity(header.len() + width * height * 3);
+        out.extend_from_slice(header.as_bytes());
+        for i in 0..(width * height) {
+            let addr = base_addr + i;
+            let byte = if addr < self.memory.len() {
+                self.memory[addr]
+            } else {
+                0
+            };
+            let (r, g, b) = CGA_PALETTE[(byte as usize) & 0x0F];
+            out.push(r);
+            out.push(g);
+            out.push(b);
+        }
+        out
+    }
+
+    /// Read a graphics-mode framebuffer as raw RGBA bytes for canvas blit.
+    ///
+    /// Returns `width * height * 4` bytes (R, G, B, A per pixel) suitable
+    /// for `new ImageData(new Uint8ClampedArray(bytes), width, height)`
+    /// in the browser. Alpha is always 255.
+    ///
+    /// This is the same pixel data as [`render_framebuffer`] but without
+    /// the PPM header and with an alpha channel, so the browser can stuff
+    /// it straight into a canvas without reformatting.
+    pub fn read_framebuffer_rgba(
+        &self,
+        base_addr: usize,
+        width: usize,
+        height: usize,
+    ) -> Vec<u8> {
+        let mut out = vec![0u8; width * height * 4];
+        for i in 0..(width * height) {
+            let addr = base_addr + i;
+            let byte = if addr < self.memory.len() {
+                self.memory[addr]
+            } else {
+                0
+            };
+            let (r, g, b) = CGA_PALETTE[(byte as usize) & 0x0F];
+            let o = i * 4;
+            out[o] = r;
+            out[o + 1] = g;
+            out[o + 2] = b;
+            out[o + 3] = 255;
+        }
+        out
     }
 
     /// Read raw video memory bytes (character bytes only, no attributes).

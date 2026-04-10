@@ -109,21 +109,74 @@ impl CalciteEngine {
         self.state.render_screen(base_addr, width, height)
     }
 
-    /// Detect video memory region from the CSS structure.
+    /// Render a graphics-mode framebuffer as a PPM P6 image.
     ///
-    /// Returns a JSON string like `{"addr":753664,"size":4000,"width":80,"height":25}`
-    /// if video memory is detected, or `"null"` otherwise.
+    /// Each byte at `base_addr + i` is a palette index; the returned buffer
+    /// is a complete PPM P6 file including header. For VGA Mode 13h:
+    /// `render_framebuffer(0xA0000, 320, 200)`.
+    pub fn render_framebuffer(&self, base_addr: usize, width: usize, height: usize) -> Vec<u8> {
+        self.state.render_framebuffer(base_addr, width, height)
+    }
+
+    /// Read a graphics-mode framebuffer as raw RGBA bytes.
+    ///
+    /// Returns `width * height * 4` bytes suitable for direct use with
+    /// `new ImageData(new Uint8ClampedArray(bytes), width, height)` and
+    /// `ctx.putImageData()` in the browser.
+    pub fn read_framebuffer_rgba(
+        &self,
+        base_addr: usize,
+        width: usize,
+        height: usize,
+    ) -> Vec<u8> {
+        self.state.read_framebuffer_rgba(base_addr, width, height)
+    }
+
+    /// Detect VGA memory regions (text and/or graphics) from the CSS.
+    ///
+    /// Returns a JSON object:
+    /// ```json
+    /// {
+    ///   "text": {"addr": 753664, "size": 4000, "width": 80, "height": 25},
+    ///   "gfx":  {"addr": 655360, "size": 64000, "width": 320, "height": 200}
+    /// }
+    /// ```
+    /// Either field can be `null` if that mode isn't present. Both can
+    /// be present simultaneously for programs that use both text and gfx
+    /// memory regions.
     pub fn detect_video(&self) -> String {
-        match calcite_core::detect_video_memory() {
+        let regions = calcite_core::detect_video_regions();
+        let text_json = match regions.text {
             Some((addr, size)) => {
-                // Infer dimensions: size/2 cells (char+attr pairs)
-                // 80x25 = 4000 bytes is standard DOS text mode
+                // Text mode: size/2 cells (char+attr pairs)
                 let cells = size / 2;
-                let (w, h) = if cells == 2000 { (80, 25) } else if cells == 1000 { (40, 25) } else { (80, cells / 80) };
+                let (w, h) = if cells == 2000 {
+                    (80, 25)
+                } else if cells == 4000 {
+                    (80, 50)
+                } else if cells == 1000 {
+                    (40, 25)
+                } else {
+                    (80, cells / 80)
+                };
                 format!("{{\"addr\":{addr},\"size\":{size},\"width\":{w},\"height\":{h}}}")
             }
             None => "null".to_string(),
-        }
+        };
+        let gfx_json = match regions.gfx {
+            Some((addr, size)) => {
+                // Graphics mode: 1 byte per pixel
+                let (w, h) = if size == 64000 {
+                    (320, 200)
+                } else {
+                    // Unknown size — assume 320 wide and derive height
+                    (320, size / 320)
+                };
+                format!("{{\"addr\":{addr},\"size\":{size},\"width\":{w},\"height\":{h}}}")
+            }
+            None => "null".to_string(),
+        };
+        format!("{{\"text\":{text_json},\"gfx\":{gfx_json}}}")
     }
 
     /// Return string properties as a JSON object string, e.g. `{"textBuffer":"Hello"}`.

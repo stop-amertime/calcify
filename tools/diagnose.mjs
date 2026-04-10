@@ -89,7 +89,7 @@ if (dosMode) {
   for (let i = 0; i < biosBin.length; i++) memory[0xF0000 + i] = biosBin[i];
 
   const BIOS_SEG = 0xF000;
-  const handlers = { 0x10: 0x0000, 0x16: 0x0155, 0x1A: 0x0190, 0x20: 0x0232, 0x21: 0x01A9 };
+  const handlers = { 0x10: 0x0000, 0x16: 0x0171, 0x1A: 0x01AC, 0x20: 0x0259, 0x21: 0x01C5 };
   for (const [intNum, off] of Object.entries(handlers)) {
     const addr = parseInt(intNum) * 4;
     memory[addr] = off & 0xFF;
