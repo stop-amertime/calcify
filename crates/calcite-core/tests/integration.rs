@@ -637,9 +637,12 @@ fn fibonacci_benchmark() {
     for tick in 0..max_ticks {
         let ip = state.registers[state::reg::IP];
 
-        // When the program reaches readInput (IP=0x2006), provide keyboard input
+        // When the program reaches readInput (IP=0x2006), provide keyboard input.
+        // NOTE: x86css-demo.css uses the legacy keyboard convention (0x500 polling),
+        // not the gossamer-dos BDA ring buffer. New programs should use the BDA.
         if !keyboard_set && ip == 0x2006 {
-            state.keyboard = 49; // ASCII '1' = select Fibonacci
+            state.write_mem(0x500, 49); // ASCII '1' = select Fibonacci
+            state.write_mem(0x501, 0x02); // scancode for '1'
             keyboard_set = true;
         }
 

@@ -55,10 +55,6 @@ pub enum Op {
         dst: Slot,
         addr_slot: Slot,
     },
-    /// slot[dst] = state.keyboard
-    LoadKeyboard {
-        dst: Slot,
-    },
 
     // --- Arithmetic ---
     Add {
@@ -264,30 +260,37 @@ pub(crate) fn is_var_ref(expr: &Expr, param_name: &str) -> bool {
     matches!(expr, Expr::Var { name, .. } if name == param_name)
 }
 
-/// Check if an expression is `calc(readMem(var(param)) + readMem(calc(var(param) + 1)) * 256)`
-/// — a 16-bit word read pattern (little-endian).
-fn is_word_read_pattern(expr: &Expr, param: &str) -> bool {
+/// Check if an expression is `calc(readFn(var(param)) + readFn(calc(var(param) + 1)) * 256)`
+/// — a 16-bit word read pattern (little-endian). If matched, returns the
+/// name of the inner read function (e.g. `--readMem`) so the caller can
+/// verify that function is a pure identity read before shortcutting to
+/// `LoadMem16`. The two calls must use the same function name.
+fn is_word_read_pattern(expr: &Expr, param: &str) -> Option<String> {
     // Top level: calc(A + B)
-    let Expr::Calc(CalcOp::Add(lhs, rhs)) = expr else { return false };
+    let Expr::Calc(CalcOp::Add(lhs, rhs)) = expr else { return None };
 
     // LHS: FunctionCall("--readMem", [Var(param)])
-    let Expr::FunctionCall { name: name_lo, args: args_lo } = lhs.as_ref() else { return false };
+    let Expr::FunctionCall { name: name_lo, args: args_lo } = lhs.as_ref() else { return None };
     if !name_lo.ends_with("readMem") || args_lo.len() != 1 || !is_var_ref(&args_lo[0], param) {
-        return false;
+        return None;
     }
 
     // RHS: calc(FunctionCall("--readMem", [calc(Var(param) + 1)]) * 256)
-    let Expr::Calc(CalcOp::Mul(hi_call, multiplier)) = rhs.as_ref() else { return false };
+    let Expr::Calc(CalcOp::Mul(hi_call, multiplier)) = rhs.as_ref() else { return None };
     if !matches!(multiplier.as_ref(), Expr::Literal(v) if (*v - 256.0).abs() < f64::EPSILON) {
-        return false;
+        return None;
     }
-    let Expr::FunctionCall { name: name_hi, args: args_hi } = hi_call.as_ref() else { return false };
-    if !name_hi.ends_with("readMem") || args_hi.len() != 1 { return false }
+    let Expr::FunctionCall { name: name_hi, args: args_hi } = hi_call.as_ref() else { return None };
+    if !name_hi.ends_with("readMem") || args_hi.len() != 1 { return None }
+    if name_hi != name_lo { return None }
 
     // The argument should be calc(Var(param) + 1)
-    let Expr::Calc(CalcOp::Add(inner_var, one)) = &args_hi[0] else { return false };
-    if !is_var_ref(inner_var, param) { return false }
-    matches!(one.as_ref(), Expr::Literal(v) if (*v - 1.0).abs() < f64::EPSILON)
+    let Expr::Calc(CalcOp::Add(inner_var, one)) = &args_hi[0] else { return None };
+    if !is_var_ref(inner_var, param) { return None }
+    if !matches!(one.as_ref(), Expr::Literal(v) if (*v - 1.0).abs() < f64::EPSILON) {
+        return None;
+    }
+    Some(name_lo.clone())
 }
 
 /// Check if an expression is `mod(var(a), pow(2, var(b)))` — bitmask pattern.
@@ -774,12 +777,6 @@ impl<'a> Compiler<'a> {
             return dst;
         }
 
-        // Keyboard I/O property
-        if name == "--keyboard" || name == "--__1keyboard" || name == "--__2keyboard" {
-            let dst = self.alloc();
-            ops.push(Op::LoadKeyboard { dst });
-            return dst;
-        }
 
         // Unknown property — use fallback or 0
         if let Some(fb) = fallback {
@@ -1166,13 +1163,27 @@ impl<'a> Compiler<'a> {
         }
 
         // Word read: 1 param, body = calc(readMem(param) + readMem(param+1) * 256)
-        // Compile as LoadMem16 instead of two separate readMem calls.
+        // Compile as LoadMem16 instead of two separate readMem calls — BUT ONLY
+        // if the inner readMem is a pure identity read. If it has literal
+        // exception entries (e.g. BIOS ROM constants encoded as
+        // `style(--at: N): 201` inside --readMem's dispatch), LoadMem16 would
+        // bypass those and read 0 from state. In that case we must fall through
+        // to general compilation so the two nested readMem calls each go
+        // through compile_near_identity_dispatch and pick up the exceptions.
         if params.len() == 1 && func.locals.is_empty() {
-            if is_word_read_pattern(&func.result, &params[0].name) {
-                let addr_slot = self.compile_expr(&args[0], ops);
-                let dst = self.alloc();
-                ops.push(Op::LoadMem16 { dst, addr_slot });
-                return Some(dst);
+            if let Some(inner_name) = is_word_read_pattern(&func.result, &params[0].name) {
+                let inner_is_pure_identity = self
+                    .dispatch_tables
+                    .get(&inner_name)
+                    .map(is_dispatch_identity_read)
+                    .unwrap_or(true);
+                if inner_is_pure_identity {
+                    let addr_slot = self.compile_expr(&args[0], ops);
+                    let dst = self.alloc();
+                    ops.push(Op::LoadMem16 { dst, addr_slot });
+                    return Some(dst);
+                }
+                // Else: fall through to general function-call compilation.
             }
         }
 
@@ -2108,7 +2119,6 @@ fn op_slots_read(op: &Op) -> Vec<Slot> {
         Op::LoadState { .. } => vec![],
         Op::LoadMem { addr_slot, .. } => vec![*addr_slot],
         Op::LoadMem16 { addr_slot, .. } => vec![*addr_slot],
-        Op::LoadKeyboard { .. } => vec![],
         Op::Add { a, b, .. }
         | Op::Sub { a, b, .. }
         | Op::Mul { a, b, .. }
@@ -2145,7 +2155,6 @@ fn op_dst(op: &Op) -> Option<Slot> {
         | Op::LoadState { dst, .. }
         | Op::LoadMem { dst, .. }
         | Op::LoadMem16 { dst, .. }
-        | Op::LoadKeyboard { dst, .. }
         | Op::Add { dst, .. }
         | Op::Sub { dst, .. }
         | Op::Mul { dst, .. }
@@ -2191,9 +2200,6 @@ fn map_op_slots(op: &mut Op, slot_map: &mut HashMap<Slot, Slot>, alloc: &mut Slo
         }
         Op::LoadMem16 { dst, addr_slot } => {
             *addr_slot = alloc.get_or_alloc(*addr_slot, slot_map);
-            *dst = alloc.get_or_alloc(*dst, slot_map);
-        }
-        Op::LoadKeyboard { dst } => {
             *dst = alloc.get_or_alloc(*dst, slot_map);
         }
         Op::Add { dst, a, b }
@@ -2292,7 +2298,6 @@ fn seed_from_parent(
         Op::LoadSlot { src, .. } => { seed(*src); }
         Op::LoadState { .. } => {}
         Op::LoadMem { addr_slot, .. } | Op::LoadMem16 { addr_slot, .. } => { seed(*addr_slot); }
-        Op::LoadKeyboard { .. } => {}
         Op::Add { a, b, .. } | Op::Sub { a, b, .. } | Op::Mul { a, b, .. }
         | Op::Div { a, b, .. } | Op::Mod { a, b, .. } | Op::And { a, b, .. }
         | Op::Shr { a, b, .. } | Op::Shl { a, b, .. } => { seed(*a); seed(*b); }
@@ -2448,9 +2453,6 @@ fn exec_ops(
                 } else {
                     slots[*dst as usize] = state.read_mem16(addr);
                 }
-            }
-            Op::LoadKeyboard { dst } => {
-                slots[*dst as usize] = state.keyboard;
             }
             Op::Add { dst, a, b } => {
                 slots[*dst as usize] = slots[*a as usize].wrapping_add(slots[*b as usize]);

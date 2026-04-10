@@ -805,6 +805,14 @@ pub fn property_to_address(name: &str) -> Option<i32> {
         return parse_mem_address(rest);
     }
 
+    // keyboard / __1keyboard / __2keyboard → linear address 0x500.
+    // The CSS-DOS BIOS polls address 0x500 (word) for keystrokes.
+    // The host layer (CLI, web worker, etc.) is responsible for writing
+    // the key value there before each tick — calcite just reads memory.
+    if canonical == "keyboard" || canonical == "__1keyboard" || canonical == "__2keyboard" {
+        return Some(0x500);
+    }
+
     // Register name fallback: standard register names (AX, IP, flags, etc.)
     // Always consulted — the CSS-derived map may contain only memory cells
     // (e.g., v2 i8086-css where --readMem maps m0..mN but not registers).
@@ -1311,10 +1319,6 @@ impl Evaluator {
         }
         if let Some(addr) = property_to_address(name) {
             return Value::Number(state.read_mem(addr) as f64);
-        }
-        // Special I/O properties not mapped to the register/memory address space
-        if name == "--keyboard" || name == "--__1keyboard" || name == "--__2keyboard" {
-            return Value::Number(state.keyboard as f64);
         }
         // Default: empty string for string properties, 0 for numeric
         if self.string_property_names.contains(bare) {

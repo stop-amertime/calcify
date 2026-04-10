@@ -104,19 +104,16 @@ function jsStep() {
   jsTick++;
 }
 
-function jsReset() {
+async function jsReset() {
   // Re-zero memory and reload BIOS/kernel/disk.
   jsMemory.fill(0);
   for (let i = 0; i < kernelBin.length; i++) jsMemory[0x600 + i] = kernelBin[i];
   for (let i = 0; i < diskBin.length && 0xD0000 + i < jsMemory.length; i++) jsMemory[0xD0000 + i] = diskBin[i];
   for (let i = 0; i < biosBin.length; i++) jsMemory[0xF0000 + i] = biosBin[i];
   jsCpu.reset();
-  jsCpu.setRegs({
-    cs: 0xF000, ip: biosInitOffset,
-    ss: 0, sp: 0xFFF8, ds: 0, es: 0,
-    ah: 0, al: 0, bh: 0, bl: 0, ch: 0, cl: 0, dh: 0, dl: 0,
-  });
   jsTick = 0;
+  // Re-seed registers from calcite tick-0 state (canonical source).
+  await initJsCpu();
 }
 
 function jsRenderScreen(base = 0xB8000, width = 80, height = 25) {
@@ -136,10 +133,41 @@ function jsRenderScreen(base = 0xB8000, width = 80, height = 25) {
   return rows.join('\n');
 }
 
+// BDA ring buffer constants (matching gossamer-dos.asm / IBM PC BIOS).
+// All offsets are relative to segment 0x40 (linear 0x400 + offset).
+const BDA_KBD_HEAD  = 0x41A;  // word — head pointer (offset into buffer)
+const BDA_KBD_TAIL  = 0x41C;  // word — tail pointer
+const BDA_KBD_START = 0x480;  // word — buffer start offset (0x1E)
+const BDA_KBD_END   = 0x482;  // word — buffer end offset (0x3E)
+
+function jsReadWord(addr) {
+  return jsMemory[addr] | (jsMemory[addr + 1] << 8);
+}
+function jsWriteWord(addr, val) {
+  jsMemory[addr]     = val & 0xFF;
+  jsMemory[addr + 1] = (val >> 8) & 0xFF;
+}
+
 function jsWriteKey(value) {
-  // BIOS polls linear 0x500 (word: ASCII in low byte, scancode in high byte).
-  jsMemory[0x500] = value & 0xFF;
-  jsMemory[0x501] = (value >> 8) & 0xFF;
+  // Write into the BDA ring buffer — the standard PC keyboard buffer.
+  // This is exactly what the 8042 keyboard controller / INT 9 handler does on real hardware.
+  const tail    = jsReadWord(BDA_KBD_TAIL);
+  const bufEnd  = jsReadWord(BDA_KBD_END);
+  const bufStart= jsReadWord(BDA_KBD_START);
+
+  // The buffer lives at segment 0x40, so linear = 0x400 + offset.
+  jsWriteWord(0x400 + tail, value & 0xFFFF);
+
+  let newTail = tail + 2;
+  if (newTail >= bufEnd) newTail = bufStart;
+
+  // Only write if buffer isn't full (head == newTail means full).
+  const head = jsReadWord(BDA_KBD_HEAD);
+  if (newTail !== head) {
+    jsWriteWord(BDA_KBD_TAIL, newTail);
+  } else {
+    console.error('[codebug] WARNING: BDA keyboard buffer full, key dropped');
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -363,9 +391,12 @@ async function compareMemoryRanges(ranges) {
 }
 
 async function seekBoth(targetTick) {
+  // To replay JS cleanly, we need calcite at tick 0 so jsReset() can seed
+  // the JS CPU from the canonical CSS initial state. Then we fast-forward
+  // both sides to the target tick.
   if (targetTick < jsTick) {
-    // JS side has no checkpoints in phase 1 — reset and replay.
-    jsReset();
+    await httpRequest('POST', '/seek', { tick: 0 });
+    await jsReset();
   }
   await httpRequest('POST', '/seek', { tick: targetTick });
   while (jsTick < targetTick) {
@@ -373,6 +404,121 @@ async function seekBoth(targetTick) {
     catch (e) { return { ok: false, error: e.message, tick_js: jsTick }; }
   }
   return { ok: true, tick_js: jsTick };
+}
+
+// ---------------------------------------------------------------------------
+// Run-until-diverge: step both sides in batches; on first diff, bisect down
+// to the exact tick where calcite and JS first disagree on registers.
+// ---------------------------------------------------------------------------
+
+async function calciteRegs() {
+  return (await httpRequest('GET', '/state')).registers;
+}
+
+function regsAgree(a, b) {
+  for (const name of REG_NAMES) {
+    let av = (a[name] | 0) & 0xFFFF;
+    let bv = (b[name] | 0) & 0xFFFF;
+    if (av !== bv) return false;
+  }
+  return true;
+}
+
+async function runUntilDiverge(opts = {}) {
+  const maxTicks   = opts.max_ticks   ?? 1_000_000;
+  const batchSize  = opts.batch_size  ?? 1000;
+  const startTick  = jsTick;
+
+  // Coarse phase: step in batches until diff or max.
+  let stop = null;  // tick at which divergence is observed (calcite tick after batch)
+  while (jsTick - startTick < maxTicks) {
+    const remaining = maxTicks - (jsTick - startTick);
+    const batch = Math.min(batchSize, remaining);
+    const before_tick_js = jsTick;
+    await stepBoth(batch);
+    const cReg = await calciteRegs();
+    const jReg = jsGetRegs();
+    if (!regsAgree(cReg, jReg)) {
+      stop = { batch_start: before_tick_js, batch_end: jsTick };
+      break;
+    }
+  }
+
+  if (!stop) {
+    return {
+      diverged: false,
+      ticks_run: jsTick - startTick,
+      tick_js: jsTick,
+      tick_calcite: (await httpRequest('GET', '/info')).current_tick,
+    };
+  }
+
+  // Bisection phase: we know they agreed at stop.batch_start and disagreed at
+  // stop.batch_end. Reset and replay to batch_start, then single-step.
+  // Replay JS by reset+step (no checkpoints); calcite uses /seek (it has snapshots).
+  // IMPORTANT: seek calcite FIRST so that jsReset()'s call to initJsCpu reads
+  // the tick-0 state, not whatever tick we left it at.
+  await httpRequest('POST', '/seek', { tick: 0 });
+  await jsReset();
+  await httpRequest('POST', '/seek', { tick: stop.batch_start });
+  while (jsTick < stop.batch_start) jsStep();
+
+  // Single-step until first diff.
+  let firstDivergeTick = null;
+  let lastAgreeRegs = { js: jsGetRegs(), calcite: await calciteRegs() };
+  while (jsTick < stop.batch_end) {
+    // Step exactly 1 tick.
+    await httpRequest('POST', '/tick', { count: 1 });
+    try { jsStep(); }
+    catch (e) {
+      return {
+        diverged: true,
+        diverge_tick: jsTick,
+        js_error: e.message,
+        before: lastAgreeRegs,
+      };
+    }
+    const cReg = await calciteRegs();
+    const jReg = jsGetRegs();
+    if (!regsAgree(cReg, jReg)) {
+      firstDivergeTick = jsTick;
+      // Build a register diff list.
+      const diffs = [];
+      for (const name of REG_NAMES) {
+        const jv = (jReg[name] | 0) & 0xFFFF;
+        const cv = (cReg[name] | 0) & 0xFFFF;
+        if (jv !== cv) diffs.push({ name, js: jv, calcite: cv, js_hex: '0x' + jv.toString(16), calcite_hex: '0x' + cv.toString(16) });
+      }
+      return {
+        diverged: true,
+        diverge_tick: firstDivergeTick,
+        before: {
+          tick: firstDivergeTick - 1,
+          js: lastAgreeRegs.js,
+          calcite: lastAgreeRegs.calcite,
+          // Useful: where was execution about to happen?
+          js_csip: `${(lastAgreeRegs.js.CS).toString(16)}:${(lastAgreeRegs.js.IP & 0xFFFF).toString(16)}`,
+          calcite_csip: `${(lastAgreeRegs.calcite.CS).toString(16)}:${(lastAgreeRegs.calcite.IP & 0xFFFF).toString(16)}`,
+        },
+        after: {
+          tick: firstDivergeTick,
+          js: jReg,
+          calcite: cReg,
+          js_csip: `${jReg.CS.toString(16)}:${(jReg.IP & 0xFFFF).toString(16)}`,
+          calcite_csip: `${cReg.CS.toString(16)}:${(cReg.IP & 0xFFFF).toString(16)}`,
+        },
+        register_diffs: diffs,
+      };
+    }
+    lastAgreeRegs = { js: jReg, calcite: cReg };
+  }
+
+  // Shouldn't reach here — coarse phase saw a diff in this batch.
+  return {
+    diverged: true,
+    diverge_tick: stop.batch_end,
+    note: 'bisection failed to localize — coarse saw diff but single-step did not',
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -459,6 +605,15 @@ const server = createServer(async (req, res) => {
     if (req.method === 'POST' && path === '/seek') {
       const body = await readBody(req);
       const r = await seekBoth(body.tick | 0);
+      return sendJson(res, 200, r);
+    }
+
+    if (req.method === 'POST' && path === '/run-until-diverge') {
+      const body = await readBody(req);
+      const r = await runUntilDiverge({
+        max_ticks: body.max_ticks,
+        batch_size: body.batch_size,
+      });
       return sendJson(res, 200, r);
     }
 

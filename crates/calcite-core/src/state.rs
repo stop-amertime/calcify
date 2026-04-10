@@ -130,9 +130,6 @@ pub struct State {
     pub extended: std::collections::HashMap<i32, i32>,
     /// String property values (e.g., `--textBuffer` for text output).
     pub string_properties: std::collections::HashMap<String, String>,
-    /// Last keyboard input (for INT 16h / INT 21h).
-    /// Packed as (scancode << 8 | ascii) matching DOS conventions.
-    pub keyboard: i32,
     /// Tick counter (incremented each evaluation cycle).
     pub frame_counter: u32,
 }
@@ -145,7 +142,6 @@ impl State {
             memory: vec![0; mem_size],
             extended: std::collections::HashMap::new(),
             string_properties: std::collections::HashMap::new(),
-            keyboard: 0i32,
             frame_counter: 0,
         }
     }
@@ -176,15 +172,6 @@ impl State {
             }
             _ => {
                 let addr_u = addr as usize;
-                // Keyboard I/O: 0x500 = ASCII byte, 0x501 = scancode byte
-                // These are mapped to state.keyboard in the CSS but LoadMem/LoadMem16
-                // bypass the CSS dispatch, so we handle them here too.
-                if addr_u == 0x500 {
-                    return self.keyboard & 0xFF;
-                }
-                if addr_u == 0x501 {
-                    return (self.keyboard >> 8) & 0xFF;
-                }
                 // High addresses (>= 0xF0000) use extended map for full-width i32 storage
                 if addr_u >= 0xF0000 {
                     return self.extended.get(&addr).copied().unwrap_or(0);
@@ -237,13 +224,6 @@ impl State {
             }
             _ => {
                 let addr_u = addr as usize;
-                // Keyboard consume: writing to 0x500 clears the keyboard state.
-                // The BIOS writes 0 here after reading a key via INT 16h.
-                // Reads from 0x500/0x501 come from state.keyboard (via CSS dispatch),
-                // so we must clear that too, not just the memory cell.
-                if addr_u == 0x500 && value == 0 {
-                    self.keyboard = 0;
-                }
                 // High addresses (>= 0xF0000) use extended map for full-width i32 storage
                 if addr_u >= 0xF0000 {
                     self.extended.insert(addr, value);
@@ -253,6 +233,36 @@ impl State {
                     self.memory[addr_u] = (value & 0xFF) as u8;
                 }
             }
+        }
+    }
+
+    /// Push a key into the BDA keyboard ring buffer.
+    ///
+    /// `key` is packed as `(scancode << 8) | ascii`, matching the IBM PC
+    /// BIOS convention. This is what the 8042 keyboard controller / INT 9
+    /// handler does on real hardware.
+    ///
+    /// The buffer lives at segment 0x40 (linear 0x400 + BDA offset):
+    /// - 0x41A: head pointer (offset into buffer)
+    /// - 0x41C: tail pointer
+    /// - 0x480: buffer start offset
+    /// - 0x482: buffer end offset
+    ///
+    /// If the buffer is full the key is silently dropped (matching real hardware).
+    pub fn bda_push_key(&mut self, key: i32) {
+        let tail      = self.read_mem16(0x41C);
+        let buf_end   = self.read_mem16(0x482);
+        let buf_start = self.read_mem16(0x480);
+        let linear    = 0x400 + tail;
+        self.write_mem(linear,     key & 0xFF);
+        self.write_mem(linear + 1, (key >> 8) & 0xFF);
+        let mut new_tail = tail + 2;
+        if new_tail >= buf_end { new_tail = buf_start; }
+        let head = self.read_mem16(0x41A);
+        if new_tail != head {
+            // Not full — advance tail.
+            self.write_mem(0x41C, new_tail & 0xFF);
+            self.write_mem(0x41D, (new_tail >> 8) & 0xFF);
         }
     }
 

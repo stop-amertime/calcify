@@ -767,9 +767,9 @@ fn main() {
                 match serde_json::from_str::<KeyRequest>(&body) {
                     Ok(r) => {
                         let mut s = session.lock().unwrap();
-                        s.state.keyboard = r.value;
+                        s.state.bda_push_key(r.value);
                         json_response(&serde_json::json!({
-                            "keyboard": s.state.keyboard,
+                            "keyboard": r.value,
                             "tick": s.current_tick(),
                         }))
                     }

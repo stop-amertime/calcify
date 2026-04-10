@@ -368,6 +368,7 @@ fn main() {
             // CPU (which takes many ticks per instruction) has time to read it.
             const KEY_HOLD_TICKS: u32 = 50;
             let mut key_hold_remaining: u32 = 0;
+            let mut held_key: i32 = 0; // the key currently being held
 
             if needs_per_tick {
                 // When verbose, batch early ticks then show tail
@@ -391,10 +392,22 @@ fn main() {
                 for tick in batch_skip..cli.ticks {
                     // Poll keyboard (non-blocking) in interactive mode
                     if interactive {
-                        // Hold timer: rate-limits key repeat by ignoring new presses
-                        // for KEY_HOLD_TICKS after each keypress.
+                        // On every tick while a key is held, ensure the BDA ring buffer
+                        // contains that key. The CSS INT 16h AH=00h handler busy-spins
+                        // on head==tail (empty), so we must keep the buffer non-empty for
+                        // the entire hold window — the BIOS may consume the entry each tick.
                         if key_hold_remaining > 0 {
                             key_hold_remaining -= 1;
+                            if key_hold_remaining == 0 {
+                                held_key = 0;
+                            } else {
+                                // Re-fill if the BIOS consumed last tick's entry.
+                                let head = state.read_mem16(0x41A);
+                                let tail = state.read_mem16(0x41C);
+                                if head == tail {
+                                    state.bda_push_key(held_key);
+                                }
+                            }
                         }
 
                         while event::poll(std::time::Duration::ZERO).unwrap_or(false) {
@@ -410,22 +423,8 @@ fn main() {
                                         }
                                         let dos_key = key_to_dos(&key_event);
                                         if dos_key != 0 && key_hold_remaining == 0 {
-                                            // Write into the BDA keyboard ring buffer.
-                                            // The BIOS INT 16h handler pops it — no host-side
-                                            // clearing needed (matches real 8042 behaviour).
-                                            let tail      = state.read_mem16(0x41C);
-                                            let buf_end   = state.read_mem16(0x482);
-                                            let buf_start = state.read_mem16(0x480);
-                                            let linear    = 0x400 + tail;
-                                            state.write_mem(linear,     dos_key & 0xFF);
-                                            state.write_mem(linear + 1, (dos_key >> 8) & 0xFF);
-                                            let mut new_tail = tail + 2;
-                                            if new_tail >= buf_end { new_tail = buf_start; }
-                                            let head = state.read_mem16(0x41A);
-                                            if new_tail != head {
-                                                state.write_mem(0x41C, new_tail & 0xFF);
-                                                state.write_mem(0x41D, (new_tail >> 8) & 0xFF);
-                                            }
+                                            state.bda_push_key(dos_key);
+                                            held_key = dos_key;
                                             key_hold_remaining = KEY_HOLD_TICKS;
                                         }
                                     }

@@ -81,13 +81,11 @@ impl CalciteEngine {
         Ok(format!("[{}]", json_parts.join(",")))
     }
 
-    /// Set the keyboard input state.
-    /// Pass (scancode << 8 | ascii), or 0 for no key.
-    /// Writes to memory 0x500 (ascii) and 0x501 (scancode) — the address
-    /// that the CSS-DOS BIOS polls for keystrokes via INT 16h.
+    /// Inject a keypress into the BDA ring buffer.
+    /// Pass (scancode << 8 | ascii), matching the standard PC keyboard convention.
+    /// The BIOS INT 16h handler will pop it when the program next reads keyboard input.
     pub fn set_keyboard(&mut self, key: i32) {
-        self.state.write_mem(0x500, key & 0xFF);
-        self.state.write_mem(0x501, (key >> 8) & 0xFF);
+        self.state.bda_push_key(key);
     }
 
     /// Get the current value of a register (for debugging).
