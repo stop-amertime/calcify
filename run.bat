@@ -162,7 +162,7 @@ if errorlevel 1 (pause & goto :menu)
 
 title CSS-DOS: %NAME%
 cls
-"%CALCITE%" --input "%CSS%" --ticks 4294967295 --halt 0x0504 --screen 0xB8000 80x25 --screen-interval 500
+"%CALCITE%" --input "%CSS%" --ticks 4294967295 --halt 0x0504
 
 echo.
 echo   Program exited. Press any key to return to menu...

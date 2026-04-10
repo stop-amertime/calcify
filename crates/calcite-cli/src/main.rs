@@ -25,19 +25,13 @@ struct Cli {
     #[arg(long)]
     parse_only: bool,
 
-    /// Render a region of memory as a text-mode screen after execution.
+    /// Render the screen every N ticks.
     ///
-    /// Format: ADDR WIDTHxHEIGHT (e.g. "0xB8000 80x25").
-    /// Memory is read in text-mode format (char+attribute byte pairs).
-    #[arg(long, value_name = "ADDR WxH", num_args = 2)]
-    screen: Option<Vec<String>>,
-
-    /// Render the screen every N ticks (requires --screen).
-    ///
-    /// Uses ANSI cursor movement to update in-place. Without this flag,
-    /// the screen is only rendered once after execution completes.
-    #[arg(long, value_name = "N")]
-    screen_interval: Option<u32>,
+    /// Reads BDA 0x0449 to determine the current video mode and renders
+    /// accordingly: text modes show an in-terminal ANSI screen; Mode 13h
+    /// shows a status line. Default: 500. Set to 0 for render-on-exit only.
+    #[arg(long, value_name = "N", default_value = "500")]
+    screen_interval: u32,
 
     /// Dump all computed slot values at a specific tick for debugging.
     ///
@@ -60,42 +54,14 @@ struct Cli {
     #[arg(long, value_name = "ADDR")]
     halt: Option<String>,
 
-    /// Dump a graphics-mode framebuffer to a PPM file after execution.
+    /// After execution, write the Mode 13h framebuffer to a PPM file.
     ///
-    /// Format: ADDR WIDTHxHEIGHT PATH (e.g. "0xA0000 320x200 out.ppm").
-    /// Each byte at ADDR+i is treated as a palette index (VGA Mode 13h style).
-    /// Output is a PPM P6 image suitable for viewing in any image viewer.
-    #[arg(long, value_name = "ADDR WxH PATH", num_args = 3)]
-    framebuffer: Option<Vec<String>>,
+    /// Only written when the final video mode is 0x13 (320x200x256).
+    /// Useful for capturing the last frame of a graphics program.
+    #[arg(long, value_name = "PATH")]
+    framebuffer_out: Option<String>,
 }
 
-fn parse_screen_args(args: &[String]) -> (i32, usize, usize) {
-    if args.len() != 2 {
-        eprintln!("--screen requires ADDR WxH (e.g. --screen 0xB8000 40x25)");
-        std::process::exit(1);
-    }
-    let addr = if args[0].starts_with("0x") || args[0].starts_with("0X") {
-        i32::from_str_radix(&args[0][2..], 16).unwrap_or_else(|_| {
-            eprintln!("Invalid address '{}', expected hex (e.g. 0xB8000)", args[0]);
-            std::process::exit(1);
-        })
-    } else {
-        args[0].parse().unwrap_or_else(|_| {
-            eprintln!("Invalid address '{}', expected integer or hex", args[0]);
-            std::process::exit(1);
-        })
-    };
-    if let Some((w, h)) = args[1].split_once('x') {
-        if let (Ok(w), Ok(h)) = (w.parse(), h.parse()) {
-            return (addr, w, h);
-        }
-    }
-    eprintln!(
-        "Invalid screen dimensions '{}', expected WxH (e.g. 40x25)",
-        args[1]
-    );
-    std::process::exit(1);
-}
 
 /// Map a crossterm key event to DOS keyboard value: (scancode << 8) | ascii.
 /// Returns 0 for unmapped keys.
@@ -228,7 +194,6 @@ fn main() {
     match calcite_core::parser::parse_css(&css) {
         Ok(parsed) => {
             let parse_time = t0.elapsed();
-            let has_screen = cli.screen.is_some();
             eprintln!(
                 "Parsed: {} @property, {} @function, {} assignments ({:.2}s)",
                 parsed.properties.len(),
@@ -248,6 +213,7 @@ fn main() {
             let mut state = calcite_core::State::default();
             state.load_properties(&parsed.properties);
 
+            let interactive = cli.ticks > 1;
             eprintln!(
                 "Compiled: {:.2}s (parse {:.2}s + compile {:.2}s), memory: {} KB",
                 (parse_time + compile_time).as_secs_f64(),
@@ -255,7 +221,7 @@ fn main() {
                 compile_time.as_secs_f64(),
                 state.memory.len() / 1024,
             );
-            if has_screen {
+            if interactive {
                 eprintln!("Starting... (Ctrl+C to quit)");
             }
 
@@ -268,6 +234,38 @@ fn main() {
             });
 
             let t2 = std::time::Instant::now();
+
+            // Render the screen based on BDA video mode (0x0449).
+            // Text modes: render in-terminal using ANSI. Mode 13h: status line.
+            let render_screen = |state: &calcite_core::State, tick: u32, first: bool| {
+                let video_mode = state.read_mem(0x0449) as u8;
+                if video_mode == 0x13 {
+                    // Mode 13h — can't draw pixels in a terminal.
+                    // Just show a status line so the user knows it's running.
+                    if first {
+                        eprint!("\x1b[2J\x1b[H\x1b[?25l");
+                    } else {
+                        eprint!("\x1b[H");
+                    }
+                    eprint!("[Mode 13h 320x200 graphics]\r\n tick {tick}\r\n");
+                } else {
+                    // Text mode: infer dimensions from BDA columns byte.
+                    let cols = state.read_mem(0x044A) as usize;
+                    let (width, height) = if cols == 40 { (40, 25) } else { (80, 25) };
+                    if first {
+                        eprint!("\x1b[2J\x1b[H\x1b[?25l");
+                    } else {
+                        eprint!("\x1b[H");
+                    }
+                    let screen = state.render_screen(0xB8000, width, height);
+                    eprint!("┌{}┐\r\n", "─".repeat(width));
+                    for line in screen.lines() {
+                        eprint!("│{line}│\r\n");
+                    }
+                    eprint!("└{}┘\r\n", "─".repeat(width));
+                    eprint!(" tick {tick} \r\n");
+                }
+            };
 
             // --dump-tick: run to specific tick and dump all computed properties
             if let Some(target_tick) = cli.dump_tick {
@@ -354,36 +352,14 @@ fn main() {
                 return;
             }
 
-            // Parse screen args once if present
-            let screen_cfg = cli.screen.as_ref().map(|args| parse_screen_args(args));
-            let screen_interval = cli.screen_interval.unwrap_or(0);
 
-            // Helper: render screen with ANSI in-place update.
-            // Uses \r\n line endings because raw terminal mode doesn't translate \n.
-            let render_screen = |state: &calcite_core::State, cfg: (i32, usize, usize), tick: u32, first: bool| {
-                let (addr, width, height) = cfg;
-                if first {
-                    // Clear screen and hide cursor on first frame
-                    eprint!("\x1b[2J\x1b[H\x1b[?25l");
-                } else {
-                    // Move cursor to top-left to overwrite previous frame
-                    eprint!("\x1b[H");
-                }
-                let screen = state.render_screen(addr as usize, width, height);
-                eprint!("┌{}┐\r\n", "─".repeat(width));
-                for line in screen.lines() {
-                    eprint!("│{line}│\r\n");
-                }
-                eprint!("└{}┘\r\n", "─".repeat(width));
-                eprint!(" tick {} \r\n", tick);
-            };
 
             let mut ticks_run: u32 = 0;
             let mut first_frame = true;
-            let interactive = has_screen;
-            let needs_per_tick = cli.verbose || halt_addr.is_some() || (screen_cfg.is_some() && screen_interval > 0);
+            let screen_interval = cli.screen_interval;
+            let needs_per_tick = cli.verbose || halt_addr.is_some() || (interactive && screen_interval > 0);
 
-            // Enable raw terminal mode for keyboard input in screen mode
+            // Enable raw terminal mode for keyboard input
             if interactive {
                 crossterm::terminal::enable_raw_mode().ok();
             }
@@ -415,12 +391,10 @@ fn main() {
                 for tick in batch_skip..cli.ticks {
                     // Poll keyboard (non-blocking) in interactive mode
                     if interactive {
-                        // Count down hold timer; clear key when expired
+                        // Hold timer: rate-limits key repeat by ignoring new presses
+                        // for KEY_HOLD_TICKS after each keypress.
                         if key_hold_remaining > 0 {
                             key_hold_remaining -= 1;
-                            if key_hold_remaining == 0 {
-                                state.keyboard = 0;
-                            }
                         }
 
                         while event::poll(std::time::Duration::ZERO).unwrap_or(false) {
@@ -435,8 +409,23 @@ fn main() {
                                             break;
                                         }
                                         let dos_key = key_to_dos(&key_event);
-                                        if dos_key != 0 {
-                                            state.keyboard = dos_key;
+                                        if dos_key != 0 && key_hold_remaining == 0 {
+                                            // Write into the BDA keyboard ring buffer.
+                                            // The BIOS INT 16h handler pops it — no host-side
+                                            // clearing needed (matches real 8042 behaviour).
+                                            let tail      = state.read_mem16(0x41C);
+                                            let buf_end   = state.read_mem16(0x482);
+                                            let buf_start = state.read_mem16(0x480);
+                                            let linear    = 0x400 + tail;
+                                            state.write_mem(linear,     dos_key & 0xFF);
+                                            state.write_mem(linear + 1, (dos_key >> 8) & 0xFF);
+                                            let mut new_tail = tail + 2;
+                                            if new_tail >= buf_end { new_tail = buf_start; }
+                                            let head = state.read_mem16(0x41A);
+                                            if new_tail != head {
+                                                state.write_mem(0x41C, new_tail & 0xFF);
+                                                state.write_mem(0x41D, (new_tail >> 8) & 0xFF);
+                                            }
                                             key_hold_remaining = KEY_HOLD_TICKS;
                                         }
                                     }
@@ -472,11 +461,9 @@ fn main() {
                     }
 
                     // Periodic screen rendering
-                    if let Some(cfg) = screen_cfg {
-                        if screen_interval > 0 && ticks_run % screen_interval == 0 {
-                            render_screen(&state, cfg, ticks_run, first_frame);
-                            first_frame = false;
-                        }
+                    if interactive && screen_interval > 0 && ticks_run % screen_interval == 0 {
+                        render_screen(&state, ticks_run, first_frame);
+                        first_frame = false;
                     }
 
                     if let Some(addr) = halt_addr {
@@ -497,7 +484,7 @@ fn main() {
             }
             let tick_time = t2.elapsed();
 
-            if !cli.verbose && cli.dump_tick.is_none() && !cli.trace_json && !has_screen {
+            if !cli.verbose && cli.dump_tick.is_none() && !cli.trace_json {
                 println!(
                     "Ran {} ticks | AX={} CX={} IP={}",
                     ticks_run,
@@ -506,13 +493,11 @@ fn main() {
                     state.registers[calcite_core::state::reg::IP],
                 );
             }
-            if !has_screen {
-                eprintln!(
-                    "Ticks: {:.3}s ({:.0} ticks/sec)",
-                    tick_time.as_secs_f64(),
-                    ticks_run as f64 / tick_time.as_secs_f64(),
-                );
-            }
+            eprintln!(
+                "Ticks: {:.3}s ({:.0} ticks/sec)",
+                tick_time.as_secs_f64(),
+                ticks_run as f64 / tick_time.as_secs_f64(),
+            );
 
             // Display string property output (e.g., --textBuffer)
             for (name, value) in &state.string_properties {
@@ -522,37 +507,29 @@ fn main() {
             }
 
             // Final screen render (always, unless we just rendered this exact tick)
-            if let Some(cfg) = screen_cfg {
+            if interactive {
                 let just_rendered = screen_interval > 0 && ticks_run % screen_interval == 0;
                 if !just_rendered {
-                    render_screen(&state, cfg, ticks_run, first_frame);
+                    render_screen(&state, ticks_run, first_frame);
                 }
                 // Restore cursor visibility
                 eprint!("\x1b[?25h");
             }
 
-            // Dump framebuffer as PPM if requested.
-            if let Some(args) = cli.framebuffer.as_ref() {
-                if args.len() != 3 {
-                    eprintln!("--framebuffer requires ADDR WxH PATH (e.g. --framebuffer 0xA0000 320x200 out.ppm)");
-                    std::process::exit(1);
-                }
-                let (addr, width, height) = parse_screen_args(&args[0..2]);
-                let path = &args[2];
-                let ppm = state.render_framebuffer(addr as usize, width, height);
-                match std::fs::write(path, &ppm) {
-                    Ok(()) => eprintln!(
-                        "Framebuffer: wrote {} bytes to {} ({}x{} from 0x{:X})",
-                        ppm.len(),
-                        path,
-                        width,
-                        height,
-                        addr,
-                    ),
-                    Err(e) => {
-                        eprintln!("Failed to write framebuffer to {}: {}", path, e);
-                        std::process::exit(1);
+            // Write Mode 13h framebuffer to PPM if requested.
+            if let Some(path) = cli.framebuffer_out.as_ref() {
+                let video_mode = state.read_mem(0x0449) as u8;
+                if video_mode == 0x13 {
+                    let ppm = state.render_framebuffer(0xA0000, 320, 200);
+                    match std::fs::write(path, &ppm) {
+                        Ok(()) => eprintln!("Framebuffer: wrote {} bytes to {}", ppm.len(), path),
+                        Err(e) => {
+                            eprintln!("Failed to write framebuffer to {}: {}", path, e);
+                            std::process::exit(1);
+                        }
                     }
+                } else {
+                    eprintln!("--framebuffer-out: current video mode is 0x{video_mode:02X}, not Mode 13h — nothing written");
                 }
             }
         }
