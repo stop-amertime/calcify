@@ -28,7 +28,7 @@ const BASE = `http://localhost:${port}`;
 
 // --- Reference emulator setup ---
 const cssDir = resolve(__dirname, '..', '..', 'CSS-DOS');
-const js8086Source = readFileSync(resolve(__dirname, 'js8086.js'), 'utf-8');
+const js8086Source = readFileSync(resolve(__dirname, '..', '..', 'CSS-DOS', 'tools', 'js8086.js'), 'utf-8');
 const evalSource = js8086Source.replace("'use strict';", '').replace('let CPU_186 = 0;', 'var CPU_186 = 1;');
 const Intel8086 = new Function(evalSource + '\nreturn Intel8086;')();
 

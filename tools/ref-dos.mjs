@@ -36,7 +36,7 @@ const intTraceFrom = parseInt(flags['int-trace-from'] || '-1');
 const portTrace = flags['port-trace'] === 'true';
 
 // --- Load JS 8086 ---
-const js8086Source = readFileSync(resolve(__dirname, 'js8086.js'), 'utf-8');
+const js8086Source = readFileSync(resolve(__dirname, '..', '..', 'CSS-DOS', 'tools', 'js8086.js'), 'utf-8');
 const evalSource = js8086Source.replace("'use strict';", '').replace('let CPU_186 = 0;', 'var CPU_186 = 1;');
 const Intel8086 = new Function(evalSource + '\nreturn Intel8086;')();
 

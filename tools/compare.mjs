@@ -1,4 +1,15 @@
 #!/usr/bin/env node
+// TEST HARNESS SHORTCUT — not a machine model.
+//
+// This file bypasses the normal PC boot sequence (BIOS init, IVT setup via
+// bios_init) and sets up the emulator state directly from outside. It loads
+// the .COM at 0x100, pre-populates the IVT with hardcoded handler offsets,
+// and starts the CPU at CS:IP=0000:0100. This is enough for conformance
+// testing but does NOT replicate what a real PC does at power-on.
+//
+// If you need a faithful DOS boot, use CSS-DOS/tools/compare.mjs which
+// reads handler offsets dynamically from the BIOS listing file.
+//
 // Conformance comparison: reference 8086 emulator vs calcite
 //
 // Usage: node tools/compare.mjs <program.com> <bios.bin> <fib.css> [--ticks N] [--dump-slots]
@@ -35,7 +46,7 @@ const maxTicks = parseInt(flags.ticks || '500');
 const dumpSlots = 'dump-slots' in flags;
 
 // --- Load reference emulator ---
-const js8086Source = readFileSync(resolve(__dirname, 'js8086.js'), 'utf-8');
+const js8086Source = readFileSync(resolve(__dirname, '..', '..', 'CSS-DOS', 'tools', 'js8086.js'), 'utf-8');
 const evalSource = js8086Source.replace("'use strict';", '').replace('let CPU_186 = 0;', 'var CPU_186 = 0;');
 const Intel8086 = new Function(evalSource + '\nreturn Intel8086;')();
 

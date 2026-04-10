@@ -1,6 +1,17 @@
 #!/usr/bin/env node
+// TEST HARNESS SHORTCUT — not a machine model.
+//
+// This file bypasses the normal PC boot sequence (BIOS init, IVT setup via
+// bios_init) and sets up the emulator state directly from outside. It loads
+// the .COM at 0x100, pre-populates the IVT with hardcoded handler offsets,
+// and starts the CPU at CS:IP=0000:0100. This is enough for conformance
+// testing but does NOT replicate what a real PC does at power-on.
+//
+// If you need a faithful DOS boot, use CSS-DOS/tools/ref-emu.mjs which
+// reads handler offsets dynamically from the BIOS listing file.
+//
 // Reference 8086 emulator for conformance testing against calcite.
-// Uses emu8's js8086.js CPU core.
+// Uses emu8's js8086.js CPU core (loaded from ../CSS-DOS/tools/).
 //
 // Usage: node tools/ref-emu.mjs <program.com> <bios.bin> <ticks> [--json]
 //
@@ -13,11 +24,9 @@ import { fileURLToPath } from 'url';
 
 // Load the 8086 CPU core
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const js8086Path = resolve(__dirname, 'js8086.js');
-
 // We need to load it as a module. The file uses 'use strict' and defines
 // Intel8086 as a function. Let's just import it by evaluating.
-const js8086Source = readFileSync(js8086Path, 'utf-8');
+const js8086Source = readFileSync(resolve(__dirname, '..', '..', 'CSS-DOS', 'tools', 'js8086.js'), 'utf-8');
 
 // The file defines Intel8086 as a plain function at top level.
 // Wrap it so we can extract it.
