@@ -6,7 +6,7 @@ license.workspace = true
 description = "HTTP debug server for calcite — step, inspect, compare CSS execution"
 
 [dependencies]
-calcite-core = { workspace = true }
+calcite-core = { workspace = true, features = ["conformance"] }
 log = { workspace = true }
 env_logger = "0.11"
 tiny_http = "0.12"

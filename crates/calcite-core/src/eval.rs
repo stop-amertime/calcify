@@ -140,15 +140,15 @@ impl Evaluator {
             }
         }
 
-        // Build and install the CSS-derived address map from identity-read dispatch tables.
-        // Only override if we found actual mappings (preserves any pre-installed test map).
+        // Merge memory address mappings from identity-read dispatch tables into
+        // the address map. State var addresses (from load_properties) take priority.
         let address_map = build_address_map(&dispatch_tables);
         if !address_map.is_empty() {
             log::info!(
-                "Derived {} property→address mappings from CSS structure",
+                "Merging {} property→address mappings from dispatch tables",
                 address_map.len()
             );
-            set_address_map(address_map);
+            merge_address_map(address_map);
         }
 
         log::info!("[compile phase] dispatch tables: {:.2}s", _t.elapsed().as_secs_f64());
@@ -295,8 +295,8 @@ impl Evaluator {
             hook(state);
         }
 
-        // Snapshot registers for change detection
-        let prev_regs = state.registers;
+        // Snapshot state vars for change detection
+        let prev_vars = state.state_vars.clone();
 
         // Execute numeric assignments via compiled bytecode
         compile::execute(&self.compiled, state, &mut self.slots);
@@ -330,15 +330,11 @@ impl Evaluator {
             }
         }
 
-        // Detect register changes
+        // Detect state var changes
         let mut changes = Vec::new();
-        let reg_names = [
-            "--AX", "--CX", "--DX", "--BX", "--SP", "--BP", "--SI", "--DI", "--IP", "--ES", "--CS",
-            "--SS", "--DS", "--flags",
-        ];
-        for (i, name) in reg_names.iter().enumerate() {
-            if state.registers[i] != prev_regs[i] {
-                changes.push((name.to_string(), state.registers[i].to_string()));
+        for (i, name) in state.state_var_names.iter().enumerate() {
+            if i < prev_vars.len() && state.state_vars[i] != prev_vars[i] {
+                changes.push((format!("--{}", name), state.state_vars[i].to_string()));
             }
         }
 
@@ -429,6 +425,139 @@ impl Evaluator {
             .and_then(|&slot| self.slots.get(slot as usize).copied())
     }
 
+    /// Snapshot all named slot values after a compiled tick. Used by the debugger to
+    /// compare computed intermediate properties between compiled and interpreted paths.
+    pub fn get_all_slot_values(&self) -> HashMap<String, i32> {
+        self.compiled
+            .property_slots
+            .iter()
+            .filter_map(|(name, &slot)| {
+                self.slots.get(slot as usize).map(|&v| (name.clone(), v))
+            })
+            .collect()
+    }
+
+    /// Dump the compiled ops and dispatch tables to stderr for debugging.
+    pub fn dump_compiled(&self) {
+        eprintln!("=== COMPILED PROGRAM ({} ops, {} slots, {} dispatch tables, {} writeback) ===",
+            self.compiled.ops.len(),
+            self.compiled.slot_count,
+            self.compiled.dispatch_tables.len(),
+            self.compiled.writeback.len(),
+        );
+        eprintln!("--- main ops ---");
+        for (i, op) in self.compiled.ops.iter().enumerate() {
+            eprintln!("  [{:4}] {:?}", i, op);
+        }
+        eprintln!("--- dispatch tables ---");
+        for (tid, dt) in self.compiled.dispatch_tables.iter().enumerate() {
+            eprintln!("  table[{}]: {} entries, fallback_slot={}", tid, dt.entries.len(), dt.fallback_slot);
+            let mut keys: Vec<i64> = dt.entries.keys().copied().collect();
+            keys.sort();
+            for k in &keys {
+                let (ops, result) = &dt.entries[k];
+                eprintln!("    key={} → slot={} ({} ops)", k, result, ops.len());
+                for (j, op) in ops.iter().enumerate() {
+                    eprintln!("      [{:3}] {:?}", j, op);
+                }
+            }
+            eprintln!("    fallback ({} ops):", dt.fallback_ops.len());
+            for (j, op) in dt.fallback_ops.iter().enumerate() {
+                eprintln!("      [{:3}] {:?}", j, op);
+            }
+        }
+        eprintln!("--- writeback ---");
+        for (slot, addr) in &self.compiled.writeback {
+            let name = self.compiled.property_slots.iter()
+                .find(|(_, &s)| s == *slot)
+                .map(|(n, _)| n.as_str())
+                .unwrap_or("?");
+            eprintln!("  slot={} ({}) → addr={}", slot, name, addr);
+        }
+        eprintln!("--- property_slots ---");
+        let mut ps: Vec<(&String, &u32)> = self.compiled.property_slots.iter().collect();
+        ps.sort_by_key(|(_, &s)| s);
+        for (name, slot) in ps {
+            eprintln!("  {} → slot {}", name, slot);
+        }
+    }
+
+    /// Return a map of slot index → property name for all compiled properties.
+    pub fn get_slot_map(&self) -> Vec<(u32, String)> {
+        let mut result: Vec<(u32, String)> = self.compiled.property_slots
+            .iter()
+            .map(|(name, &slot)| (slot, name.clone()))
+            .collect();
+        result.sort_by_key(|(slot, _)| *slot);
+        result
+    }
+
+    /// Return the current value of a given slot index after the last tick.
+    pub fn get_slot_by_index(&self, slot: u32) -> Option<i32> {
+        self.slots.get(slot as usize).copied()
+    }
+
+    /// Return the compiled ops for a single named property, plus any dispatch tables they reference.
+    /// Returns None if the property has no compiled slot.
+    pub fn get_ops_for_property(&self, name: &str) -> Option<Vec<String>> {
+        let slot = *self.compiled.property_slots.get(name)?;
+        // Find the range of ops that write to this slot
+        let mut lines = Vec::new();
+        lines.push(format!("property {} → slot {}", name, slot));
+
+        // Dump all main ops (can be large — caller should filter or limit)
+        lines.push(format!("main_ops: {} total", self.compiled.ops.len()));
+        for (i, op) in self.compiled.ops.iter().enumerate() {
+            lines.push(format!("  [{:4}] {:?}", i, op));
+        }
+
+        lines.push(format!("dispatch_tables: {}", self.compiled.dispatch_tables.len()));
+        for (tid, dt) in self.compiled.dispatch_tables.iter().enumerate() {
+            lines.push(format!("  table[{}]: {} entries, fallback_slot={}", tid, dt.entries.len(), dt.fallback_slot));
+            let mut keys: Vec<i64> = dt.entries.keys().copied().collect();
+            keys.sort();
+            for k in &keys {
+                let (entry_ops, result) = &dt.entries[k];
+                lines.push(format!("    [{}] key={} → slot={} ({} ops)", tid, k, result, entry_ops.len()));
+                for (j, op) in entry_ops.iter().enumerate() {
+                    lines.push(format!("      [{:3}] {:?}", j, op));
+                }
+            }
+            lines.push(format!("    [{}] fallback ({} ops):", tid, dt.fallback_ops.len()));
+            for (j, op) in dt.fallback_ops.iter().enumerate() {
+                lines.push(format!("      [{:3}] {:?}", j, op));
+            }
+        }
+        Some(lines)
+    }
+
+    /// Dump compiled ops in a given range as debug strings.
+    pub fn dump_ops_range(&self, start: usize, end: usize) -> Vec<String> {
+        let mut lines = Vec::new();
+        let end = end.min(self.compiled.ops.len());
+        for i in start..end {
+            lines.push(format!("[{:5}] {:?}", i, self.compiled.ops[i]));
+        }
+        lines
+    }
+
+    /// Snapshot all named property values from the most recent interpreted tick.
+    /// Returns values from `self.properties` (the interpreted path's HashMap).
+    pub fn get_all_interpreted_values(&self) -> HashMap<String, i32> {
+        self.properties
+            .iter()
+            .map(|(name, v)| (name.clone(), v.as_number() as i32))
+            .collect()
+    }
+
+    /// Trace the compiled execution of a specific property at the current state.
+    /// Returns (compiled_value, trace_entries) or None if property not found.
+    /// Does NOT modify the state (clones internally).
+    pub fn trace_property(&mut self, state: &State, property_name: &str) -> Option<(i32, Vec<compile::TraceEntry>)> {
+        let mut state_clone = state.clone();
+        compile::trace_property(&self.compiled, &mut state_clone, &mut self.slots, property_name)
+    }
+
     /// Run a batch of ticks, returning the net state diff across all ticks.
     ///
     /// Takes a snapshot before the batch and diffs at the end, so callers
@@ -439,15 +568,13 @@ impl Evaluator {
             self.tick(state);
         }
 
-        // Diff registers
+        // Diff state vars
         let mut changes = Vec::new();
-        let reg_names = [
-            "--AX", "--CX", "--DX", "--BX", "--SP", "--BP", "--SI", "--DI", "--IP", "--ES", "--CS",
-            "--SS", "--DS", "--flags",
-        ];
-        for (i, name) in reg_names.iter().enumerate() {
-            if state.registers[i] != snapshot.registers[i] {
-                changes.push((name.to_string(), state.registers[i].to_string()));
+        for (i, name) in state.state_var_names.iter().enumerate() {
+            if i < state.state_vars.len() && i < snapshot.state_vars.len()
+                && state.state_vars[i] != snapshot.state_vars[i]
+            {
+                changes.push((format!("--{}", name), state.state_vars[i].to_string()));
             }
         }
 
@@ -471,10 +598,9 @@ impl Evaluator {
             if name.starts_with("--__0") || name.starts_with("--__1") || name.starts_with("--__2") {
                 continue;
             }
-            // Skip byte-half properties
-            if is_byte_half(name) {
-                continue;
-            }
+            // Byte-half properties (AL, AH, etc.) are computed CSS expressions
+            // with no @property declaration — they won't be in the address map,
+            // so property_to_address returns None and they're skipped below.
             match value {
                 Value::Number(n) => {
                     let int_val = *n as i32;
@@ -747,12 +873,10 @@ fn collect_style_test_deps(
 ///
 /// Detection: byte-half addresses have values < -14 (below the full register
 /// range). This is derived from the CSS structure, not hardcoded names.
-fn is_byte_half(name: &str) -> bool {
-    if let Some(addr) = property_to_address(name) {
-        return addr < -14;
-    }
-    false
-}
+// is_byte_half removed — byte-halves (AL, AH, etc.) are computed CSS expressions
+// with no @property declaration. They never appear in the address map, so
+// property_to_address() returns None for them and they're automatically
+// excluded from writeback.
 
 /// Check if a property is a triple-buffer copy (`--__0*`, `--__1*`, `--__2*`).
 ///
@@ -785,16 +909,15 @@ fn to_bare_name(name: &str) -> &str {
 
 /// Map a CSS custom property name to a state address.
 ///
-/// Uses a CSS-derived address map (from identity-read dispatch tables) when
-/// available. Falls back to:
-/// 1. `--m{N}` memory address parsing (generic).
-/// 2. Register name heuristic (when no CSS-derived map is available).
+/// Uses the CSS-derived address map (populated from `@property` declarations
+/// during `State::load_properties`). Falls back to `--m{N}` memory address
+/// parsing. No hardcoded register names.
 ///
 /// Automatically strips triple-buffer prefixes (`--__0`, `--__1`, `--__2`).
 pub fn property_to_address(name: &str) -> Option<i32> {
     let canonical = to_bare_name(name);
 
-    // Check the CSS-derived address map first.
+    // Check the CSS-derived address map (state vars + any dispatch table entries).
     let found = ADDRESS_MAP.with(|map| map.borrow().get(canonical).copied());
     if found.is_some() {
         return found;
@@ -807,50 +930,11 @@ pub fn property_to_address(name: &str) -> Option<i32> {
 
     // keyboard / __1keyboard / __2keyboard → linear address 0x500.
     // The CSS-DOS BIOS polls address 0x500 (word) for keystrokes.
-    // The host layer (CLI, web worker, etc.) is responsible for writing
-    // the key value there before each tick — calcite just reads memory.
     if canonical == "keyboard" || canonical == "__1keyboard" || canonical == "__2keyboard" {
         return Some(0x500);
     }
 
-    // Register name fallback: standard register names (AX, IP, flags, etc.)
-    // Always consulted — the CSS-derived map may contain only memory cells
-    // (e.g., v2 i8086-css where --readMem maps m0..mN but not registers).
-    register_name_heuristic(canonical)
-}
-
-/// Map standard register names to their state addresses.
-///
-/// Always consulted as a fallback after the CSS-derived address map.
-/// The address map may only contain memory cells (e.g., from --readMem
-/// identity-read dispatch) without register entries.
-fn register_name_heuristic(name: &str) -> Option<i32> {
-    use crate::state::addr;
-    match name {
-        "AX" => Some(addr::AX),
-        "CX" => Some(addr::CX),
-        "DX" => Some(addr::DX),
-        "BX" => Some(addr::BX),
-        "SP" => Some(addr::SP),
-        "BP" => Some(addr::BP),
-        "SI" => Some(addr::SI),
-        "DI" => Some(addr::DI),
-        "IP" => Some(addr::IP),
-        "ES" => Some(addr::ES),
-        "CS" => Some(addr::CS),
-        "SS" => Some(addr::SS),
-        "DS" => Some(addr::DS),
-        "flags" => Some(addr::FLAGS),
-        "AH" => Some(addr::AH),
-        "CH" => Some(addr::CH),
-        "DH" => Some(addr::DH),
-        "BH" => Some(addr::BH),
-        "AL" => Some(addr::AL),
-        "CL" => Some(addr::CL),
-        "DL" => Some(addr::DL),
-        "BL" => Some(addr::BL),
-        _ => None,
-    }
+    None
 }
 
 // Thread-local address map, populated from CSS analysis.
@@ -863,11 +947,24 @@ thread_local! {
 
 /// Install an address map derived from CSS structure for the current thread.
 ///
-/// Called during `Evaluator::from_parsed()` so that all subsequent
-/// `property_to_address()` calls use the CSS-derived mapping.
+/// Called during `State::load_properties()` for state variables and during
+/// `Evaluator::from_parsed()` for dispatch-table-derived memory mappings.
 pub fn set_address_map(map: HashMap<String, i32>) {
     ADDRESS_MAP.with(|m| {
         *m.borrow_mut() = map;
+    });
+}
+
+/// Merge additional entries into the existing address map.
+///
+/// Existing entries are NOT overwritten — state var addresses (installed by
+/// `load_properties`) take priority over dispatch-table-derived addresses.
+pub fn merge_address_map(map: HashMap<String, i32>) {
+    ADDRESS_MAP.with(|m| {
+        let mut existing = m.borrow_mut();
+        for (k, v) in map {
+            existing.entry(k).or_insert(v);
+        }
     });
 }
 
@@ -1293,20 +1390,28 @@ impl Evaluator {
 
     /// Resolve a property value: check computed properties, then state.
     ///
-    /// For buffer-prefixed names (`--__1AX`), also checks the canonical name (`--AX`)
-    /// in computed properties before falling back to state.
+    /// For `--__1`-prefixed names (previous-tick reads), we skip self.properties
+    /// entirely — they must come from committed state, never from this tick's
+    /// computed values. Reading `--__1uOp` must return the previous tick's uOp,
+    /// not the newly computed `--uOp` for this tick.
     fn resolve_property(&self, name: &str, state: &State) -> Value {
+        // --__1X names: always read from committed state, never from computed properties.
+        if name.starts_with("--__1") {
+            let suffix = &name[5..];
+            // Check string properties on state (for buffer-prefixed string vars)
+            if let Some(s) = state.string_properties.get(suffix) {
+                return Value::Str(s.clone());
+            }
+            if let Some(addr) = property_to_address(name) {
+                return Value::Number(state.read_mem(addr) as f64);
+            }
+            return Value::Number(0.0);
+        }
         if let Some(v) = self.properties.get(name) {
             return v.clone();
         }
         if name.starts_with("--__") && name.len() > 5 {
             let suffix = &name[5..];
-            if !self.properties.is_empty() {
-                let canonical = format!("--{suffix}");
-                if let Some(v) = self.properties.get(&canonical) {
-                    return v.clone();
-                }
-            }
             // Check string properties on state (for buffer-prefixed string vars)
             if let Some(s) = state.string_properties.get(suffix) {
                 return Value::Str(s.clone());
@@ -1556,49 +1661,36 @@ impl Evaluator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state;
 
-    /// Install a test address map with standard register mappings.
-    ///
-    /// Tests that reference `--AX`, `--CX`, etc. must call this to set up the
-    /// CSS-derived address mapping that the evaluator and compiler depend on.
-    fn install_test_address_map() {
-        use crate::state::addr;
+    const STATE_VAR_NAMES: &[&str] = &[
+        "AX", "CX", "DX", "BX", "SP", "BP", "SI", "DI",
+        "IP", "ES", "CS", "SS", "DS", "flags",
+    ];
+
+    /// Install a test address map and return a State with matching state vars.
+    fn install_test_address_map() -> State {
         let mut map = HashMap::new();
-        map.insert("AX".to_string(), addr::AX);
-        map.insert("CX".to_string(), addr::CX);
-        map.insert("DX".to_string(), addr::DX);
-        map.insert("BX".to_string(), addr::BX);
-        map.insert("SP".to_string(), addr::SP);
-        map.insert("BP".to_string(), addr::BP);
-        map.insert("SI".to_string(), addr::SI);
-        map.insert("DI".to_string(), addr::DI);
-        map.insert("IP".to_string(), addr::IP);
-        map.insert("ES".to_string(), addr::ES);
-        map.insert("CS".to_string(), addr::CS);
-        map.insert("SS".to_string(), addr::SS);
-        map.insert("DS".to_string(), addr::DS);
-        map.insert("flags".to_string(), addr::FLAGS);
-        map.insert("AH".to_string(), addr::AH);
-        map.insert("CH".to_string(), addr::CH);
-        map.insert("DH".to_string(), addr::DH);
-        map.insert("BH".to_string(), addr::BH);
-        map.insert("AL".to_string(), addr::AL);
-        map.insert("CL".to_string(), addr::CL);
-        map.insert("DL".to_string(), addr::DL);
-        map.insert("BL".to_string(), addr::BL);
+        let mut state = State::default();
+        for (i, &name) in STATE_VAR_NAMES.iter().enumerate() {
+            map.insert(name.to_string(), -(i as i32 + 1));
+            state.state_vars.push(0);
+            state.state_var_names.push(name.to_string());
+            state.state_var_index.insert(name.to_string(), i);
+        }
         set_address_map(map);
+        state
     }
 
     /// Helper: create a minimal Evaluator for unit tests (no assignments/patterns).
+    /// Also returns a State with matching state vars.
     fn test_evaluator(
         functions: HashMap<String, FunctionDef>,
         dispatch_tables: HashMap<String, DispatchTable>,
-    ) -> Evaluator {
-        install_test_address_map();
+    ) -> (Evaluator, State) {
+        let state = install_test_address_map();
         let compiled = crate::compile::compile(&[], &[], &functions, &dispatch_tables);
         let function_patterns = detect_function_patterns(&functions, &dispatch_tables);
-        Evaluator {
+        let evaluator = Evaluator {
             functions,
             assignments: vec![],
             dispatch_tables,
@@ -1611,13 +1703,13 @@ mod tests {
             string_property_names: HashSet::new(),
             compiled,
             slots: Vec::new(),
-        }
+        };
+        (evaluator, state)
     }
 
     #[test]
     fn eval_literal() {
-        let mut eval = test_evaluator(HashMap::new(), HashMap::new());
-        let state = State::default();
+        let (mut eval, state) = test_evaluator(HashMap::new(), HashMap::new());
         assert_eq!(
             eval.eval_expr(&Expr::Literal(42.0), &state).as_number(),
             42.0
@@ -1626,8 +1718,7 @@ mod tests {
 
     #[test]
     fn eval_calc_operations() {
-        let mut eval = test_evaluator(HashMap::new(), HashMap::new());
-        let state = State::default();
+        let (mut eval, state) = test_evaluator(HashMap::new(), HashMap::new());
 
         let expr = Expr::Calc(CalcOp::Add(
             Box::new(Expr::Literal(10.0)),
@@ -1650,9 +1741,8 @@ mod tests {
 
     #[test]
     fn eval_var_from_state() {
-        let mut eval = test_evaluator(HashMap::new(), HashMap::new());
-        let mut state = State::default();
-        state.registers[state::reg::AX] = 0x1234;
+        let (mut eval, mut state) = test_evaluator(HashMap::new(), HashMap::new());
+        state.set_var("AX", 0x1234);
 
         let expr = Expr::Var {
             name: "--AX".to_string(),
@@ -1663,8 +1753,7 @@ mod tests {
 
     #[test]
     fn eval_var_fallback() {
-        let mut eval = test_evaluator(HashMap::new(), HashMap::new());
-        let state = State::default();
+        let (mut eval, state) = test_evaluator(HashMap::new(), HashMap::new());
 
         let expr = Expr::Var {
             name: "--nonexistent".to_string(),
@@ -1675,9 +1764,8 @@ mod tests {
 
     #[test]
     fn eval_style_condition() {
-        let mut eval = test_evaluator(HashMap::new(), HashMap::new());
-        let mut state = State::default();
-        state.registers[state::reg::AX] = 2;
+        let (mut eval, mut state) = test_evaluator(HashMap::new(), HashMap::new());
+        state.set_var("AX", 2);
 
         let expr = Expr::StyleCondition {
             branches: vec![
@@ -1704,8 +1792,7 @@ mod tests {
 
     #[test]
     fn eval_round() {
-        let mut eval = test_evaluator(HashMap::new(), HashMap::new());
-        let state = State::default();
+        let (mut eval, state) = test_evaluator(HashMap::new(), HashMap::new());
 
         let expr = Expr::Calc(CalcOp::Round(
             RoundStrategy::Down,
@@ -1737,8 +1824,7 @@ mod tests {
             },
         );
 
-        let mut eval = test_evaluator(functions, HashMap::new());
-        let state = State::default();
+        let (mut eval, state) = test_evaluator(functions, HashMap::new());
 
         let expr = Expr::FunctionCall {
             name: "--double".to_string(),
@@ -1779,8 +1865,7 @@ mod tests {
             },
         );
 
-        let mut eval = test_evaluator(functions, dispatch);
-        let state = State::default();
+        let (mut eval, state) = test_evaluator(functions, dispatch);
 
         let expr = Expr::FunctionCall {
             name: "--lookup".to_string(),
@@ -1797,9 +1882,16 @@ mod tests {
 
     #[test]
     fn tick_applies_assignments() {
-        install_test_address_map();
+        use crate::types::PropertyDef;
         let program = ParsedProgram {
-            properties: vec![],
+            properties: vec![
+                PropertyDef {
+                    name: "--AX".to_string(),
+                    syntax: crate::types::PropertySyntax::Integer,
+                    inherits: true,
+                    initial_value: Some(crate::types::CssValue::Integer(0)),
+                },
+            ],
             functions: vec![],
             assignments: vec![
                 Assignment {
@@ -1813,12 +1905,13 @@ mod tests {
             ],
         };
 
-        let mut evaluator = Evaluator::from_parsed(&program);
         let mut state = State::default();
+        state.load_properties(&program.properties);
+        let mut evaluator = Evaluator::from_parsed(&program);
 
         let result = evaluator.tick(&mut state);
 
-        assert_eq!(state.registers[state::reg::AX], 42);
+        assert_eq!(state.get_var("AX").unwrap(), 42);
         assert_eq!(state.memory[0], 255);
         assert_eq!(result.ticks_executed, 1);
         assert!(!result.changes.is_empty());
@@ -1840,8 +1933,7 @@ mod tests {
 
     #[test]
     fn eval_division_by_zero() {
-        let mut eval = test_evaluator(HashMap::new(), HashMap::new());
-        let state = State::default();
+        let (mut eval, state) = test_evaluator(HashMap::new(), HashMap::new());
 
         let expr = Expr::Calc(CalcOp::Div(
             Box::new(Expr::Literal(100.0)),
@@ -1852,8 +1944,7 @@ mod tests {
 
     #[test]
     fn eval_mod_by_zero() {
-        let mut eval = test_evaluator(HashMap::new(), HashMap::new());
-        let state = State::default();
+        let (mut eval, state) = test_evaluator(HashMap::new(), HashMap::new());
 
         let expr = Expr::Calc(CalcOp::Mod(
             Box::new(Expr::Literal(17.0)),
@@ -1864,8 +1955,7 @@ mod tests {
 
     #[test]
     fn eval_negate() {
-        let mut eval = test_evaluator(HashMap::new(), HashMap::new());
-        let state = State::default();
+        let (mut eval, state) = test_evaluator(HashMap::new(), HashMap::new());
 
         let expr = Expr::Calc(CalcOp::Negate(Box::new(Expr::Literal(42.0))));
         assert_eq!(eval.eval_expr(&expr, &state).as_number(), -42.0);
@@ -1876,8 +1966,7 @@ mod tests {
 
     #[test]
     fn eval_sign_and_abs() {
-        let mut eval = test_evaluator(HashMap::new(), HashMap::new());
-        let state = State::default();
+        let (mut eval, state) = test_evaluator(HashMap::new(), HashMap::new());
 
         assert_eq!(
             eval.eval_expr(
@@ -1915,8 +2004,7 @@ mod tests {
 
     #[test]
     fn eval_clamp() {
-        let mut eval = test_evaluator(HashMap::new(), HashMap::new());
-        let state = State::default();
+        let (mut eval, state) = test_evaluator(HashMap::new(), HashMap::new());
 
         // Value within range
         let expr = Expr::Calc(CalcOp::Clamp(
@@ -1960,8 +2048,7 @@ mod tests {
             },
         );
 
-        let mut eval = test_evaluator(functions, HashMap::new());
-        let state = State::default();
+        let (mut eval, state) = test_evaluator(functions, HashMap::new());
 
         // Should not panic — returns 0 when depth exceeded
         let expr = Expr::FunctionCall {

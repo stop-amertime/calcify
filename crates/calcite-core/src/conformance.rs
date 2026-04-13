@@ -8,8 +8,9 @@
 //! 3. Divergence: Binary-search to find the first divergent tick and property.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
-use crate::state::{reg, State};
+use crate::state::State;
 
 /// A snapshot of the machine state at a specific tick.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -21,23 +22,11 @@ pub struct StateSnapshot {
     pub memory: Vec<MemoryEntry>,
 }
 
-/// Register values at a point in time.
+/// Register values at a point in time (dynamically extracted from State).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RegisterSnapshot {
-    pub ax: i32,
-    pub cx: i32,
-    pub dx: i32,
-    pub bx: i32,
-    pub sp: i32,
-    pub bp: i32,
-    pub si: i32,
-    pub di: i32,
-    pub ip: i32,
-    pub es: i32,
-    pub cs: i32,
-    pub ss: i32,
-    pub ds: i32,
-    pub flags: i32,
+    #[serde(flatten)]
+    pub values: BTreeMap<String, i32>,
 }
 
 /// A single memory address and its value.
@@ -57,7 +46,7 @@ pub struct SnapshotDiff {
 
 #[derive(Debug, Clone)]
 pub struct RegisterDiff {
-    pub name: &'static str,
+    pub name: String,
     pub expected: i32,
     pub actual: i32,
 }
@@ -117,74 +106,35 @@ impl StateSnapshot {
 }
 
 impl RegisterSnapshot {
+    /// Create a snapshot from the current State's state variables.
     pub fn from_state(state: &State) -> Self {
-        Self {
-            ax: state.registers[reg::AX],
-            cx: state.registers[reg::CX],
-            dx: state.registers[reg::DX],
-            bx: state.registers[reg::BX],
-            sp: state.registers[reg::SP],
-            bp: state.registers[reg::BP],
-            si: state.registers[reg::SI],
-            di: state.registers[reg::DI],
-            ip: state.registers[reg::IP],
-            es: state.registers[reg::ES],
-            cs: state.registers[reg::CS],
-            ss: state.registers[reg::SS],
-            ds: state.registers[reg::DS],
-            flags: state.registers[reg::FLAGS],
+        let mut values = BTreeMap::new();
+        for (i, name) in state.state_var_names.iter().enumerate() {
+            values.insert(name.clone(), state.state_vars[i]);
+        }
+        Self { values }
+    }
+
+    /// Apply this snapshot to a State, restoring all captured variables.
+    pub fn apply_to(&self, state: &mut State) {
+        for (name, &value) in &self.values {
+            state.set_var(name, value);
         }
     }
 
-    /// Apply this snapshot to a State.
-    pub fn apply_to(&self, state: &mut State) {
-        state.registers[reg::AX] = self.ax;
-        state.registers[reg::CX] = self.cx;
-        state.registers[reg::DX] = self.dx;
-        state.registers[reg::BX] = self.bx;
-        state.registers[reg::SP] = self.sp;
-        state.registers[reg::BP] = self.bp;
-        state.registers[reg::SI] = self.si;
-        state.registers[reg::DI] = self.di;
-        state.registers[reg::IP] = self.ip;
-        state.registers[reg::ES] = self.es;
-        state.registers[reg::CS] = self.cs;
-        state.registers[reg::SS] = self.ss;
-        state.registers[reg::DS] = self.ds;
-        state.registers[reg::FLAGS] = self.flags;
-    }
-
+    /// Compare two snapshots and return a list of differences.
     fn diff(&self, other: &RegisterSnapshot) -> Vec<RegisterDiff> {
         let mut diffs = Vec::new();
-        let checks: &[(&str, i32, i32)] = &[
-            ("AX", self.ax, other.ax),
-            ("CX", self.cx, other.cx),
-            ("DX", self.dx, other.dx),
-            ("BX", self.bx, other.bx),
-            ("SP", self.sp, other.sp),
-            ("BP", self.bp, other.bp),
-            ("SI", self.si, other.si),
-            ("DI", self.di, other.di),
-            ("IP", self.ip, other.ip),
-            ("ES", self.es, other.es),
-            ("CS", self.cs, other.cs),
-            ("SS", self.ss, other.ss),
-            ("DS", self.ds, other.ds),
-            ("FLAGS", self.flags, other.flags),
-        ];
-
-        for &(name, expected, actual) in checks {
+        for (name, &expected) in &self.values {
+            let actual = other.values.get(name).copied().unwrap_or(0);
             if expected != actual {
-                // name is &str, but we need &'static str for RegisterDiff
-                // Since these are all static strings from the match above, this is safe
                 diffs.push(RegisterDiff {
-                    name,
+                    name: name.clone(),
                     expected,
                     actual,
                 });
             }
         }
-
         diffs
     }
 }
@@ -271,11 +221,27 @@ impl std::fmt::Display for SnapshotDiff {
 mod tests {
     use super::*;
 
+    /// Helper to create a state with standard x86 state variables for testing.
+    fn test_state() -> State {
+        let mut state = State::new(1536);
+        // Manually add the standard x86 state variables that CSS would define.
+        // The state_var_index is private, so we use the public API if available.
+        // For testing, we populate state_vars and state_var_names directly
+        // (the index will be checked when set_var is called).
+
+        for name in ["AX", "CX", "DX", "BX", "SP", "BP", "SI", "DI", "IP", "ES", "CS", "SS", "DS", "flags"].iter() {
+            state.state_vars.push(0);
+            state.state_var_names.push(name.to_string());
+        }
+        state
+    }
+
     #[test]
     fn snapshot_roundtrip() {
-        let mut state = State::default();
-        state.registers[reg::AX] = 0x1234;
-        state.registers[reg::IP] = 0x100;
+        let mut state = test_state();
+        // Set values using direct mutation since state_var_index is private
+        state.state_vars[0] = 0x1234; // AX
+        state.state_vars[8] = 0x100;  // IP
         state.memory[0] = 0xFF;
         state.memory[1] = 0x42;
 
@@ -284,17 +250,17 @@ mod tests {
         let restored: StateSnapshot = serde_json::from_str(&json).unwrap();
 
         assert_eq!(snapshot, restored);
-        assert_eq!(restored.registers.ax, 0x1234);
+        assert_eq!(restored.registers.values.get("AX").copied(), Some(0x1234));
         assert_eq!(restored.memory.len(), 2);
     }
 
     #[test]
     fn snapshot_diff_detects_changes() {
-        let mut state1 = State::default();
-        state1.registers[reg::AX] = 100;
+        let mut state1 = test_state();
+        state1.state_vars[0] = 100; // AX
 
-        let mut state2 = State::default();
-        state2.registers[reg::AX] = 200;
+        let mut state2 = test_state();
+        state2.state_vars[0] = 200; // AX
 
         let snap1 = StateSnapshot::from_state(&state1, 0);
         let snap2 = StateSnapshot::from_state(&state2, 0);
@@ -308,7 +274,7 @@ mod tests {
 
     #[test]
     fn identical_snapshots_no_diff() {
-        let state = State::default();
+        let state = test_state();
         let snap1 = StateSnapshot::from_state(&state, 0);
         let snap2 = StateSnapshot::from_state(&state, 0);
 

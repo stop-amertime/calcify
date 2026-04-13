@@ -272,6 +272,9 @@ fn parse_if<'i, 't>(input: &mut Parser<'i, 't>) -> Result<Expr> {
         if input.try_parse(|i| i.expect_ident_matching("else")).is_ok() {
             input.expect_colon().map_err(basic_err)?;
             let fallback = parse_expr_list(input)?;
+            // Consume optional trailing semicolon (e.g. `else: 0;`) so that
+            // parse_nested_block doesn't fail on the leftover `;` token.
+            let _ = input.try_parse(|i| i.expect_semicolon());
             return Ok(Expr::StyleCondition {
                 branches,
                 fallback: Box::new(fallback),

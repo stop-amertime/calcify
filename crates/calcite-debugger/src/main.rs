@@ -1,8 +1,8 @@
-use calcite_core::state::{self, State};
+use calcite_core::State;
 use calcite_core::Evaluator;
 use clap::Parser;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use tiny_http::{Header, Method, Response, Server};
@@ -112,36 +112,7 @@ struct StateResponse {
 }
 
 #[derive(Serialize)]
-struct RegisterState {
-    #[serde(rename = "AX")]
-    ax: i32,
-    #[serde(rename = "CX")]
-    cx: i32,
-    #[serde(rename = "DX")]
-    dx: i32,
-    #[serde(rename = "BX")]
-    bx: i32,
-    #[serde(rename = "SP")]
-    sp: i32,
-    #[serde(rename = "BP")]
-    bp: i32,
-    #[serde(rename = "SI")]
-    si: i32,
-    #[serde(rename = "DI")]
-    di: i32,
-    #[serde(rename = "IP")]
-    ip: i32,
-    #[serde(rename = "ES")]
-    es: i32,
-    #[serde(rename = "CS")]
-    cs: i32,
-    #[serde(rename = "SS")]
-    ss: i32,
-    #[serde(rename = "DS")]
-    ds: i32,
-    #[serde(rename = "FLAGS")]
-    flags: i32,
-}
+struct RegisterState(BTreeMap<String, i32>);
 
 #[derive(Serialize)]
 struct MemoryResponse {
@@ -188,6 +159,7 @@ struct DiffEntry {
 struct ComparePathsResponse {
     tick: u32,
     register_diffs: Vec<DiffEntry>,
+    property_diffs: Vec<DiffEntry>,
     memory_diffs: Vec<DiffEntry>,
     total_diffs: usize,
 }
@@ -197,6 +169,22 @@ struct TickResponse {
     tick: u32,
     ticks_executed: u32,
     changes: Vec<(String, String)>,
+}
+
+#[derive(Deserialize)]
+struct TracePropertyRequest {
+    /// CSS property name to trace (e.g. "--memAddr")
+    property: String,
+}
+
+#[derive(Serialize)]
+struct TracePropertyResponse {
+    tick: u32,
+    property: String,
+    compiled_value: i32,
+    interpreted_value: Option<i32>,
+    trace_entries: usize,
+    trace: Vec<calcite_core::compile::TraceEntry>,
 }
 
 #[derive(Serialize)]
@@ -244,23 +232,13 @@ impl DebugSession {
     }
 
     fn registers(&self) -> RegisterState {
-        let r = &self.state.registers;
-        RegisterState {
-            ax: r[state::reg::AX],
-            cx: r[state::reg::CX],
-            dx: r[state::reg::DX],
-            bx: r[state::reg::BX],
-            sp: r[state::reg::SP],
-            bp: r[state::reg::BP],
-            si: r[state::reg::SI],
-            di: r[state::reg::DI],
-            ip: r[state::reg::IP],
-            es: r[state::reg::ES],
-            cs: r[state::reg::CS],
-            ss: r[state::reg::SS],
-            ds: r[state::reg::DS],
-            flags: r[state::reg::FLAGS],
+        let mut map = BTreeMap::new();
+        for (i, name) in self.state.state_var_names.iter().enumerate() {
+            if i < self.state.state_vars.len() {
+                map.insert(name.clone(), self.state.state_vars[i]);
+            }
         }
+        RegisterState(map)
     }
 
     fn get_properties(&self) -> HashMap<String, i64> {
@@ -367,28 +345,44 @@ impl DebugSession {
         // Save current state
         let saved_state = self.state.clone();
 
-        // Run one tick via compiled path (normal)
+        // Run one tick via compiled path, capture slot values before interpreted overwrites them
         let mut compiled_state = saved_state.clone();
         self.evaluator.tick(&mut compiled_state);
+        let compiled_slots = self.evaluator.get_all_slot_values();
 
-        // Run one tick via interpreted path
+        // Run one tick via interpreted path, capture interpreted property values
         let mut interpreted_state = saved_state.clone();
         self.evaluator.tick_interpreted(&mut interpreted_state);
+        let interpreted_props = self.evaluator.get_all_interpreted_values();
 
         // Restore original state (don't advance)
         self.state = saved_state;
 
         // Compare registers
-        let reg_names = [
-            "AX", "CX", "DX", "BX", "SP", "BP", "SI", "DI", "IP", "ES", "CS", "SS", "DS", "FLAGS",
-        ];
         let mut register_diffs = Vec::new();
+        let reg_names: Vec<String> = compiled_state.state_var_names.clone();
         for (i, name) in reg_names.iter().enumerate() {
-            let c = compiled_state.registers[i];
-            let interp = interpreted_state.registers[i];
+            let c = compiled_state.state_vars.get(i).copied().unwrap_or(0);
+            let interp = interpreted_state.state_vars.get(i).copied().unwrap_or(0);
             if c != interp {
                 register_diffs.push(DiffEntry {
-                    property: name.to_string(),
+                    property: name.clone(),
+                    compiled: c as i64,
+                    interpreted: interp as i64,
+                });
+            }
+        }
+
+        // Compare computed intermediate properties: compiled slots vs interpreted properties
+        let mut property_diffs = Vec::new();
+        let mut all_prop_names: std::collections::BTreeSet<String> = compiled_slots.keys().cloned().collect();
+        all_prop_names.extend(interpreted_props.keys().cloned());
+        for name in &all_prop_names {
+            let c = compiled_slots.get(name).copied().unwrap_or(0);
+            let interp = interpreted_props.get(name).copied().unwrap_or(0);
+            if c != interp {
+                property_diffs.push(DiffEntry {
+                    property: name.clone(),
                     compiled: c as i64,
                     interpreted: interp as i64,
                 });
@@ -410,12 +404,36 @@ impl DebugSession {
             }
         }
 
-        let total_diffs = register_diffs.len() + memory_diffs.len();
+        let total_diffs = register_diffs.len() + property_diffs.len() + memory_diffs.len();
         ComparePathsResponse {
             tick,
             register_diffs,
+            property_diffs,
             memory_diffs,
             total_diffs,
+        }
+    }
+
+    fn trace_property(&mut self, property: &str) -> TracePropertyResponse {
+        let tick = self.current_tick();
+
+        // Get interpreted value for comparison
+        let mut interp_state = self.state.clone();
+        self.evaluator.tick_interpreted(&mut interp_state);
+        let interp_props = self.evaluator.get_all_interpreted_values();
+        let interpreted_value = interp_props.get(property).copied();
+
+        // Run traced compiled execution
+        let (compiled_value, trace) = self.evaluator.trace_property(&self.state, property)
+            .unwrap_or((0, Vec::new()));
+
+        TracePropertyResponse {
+            tick,
+            property: property.to_string(),
+            compiled_value,
+            interpreted_value,
+            trace_entries: trace.len(),
+            trace,
         }
     }
 }
@@ -492,13 +510,13 @@ fn main() {
         parse_time.as_secs_f64(),
     );
 
+    let mut state = State::default();
+    state.load_properties(&parsed.properties);
+
     let t1 = std::time::Instant::now();
     let evaluator = Evaluator::from_parsed(&parsed);
     let compile_time = t1.elapsed();
     eprintln!("Compiled in {:.2}s", compile_time.as_secs_f64());
-
-    let mut state = State::default();
-    state.load_properties(&parsed.properties);
 
     let video_config = calcite_core::detect_video_memory();
     if let Some((addr, size)) = video_config {
@@ -533,8 +551,18 @@ fn main() {
         parsed_program: parsed,
     });
 
-    // Start HTTP server
+    // Kill any existing debugger on this port before binding
     let addr = format!("0.0.0.0:{}", cli.port);
+    if let Ok(mut stream) = std::net::TcpStream::connect(format!("127.0.0.1:{}", cli.port)) {
+        use std::io::Write;
+        let _ = stream.write_all(b"POST /shutdown HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n");
+        let _ = stream.flush();
+        drop(stream);
+        eprintln!("WARNING: Killed existing debugger on port {}. Use 'curl -X POST localhost:{}/shutdown' next time.", cli.port, cli.port);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+
+    // Start HTTP server
     let server = Server::http(&addr).unwrap_or_else(|e| {
         eprintln!("Failed to start server on {}: {e}", addr);
         std::process::exit(1);
@@ -550,8 +578,10 @@ fn main() {
     eprintln!("  POST /screen            — render screen: {{\"addr\": 0xB8000, \"width\": 80, \"height\": 25}}");
     eprintln!("  POST /compare           — compare vs reference: {{\"reference\": [...]}}");
     eprintln!("  POST /compare-state     — diff current state vs supplied registers/memory");
-    eprintln!("  POST /key               — set keyboard buffer: {{\"value\": (scancode<<8)|ascii}}");
+    eprintln!("  POST /key               — set keyboard buffer (BDA): {{\"value\": (scancode<<8)|ascii}}");
+    eprintln!("  POST /keyboard          — set --keyboard CSS property: {{\"value\": (scancode<<8)|ascii}}");
     eprintln!("  GET  /compare-paths     — diff compiled vs interpreted for current tick");
+    eprintln!("  POST /trace-property    — trace compiled ops for a property: {{\"property\": \"--memAddr\"}}");
     eprintln!("  POST /snapshot          — create snapshot at current tick");
     eprintln!("  GET  /snapshots         — list all snapshots");
 
@@ -579,7 +609,9 @@ fn main() {
                         "POST /compare {reference}",
                         "POST /compare-state {registers, memory}",
                         "POST /key {value}",
+                        "POST /keyboard {value}",
                         "GET /compare-paths",
+                        "POST /trace-property {property}",
                         "POST /snapshot",
                         "GET /snapshots",
                     ],
@@ -697,22 +729,6 @@ fn main() {
                         s.seek(0);
 
                         let mut divergences = Vec::new();
-                        let reg_keys = [
-                            ("AX", state::reg::AX),
-                            ("CX", state::reg::CX),
-                            ("DX", state::reg::DX),
-                            ("BX", state::reg::BX),
-                            ("SP", state::reg::SP),
-                            ("BP", state::reg::BP),
-                            ("SI", state::reg::SI),
-                            ("DI", state::reg::DI),
-                            ("IP", state::reg::IP),
-                            ("ES", state::reg::ES),
-                            ("CS", state::reg::CS),
-                            ("SS", state::reg::SS),
-                            ("DS", state::reg::DS),
-                            ("FLAGS", state::reg::FLAGS),
-                        ];
 
                         let ticks_to_compare = r.reference.len() as u32;
                         for ref_tick in &r.reference {
@@ -725,19 +741,17 @@ fn main() {
                                 s.tick(1);
                             }
 
-                            // Compare registers
-                            for (name, reg_idx) in &reg_keys {
-                                if let Some(expected) = ref_tick.registers.get(*name) {
-                                    if let Some(expected_val) = expected.as_i64() {
-                                        let actual = s.state.registers[*reg_idx] as i64;
-                                        if actual != expected_val {
-                                            divergences.push(DivergenceInfo {
-                                                tick: ref_tick.tick,
-                                                register: name.to_string(),
-                                                expected: expected_val,
-                                                actual,
-                                            });
-                                        }
+                            // Compare registers by name
+                            for (name, expected) in &ref_tick.registers {
+                                if let Some(expected_val) = expected.as_i64() {
+                                    let actual = s.state.get_var(name).unwrap_or(0) as i64;
+                                    if actual != expected_val {
+                                        divergences.push(DivergenceInfo {
+                                            tick: ref_tick.tick,
+                                            register: name.clone(),
+                                            expected: expected_val,
+                                            actual,
+                                        });
                                     }
                                 }
                             }
@@ -762,6 +776,32 @@ fn main() {
                 json_response(&resp)
             }
 
+            (Method::Post, "/dump-ops") => {
+                let body = read_body(&mut request);
+                #[derive(Deserialize)]
+                struct DumpOpsReq { start: usize, end: usize }
+                match serde_json::from_str::<DumpOpsReq>(&body) {
+                    Ok(r) => {
+                        let s = session.lock().unwrap();
+                        let lines = s.evaluator.dump_ops_range(r.start, r.end);
+                        json_response(&serde_json::json!({"ops": lines}))
+                    }
+                    Err(e) => error_response(400, &format!("Bad JSON: {e}")),
+                }
+            }
+
+            (Method::Post, "/trace-property") => {
+                let body = read_body(&mut request);
+                match serde_json::from_str::<TracePropertyRequest>(&body) {
+                    Ok(r) => {
+                        let mut s = session.lock().unwrap();
+                        let resp = s.trace_property(&r.property);
+                        json_response(&resp)
+                    }
+                    Err(e) => error_response(400, &format!("Bad JSON: {e}")),
+                }
+            }
+
             (Method::Post, "/key") => {
                 let body = read_body(&mut request);
                 match serde_json::from_str::<KeyRequest>(&body) {
@@ -769,6 +809,26 @@ fn main() {
                         let mut s = session.lock().unwrap();
                         s.state.bda_push_key(r.value);
                         json_response(&serde_json::json!({
+                            "keyboard": r.value,
+                            "tick": s.current_tick(),
+                        }))
+                    }
+                    Err(e) => error_response(400, &format!("Bad JSON: {e}")),
+                }
+            }
+
+            // Set the --keyboard CSS state variable.
+            // This is for the v3 microcode path where keyboard input goes through
+            // CSS edge detection → IRQ 1 → INT 09h microcode → BDA buffer.
+            // Use value=(scancode<<8)|ascii for key press, value=0 for release.
+            (Method::Post, "/keyboard") => {
+                let body = read_body(&mut request);
+                match serde_json::from_str::<KeyRequest>(&body) {
+                    Ok(r) => {
+                        let mut s = session.lock().unwrap();
+                        let set = s.state.set_var("keyboard", r.value);
+                        json_response(&serde_json::json!({
+                            "ok": set,
                             "keyboard": r.value,
                             "tick": s.current_tick(),
                         }))
@@ -786,32 +846,14 @@ fn main() {
                         let mut memory_diffs = Vec::new();
 
                         if let Some(regs) = r.registers {
-                            let reg_keys = [
-                                ("AX", state::reg::AX),
-                                ("CX", state::reg::CX),
-                                ("DX", state::reg::DX),
-                                ("BX", state::reg::BX),
-                                ("SP", state::reg::SP),
-                                ("BP", state::reg::BP),
-                                ("SI", state::reg::SI),
-                                ("DI", state::reg::DI),
-                                ("IP", state::reg::IP),
-                                ("ES", state::reg::ES),
-                                ("CS", state::reg::CS),
-                                ("SS", state::reg::SS),
-                                ("DS", state::reg::DS),
-                                ("FLAGS", state::reg::FLAGS),
-                            ];
-                            for (name, idx) in &reg_keys {
-                                if let Some(expected) = regs.get(*name) {
-                                    let actual = s.state.registers[*idx] as i64;
-                                    if actual != *expected {
-                                        register_diffs.push(DiffEntry {
-                                            property: name.to_string(),
-                                            compiled: actual,
-                                            interpreted: *expected,
-                                        });
-                                    }
+                            for (name, expected) in regs {
+                                let actual = s.state.get_var(&name).unwrap_or(0) as i64;
+                                if actual != expected {
+                                    register_diffs.push(DiffEntry {
+                                        property: name.clone(),
+                                        compiled: actual,
+                                        interpreted: expected,
+                                    });
                                 }
                             }
                         }
@@ -868,6 +910,27 @@ fn main() {
                     "snapshots": ticks,
                     "count": ticks.len(),
                 }))
+            }
+
+            (Method::Get, "/slot-map") => {
+                let s = session.lock().unwrap();
+                let map = s.evaluator.get_slot_map();
+                let entries: Vec<serde_json::Value> = map.iter()
+                    .map(|(slot, name)| serde_json::json!({"slot": slot, "name": name, "value": s.evaluator.get_slot_by_index(*slot)}))
+                    .collect();
+                json_response(&serde_json::json!({ "slots": entries }))
+            }
+
+            (Method::Post, "/ops") => {
+                // Dump compiled ops for a property: {"property": "--CS"}
+                let body = read_body(&mut request);
+                let req: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+                let prop = req["property"].as_str().unwrap_or("--CS").to_string();
+                let s = session.lock().unwrap();
+                match s.evaluator.get_ops_for_property(&prop) {
+                    Some(lines) => json_response(&serde_json::json!({ "property": prop, "ops": lines })),
+                    None => error_response(404, &format!("Property {} not found", prop)),
+                }
             }
 
             (Method::Post, "/shutdown") => {

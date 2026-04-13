@@ -42,19 +42,65 @@ const Intel8086 = new Function(evalSource + '\nreturn Intel8086;')();
 
 // --- Load binaries ---
 const cssDir = resolve(__dirname, '..', '..', 'CSS-DOS');
-const biosBin = readFileSync(resolve(cssDir, 'build', 'gossamer-dos.bin'));
 const kernelBin = readFileSync(resolve(cssDir, 'dos', 'bin', 'kernel.sys'));
 const diskBin = readFileSync(resolve(cssDir, 'dos', 'disk.img'));
 
-// --- Setup memory ---
+// --- Setup memory (microcode BIOS path — matches generate-dos.mjs) ---
 const memory = new Uint8Array(1024 * 1024);
 
 // Load kernel at 0060:0000 (linear 0x600)
 for (let i = 0; i < kernelBin.length; i++) memory[0x600 + i] = kernelBin[i];
 // Load disk image at D000:0000 (linear 0xD0000)
 for (let i = 0; i < diskBin.length && 0xD0000 + i < memory.length; i++) memory[0xD0000 + i] = diskBin[i];
-// Load BIOS at F000:0000 (linear 0xF0000)
-for (let i = 0; i < biosBin.length; i++) memory[0xF0000 + i] = biosBin[i];
+
+// Build BIOS ROM and IVT (matching generate-dos.mjs exactly)
+const { buildBiosRom } = await import(pathToFileURL(resolve(cssDir, 'transpiler', 'src', 'patterns', 'bios.mjs')).href);
+const { handlers: biosRomHandlers, romBytes: biosRomBytes } = buildBiosRom();
+const BIOS_SEG = 0xF000;
+const biosBytes = [0xCF, ...biosRomBytes];
+const romStubBase = 1;
+for (const intNum of Object.keys(biosRomHandlers)) {
+  biosRomHandlers[intNum] += romStubBase;
+}
+for (let i = 0; i < biosBytes.length; i++) memory[0xF0000 + i] = biosBytes[i];
+
+// IVT: all 256 entries default to dummy IRET at F000:0000
+for (let i = 0; i < 256; i++) {
+  memory[i * 4 + 0] = 0x00; memory[i * 4 + 1] = 0x00;
+  memory[i * 4 + 2] = BIOS_SEG & 0xFF; memory[i * 4 + 3] = (BIOS_SEG >> 8) & 0xFF;
+}
+for (const [intNum, stubOffset] of Object.entries(biosRomHandlers)) {
+  const idx = parseInt(intNum);
+  memory[idx * 4 + 0] = stubOffset & 0xFF; memory[idx * 4 + 1] = (stubOffset >> 8) & 0xFF;
+  memory[idx * 4 + 2] = BIOS_SEG & 0xFF; memory[idx * 4 + 3] = (BIOS_SEG >> 8) & 0xFF;
+}
+
+// BDA (matching generate-dos.mjs)
+const BDA = 0x0400;
+memory[BDA + 0x10] = 0x21; memory[BDA + 0x11] = 0x00;
+memory[BDA + 0x13] = 640 & 0xFF; memory[BDA + 0x14] = (640 >> 8) & 0xFF;
+memory[BDA + 0x1A] = 0x1E; memory[BDA + 0x1B] = 0x00;
+memory[BDA + 0x1C] = 0x1E; memory[BDA + 0x1D] = 0x00;
+memory[BDA + 0x80] = 0x1E; memory[BDA + 0x81] = 0x00;
+memory[BDA + 0x82] = 0x3E; memory[BDA + 0x83] = 0x00;
+memory[BDA + 0x49] = 0x03;
+memory[BDA + 0x4A] = 80; memory[BDA + 0x4B] = 0;
+memory[BDA + 0x4C] = 0x00; memory[BDA + 0x4D] = 0x10;
+memory[BDA + 0x60] = 0x07; memory[BDA + 0x61] = 0x06;
+memory[BDA + 0x63] = 0xD4; memory[BDA + 0x64] = 0x03;
+memory[BDA + 0x84] = 24;
+memory[BDA + 0x85] = 16;
+
+// --- Peripherals and BIOS handlers ---
+import { pathToFileURL } from 'url';
+const { PIC, PIT, KeyboardController } = await import(pathToFileURL(resolve(cssDir, 'tools', 'peripherals.mjs')).href);
+const { createBiosHandlers } = await import(pathToFileURL(resolve(cssDir, 'tools', 'lib', 'bios-handlers.mjs')).href);
+
+const pic = new PIC();
+const pit = new PIT(pic);
+const kbd = new KeyboardController(pic);
+
+let int_handler = null;
 
 // --- CPU ---
 let vgaWriteCount = 0;
@@ -65,7 +111,6 @@ const cpu = Intel8086(
   (addr, val) => {
     const a = addr & 0xFFFFF;
     memory[a] = val & 0xFF;
-    // Track VGA buffer writes (B8000-B8FFF) - character bytes only (even addresses)
     if (a >= 0xB8000 && a < 0xB9000 && vgaWriteTickStart >= 0 && currentTick >= vgaWriteTickStart && (vgaWriteTickEnd < 0 || currentTick <= vgaWriteTickEnd)) {
       const offset = a - 0xB8000;
       const row = Math.floor(offset / 160);
@@ -80,28 +125,24 @@ const cpu = Intel8086(
     }
   },
   (addr) => memory[addr & 0xFFFFF],
+  pic,
+  pit,
+  (type) => int_handler ? int_handler(type) : false,
 );
 
 cpu.reset();
-// Read bios_init offset from listing file
-let biosInitOffset = 0x038A;
-try {
-  const lst = readFileSync(resolve(cssDir, 'build', 'gossamer-dos.lst'), 'utf-8');
-  for (const line of lst.split('\n')) {
-    if (line.includes('bios_init:')) {
-      const idx = lst.split('\n').indexOf(line);
-      const m = lst.split('\n')[idx + 1]?.match(/([0-9A-Fa-f]{8})/);
-      if (m) biosInitOffset = parseInt(m[1], 16);
-      break;
-    }
-  }
-} catch {}
-
 cpu.setRegs({
-  cs: 0xF000, ip: biosInitOffset,
-  ss: 0, sp: 0xFFF8, ds: 0, es: 0,
+  cs: 0x0060, ip: 0x0000,
+  ss: 0x0030, sp: 0x0100,
+  ds: 0, es: 0,
   ah: 0, al: 0, bh: 0, bl: 0, ch: 0, cl: 0, dh: 0, dl: 0,
 });
+
+int_handler = createBiosHandlers(
+  memory, pic, kbd,
+  () => cpu.getRegs(),
+  (regs) => cpu.setRegs(regs),
+);
 
 function hex(v, w = 4) { return v.toString(16).toUpperCase().padStart(w, '0'); }
 
@@ -146,8 +187,8 @@ function dumpVGA() {
 let ttyOutput = '';
 
 // --- Run ---
-console.error(`Running JS reference emulator in DOS mode, up to ${maxTicks} ticks...`);
-console.error(`BIOS init at F000:${hex(biosInitOffset)}, kernel at 0060:0000`);
+console.error(`Running JS reference emulator in DOS mode (microcode BIOS), up to ${maxTicks} ticks...`);
+console.error(`Kernel entry at 0060:0000`);
 
 let prevIP = -1;
 let prevCS = -1;

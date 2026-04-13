@@ -56,12 +56,14 @@ impl CalciteEngine {
             parsed.assignments.len(),
         );
 
-        log::info!("Creating evaluator...");
-        let evaluator = calcite_core::Evaluator::from_parsed(&parsed);
-        log::info!("Evaluator created, loading properties...");
+        log::info!("Loading properties...");
         let mut state = calcite_core::State::default();
         state.load_properties(&parsed.properties);
         log::info!("Properties loaded, memory size: {} bytes", state.memory.len());
+
+        log::info!("Creating evaluator...");
+        let evaluator = calcite_core::Evaluator::from_parsed(&parsed);
+        log::info!("Evaluator created");
 
         Ok(CalciteEngine { state, evaluator })
     }
@@ -90,8 +92,8 @@ impl CalciteEngine {
 
     /// Get the current value of a register (for debugging).
     pub fn get_register(&self, index: usize) -> i32 {
-        if index < self.state.registers.len() {
-            self.state.registers[index]
+        if index < self.state.state_vars.len() {
+            self.state.state_vars[index]
         } else {
             0
         }

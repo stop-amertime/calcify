@@ -60,6 +60,17 @@ struct Cli {
     /// Useful for capturing the last frame of a graphics program.
     #[arg(long, value_name = "PATH")]
     framebuffer_out: Option<String>,
+
+    /// Inject keyboard events at specific ticks.
+    ///
+    /// Format: TICK:VALUE,TICK:VALUE,...
+    /// VALUE is (scancode<<8)|ascii in decimal or 0x hex.
+    /// Use VALUE=0 for key release.
+    ///
+    /// Example: --key-events=50:0x1E61,100:0
+    /// Injects key 'a' (scan=0x1E, ascii=0x61) at tick 50, release at tick 100.
+    #[arg(long, value_name = "EVENTS")]
+    key_events: Option<String>,
 }
 
 
@@ -206,12 +217,14 @@ fn main() {
                 return;
             }
 
+            // load_properties MUST be called before from_parsed so that state
+            // variable addresses are in the address map before compilation.
+            let mut state = calcite_core::State::default();
+            state.load_properties(&parsed.properties);
+
             let t1 = std::time::Instant::now();
             let mut evaluator = calcite_core::Evaluator::from_parsed(&parsed);
             let compile_time = t1.elapsed();
-
-            let mut state = calcite_core::State::default();
-            state.load_properties(&parsed.properties);
 
             let interactive = cli.ticks > 1;
             eprintln!(
@@ -228,10 +241,38 @@ fn main() {
             let halt_addr: Option<i32> = cli.halt.as_ref().map(|s| {
                 if s.starts_with("0x") || s.starts_with("0X") {
                     i32::from_str_radix(&s[2..], 16).expect("Invalid halt address")
-                } else {
+                } else if s.starts_with('-') || s.chars().next().map_or(false, |c| c.is_ascii_digit()) {
                     s.parse().expect("Invalid halt address")
+                } else {
+                    // Treat as a state variable name — look up its slot address
+                    if let Some(slot) = state.var_slot(s) {
+                        -(slot as i32) - 1
+                    } else {
+                        panic!("Unknown state variable for --halt: {}", s);
+                    }
                 }
             });
+
+            // Parse --key-events=TICK:VALUE,TICK:VALUE,...
+            let key_events: Vec<(u32, i32)> = cli.key_events.as_ref().map(|s| {
+                s.split(',')
+                    .filter(|part| !part.is_empty())
+                    .map(|part| {
+                        let (tick_str, val_str) = part.split_once(':')
+                            .unwrap_or_else(|| panic!("Invalid key-event format: {}", part));
+                        let tick: u32 = tick_str.parse()
+                            .unwrap_or_else(|_| panic!("Invalid tick in key-event: {}", tick_str));
+                        let val: i32 = if val_str.starts_with("0x") || val_str.starts_with("0X") {
+                            i32::from_str_radix(&val_str[2..], 16)
+                                .unwrap_or_else(|_| panic!("Invalid hex value in key-event: {}", val_str))
+                        } else {
+                            val_str.parse()
+                                .unwrap_or_else(|_| panic!("Invalid value in key-event: {}", val_str))
+                        };
+                        (tick, val)
+                    })
+                    .collect()
+            }).unwrap_or_default();
 
             let t2 = std::time::Instant::now();
 
@@ -269,28 +310,28 @@ fn main() {
 
             // --dump-tick: run to specific tick and dump all computed properties
             if let Some(target_tick) = cli.dump_tick {
-                if target_tick > 0 {
-                    evaluator.run_batch(&mut state, target_tick);
+                // Run tick-by-tick when key events need injection
+                if !key_events.is_empty() {
+                    for tick in 0..=target_tick {
+                        for &(ev_tick, ev_val) in &key_events {
+                            if ev_tick == tick {
+                                state.set_var("keyboard", ev_val);
+                            }
+                        }
+                        evaluator.tick(&mut state);
+                    }
+                } else {
+                    if target_tick > 0 {
+                        evaluator.run_batch(&mut state, target_tick);
+                    }
+                    evaluator.tick(&mut state);
                 }
-                evaluator.tick(&mut state);
                 println!("=== Slot dump at tick {} ===", target_tick);
-                println!(
-                    "Registers: AX={} CX={} DX={} BX={} SP={} BP={} SI={} DI={} IP={} ES={} CS={} SS={} DS={} FLAGS={}",
-                    state.registers[calcite_core::state::reg::AX],
-                    state.registers[calcite_core::state::reg::CX],
-                    state.registers[calcite_core::state::reg::DX],
-                    state.registers[calcite_core::state::reg::BX],
-                    state.registers[calcite_core::state::reg::SP],
-                    state.registers[calcite_core::state::reg::BP],
-                    state.registers[calcite_core::state::reg::SI],
-                    state.registers[calcite_core::state::reg::DI],
-                    state.registers[calcite_core::state::reg::IP],
-                    state.registers[calcite_core::state::reg::ES],
-                    state.registers[calcite_core::state::reg::CS],
-                    state.registers[calcite_core::state::reg::SS],
-                    state.registers[calcite_core::state::reg::DS],
-                    state.registers[calcite_core::state::reg::FLAGS],
-                );
+                print!("Registers:");
+                for (i, name) in state.state_var_names.iter().enumerate() {
+                    print!(" {}={}", name, state.state_vars[i]);
+                }
+                println!();
                 // Dump key computed properties
                 let props = [
                     // v2 decode properties
@@ -299,6 +340,9 @@ fn main() {
                     "--modrmExtra", "--ea", "--eaSeg", "--eaOff",
                     "--immOff", "--immByte", "--immWord", "--imm8", "--imm16",
                     "--rmVal8", "--rmVal16", "--regVal8", "--regVal16",
+                    // v3 memory write
+                    "--memAddr", "--memVal",
+                    // v2 legacy memory write (kept for compatibility)
                     "--memAddr0", "--memVal0", "--memAddr1", "--memVal1",
                     "--memAddr2", "--memVal2",
                     // v1 legacy properties
@@ -312,7 +356,8 @@ fn main() {
                     "--AL", "--CL", "--DL", "--BL",
                     "--AH", "--CH", "--DH", "--BH",
                     "--SP", "--BP", "--SI", "--DI", "--IP",
-                    "--ES", "--CS", "--SS", "--DS", "--flags", "--halt",
+                    "--ES", "--CS", "--SS", "--DS", "--flags",
+                    "--halt", "--uOp",
                 ];
                 println!("\nComputed properties:");
                 for name in &props {
@@ -325,28 +370,28 @@ fn main() {
 
             // --trace-json: output JSON register trace
             if cli.trace_json {
+                let halt_check = halt_addr;
                 print!("[");
                 for tick in 0..cli.ticks {
+                    // Inject keyboard events at the right tick
+                    for &(ev_tick, ev_val) in &key_events {
+                        if ev_tick == tick {
+                            state.set_var("keyboard", ev_val);
+                        }
+                    }
                     evaluator.tick(&mut state);
                     if tick > 0 { print!(","); }
-                    print!(
-                        "{{\"tick\":{},\"AX\":{},\"CX\":{},\"DX\":{},\"BX\":{},\"SP\":{},\"BP\":{},\"SI\":{},\"DI\":{},\"IP\":{},\"ES\":{},\"CS\":{},\"SS\":{},\"DS\":{},\"FLAGS\":{}}}",
-                        tick,
-                        state.registers[calcite_core::state::reg::AX],
-                        state.registers[calcite_core::state::reg::CX],
-                        state.registers[calcite_core::state::reg::DX],
-                        state.registers[calcite_core::state::reg::BX],
-                        state.registers[calcite_core::state::reg::SP],
-                        state.registers[calcite_core::state::reg::BP],
-                        state.registers[calcite_core::state::reg::SI],
-                        state.registers[calcite_core::state::reg::DI],
-                        state.registers[calcite_core::state::reg::IP],
-                        state.registers[calcite_core::state::reg::ES],
-                        state.registers[calcite_core::state::reg::CS],
-                        state.registers[calcite_core::state::reg::SS],
-                        state.registers[calcite_core::state::reg::DS],
-                        state.registers[calcite_core::state::reg::FLAGS],
-                    );
+                    print!("{{\"tick\":{}", tick);
+                    for (i, name) in state.state_var_names.iter().enumerate() {
+                        print!(",\"{}\":{}", name, state.state_vars[i]);
+                    }
+                    print!("}}");
+                    // Halt check for trace mode too
+                    if let Some(addr) = halt_check {
+                        if state.read_mem(addr) != 0 {
+                            break;
+                        }
+                    }
                 }
                 println!("]");
                 return;
@@ -357,7 +402,7 @@ fn main() {
             let mut ticks_run: u32 = 0;
             let mut first_frame = true;
             let screen_interval = cli.screen_interval;
-            let needs_per_tick = cli.verbose || halt_addr.is_some() || (interactive && screen_interval > 0);
+            let needs_per_tick = cli.verbose || halt_addr.is_some() || (interactive && screen_interval > 0) || !key_events.is_empty();
 
             // Enable raw terminal mode for keyboard input
             if interactive {
@@ -381,10 +426,11 @@ fn main() {
                     evaluator.run_batch(&mut state, batch_skip);
                     ticks_run = batch_skip;
                     if cli.verbose {
+                        let ip = state.get_var("IP").unwrap_or(0);
                         eprintln!(
                             "(batch: {} ticks, IP={})",
                             batch_skip,
-                            state.registers[calcite_core::state::reg::IP]
+                            ip
                         );
                     }
                 }
@@ -436,27 +482,22 @@ fn main() {
                         if quit { break; }
                     }
 
+                    // Inject scripted keyboard events (--key-events)
+                    for &(ev_tick, ev_val) in &key_events {
+                        if ev_tick == tick {
+                            state.set_var("keyboard", ev_val);
+                        }
+                    }
+
                     evaluator.tick(&mut state);
                     ticks_run = tick + 1;
 
                     if cli.verbose {
-                        println!(
-                            "Tick {tick}: AX={} CX={} DX={} BX={} SP={} BP={} SI={} DI={} IP={} ES={} CS={} SS={} DS={} flags={}",
-                            state.registers[calcite_core::state::reg::AX],
-                            state.registers[calcite_core::state::reg::CX],
-                            state.registers[calcite_core::state::reg::DX],
-                            state.registers[calcite_core::state::reg::BX],
-                            state.registers[calcite_core::state::reg::SP],
-                            state.registers[calcite_core::state::reg::BP],
-                            state.registers[calcite_core::state::reg::SI],
-                            state.registers[calcite_core::state::reg::DI],
-                            state.registers[calcite_core::state::reg::IP],
-                            state.registers[calcite_core::state::reg::ES],
-                            state.registers[calcite_core::state::reg::CS],
-                            state.registers[calcite_core::state::reg::SS],
-                            state.registers[calcite_core::state::reg::DS],
-                            state.registers[calcite_core::state::reg::FLAGS],
-                        );
+                        print!("Tick {tick}:");
+                        for (i, name) in state.state_var_names.iter().enumerate() {
+                            print!(" {}={}", name, state.state_vars[i]);
+                        }
+                        println!();
                     }
 
                     // Periodic screen rendering
@@ -484,12 +525,15 @@ fn main() {
             let tick_time = t2.elapsed();
 
             if !cli.verbose && cli.dump_tick.is_none() && !cli.trace_json {
+                let ax = state.get_var("AX").unwrap_or(0);
+                let cx = state.get_var("CX").unwrap_or(0);
+                let ip = state.get_var("IP").unwrap_or(0);
                 println!(
                     "Ran {} ticks | AX={} CX={} IP={}",
                     ticks_run,
-                    state.registers[calcite_core::state::reg::AX],
-                    state.registers[calcite_core::state::reg::CX],
-                    state.registers[calcite_core::state::reg::IP],
+                    ax,
+                    cx,
+                    ip,
                 );
             }
             eprintln!(

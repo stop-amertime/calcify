@@ -4,14 +4,42 @@
 
 use calcite_core::eval::Evaluator;
 use calcite_core::parser::parse_css;
-use calcite_core::state::{self, State};
+use calcite_core::State;
 
-/// Parse CSS and build an evaluator.
+/// Standard @property declarations for test state variables.
+/// Tests that assign to --AX, --BX, etc. need these so that the state var
+/// map is populated (no hardcoded register names in calcite).
+const TEST_PROPERTIES: &str = r#"
+@property --AX { syntax: "<integer>"; inherits: true; initial-value: 0; }
+@property --CX { syntax: "<integer>"; inherits: true; initial-value: 0; }
+@property --DX { syntax: "<integer>"; inherits: true; initial-value: 0; }
+@property --BX { syntax: "<integer>"; inherits: true; initial-value: 0; }
+@property --SP { syntax: "<integer>"; inherits: true; initial-value: 0; }
+@property --BP { syntax: "<integer>"; inherits: true; initial-value: 0; }
+@property --SI { syntax: "<integer>"; inherits: true; initial-value: 0; }
+@property --DI { syntax: "<integer>"; inherits: true; initial-value: 0; }
+@property --IP { syntax: "<integer>"; inherits: true; initial-value: 0; }
+@property --ES { syntax: "<integer>"; inherits: true; initial-value: 0; }
+@property --CS { syntax: "<integer>"; inherits: true; initial-value: 0; }
+@property --SS { syntax: "<integer>"; inherits: true; initial-value: 0; }
+@property --DS { syntax: "<integer>"; inherits: true; initial-value: 0; }
+@property --flags { syntax: "<integer>"; inherits: true; initial-value: 0; }
+"#;
+
+/// Parse CSS and build an evaluator. Prepends standard @property declarations
+/// if the CSS doesn't already contain any (so tests don't need boilerplate).
 fn setup(css: &str) -> (Evaluator, State) {
-    let parsed = parse_css(css).expect("CSS should parse");
-    let evaluator = Evaluator::from_parsed(&parsed);
+    let full_css = if css.contains("@property") {
+        css.to_string()
+    } else {
+        format!("{}\n{}", TEST_PROPERTIES, css)
+    };
+    let parsed = parse_css(&full_css).expect("CSS should parse");
+    // load_properties MUST be called before from_parsed so that state var
+    // addresses are in the address map before compilation resolves them.
     let mut state = State::default();
     state.load_properties(&parsed.properties);
+    let evaluator = Evaluator::from_parsed(&parsed);
     (evaluator, state)
 }
 
@@ -27,8 +55,8 @@ fn simple_assignment() {
     let (mut evaluator, mut state) = setup(css);
     evaluator.tick(&mut state);
 
-    assert_eq!(state.registers[state::reg::AX], 42);
-    assert_eq!(state.registers[state::reg::CX], 7);
+    assert_eq!(state.get_var("AX").unwrap(), 42);
+    assert_eq!(state.get_var("CX").unwrap(), 7);
 }
 
 #[test]
@@ -43,9 +71,9 @@ fn calc_expression() {
     let (mut evaluator, mut state) = setup(css);
     evaluator.tick(&mut state);
 
-    assert_eq!(state.registers[state::reg::AX], 42);
+    assert_eq!(state.get_var("AX").unwrap(), 42);
     // --CX depends on --AX being computed first (declaration order)
-    assert_eq!(state.registers[state::reg::CX], 84);
+    assert_eq!(state.get_var("CX").unwrap(), 84);
 }
 
 #[test]
@@ -61,9 +89,9 @@ fn var_references_between_properties() {
     let (mut evaluator, mut state) = setup(css);
     evaluator.tick(&mut state);
 
-    assert_eq!(state.registers[state::reg::AX], 100);
-    assert_eq!(state.registers[state::reg::BX], 150);
-    assert_eq!(state.registers[state::reg::CX], 50);
+    assert_eq!(state.get_var("AX").unwrap(), 100);
+    assert_eq!(state.get_var("BX").unwrap(), 150);
+    assert_eq!(state.get_var("CX").unwrap(), 50);
 }
 
 #[test]
@@ -78,7 +106,7 @@ fn if_style_condition() {
     let (mut evaluator, mut state) = setup(css);
     evaluator.tick(&mut state);
 
-    assert_eq!(state.registers[state::reg::BX], 20);
+    assert_eq!(state.get_var("BX").unwrap(), 20);
 }
 
 #[test]
@@ -95,11 +123,11 @@ fn mod_and_round() {
     let (mut evaluator, mut state) = setup(css);
     evaluator.tick(&mut state);
 
-    assert_eq!(state.registers[state::reg::AX], 4660);
+    assert_eq!(state.get_var("AX").unwrap(), 4660);
     // AL = AX mod 256 = 0x34 = 52
-    assert_eq!(state.registers[state::reg::BX], 52);
+    assert_eq!(state.get_var("BX").unwrap(), 52);
     // AH = floor(AX / 256) = 0x12 = 18
-    assert_eq!(state.registers[state::reg::CX], 18);
+    assert_eq!(state.get_var("CX").unwrap(), 18);
 }
 
 #[test]
@@ -136,7 +164,7 @@ fn function_call() {
     let (mut evaluator, mut state) = setup(css);
     evaluator.tick(&mut state);
 
-    assert_eq!(state.registers[state::reg::AX], 42);
+    assert_eq!(state.get_var("AX").unwrap(), 42);
 }
 
 #[test]
@@ -154,7 +182,7 @@ fn multiple_ticks_accumulate() {
         evaluator.tick(&mut state);
     }
 
-    assert_eq!(state.registers[state::reg::AX], 10);
+    assert_eq!(state.get_var("AX").unwrap(), 10);
 }
 
 #[test]
@@ -180,7 +208,7 @@ fn dispatch_table_in_function() {
     let (mut evaluator, mut state) = setup(css);
     evaluator.tick(&mut state);
 
-    assert_eq!(state.registers[state::reg::AX], 400);
+    assert_eq!(state.get_var("AX").unwrap(), 400);
 }
 
 #[test]
@@ -219,8 +247,8 @@ fn complex_nested_expression() {
     evaluator.tick(&mut state);
 
     // BX should reconstruct AX from its bytes: AL + AH*256 = AX
-    assert_eq!(state.registers[state::reg::AX], 4660);
-    assert_eq!(state.registers[state::reg::BX], 4660);
+    assert_eq!(state.get_var("AX").unwrap(), 4660);
+    assert_eq!(state.get_var("BX").unwrap(), 4660);
 }
 
 #[test]
@@ -236,9 +264,9 @@ fn min_max_clamp() {
     let (mut evaluator, mut state) = setup(css);
     evaluator.tick(&mut state);
 
-    assert_eq!(state.registers[state::reg::AX], 50);
-    assert_eq!(state.registers[state::reg::BX], 30);
-    assert_eq!(state.registers[state::reg::CX], 255);
+    assert_eq!(state.get_var("AX").unwrap(), 50);
+    assert_eq!(state.get_var("BX").unwrap(), 30);
+    assert_eq!(state.get_var("CX").unwrap(), 255);
 }
 
 #[test]
@@ -265,9 +293,9 @@ fn and_or_conditions() {
     evaluator.tick(&mut state);
 
     // Both conditions true → 1
-    assert_eq!(state.registers[state::reg::CX], 1);
+    assert_eq!(state.get_var("CX").unwrap(), 1);
     // First false, second true → 1 (or)
-    assert_eq!(state.registers[state::reg::DX], 1);
+    assert_eq!(state.get_var("DX").unwrap(), 1);
 }
 
 #[test]
@@ -282,7 +310,7 @@ fn if_without_else() {
     let (mut evaluator, mut state) = setup(css);
     evaluator.tick(&mut state);
 
-    assert_eq!(state.registers[state::reg::BX], 100);
+    assert_eq!(state.get_var("BX").unwrap(), 100);
 }
 
 #[test]
@@ -297,7 +325,7 @@ fn string_literal_in_if() {
     let (mut evaluator, mut state) = setup(css);
     evaluator.tick(&mut state);
 
-    assert_eq!(state.registers[state::reg::AX], 1);
+    assert_eq!(state.get_var("AX").unwrap(), 1);
 }
 
 /// Parse the real x86CSS generated CSS and validate key metrics.
@@ -406,12 +434,12 @@ fn chrome_conformance_steady_state() {
     for _ in 0..200 {
         evaluator.tick(&mut calcite_state);
         let regs = calcite_core::conformance::RegisterSnapshot::from_state(&calcite_state);
-        calcite_ip_values.insert(regs.ip);
-        calcite_ax_values.insert(regs.ax);
-        calcite_si_values.insert(regs.si);
-        calcite_sp_values.insert(regs.sp);
-        calcite_bp_values.insert(regs.bp);
-        calcite_flags_values.insert(regs.flags);
+        calcite_ip_values.insert(regs.values.get("IP").copied().unwrap_or(0));
+        calcite_ax_values.insert(regs.values.get("AX").copied().unwrap_or(0));
+        calcite_si_values.insert(regs.values.get("SI").copied().unwrap_or(0));
+        calcite_sp_values.insert(regs.values.get("SP").copied().unwrap_or(0));
+        calcite_bp_values.insert(regs.values.get("BP").copied().unwrap_or(0));
+        calcite_flags_values.insert(regs.values.get("flags").copied().unwrap_or(0));
     }
 
     // Chrome baseline ranges (captured from lyra.horse/x86css/ via Playwright).
@@ -522,7 +550,7 @@ fn execution_trace() {
 
     for tick in 0..50 {
         evaluator.tick(&mut state);
-        let ip = state.registers[state::reg::IP];
+        let ip = state.get_var("IP").unwrap_or(0);
         let inst_id = evaluator.get_property("--instId").unwrap_or(-1.0) as i32;
         let inst_len = evaluator.get_property("--instLen").unwrap_or(0.0) as i32;
         let dest_a = evaluator.get_property("--addrDestA").unwrap_or(-100.0) as i32;
@@ -540,9 +568,9 @@ fn execution_trace() {
             dest_b,
             val_a,
             val_b,
-            state.registers[state::reg::AX],
-            state.registers[state::reg::SP],
-            state.registers[state::reg::FLAGS],
+            state.get_var("AX").unwrap_or(0),
+            state.get_var("SP").unwrap_or(0),
+            state.get_var("flags").unwrap_or(0),
         );
     }
 }
@@ -604,11 +632,12 @@ fn compiled_vs_interpreted_benchmark() {
     println!("  Speedup:     {:.1}x", speedup);
 
     // Verify both paths reach same state
-    for i in 0..state::reg::COUNT {
+    for i in 0..state_compiled.state_var_count() {
         assert_eq!(
-            state_compiled.registers[i], state_interp.registers[i],
-            "register {} diverged after {ticks} ticks: compiled={}, interpreted={}",
-            i, state_compiled.registers[i], state_interp.registers[i]
+            state_compiled.state_vars[i], state_interp.state_vars[i],
+            "state var {} diverged after {ticks} ticks: compiled={}, interpreted={}",
+            state_compiled.state_var_names.get(i).map(|s| s.as_str()).unwrap_or("?"),
+            state_compiled.state_vars[i], state_interp.state_vars[i]
         );
     }
 }
@@ -635,7 +664,7 @@ fn fibonacci_benchmark() {
     let start = std::time::Instant::now();
 
     for tick in 0..max_ticks {
-        let ip = state.registers[state::reg::IP];
+        let ip = state.get_var("IP").unwrap_or(0);
 
         // When the program reaches readInput (IP=0x2006), provide keyboard input.
         // NOTE: x86css-demo.css uses the legacy keyboard convention (0x500 polling),
@@ -813,10 +842,9 @@ fn deeply_nested_expressions() {
     let parsed = parse_css(&css).expect("should not error");
     assert_eq!(parsed.assignments.len(), 1);
 
-    let mut evaluator = Evaluator::from_parsed(&parsed);
-    let mut state = State::default();
+    let (mut evaluator, mut state) = setup(&format!(".cpu {{ --AX: {expr}; }}"));
     evaluator.tick(&mut state);
-    assert_eq!(state.registers[state::reg::AX], 51);
+    assert_eq!(state.get_var("AX").unwrap(), 51);
 }
 
 /// Run the same CSS through both compiled and interpreted paths and verify
@@ -849,27 +877,85 @@ fn compiled_vs_interpreted() {
     let parsed = parse_css(css).expect("CSS should parse");
 
     // Compiled path
-    let mut eval_compiled = Evaluator::from_parsed(&parsed);
     let mut state_compiled = State::default();
     state_compiled.load_properties(&parsed.properties);
+    let mut eval_compiled = Evaluator::from_parsed(&parsed);
     for _ in 0..5 {
         eval_compiled.tick(&mut state_compiled);
     }
 
     // Interpreted path
-    let mut eval_interp = Evaluator::from_parsed(&parsed);
     let mut state_interp = State::default();
     state_interp.load_properties(&parsed.properties);
+    let mut eval_interp = Evaluator::from_parsed(&parsed);
     for _ in 0..5 {
         eval_interp.tick_interpreted(&mut state_interp);
     }
 
-    // Compare all registers
-    for i in 0..state::reg::COUNT {
+    // Compare all state variables
+    for i in 0..state_compiled.state_var_count() {
         assert_eq!(
-            state_compiled.registers[i], state_interp.registers[i],
-            "register {} diverged: compiled={}, interpreted={}",
-            i, state_compiled.registers[i], state_interp.registers[i]
+            state_compiled.state_vars[i], state_interp.state_vars[i],
+            "state var {} diverged: compiled={}, interpreted={}",
+            state_compiled.state_var_names.get(i).map(|s| s.as_str()).unwrap_or("?"),
+            state_compiled.state_vars[i], state_interp.state_vars[i]
         );
     }
+}
+
+/// Test that function calls inside nested style() conditions work in the compiled path.
+/// This is a regression test for a bug where --read2(calc(...)) returned 0 when called
+/// inside if(style(--opcode:X): if(style(--uOp:Y): func(...))).
+#[test]
+fn nested_style_function_call() {
+    // Minimal reproduction: --CS should be set to --double(var(--q1)) when both
+    // opcode=205 and uOp=5. The compiled path was returning 0 instead.
+    let css = r#"
+        @property --CS { syntax: "<integer>"; inherits: false; initial-value: 0; }
+        @property --opcode { syntax: "<integer>"; inherits: false; initial-value: 205; }
+        @property --uOp { syntax: "<integer>"; inherits: false; initial-value: 5; }
+        @property --q1 { syntax: "<integer>"; inherits: false; initial-value: 42; }
+
+        @function --double(--x <integer>) returns <integer> {
+            result: calc(var(--x) * 2);
+        }
+
+        .cpu {
+            --CS: if(
+                style(--opcode: 205): if(
+                    style(--uOp: 5): --double(var(--q1));
+                    else: 0;
+                );
+                else: 0;
+            );
+        }
+    "#;
+
+    // Enable debug logging to see parser errors
+    let parsed = parse_css(css).expect("CSS should parse");
+
+    // Compiled path
+    let mut state_compiled = State::default();
+    state_compiled.load_properties(&parsed.properties);
+    let mut eval_compiled = Evaluator::from_parsed(&parsed);
+    eval_compiled.tick(&mut state_compiled);
+
+    // Interpreted path
+    let mut state_interp = State::default();
+    state_interp.load_properties(&parsed.properties);
+    let mut eval_interp = Evaluator::from_parsed(&parsed);
+    eval_interp.tick_interpreted(&mut state_interp);
+
+    let cs_slot = state_compiled.state_var_names.iter().position(|n| n == "--CS" || n == "CS").unwrap_or_else(|| {
+        panic!("--CS not found in state_var_names: {:?}", state_compiled.state_var_names)
+    });
+    let compiled_cs = state_compiled.state_vars[cs_slot];
+    let interp_cs = state_interp.state_vars[cs_slot];
+
+    assert_eq!(
+        compiled_cs, interp_cs,
+        "nested style function call: compiled CS={} vs interpreted CS={} (expected 84)",
+        compiled_cs, interp_cs
+    );
+    assert_eq!(compiled_cs, 84, "expected --double(42) = 84, got {}", compiled_cs);
 }

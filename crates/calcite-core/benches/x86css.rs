@@ -2,7 +2,7 @@ use criterion::{criterion_group, criterion_main, Criterion};
 
 use calcite_core::eval::Evaluator;
 use calcite_core::parser::parse_css;
-use calcite_core::state::State;
+use calcite_core::State;
 
 fn load_css() -> String {
     std::fs::read_to_string("../../tests/fixtures/x86css-main.css")
@@ -27,9 +27,9 @@ fn bench_setup(c: &mut Criterion) {
 fn bench_tick(c: &mut Criterion) {
     let css = load_css();
     let parsed = parse_css(&css).unwrap();
-    let mut evaluator = Evaluator::from_parsed(&parsed);
     let mut state = State::default();
     state.load_properties(&parsed.properties);
+    let mut evaluator = Evaluator::from_parsed(&parsed);
     // Warm up past BIOS init
     for _ in 0..50 {
         evaluator.tick(&mut state);
@@ -43,6 +43,9 @@ fn bench_tick(c: &mut Criterion) {
 fn bench_batch(c: &mut Criterion) {
     let css = load_css();
     let parsed = parse_css(&css).unwrap();
+    // load_properties must be called to install the address map before from_parsed
+    let mut init_state = State::default();
+    init_state.load_properties(&parsed.properties);
     let mut evaluator = Evaluator::from_parsed(&parsed);
 
     let mut group = c.benchmark_group("batch_ticks");

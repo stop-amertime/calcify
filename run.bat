@@ -162,7 +162,7 @@ if errorlevel 1 (pause & goto :menu)
 
 title CSS-DOS: %NAME%
 cls
-"%CALCITE%" --input "%CSS%" --ticks 4294967295 --halt 0x0504
+"%CALCITE%" --input "%CSS%" --ticks 4294967295 --halt halt
 
 echo.
 echo   Program exited. Press any key to return to menu...

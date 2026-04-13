@@ -1,93 +1,11 @@
-//! Emulator state — flat representation of the x86CSS machine.
+//! Emulator state — flat representation of the CSS machine.
 //!
-//! Replaces CSS's triple-buffered custom properties with direct mutable state.
-
-/// CPU register indices into `State::registers`.
-pub mod reg {
-    /// Accumulator.
-    pub const AX: usize = 0;
-    /// Counter.
-    pub const CX: usize = 1;
-    /// Data.
-    pub const DX: usize = 2;
-    /// Base.
-    pub const BX: usize = 3;
-    /// Stack pointer.
-    pub const SP: usize = 4;
-    /// Base pointer.
-    pub const BP: usize = 5;
-    /// Source index.
-    pub const SI: usize = 6;
-    /// Destination index.
-    pub const DI: usize = 7;
-    /// Instruction pointer.
-    pub const IP: usize = 8;
-    /// Extra segment.
-    pub const ES: usize = 9;
-    /// Code segment.
-    pub const CS: usize = 10;
-    /// Stack segment.
-    pub const SS: usize = 11;
-    /// Data segment.
-    pub const DS: usize = 12;
-    /// Flags register.
-    pub const FLAGS: usize = 13;
-    /// Total number of registers.
-    pub const COUNT: usize = 14;
-}
-
-/// x86CSS unified address space mapping.
-///
-/// x86CSS uses negative addresses for registers and split register halves.
-/// These constants match the convention used in `base_template.html`.
-pub mod addr {
-    /// AX register (full 16-bit).
-    pub const AX: i32 = -1;
-    /// CX register (full 16-bit).
-    pub const CX: i32 = -2;
-    /// DX register (full 16-bit).
-    pub const DX: i32 = -3;
-    /// BX register (full 16-bit).
-    pub const BX: i32 = -4;
-    /// SP register (full 16-bit).
-    pub const SP: i32 = -5;
-    /// BP register (full 16-bit).
-    pub const BP: i32 = -6;
-    /// SI register (full 16-bit).
-    pub const SI: i32 = -7;
-    /// DI register (full 16-bit).
-    pub const DI: i32 = -8;
-    /// IP register (full 16-bit).
-    pub const IP: i32 = -9;
-    /// ES register (full 16-bit).
-    pub const ES: i32 = -10;
-    /// CS register (full 16-bit).
-    pub const CS: i32 = -11;
-    /// SS register (full 16-bit).
-    pub const SS: i32 = -12;
-    /// DS register (full 16-bit).
-    pub const DS: i32 = -13;
-    /// FLAGS register (full 16-bit).
-    pub const FLAGS: i32 = -14;
-
-    /// AH — high byte of AX. Address = -(reg_index + 20).
-    pub const AH: i32 = -21;
-    /// CH — high byte of CX.
-    pub const CH: i32 = -22;
-    /// DH — high byte of DX.
-    pub const DH: i32 = -23;
-    /// BH — high byte of BX.
-    pub const BH: i32 = -24;
-
-    /// AL — low byte of AX. Address = -(reg_index + 30).
-    pub const AL: i32 = -31;
-    /// CL — low byte of CX.
-    pub const CL: i32 = -32;
-    /// DL — low byte of DX.
-    pub const DL: i32 = -33;
-    /// BL — low byte of BX.
-    pub const BL: i32 = -34;
-}
+//! State variables are discovered from CSS `@property` declarations at load time.
+//! Calcite has no hardcoded knowledge of what those variables represent — they
+//! could be x86 registers, halt flags, micro-op counters, or anything else the
+//! CSS program defines. The negative address convention (slot 0 → -1, slot 1 → -2,
+//! etc.) simply separates state variables from memory bytes in the unified
+//! address space.
 
 /// Default memory size for x86CSS (0x600 bytes = 1,536).
 pub const DEFAULT_MEM_SIZE: usize = 0x600;
@@ -120,8 +38,13 @@ pub const CGA_PALETTE: [(u8, u8, u8); 16] = [
 /// The flat machine state that replaces CSS's triple-buffered custom properties.
 #[derive(Debug, Clone)]
 pub struct State {
-    /// CPU registers (AX, CX, DX, BX, SP, BP, SI, DI, IP, ES, CS, SS, DS, FLAGS).
-    pub registers: [i32; reg::COUNT],
+    /// State variables discovered from CSS `@property` declarations.
+    /// Addressed via negative numbers: slot 0 → addr -1, slot 1 → addr -2, etc.
+    pub state_vars: Vec<i32>,
+    /// State variable names, in slot order (for display/debugging).
+    pub state_var_names: Vec<String>,
+    /// Name → slot index lookup.
+    pub(crate) state_var_index: std::collections::HashMap<String, usize>,
     /// Flat memory (byte-addressable, default 1,536 bytes).
     pub memory: Vec<u8>,
     /// Extended properties: full-width i32 storage for addresses above the byte
@@ -138,7 +61,9 @@ impl State {
     /// Create a new state with the given memory size.
     pub fn new(mem_size: usize) -> Self {
         Self {
-            registers: [0; reg::COUNT],
+            state_vars: Vec::new(),
+            state_var_names: Vec::new(),
+            state_var_index: std::collections::HashMap::new(),
             memory: vec![0; mem_size],
             extended: std::collections::HashMap::new(),
             string_properties: std::collections::HashMap::new(),
@@ -146,41 +71,53 @@ impl State {
         }
     }
 
+    /// Look up a state variable by name. Returns None if not found.
+    pub fn get_var(&self, name: &str) -> Option<i32> {
+        self.state_var_index.get(name).map(|&i| self.state_vars[i])
+    }
+
+    /// Set a state variable by name. Returns false if not found.
+    pub fn set_var(&mut self, name: &str, value: i32) -> bool {
+        if let Some(&i) = self.state_var_index.get(name) {
+            self.state_vars[i] = value;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Look up the slot index for a state variable name.
+    pub fn var_slot(&self, name: &str) -> Option<usize> {
+        self.state_var_index.get(name).copied()
+    }
+
+    /// Number of state variables.
+    pub fn state_var_count(&self) -> usize {
+        self.state_vars.len()
+    }
+
     /// Read from the unified address space.
     ///
-    /// Address conventions (matching x86CSS's `readMem` / `base_template.html`):
-    /// - `-1..-14`: full 16-bit registers (AX, CX, ..., FLAGS)
-    /// - `-21..-24`: high byte halves (AH, CH, DH, BH)
-    /// - `-31..-34`: low byte halves (AL, CL, DL, BL)
+    /// Address conventions:
+    /// - Negative: state variables (slot index = -addr - 1)
     /// - `0..`: memory bytes
     pub fn read_mem(&self, addr: i32) -> i32 {
-        match addr {
-            // Low byte halves: AL=-31, CL=-32, DL=-33, BL=-34
-            -34..=-31 => {
-                let reg_idx = (-addr - 31) as usize;
-                Self::lo8(self.registers[reg_idx])
+        if addr < 0 {
+            let idx = (-addr - 1) as usize;
+            if idx < self.state_vars.len() {
+                self.state_vars[idx]
+            } else {
+                0
             }
-            // High byte halves: AH=-21, CH=-22, DH=-23, BH=-24
-            -24..=-21 => {
-                let reg_idx = (-addr - 21) as usize;
-                Self::hi8(self.registers[reg_idx])
+        } else {
+            let addr_u = addr as usize;
+            if addr_u >= 0xF0000 {
+                return self.extended.get(&addr).copied().unwrap_or(0);
             }
-            // Full 16-bit registers: AX=-1, CX=-2, ..., FLAGS=-14
-            -14..=-1 => {
-                let reg_idx = (-addr - 1) as usize;
-                self.registers[reg_idx]
-            }
-            _ => {
-                let addr_u = addr as usize;
-                // High addresses (>= 0xF0000) use extended map for full-width i32 storage
-                if addr_u >= 0xF0000 {
-                    return self.extended.get(&addr).copied().unwrap_or(0);
-                }
-                if addr_u < self.memory.len() {
-                    self.memory[addr_u] as i32
-                } else {
-                    0
-                }
+            if addr_u < self.memory.len() {
+                self.memory[addr_u] as i32
+            } else {
+                0
             }
         }
     }
@@ -193,45 +130,20 @@ impl State {
     }
 
     /// Write a value to the unified address space.
-    ///
-    /// Handles split register writes (AH/AL merge into AX, etc.) matching
-    /// x86CSS's broadcast write pattern for split registers.
     pub fn write_mem(&mut self, addr: i32, value: i32) {
-        match addr {
-            // Write to low byte: AL=-31, CL=-32, DL=-33, BL=-34
-            // Merges: keep high byte, replace low byte
-            -34..=-31 => {
-                let reg_idx = (-addr - 31) as usize;
-                let hi = Self::hi8(self.registers[reg_idx]);
-                self.registers[reg_idx] = hi * 256 + (value & 0xFF);
+        if addr < 0 {
+            let idx = (-addr - 1) as usize;
+            if idx < self.state_vars.len() {
+                self.state_vars[idx] = value;
             }
-            // Write to high byte: AH=-21, CH=-22, DH=-23, BH=-24
-            // Merges: replace high byte, keep low byte
-            -24..=-21 => {
-                let reg_idx = (-addr - 21) as usize;
-                let lo = Self::lo8(self.registers[reg_idx]);
-                self.registers[reg_idx] = (value & 0xFF) * 256 + lo;
+        } else {
+            let addr_u = addr as usize;
+            if addr_u >= 0xF0000 {
+                self.extended.insert(addr, value);
+                return;
             }
-            // Write to register — mask to 16 bits, except IP which stores
-            // flat addresses (CS*16 + offset) that can exceed 0xFFFF.
-            -14..=-1 => {
-                let reg_idx = (-addr - 1) as usize;
-                if addr == crate::state::addr::IP {
-                    self.registers[reg_idx] = value;
-                } else {
-                    self.registers[reg_idx] = value & 0xFFFF;
-                }
-            }
-            _ => {
-                let addr_u = addr as usize;
-                // High addresses (>= 0xF0000) use extended map for full-width i32 storage
-                if addr_u >= 0xF0000 {
-                    self.extended.insert(addr, value);
-                    return;
-                }
-                if addr_u < self.memory.len() {
-                    self.memory[addr_u] = (value & 0xFF) as u8;
-                }
+            if addr_u < self.memory.len() {
+                self.memory[addr_u] = (value & 0xFF) as u8;
             }
         }
     }
@@ -383,39 +295,95 @@ impl State {
         buf
     }
 
-    /// Initialize state from `@property` initial values.
+    /// Discover state variables and load initial values from `@property` declarations.
     ///
-    /// This loads the program binary and register defaults from the CSS —
-    /// without it, the engine runs against empty memory.
+    /// Any `@property --X` where X is not `m{digits}` and not `clock` is a state
+    /// variable. State variables get auto-assigned negative addresses: the first
+    /// one gets -1, the second -2, etc. Memory bytes (`--m{N}`) are stored in
+    /// the flat byte array at address N.
+    ///
+    /// This method populates the state var map AND installs the address map into
+    /// the eval module's thread-local so that `property_to_address()` works for
+    /// all subsequent operations.
     pub fn load_properties(&mut self, properties: &[crate::types::PropertyDef]) {
         use crate::types::CssValue;
 
-        // First pass: find the maximum memory address to size the array.
-        // Skip extended addresses (>= 0xF0000) — they use the HashMap, not the byte array.
-        let mut max_addr: usize = 0;
-        for prop in properties {
-            if let Some(addr) = super::eval::property_to_address(&prop.name) {
-                let addr_u = addr as usize;
-                if addr >= 0 && addr_u < 0xF0000 {
-                    max_addr = max_addr.max(addr_u + 1);
-                }
-            }
-        }
-        if max_addr > self.memory.len() {
-            log::info!("Auto-sizing memory: {} → {} bytes", self.memory.len(), max_addr);
-            self.memory.resize(max_addr, 0);
-        }
+        // Classify properties: state vars vs memory vs other
+        let mut state_var_defs: Vec<(&str, i32)> = Vec::new(); // (bare_name, initial_value)
+        let mut memory_defs: Vec<(usize, u8)> = Vec::new();    // (addr, value)
+        let mut max_mem_addr: usize = 0;
 
-        // Second pass: load values
         for prop in properties {
             let value = match &prop.initial_value {
                 Some(CssValue::Integer(v)) => *v as i32,
-                _ => continue,
+                _ => 0,
             };
 
-            let name = &prop.name;
-            if let Some(addr) = super::eval::property_to_address(name) {
-                self.write_mem(addr, value);
+            // Strip leading "--"
+            let bare = if prop.name.starts_with("--") {
+                &prop.name[2..]
+            } else {
+                &prop.name
+            };
+
+            // Skip clock — it's animation plumbing, not state
+            if bare == "clock" {
+                continue;
+            }
+
+            // Check if it's a memory byte: m{digits}
+            if let Some(rest) = bare.strip_prefix('m') {
+                if !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()) {
+                    if let Ok(addr) = rest.parse::<usize>() {
+                        if addr < 0xF0000 {
+                            max_mem_addr = max_mem_addr.max(addr + 1);
+                        }
+                        memory_defs.push((addr, (value & 0xFF) as u8));
+                        continue;
+                    }
+                }
+            }
+
+            // It's a state variable
+            state_var_defs.push((bare, value));
+        }
+
+        // Set up state vars
+        self.state_vars.clear();
+        self.state_var_names.clear();
+        self.state_var_index.clear();
+
+        let mut address_map = std::collections::HashMap::new();
+        for (i, &(name, init)) in state_var_defs.iter().enumerate() {
+            let addr = -(i as i32 + 1);
+            self.state_vars.push(init);
+            self.state_var_names.push(name.to_string());
+            self.state_var_index.insert(name.to_string(), i);
+            address_map.insert(name.to_string(), addr);
+        }
+
+        log::info!(
+            "Discovered {} state variables from CSS: {:?}",
+            self.state_vars.len(),
+            self.state_var_names,
+        );
+
+        // Install the state var address map so property_to_address() works.
+        // This REPLACES any existing map — call load_properties BEFORE
+        // Evaluator::from_parsed() so that dispatch-table entries are merged
+        // on top of state var entries (not the other way around).
+        super::eval::set_address_map(address_map);
+
+        // Set up memory
+        if max_mem_addr > self.memory.len() {
+            log::info!("Auto-sizing memory: {} → {} bytes", self.memory.len(), max_mem_addr);
+            self.memory.resize(max_mem_addr, 0);
+        }
+        for (addr, value) in &memory_defs {
+            if *addr >= 0xF0000 {
+                self.extended.insert(*addr as i32, *value as i32);
+            } else if *addr < self.memory.len() {
+                self.memory[*addr] = *value;
             }
         }
     }
@@ -467,14 +435,36 @@ fn cp437_to_unicode(b: u8) -> char {
 mod tests {
     use super::*;
 
+    /// Create a state with some state variables for testing.
+    fn test_state() -> State {
+        let mut state = State::new(DEFAULT_MEM_SIZE);
+        // Simulate discovering state vars from CSS
+        let names = vec!["AX", "CX", "DX", "BX"];
+        for (i, name) in names.iter().enumerate() {
+            state.state_vars.push(0);
+            state.state_var_names.push(name.to_string());
+            state.state_var_index.insert(name.to_string(), i);
+        }
+        state
+    }
+
     #[test]
-    fn register_addressing() {
-        let mut state = State::default();
-        state.registers[reg::AX] = 0x1234;
+    fn state_var_addressing() {
+        let mut state = test_state();
+        // AX is slot 0 → address -1
+        state.state_vars[0] = 0x1234;
         assert_eq!(state.read_mem(-1), 0x1234);
 
         state.write_mem(-1, 0xABCD);
-        assert_eq!(state.registers[reg::AX], 0xABCD);
+        assert_eq!(state.state_vars[0], 0xABCD);
+    }
+
+    #[test]
+    fn state_var_by_name() {
+        let mut state = test_state();
+        state.set_var("AX", 42);
+        assert_eq!(state.get_var("AX"), Some(42));
+        assert_eq!(state.get_var("nonexistent"), None);
     }
 
     #[test]
@@ -499,64 +489,20 @@ mod tests {
     }
 
     #[test]
-    fn split_register_read() {
-        let mut state = State::default();
-        state.registers[reg::AX] = 0x1234;
-
-        // AL (low byte) at address -31
-        assert_eq!(state.read_mem(addr::AL), 0x34);
-        // AH (high byte) at address -21
-        assert_eq!(state.read_mem(addr::AH), 0x12);
-        // Full AX at address -1
-        assert_eq!(state.read_mem(addr::AX), 0x1234);
+    fn out_of_range_state_var() {
+        let state = test_state();
+        // Address -100 is beyond the 4 state vars
+        assert_eq!(state.read_mem(-100), 0);
     }
 
     #[test]
-    fn split_register_write_low() {
-        let mut state = State::default();
-        state.registers[reg::AX] = 0x1200;
+    fn state_var_stores_full_value() {
+        let mut state = test_state();
+        // No masking — state vars store whatever the CSS computes
+        state.write_mem(-1, 0x1_ABCD);
+        assert_eq!(state.state_vars[0], 0x1_ABCD);
 
-        // Write 0x34 to AL — should merge to 0x1234
-        state.write_mem(addr::AL, 0x34);
-        assert_eq!(state.registers[reg::AX], 0x1234);
-    }
-
-    #[test]
-    fn split_register_write_high() {
-        let mut state = State::default();
-        state.registers[reg::AX] = 0x0034;
-
-        // Write 0x12 to AH — should merge to 0x1234
-        state.write_mem(addr::AH, 0x12);
-        assert_eq!(state.registers[reg::AX], 0x1234);
-    }
-
-    #[test]
-    fn all_split_registers() {
-        let mut state = State::default();
-        state.registers[reg::BX] = 0xABCD;
-
-        assert_eq!(state.read_mem(addr::BH), 0xAB);
-        assert_eq!(state.read_mem(addr::BL), 0xCD);
-
-        state.write_mem(addr::BL, 0xEF);
-        assert_eq!(state.registers[reg::BX], 0xABEF);
-
-        state.write_mem(addr::BH, 0x00);
-        assert_eq!(state.registers[reg::BX], 0x00EF);
-    }
-
-    #[test]
-    fn register_write_stores_full_value() {
-        let mut state = State::default();
-        // Full register writes are masked to 16 bits (x86 registers are 16-bit).
-        state.write_mem(addr::AX, 0x1_ABCD);
-        assert_eq!(state.registers[reg::AX], 0xABCD);
-
-        state.write_mem(addr::SP, -2);
-        assert_eq!(state.registers[reg::SP], 0xFFFE);
-
-        state.write_mem(addr::FLAGS, 0x10000);
-        assert_eq!(state.registers[reg::FLAGS], 0); // masked to 16 bits
+        state.write_mem(-2, -2);
+        assert_eq!(state.state_vars[1], -2);
     }
 }

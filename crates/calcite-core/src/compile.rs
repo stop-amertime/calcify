@@ -969,6 +969,11 @@ impl<'a> Compiler<'a> {
         // We emit a chain: for each branch, test condition, if true compute then
         // and jump to end, else fall through to next branch.
         // Patch targets are filled in after all branches are emitted.
+        //
+        // IMPORTANT: Each branch's 'then' expression is compiled in isolation
+        // (its own entry_ops) and executed via a Dispatch-like mechanism. This
+        // prevents slot aliasing across branches — a slot set by one branch's
+        // compilation won't be stale-read by another branch at runtime.
         let mut jump_to_end: Vec<usize> = Vec::new();
 
         for branch in branches {
@@ -980,12 +985,37 @@ impl<'a> Compiler<'a> {
                 target: 0,
             }); // target patched later
 
+            // Save and restore property_slots around each branch to prevent
+            // cross-branch slot aliasing. Without this, a function call in
+            // branch A can leave a parameter binding in property_slots that
+            // branch B's compilation reuses — leading to stale slot reads
+            // at runtime when only one branch executes.
+            let saved_props: Vec<(String, Slot)> = self.property_slots.iter()
+                .map(|(k, &v)| (k.clone(), v))
+                .collect();
+
             // Condition true: compute 'then' value
+            let ops_before = ops.len();
             let then_slot = self.compile_expr(&branch.then, ops);
+            let ops_after = ops.len();
+            // Log ops for the branch that produces memAddr for opcode 214 uOp 1
+            if ops_after - ops_before > 10 && ops_after - ops_before < 5000 {
+                log::warn!("[linear branch] {} ops (idx {}-{}) result_slot={} then_slot={}",
+                    ops_after - ops_before, ops_before, ops_after, result_slot, then_slot);
+                for j in ops_before..std::cmp::min(ops_after, ops_before + 30) {
+                    log::warn!("  [{:4}] {:?}", j, ops[j]);
+                }
+            }
             ops.push(Op::LoadSlot {
                 dst: result_slot,
                 src: then_slot,
             });
+
+            // Restore property_slots to prevent cross-branch contamination
+            self.property_slots.clear();
+            for (k, v) in saved_props {
+                self.property_slots.insert(k, v);
+            }
 
             // Jump to end
             jump_to_end.push(ops.len());
@@ -1292,14 +1322,20 @@ impl<'a> Compiler<'a> {
         let table = self.dispatch_tables.remove(name).unwrap();
         let func = self.functions.get(name);
 
-        // Bind arguments to parameter slots
+        // Bind arguments to parameter slots.
+        //
+        // IMPORTANT: We must ensure the parameter's LoadLit/LoadSlot is in THIS ops
+        // context. If the argument compiles to an existing slot (e.g., Var("--at") from
+        // an outer function scope), that slot's value was set by ops in a different
+        // dispatch branch that may not execute. We allocate a fresh local slot and
+        // emit a copy to guarantee the value is available in this ops sequence.
         let saved: Vec<(String, Option<Slot>)> = if let Some(ref f) = func {
             f.parameters
                 .iter()
                 .enumerate()
                 .map(|(i, param)| {
                     let old = self.property_slots.get(&param.name).copied();
-                    let val_slot = args
+                    let compiled_slot = args
                         .get(i)
                         .map(|a| self.compile_expr(a, ops))
                         .unwrap_or_else(|| {
@@ -1307,7 +1343,11 @@ impl<'a> Compiler<'a> {
                             ops.push(Op::LoadLit { dst: s, val: 0 });
                             s
                         });
-                    self.property_slots.insert(param.name.clone(), val_slot);
+                    // Always emit a fresh copy into this ops context to prevent
+                    // stale reads from dispatch entries that didn't execute.
+                    let local_slot = self.alloc();
+                    ops.push(Op::LoadSlot { dst: local_slot, src: compiled_slot });
+                    self.property_slots.insert(param.name.clone(), local_slot);
                     (param.name.clone(), old)
                 })
                 .collect()
@@ -1335,25 +1375,46 @@ impl<'a> Compiler<'a> {
                     compiled_entries.insert(key_val, (entry_ops, result));
                 }
             }
-            let mut fallback_ops = Vec::new();
-            let fallback_slot = {
-                let s = self.alloc();
-                fallback_ops.push(Op::LoadSlot { dst: s, src: dst });
-                s
-            };
-            let table_id = self.compiled_dispatches.len() as Slot;
-            self.compiled_dispatches.push(CompiledDispatchTable {
-                entries: compiled_entries,
-                fallback_ops,
-                fallback_slot,
-            });
-            let override_dst = self.alloc();
-            ops.push(Op::Dispatch {
-                dst: override_dst,
-                key: key_slot,
-                table_id,
-                fallback_target: 0,
-            });
+            // Instead of a nested Dispatch table (whose fallback would reference
+            // slots from this ops context — broken by slot compaction since the
+            // fallback_ops are compacted in a separate scope), inline the exception
+            // check as a branch chain in the calling ops. This keeps all slot
+            // references in the same scope, avoiding cross-scope aliasing bugs.
+            //
+            // For each exception key K with value V:
+            //   CmpEq(key_slot, K) → if match, compute V, jump to end
+            // Default: use LoadMem result (already in dst)
+            let result_slot = self.alloc();
+            ops.push(Op::LoadSlot { dst: result_slot, src: dst }); // default = LoadMem result
+
+            let mut jumps_to_end: Vec<usize> = Vec::new();
+            for (&key_val, (entry_ops, entry_result)) in &compiled_entries {
+                let lit = self.alloc();
+                ops.push(Op::LoadLit { dst: lit, val: key_val as i32 });
+                let cmp = self.alloc();
+                ops.push(Op::CmpEq { dst: cmp, a: key_slot, b: lit });
+                let branch_idx = ops.len();
+                ops.push(Op::BranchIfZero { cond: cmp, target: 0 }); // patched later
+
+                // Inline the exception entry's ops
+                ops.extend_from_slice(entry_ops);
+                ops.push(Op::LoadSlot { dst: result_slot, src: *entry_result });
+                jumps_to_end.push(ops.len());
+                ops.push(Op::Jump { target: 0 }); // patched later
+
+                let next_idx = ops.len() as u32;
+                if let Op::BranchIfZero { target, .. } = &mut ops[branch_idx] {
+                    *target = next_idx;
+                }
+            }
+            let end_idx = ops.len() as u32;
+            for idx in jumps_to_end {
+                if let Op::Jump { target } = &mut ops[idx] {
+                    *target = end_idx;
+                }
+            }
+
+            let override_dst = result_slot;
             // Use the dispatch result (which falls back to LoadMem result for non-exceptions)
             // Restore and return
             self.dispatch_tables.insert(name.to_string(), table);
@@ -1390,13 +1451,16 @@ impl<'a> Compiler<'a> {
 
         // Bind arguments to parameter slots, then evaluate locals
         // (the dispatch key may reference a local, e.g. --parity dispatches on --low8)
+        // Bind arguments with LoadSlot copy to prevent stale reads from
+        // dispatch entries that didn't execute (same fix as near-identity and
+        // general function paths).
         let saved: Vec<(String, Option<Slot>)> = if let Some(ref f) = func {
             let mut saved: Vec<(String, Option<Slot>)> = f.parameters
                 .iter()
                 .enumerate()
                 .map(|(i, param)| {
                     let old = self.property_slots.get(&param.name).copied();
-                    let val_slot = args
+                    let compiled_slot = args
                         .get(i)
                         .map(|a| self.compile_expr(a, ops))
                         .unwrap_or_else(|| {
@@ -1404,7 +1468,9 @@ impl<'a> Compiler<'a> {
                             ops.push(Op::LoadLit { dst: s, val: 0 });
                             s
                         });
-                    self.property_slots.insert(param.name.clone(), val_slot);
+                    let local_slot = self.alloc();
+                    ops.push(Op::LoadSlot { dst: local_slot, src: compiled_slot });
+                    self.property_slots.insert(param.name.clone(), local_slot);
                     (param.name.clone(), old)
                 })
                 .collect();
@@ -1506,13 +1572,16 @@ impl<'a> Compiler<'a> {
             }
         };
 
-        // Bind arguments to parameter slots
+        // Bind arguments to parameter slots.
+        // We emit a LoadSlot copy to ensure the value is materialized in THIS ops
+        // context. Without this, if the argument is a var reference to a slot set
+        // in a different dispatch entry's ops, the value would be stale at runtime.
         let mut saved: Vec<(String, Option<Slot>)> = Vec::with_capacity(
             func.parameters.len() + func.locals.len(),
         );
         for (i, param) in func.parameters.iter().enumerate() {
             let old = self.property_slots.get(&param.name).copied();
-            let val_slot = args
+            let compiled_slot = args
                 .get(i)
                 .map(|a| self.compile_expr(a, ops))
                 .unwrap_or_else(|| {
@@ -1520,7 +1589,9 @@ impl<'a> Compiler<'a> {
                     ops.push(Op::LoadLit { dst: s, val: 0 });
                     s
                 });
-            self.property_slots.insert(param.name.clone(), val_slot);
+            let local_slot = self.alloc();
+            ops.push(Op::LoadSlot { dst: local_slot, src: compiled_slot });
+            self.property_slots.insert(param.name.clone(), local_slot);
             saved.push((param.name.clone(), old));
         }
 
@@ -1583,7 +1654,7 @@ pub fn compile(
             .insert(assignment.property.clone(), result_slot);
 
         // Track writeback for canonical properties
-        if !is_buffer_copy(&assignment.property) && !is_byte_half(&assignment.property) {
+        if !is_buffer_copy(&assignment.property) {
             if let Some(addr) = property_to_address(&assignment.property) {
                 writeback.push((result_slot, addr));
             }
@@ -1686,6 +1757,29 @@ fn compact_slots(program: &mut CompiledProgram) {
     // Remap property_slots
     for val in program.property_slots.values_mut() {
         *val = slot_map[val];
+    }
+
+    // Debug: check for properties incorrectly sharing a physical slot.
+    // Recompute liveness here so we can report intervals.
+    {
+        let (liveness, _) = compute_liveness(&program.ops, &program.dispatch_tables);
+        let mut slot_to_names: std::collections::HashMap<Slot, Vec<String>> = std::collections::HashMap::new();
+        for (name, &slot) in &program.property_slots {
+            slot_to_names.entry(slot).or_default().push(name.clone());
+        }
+        for (phys_slot, names) in &slot_to_names {
+            if names.len() > 1 {
+                // For each original slot that maps to this physical slot, report its last-use
+                let info: Vec<String> = slot_map.iter()
+                    .filter(|(_, &v)| v == *phys_slot)
+                    .map(|(&orig, _)| {
+                        let lu = liveness.get(&orig).copied().unwrap_or(9999);
+                        format!("orig={} last_use_op={}", orig, lu)
+                    })
+                    .collect();
+                log::warn!("[slot-compaction] physical slot {} shared by {:?} — orig slots: {:?}", phys_slot, names, info);
+            }
+        }
     }
 
     // Reusable scratch buffers — avoids repeated HashMap allocations
@@ -2610,6 +2704,382 @@ fn exec_ops(
 }
 
 // ---------------------------------------------------------------------------
+// Traced execution (for debugging compiled vs interpreted divergence)
+// ---------------------------------------------------------------------------
+
+/// A single traced op execution.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct TraceEntry {
+    /// Program counter (op index in the ops array)
+    pub pc: usize,
+    /// Human-readable description of the op
+    pub op: String,
+    /// The op's destination slot (if any)
+    pub dst_slot: Option<Slot>,
+    /// The value written to the destination slot (if any)
+    pub dst_value: Option<i32>,
+    /// Key input slot values referenced by this op
+    pub inputs: Vec<(Slot, i32)>,
+    /// For branches: whether the branch was taken
+    pub branch_taken: Option<bool>,
+    /// Nesting depth (0 for main ops, incremented for dispatch sub-ops)
+    pub depth: u32,
+}
+
+/// Execute ops with full tracing. Returns (result_slot_values, trace_log).
+/// If `op_range` is Some((start, end)), only traces ops in that range.
+/// `target_slot` is the slot whose computation we're interested in.
+pub fn exec_ops_traced(
+    ops: &[Op],
+    dispatch_tables: &[CompiledDispatchTable],
+    state: &mut State,
+    slots: &mut [i32],
+    op_range: Option<(usize, usize)>,
+    depth: u32,
+) -> Vec<TraceEntry> {
+    let mut trace = Vec::new();
+    let len = ops.len();
+    let mut pc: usize = 0;
+    let (range_start, range_end) = op_range.unwrap_or((0, len));
+    let in_range = |pc: usize| pc >= range_start && pc < range_end;
+
+    while pc < len {
+        let should_trace = in_range(pc);
+        match &ops[pc] {
+            Op::LoadLit { dst, val } => {
+                slots[*dst as usize] = *val;
+                if should_trace {
+                    trace.push(TraceEntry {
+                        pc, op: format!("LoadLit dst={} val={}", dst, val),
+                        dst_slot: Some(*dst), dst_value: Some(*val),
+                        inputs: vec![], branch_taken: None, depth,
+                    });
+                }
+            }
+            Op::LoadSlot { dst, src } => {
+                let src_val = slots[*src as usize];
+                slots[*dst as usize] = src_val;
+                if should_trace {
+                    trace.push(TraceEntry {
+                        pc, op: format!("LoadSlot dst={} src={}", dst, src),
+                        dst_slot: Some(*dst), dst_value: Some(src_val),
+                        inputs: vec![(*src, src_val)], branch_taken: None, depth,
+                    });
+                }
+            }
+            Op::LoadState { dst, addr } => {
+                let val = state.read_mem(*addr);
+                slots[*dst as usize] = val;
+                if should_trace {
+                    trace.push(TraceEntry {
+                        pc, op: format!("LoadState dst={} addr={}", dst, addr),
+                        dst_slot: Some(*dst), dst_value: Some(val),
+                        inputs: vec![], branch_taken: None, depth,
+                    });
+                }
+            }
+            Op::LoadMem { dst, addr_slot } => {
+                let addr = slots[*addr_slot as usize];
+                let val = state.read_mem(addr);
+                slots[*dst as usize] = val;
+                if should_trace {
+                    trace.push(TraceEntry {
+                        pc, op: format!("LoadMem dst={} addr_slot={} addr={} → {}", dst, addr_slot, addr, val),
+                        dst_slot: Some(*dst), dst_value: Some(val),
+                        inputs: vec![(*addr_slot, addr)], branch_taken: None, depth,
+                    });
+                }
+            }
+            Op::LoadMem16 { dst, addr_slot } => {
+                let addr = slots[*addr_slot as usize];
+                let val = if addr < 0 { state.read_mem(addr) } else { state.read_mem16(addr) };
+                slots[*dst as usize] = val;
+                if should_trace {
+                    trace.push(TraceEntry {
+                        pc, op: format!("LoadMem16 dst={} addr_slot={} addr={} → {}", dst, addr_slot, addr, val),
+                        dst_slot: Some(*dst), dst_value: Some(val),
+                        inputs: vec![(*addr_slot, addr)], branch_taken: None, depth,
+                    });
+                }
+            }
+            Op::Add { dst, a, b } => {
+                let av = slots[*a as usize];
+                let bv = slots[*b as usize];
+                let val = av.wrapping_add(bv);
+                slots[*dst as usize] = val;
+                if should_trace {
+                    trace.push(TraceEntry {
+                        pc, op: format!("Add dst={} a={}({}) b={}({}) → {}", dst, a, av, b, bv, val),
+                        dst_slot: Some(*dst), dst_value: Some(val),
+                        inputs: vec![(*a, av), (*b, bv)], branch_taken: None, depth,
+                    });
+                }
+            }
+            Op::Sub { dst, a, b } => {
+                let av = slots[*a as usize];
+                let bv = slots[*b as usize];
+                let val = av.wrapping_sub(bv);
+                slots[*dst as usize] = val;
+                if should_trace {
+                    trace.push(TraceEntry {
+                        pc, op: format!("Sub dst={} a={}({}) b={}({}) → {}", dst, a, av, b, bv, val),
+                        dst_slot: Some(*dst), dst_value: Some(val),
+                        inputs: vec![(*a, av), (*b, bv)], branch_taken: None, depth,
+                    });
+                }
+            }
+            Op::Mul { dst, a, b } => {
+                let av = slots[*a as usize];
+                let bv = slots[*b as usize];
+                let val = av.wrapping_mul(bv);
+                slots[*dst as usize] = val;
+                if should_trace {
+                    trace.push(TraceEntry {
+                        pc, op: format!("Mul dst={} a={}({}) b={}({}) → {}", dst, a, av, b, bv, val),
+                        dst_slot: Some(*dst), dst_value: Some(val),
+                        inputs: vec![(*a, av), (*b, bv)], branch_taken: None, depth,
+                    });
+                }
+            }
+            Op::Div { dst, a, b } => {
+                let av = slots[*a as usize]; let bv = slots[*b as usize];
+                let val = if bv == 0 { 0 } else { av / bv };
+                slots[*dst as usize] = val;
+                if should_trace { trace.push(TraceEntry { pc, op: format!("Div dst={} → {}", dst, val), dst_slot: Some(*dst), dst_value: Some(val), inputs: vec![(*a, av), (*b, bv)], branch_taken: None, depth }); }
+            }
+            Op::Mod { dst, a, b } => {
+                let av = slots[*a as usize]; let bv = slots[*b as usize];
+                let val = if bv == 0 { 0 } else { av % bv };
+                slots[*dst as usize] = val;
+                if should_trace { trace.push(TraceEntry { pc, op: format!("Mod dst={} → {}", dst, val), dst_slot: Some(*dst), dst_value: Some(val), inputs: vec![(*a, av), (*b, bv)], branch_taken: None, depth }); }
+            }
+            Op::Neg { dst, src } => {
+                let val = slots[*src as usize].wrapping_neg();
+                slots[*dst as usize] = val;
+                if should_trace { trace.push(TraceEntry { pc, op: format!("Neg dst={} → {}", dst, val), dst_slot: Some(*dst), dst_value: Some(val), inputs: vec![(*src, slots[*src as usize])], branch_taken: None, depth }); }
+            }
+            Op::Abs { dst, src } => {
+                let val = slots[*src as usize].wrapping_abs();
+                slots[*dst as usize] = val;
+                if should_trace { trace.push(TraceEntry { pc, op: format!("Abs dst={} → {}", dst, val), dst_slot: Some(*dst), dst_value: Some(val), inputs: vec![], branch_taken: None, depth }); }
+            }
+            Op::Sign { dst, src } => {
+                let v = slots[*src as usize];
+                let val = if v > 0 { 1 } else if v < 0 { -1 } else { 0 };
+                slots[*dst as usize] = val;
+                if should_trace { trace.push(TraceEntry { pc, op: format!("Sign dst={} → {}", dst, val), dst_slot: Some(*dst), dst_value: Some(val), inputs: vec![(*src, v)], branch_taken: None, depth }); }
+            }
+            Op::Pow { dst, base, exp } => {
+                let b = slots[*base as usize]; let e = slots[*exp as usize];
+                let val = if e < 0 { 0 } else { b.wrapping_pow(e as u32) };
+                slots[*dst as usize] = val;
+                if should_trace { trace.push(TraceEntry { pc, op: format!("Pow dst={} → {}", dst, val), dst_slot: Some(*dst), dst_value: Some(val), inputs: vec![(*base, b), (*exp, e)], branch_taken: None, depth }); }
+            }
+            Op::Min { dst, args } => {
+                let mut v = i32::MAX; for &a in args { v = v.min(slots[a as usize]); }
+                slots[*dst as usize] = v;
+                if should_trace { trace.push(TraceEntry { pc, op: format!("Min dst={} → {}", dst, v), dst_slot: Some(*dst), dst_value: Some(v), inputs: args.iter().map(|&a| (a, slots[a as usize])).collect(), branch_taken: None, depth }); }
+            }
+            Op::Max { dst, args } => {
+                let mut v = i32::MIN; for &a in args { v = v.max(slots[a as usize]); }
+                slots[*dst as usize] = v;
+                if should_trace { trace.push(TraceEntry { pc, op: format!("Max dst={} → {}", dst, v), dst_slot: Some(*dst), dst_value: Some(v), inputs: args.iter().map(|&a| (a, slots[a as usize])).collect(), branch_taken: None, depth }); }
+            }
+            Op::Clamp { dst, min, val, max } => {
+                let val_v = slots[*val as usize].clamp(slots[*min as usize], slots[*max as usize]);
+                slots[*dst as usize] = val_v;
+                if should_trace { trace.push(TraceEntry { pc, op: format!("Clamp dst={} → {}", dst, val_v), dst_slot: Some(*dst), dst_value: Some(val_v), inputs: vec![], branch_taken: None, depth }); }
+            }
+            Op::Round { dst, strategy, val, interval } => {
+                let v = slots[*val as usize]; let i = slots[*interval as usize];
+                let val_r = if i == 0 { v } else {
+                    match strategy {
+                        RoundStrategy::Down => v.div_euclid(i) * i,
+                        RoundStrategy::Up => (v + i - 1).div_euclid(i) * i,
+                        RoundStrategy::Nearest => ((v + i / 2).div_euclid(i)) * i,
+                        RoundStrategy::ToZero => (v / i) * i,
+                    }
+                };
+                slots[*dst as usize] = val_r;
+                if should_trace { trace.push(TraceEntry { pc, op: format!("Round dst={} → {}", dst, val_r), dst_slot: Some(*dst), dst_value: Some(val_r), inputs: vec![], branch_taken: None, depth }); }
+            }
+            Op::Floor { dst, src } => {
+                slots[*dst as usize] = slots[*src as usize];
+                if should_trace { trace.push(TraceEntry { pc, op: format!("Floor dst={}", dst), dst_slot: Some(*dst), dst_value: Some(slots[*dst as usize]), inputs: vec![], branch_taken: None, depth }); }
+            }
+            Op::And { dst, a, b } => {
+                let av = slots[*a as usize]; let bv = slots[*b as usize] as u32;
+                let val = if bv >= 32 { av } else { av & ((1i32 << bv) - 1) };
+                slots[*dst as usize] = val;
+                if should_trace { trace.push(TraceEntry { pc, op: format!("And dst={} a={}({}) b={}({}) → {}", dst, a, av, b, bv, val), dst_slot: Some(*dst), dst_value: Some(val), inputs: vec![(*a, av), (*b, bv as i32)], branch_taken: None, depth }); }
+            }
+            Op::Shr { dst, a, b } => {
+                let av = slots[*a as usize]; let bv = slots[*b as usize] as u32;
+                let val = if bv >= 32 { 0 } else { av >> bv };
+                slots[*dst as usize] = val;
+                if should_trace { trace.push(TraceEntry { pc, op: format!("Shr dst={} → {}", dst, val), dst_slot: Some(*dst), dst_value: Some(val), inputs: vec![(*a, av), (*b, bv as i32)], branch_taken: None, depth }); }
+            }
+            Op::Shl { dst, a, b } => {
+                let av = slots[*a as usize]; let bv = slots[*b as usize] as u32;
+                let val = if bv >= 32 { 0 } else { av << bv };
+                slots[*dst as usize] = val;
+                if should_trace { trace.push(TraceEntry { pc, op: format!("Shl dst={} → {}", dst, val), dst_slot: Some(*dst), dst_value: Some(val), inputs: vec![(*a, av), (*b, bv as i32)], branch_taken: None, depth }); }
+            }
+            Op::Bit { dst, val, idx } => {
+                let v = slots[*val as usize]; let i = slots[*idx as usize] as u32;
+                let val_r = if i >= 32 { 0 } else { (v >> i) & 1 };
+                slots[*dst as usize] = val_r;
+                if should_trace { trace.push(TraceEntry { pc, op: format!("Bit dst={} → {}", dst, val_r), dst_slot: Some(*dst), dst_value: Some(val_r), inputs: vec![], branch_taken: None, depth }); }
+            }
+            Op::CmpEq { dst, a, b } => {
+                let av = slots[*a as usize]; let bv = slots[*b as usize];
+                let val = if av == bv { 1 } else { 0 };
+                slots[*dst as usize] = val;
+                if should_trace {
+                    trace.push(TraceEntry {
+                        pc, op: format!("CmpEq dst={} a={}({}) b={}({}) → {}", dst, a, av, b, bv, val),
+                        dst_slot: Some(*dst), dst_value: Some(val),
+                        inputs: vec![(*a, av), (*b, bv)], branch_taken: None, depth,
+                    });
+                }
+            }
+            Op::BranchIfZero { cond, target } => {
+                let cv = slots[*cond as usize];
+                let taken = cv == 0;
+                if should_trace {
+                    trace.push(TraceEntry {
+                        pc, op: format!("BranchIfZero cond={}({}) target={} {}", cond, cv, target, if taken { "TAKEN" } else { "not taken" }),
+                        dst_slot: None, dst_value: None,
+                        inputs: vec![(*cond, cv)], branch_taken: Some(taken), depth,
+                    });
+                }
+                if taken {
+                    pc = *target as usize;
+                    continue;
+                }
+            }
+            Op::Jump { target } => {
+                if should_trace {
+                    trace.push(TraceEntry {
+                        pc, op: format!("Jump target={}", target),
+                        dst_slot: None, dst_value: None,
+                        inputs: vec![], branch_taken: None, depth,
+                    });
+                }
+                pc = *target as usize;
+                continue;
+            }
+            Op::Dispatch { dst, key, table_id, .. } => {
+                let key_val = slots[*key as usize] as i64;
+                let table = &dispatch_tables[*table_id as usize];
+                if let Some((entry_ops, result_slot)) = table.entries.get(&key_val) {
+                    if should_trace {
+                        let mut sub = exec_ops_traced(entry_ops, dispatch_tables, state, slots, None, depth + 1);
+                        trace.push(TraceEntry {
+                            pc, op: format!("Dispatch dst={} key={}({}) table={} → entry (result_slot={}={})", dst, key, key_val, table_id, result_slot, slots[*result_slot as usize]),
+                            dst_slot: Some(*dst), dst_value: Some(slots[*result_slot as usize]),
+                            inputs: vec![(*key, key_val as i32)], branch_taken: None, depth,
+                        });
+                        trace.append(&mut sub);
+                    } else {
+                        exec_ops(entry_ops, dispatch_tables, state, slots);
+                    }
+                    slots[*dst as usize] = slots[*result_slot as usize];
+                } else {
+                    if should_trace {
+                        let mut sub = exec_ops_traced(&table.fallback_ops, dispatch_tables, state, slots, None, depth + 1);
+                        exec_ops(&table.fallback_ops, dispatch_tables, state, slots);
+                        trace.push(TraceEntry {
+                            pc, op: format!("Dispatch dst={} key={}({}) table={} → fallback (fallback_slot={}={})", dst, key, key_val, table_id, table.fallback_slot, slots[table.fallback_slot as usize]),
+                            dst_slot: Some(*dst), dst_value: Some(slots[table.fallback_slot as usize]),
+                            inputs: vec![(*key, key_val as i32)], branch_taken: None, depth,
+                        });
+                        trace.append(&mut sub);
+                    } else {
+                        exec_ops(&table.fallback_ops, dispatch_tables, state, slots);
+                    }
+                    slots[*dst as usize] = slots[table.fallback_slot as usize];
+                }
+            }
+            Op::StoreState { addr, src } => {
+                let val = slots[*src as usize];
+                state.write_mem(*addr, val);
+                if should_trace { trace.push(TraceEntry { pc, op: format!("StoreState addr={} src={}({})", addr, src, val), dst_slot: None, dst_value: None, inputs: vec![(*src, val)], branch_taken: None, depth }); }
+            }
+            Op::StoreMem { addr_slot, src } => {
+                let addr = slots[*addr_slot as usize]; let val = slots[*src as usize];
+                state.write_mem(addr, val);
+                if should_trace { trace.push(TraceEntry { pc, op: format!("StoreMem addr={}({}) src={}({})", addr_slot, addr, src, val), dst_slot: None, dst_value: None, inputs: vec![(*addr_slot, addr), (*src, val)], branch_taken: None, depth }); }
+            }
+        }
+        pc += 1;
+    }
+    trace
+}
+
+/// Trace execution of a specific property's computation.
+/// Returns the trace log for ops in the range that computes the named property.
+pub fn trace_property(
+    program: &CompiledProgram,
+    state: &mut State,
+    slots: &mut Vec<i32>,
+    property_name: &str,
+) -> Option<(i32, Vec<TraceEntry>)> {
+    let target_slot = *program.property_slots.get(property_name)?;
+
+    // Reset slots
+    slots.clear();
+    slots.resize(program.slot_count as usize, 0);
+
+    // Find the op range for this property by looking for the StoreState that
+    // writes to the property's state address, or the last LoadSlot that writes
+    // to the property's result slot. We trace the entire ops since the property
+    // computation may depend on earlier ops (state loads, condition checks).
+    // But to limit output, we'll trace only ops that are "near" the target slot.
+    //
+    // Simple approach: run all ops with full tracing, then filter to only
+    // the ops that touch the target slot or lead to it. Since this is a
+    // debugging tool (not hot path), performance doesn't matter.
+    let trace = exec_ops_traced(
+        &program.ops,
+        &program.dispatch_tables,
+        state,
+        slots,
+        None, // trace all ops
+        0,
+    );
+
+    let result_value = slots[target_slot as usize];
+
+    // Filter trace to relevant ops: find the writeback that stores to target_slot,
+    // then walk backward through the trace to find all ops that feed into it.
+    // For now, return all ops that wrote to the target slot or were branches in the
+    // path, plus a window around them.
+    let mut relevant_slots: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    relevant_slots.insert(target_slot);
+
+    // Walk backward through trace to find dependency chain
+    let mut relevant: Vec<TraceEntry> = Vec::new();
+    for entry in trace.iter().rev() {
+        let dominated = entry.dst_slot.map(|s| relevant_slots.contains(&s)).unwrap_or(false);
+        let is_branch = entry.branch_taken.is_some();
+        if dominated || is_branch || entry.depth > 0 {
+            if dominated {
+                // Add input slots as dependencies
+                for &(slot, _) in &entry.inputs {
+                    relevant_slots.insert(slot);
+                }
+            }
+            relevant.push(entry.clone());
+        }
+    }
+    relevant.reverse();
+
+    Some((result_value, relevant))
+}
+
+// ---------------------------------------------------------------------------
 // Helpers (duplicated from eval.rs to avoid coupling)
 // ---------------------------------------------------------------------------
 
@@ -2617,12 +3087,6 @@ fn is_buffer_copy(name: &str) -> bool {
     name.starts_with("--__0") || name.starts_with("--__1") || name.starts_with("--__2")
 }
 
-fn is_byte_half(name: &str) -> bool {
-    if let Some(addr) = property_to_address(name) {
-        return addr < -14;
-    }
-    false
-}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -2631,39 +3095,24 @@ fn is_byte_half(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state;
 
-    /// Install a test address map so property_to_address works for --AX etc.
-    fn setup() {
-        use crate::state::addr;
+    const STATE_VAR_NAMES: &[&str] = &[
+        "AX", "CX", "DX", "BX", "SP", "BP", "SI", "DI",
+        "IP", "ES", "CS", "SS", "DS", "flags",
+    ];
+
+    /// Install a test address map and return a State with matching state vars.
+    fn setup() -> State {
         let mut map = std::collections::HashMap::new();
-        for (name, a) in [
-            ("AX", addr::AX),
-            ("CX", addr::CX),
-            ("DX", addr::DX),
-            ("BX", addr::BX),
-            ("SP", addr::SP),
-            ("BP", addr::BP),
-            ("SI", addr::SI),
-            ("DI", addr::DI),
-            ("IP", addr::IP),
-            ("ES", addr::ES),
-            ("CS", addr::CS),
-            ("SS", addr::SS),
-            ("DS", addr::DS),
-            ("flags", addr::FLAGS),
-            ("AH", addr::AH),
-            ("CH", addr::CH),
-            ("DH", addr::DH),
-            ("BH", addr::BH),
-            ("AL", addr::AL),
-            ("CL", addr::CL),
-            ("DL", addr::DL),
-            ("BL", addr::BL),
-        ] {
-            map.insert(name.to_string(), a);
+        let mut state = State::default();
+        for (i, &name) in STATE_VAR_NAMES.iter().enumerate() {
+            map.insert(name.to_string(), -(i as i32 + 1));
+            state.state_vars.push(0);
+            state.state_var_names.push(name.to_string());
+            state.state_var_index.insert(name.to_string(), i);
         }
         crate::eval::set_address_map(map);
+        state
     }
 
     #[test]
@@ -2702,7 +3151,7 @@ mod tests {
 
     #[test]
     fn compile_var_from_state() {
-        setup();
+        let mut state = setup();
         let expr = Expr::Var {
             name: "--AX".to_string(),
             fallback: None,
@@ -2713,8 +3162,7 @@ mod tests {
         let mut ops = Vec::new();
         let slot = compiler.compile_expr(&expr, &mut ops);
 
-        let mut state = State::default();
-        state.registers[state::reg::AX] = 0x1234;
+        state.set_var("AX", 0x1234);
         let mut slots = vec![0i32; compiler.next_slot as usize];
         exec_ops(&ops, &[], &mut state, &mut slots);
         assert_eq!(slots[slot as usize], 0x1234);
@@ -2722,7 +3170,7 @@ mod tests {
 
     #[test]
     fn compile_style_condition() {
-        setup();
+        let mut state = setup();
         let expr = Expr::StyleCondition {
             branches: vec![
                 StyleBranch {
@@ -2748,8 +3196,7 @@ mod tests {
         let mut ops = Vec::new();
         let slot = compiler.compile_expr(&expr, &mut ops);
 
-        let mut state = State::default();
-        state.registers[state::reg::AX] = 2;
+        state.set_var("AX", 2);
         let mut slots = vec![0i32; compiler.next_slot as usize];
         exec_ops(&ops, &[], &mut state, &mut slots);
         assert_eq!(slots[slot as usize], 200);
@@ -2757,7 +3204,7 @@ mod tests {
 
     #[test]
     fn compile_readmem() {
-        setup();
+        let mut state = setup(); // install address map before compilation
         // Build a dispatch table that maps key K → Var at state address K
         // (identity-read pattern, detected generically).
         use crate::pattern::dispatch_table::DispatchTable;
@@ -2816,8 +3263,7 @@ mod tests {
         let mut ops = Vec::new();
         let slot = compiler.compile_expr(&expr, &mut ops);
 
-        let mut state = State::default();
-        state.registers[state::reg::AX] = 42;
+        state.set_var("AX", 42);
         let mut slots = vec![0i32; compiler.next_slot as usize];
         exec_ops(&ops, &compiler.compiled_dispatches, &mut state, &mut slots);
         assert_eq!(slots[slot as usize], 42);
@@ -2876,7 +3322,7 @@ mod tests {
 
     #[test]
     fn compile_full_program() {
-        setup();
+        let mut state = setup();
         let assignments = vec![
             Assignment {
                 property: "--AX".to_string(),
@@ -2890,11 +3336,10 @@ mod tests {
 
         let program = compile(&assignments, &[], &HashMap::new(), &HashMap::new());
 
-        let mut state = State::default();
         let mut slots = Vec::new();
         execute(&program, &mut state, &mut slots);
 
-        assert_eq!(state.registers[state::reg::AX], 42);
+        assert_eq!(state.get_var("AX").unwrap(), 42);
         assert_eq!(state.memory[0], 255);
     }
 
@@ -2937,7 +3382,7 @@ mod tests {
 
     #[test]
     fn compile_value_forwarding() {
-        setup();
+        let mut state = setup();
         // Assignment A computes --AX = 10
         // Assignment B computes --CX = var(--AX) + 5
         // B should see A's value without a state lookup
@@ -2960,12 +3405,11 @@ mod tests {
 
         let program = compile(&assignments, &[], &HashMap::new(), &HashMap::new());
 
-        let mut state = State::default();
         let mut slots = Vec::new();
         execute(&program, &mut state, &mut slots);
 
-        assert_eq!(state.registers[state::reg::AX], 10);
-        assert_eq!(state.registers[state::reg::CX], 15);
+        assert_eq!(state.get_var("AX").unwrap(), 10);
+        assert_eq!(state.get_var("CX").unwrap(), 15);
     }
 
     #[test]
