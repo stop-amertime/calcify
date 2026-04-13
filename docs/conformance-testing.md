@@ -216,7 +216,7 @@ run.bat diagnose     Pick a program and run full conformance diagnosis
 ```
 
 Programs go in `programs/` (`.com` or `.exe` files, or subdirectories with
-companion data files). CSS is auto-generated and cached in `programs/.cache/`.
+companion data files). CSS is regenerated from source on every run.
 
 ## REP instruction sync
 

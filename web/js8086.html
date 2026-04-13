@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>JS8086 — CSS-DOS Reference Emulator</title>
+  <style>
+    @font-face {
+      font-family: 'DOS';
+      src: local('Perfect DOS VGA 437'), local('Fixedsys'), local('Terminal');
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'DOS', 'Fixedsys', 'Terminal', monospace;
+      font-size: 14px;
+      background: #008080;
+      color: #000;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 8px;
+      cursor: default;
+      image-rendering: pixelated;
+    }
+
+    .window {
+      background: #c0c0c0;
+      border-top: 2px solid #fff;
+      border-left: 2px solid #fff;
+      border-right: 2px solid #808080;
+      border-bottom: 2px solid #808080;
+      box-shadow: 1px 1px 0 #000;
+      width: 720px;
+      max-width: 100%;
+      margin-bottom: 4px;
+    }
+
+    .title-bar {
+      background: #000080;
+      color: #fff;
+      padding: 2px 4px;
+      font-size: 13px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      user-select: none;
+    }
+
+    .window-body { padding: 6px; }
+
+    .btn {
+      background: #c0c0c0;
+      border-top: 2px solid #fff;
+      border-left: 2px solid #fff;
+      border-right: 2px solid #808080;
+      border-bottom: 2px solid #808080;
+      font-family: inherit;
+      font-size: 12px;
+      padding: 3px 12px;
+      cursor: pointer;
+      color: #000;
+      min-width: 70px;
+    }
+
+    .btn:active:not(:disabled) {
+      border-top: 2px solid #808080;
+      border-left: 2px solid #808080;
+      border-right: 2px solid #fff;
+      border-bottom: 2px solid #fff;
+    }
+
+    .btn:disabled { color: #808080; text-shadow: 1px 1px 0 #fff; }
+
+    .field-dark {
+      border-top: 1px solid #808080;
+      border-left: 1px solid #808080;
+      border-right: 1px solid #fff;
+      border-bottom: 1px solid #fff;
+      background: #000;
+      color: #33ff33;
+      font-family: inherit;
+      font-size: 14px;
+      padding: 8px;
+      white-space: pre;
+      line-height: 1.15;
+      min-height: 200px;
+      overflow-y: auto;
+    }
+
+    .row { display: flex; gap: 6px; align-items: center; margin-bottom: 6px; }
+    .row:last-child { margin-bottom: 0; }
+    label { font-size: 12px; }
+    .spacer { flex: 1; }
+
+    .field {
+      border-top: 1px solid #808080;
+      border-left: 1px solid #808080;
+      border-right: 1px solid #fff;
+      border-bottom: 1px solid #fff;
+      background: #fff;
+      color: #000;
+      font-family: inherit;
+      font-size: 12px;
+      padding: 2px 4px;
+    }
+
+    .status-bar {
+      border-top: 1px solid #808080;
+      border-left: 1px solid #808080;
+      border-right: 1px solid #fff;
+      border-bottom: 1px solid #fff;
+      background: #c0c0c0;
+      padding: 2px 4px;
+      font-size: 11px;
+      margin-top: 4px;
+      color: #000;
+    }
+
+    .group {
+      border: 1px solid #808080;
+      padding: 8px 6px 6px;
+      margin-bottom: 6px;
+      position: relative;
+    }
+
+    .group-label {
+      position: absolute;
+      top: -7px;
+      left: 8px;
+      background: #c0c0c0;
+      padding: 0 4px;
+      font-size: 11px;
+    }
+
+    hr.groove { border: none; border-top: 1px solid #808080; border-bottom: 1px solid #fff; margin: 6px 0; }
+    input[type="file"] { display: none; }
+    input[type="number"] { width: 80px; }
+
+    .mode-badge {
+      display: inline-block;
+      background: #800000;
+      color: #fff;
+      padding: 1px 6px;
+      font-size: 10px;
+      margin-left: 6px;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="window">
+    <div class="title-bar">
+      <span>JS8086 — CSS-DOS Reference Emulator</span>
+      <span class="mode-badge">JS REF</span>
+    </div>
+    <div class="window-body">
+
+      <div class="group">
+        <span class="group-label">Controls</span>
+        <div class="row">
+          <button id="btn-start" class="btn" disabled>Run</button>
+          <button id="btn-stop" class="btn" disabled>Stop</button>
+          <div class="spacer"></div>
+          <label>Ticks/batch:</label>
+          <input id="batch-size" class="field" type="number" value="5000" min="1" max="100000">
+        </div>
+      </div>
+
+      <hr class="groove">
+
+      <div id="output" class="field-dark">Loading...</div>
+      <canvas id="screen-canvas" width="320" height="200"
+        style="display:none; width: 640px; height: 400px; background:#000; image-rendering: pixelated;
+               border-top: 1px solid #808080; border-left: 1px solid #808080;
+               border-right: 1px solid #fff; border-bottom: 1px solid #fff;">
+      </canvas>
+
+      <div class="status-bar">
+        <span id="status">Loading binaries...</span>
+        <span style="float:right" id="stats"></span>
+      </div>
+
+    </div>
+  </div>
+
+  <script>
+    const worker = new Worker('js8086-worker.js');
+    const status = document.getElementById('status');
+    const output = document.getElementById('output');
+    const canvas = document.getElementById('screen-canvas');
+    const ctx = canvas.getContext('2d');
+    const stats = document.getElementById('stats');
+    const btnStart = document.getElementById('btn-start');
+    const btnStop = document.getElementById('btn-stop');
+    const batchInput = document.getElementById('batch-size');
+
+    let running = false;
+    let totalTicks = 0;
+    let startTime = 0;
+    let engineReady = false;
+    let gfxImageData = null;
+    let currentVideoMode = 0x03;
+
+    worker.onmessage = ({ data }) => {
+      switch (data.type) {
+        case 'ready': {
+          engineReady = true;
+          btnStart.disabled = false;
+          output.textContent = '';
+          output.style.display = '';
+          canvas.style.display = 'none';
+          if (data.video && data.video.gfx) {
+            canvas.width = data.video.gfx.width;
+            canvas.height = data.video.gfx.height;
+            canvas.style.width = (data.video.gfx.width * 2) + 'px';
+            canvas.style.height = (data.video.gfx.height * 2) + 'px';
+            gfxImageData = ctx.createImageData(data.video.gfx.width, data.video.gfx.height);
+          }
+          status.textContent = 'Ready — click Run or press any key';
+          startRunning();
+          break;
+        }
+
+        case 'tick-result': {
+          totalTicks += data.ticks;
+          const elapsed = (performance.now() - startTime) / 1000;
+          stats.textContent = `${totalTicks.toLocaleString()} ticks | ${(totalTicks / elapsed).toFixed(0)} t/s`;
+
+          const isGfxMode = (data.videoMode === 0x13);
+          if (isGfxMode !== (currentVideoMode === 0x13)) {
+            currentVideoMode = data.videoMode;
+            if (isGfxMode) { canvas.style.display = ''; output.style.display = 'none'; }
+            else { canvas.style.display = 'none'; output.style.display = ''; output.style.minHeight = '0'; }
+          }
+          currentVideoMode = data.videoMode;
+
+          if (data.gfxBytes && gfxImageData) {
+            gfxImageData.data.set(new Uint8Array(data.gfxBytes));
+            ctx.putImageData(gfxImageData, 0, 0);
+          }
+
+          if (!isGfxMode && data.screen != null) {
+            output.textContent = data.screen;
+          }
+
+          if (running && data.ticks > 0) {
+            worker.postMessage({ type: 'tick', count: parseInt(batchInput.value, 10) || 5000 });
+          } else if (data.ticks === 0) {
+            status.textContent = 'Halted';
+            running = false;
+            btnStart.disabled = false;
+            btnStop.disabled = true;
+          }
+          break;
+        }
+
+        case 'error':
+          status.textContent = `Error: ${data.message}`;
+          running = false;
+          btnStart.disabled = !engineReady;
+          btnStop.disabled = true;
+          break;
+      }
+    };
+
+    function startRunning() {
+      if (!engineReady || running) return;
+      running = true;
+      startTime = performance.now();
+      totalTicks = 0;
+      btnStart.disabled = true;
+      btnStop.disabled = false;
+      status.textContent = 'Running...';
+      worker.postMessage({ type: 'tick', count: parseInt(batchInput.value, 10) || 5000 });
+    }
+
+    btnStart.addEventListener('click', startRunning);
+    btnStop.addEventListener('click', () => {
+      running = false;
+      btnStart.disabled = false;
+      btnStop.disabled = true;
+      status.textContent = 'Stopped';
+    });
+
+    // Keyboard input
+    const dosKeyMap = {
+      'ArrowUp': 0x4800, 'ArrowDown': 0x5000,
+      'ArrowLeft': 0x4B00, 'ArrowRight': 0x4D00,
+      'Escape': 0x011B, 'Enter': 0x1C0D,
+      'Backspace': 0x0E08, 'Tab': 0x0F09,
+      ' ': 0x3920,
+    };
+
+    function keyToCode(e) {
+      if (dosKeyMap[e.key]) return dosKeyMap[e.key];
+      const c = e.key.length === 1 ? e.key.charCodeAt(0) : 0;
+      if (c >= 0x20 && c <= 0x7E) return c;
+      return 0;
+    }
+
+    document.addEventListener('keydown', (e) => {
+      if (!engineReady || !running) return;
+      if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+      const code = keyToCode(e);
+      if (code) { worker.postMessage({ type: 'keyboard', key: code }); e.preventDefault(); }
+    });
+
+    document.addEventListener('keyup', (e) => {
+      if (!engineReady) return;
+      if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+      worker.postMessage({ type: 'keyboard', key: 0 });
+    });
+
+    // Boot: fetch binaries and js8086 source, send to worker
+    async function boot() {
+      try {
+        const cssDir = '/css-dos';
+        const [js8086Resp, kernelResp, diskResp] = await Promise.all([
+          fetch(`${cssDir}/tools/js8086.js`),
+          fetch(`${cssDir}/dos/bin/kernel.sys`),
+          fetch(`${cssDir}/dos/disk.img`),
+        ]);
+
+        if (!js8086Resp.ok) throw new Error(`Failed to fetch js8086.js: ${js8086Resp.status}`);
+        if (!kernelResp.ok) throw new Error(`Failed to fetch kernel.sys: ${kernelResp.status}`);
+        if (!diskResp.ok) throw new Error(`Failed to fetch disk.img: ${diskResp.status}`);
+
+        const js8086Src = await js8086Resp.text();
+        const kernel = await kernelResp.arrayBuffer();
+        const disk = await diskResp.arrayBuffer();
+
+        status.textContent = `Loaded: js8086 ${(js8086Src.length/1024).toFixed(0)}KB, kernel ${(kernel.byteLength/1024).toFixed(0)}KB, disk ${(disk.byteLength/1024).toFixed(0)}KB`;
+
+        worker.postMessage(
+          { type: 'init', js8086Src, kernel, disk },
+          [kernel, disk],
+        );
+      } catch (e) {
+        status.textContent = `Boot failed: ${e.message}`;
+        output.textContent = 'Failed to load. Make sure you run:\n\n  node tools/serve-js8086.mjs\n\nfrom the calcite directory.';
+      }
+    }
+
+    boot();
+  </script>
+</body>
+</html>

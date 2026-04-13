@@ -34,6 +34,7 @@ const traceFrom = parseInt(flags['trace-from'] || '-1');
 const intTrace = flags['int-trace'] === 'true';
 const intTraceFrom = parseInt(flags['int-trace-from'] || '-1');
 const portTrace = flags['port-trace'] === 'true';
+const watchAddr = flags['watch'] ? parseInt(flags['watch']) : -1;  // --watch=0xA0730
 
 // --- Load JS 8086 ---
 const js8086Source = readFileSync(resolve(__dirname, '..', '..', 'CSS-DOS', 'tools', 'js8086.js'), 'utf-8');
@@ -111,6 +112,12 @@ const cpu = Intel8086(
   (addr, val) => {
     const a = addr & 0xFFFFF;
     memory[a] = val & 0xFF;
+    if (watchAddr >= 0 && (a >= watchAddr && a < watchAddr + 4)) {
+      const r = cpu.getRegs();
+      const word = memory[watchAddr] | (memory[watchAddr+1] << 8);
+      const word2 = memory[watchAddr+2] | (memory[watchAddr+3] << 8);
+      console.error(`  [T${currentTick}] WATCH ${hex(watchAddr,5)}: byte[${a - watchAddr}]=${hex(val & 0xFF, 2)} -> dword=${hex(word2)}:${hex(word)} from ${hex(r.cs)}:${hex(r.ip)}`);
+    }
     if (a >= 0xB8000 && a < 0xB9000 && vgaWriteTickStart >= 0 && currentTick >= vgaWriteTickStart && (vgaWriteTickEnd < 0 || currentTick <= vgaWriteTickEnd)) {
       const offset = a - 0xB8000;
       const row = Math.floor(offset / 160);

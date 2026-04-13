@@ -17,7 +17,7 @@ set CALCITE=target\release\calcite-cli.exe
 set DEBUGGER=target\release\calcite-debugger.exe
 set CSSDIR=..\CSS-DOS
 set GENERATOR=%CSSDIR%\transpiler\generate-dos.mjs
-set BIOSBIN=%CSSDIR%\build\gossamer-dos.bin
+set BIOSBIN=%CSSDIR%\legacy\gossamer-dos.bin
 set PROGDIR=programs
 set OUTPUTDIR=output
 
@@ -257,7 +257,7 @@ set "NAME=!NAME_%CHOICE%!"
 set "EXEC=!EXEC_%CHOICE%!"
 set "PTYPE=!TYPE_%CHOICE%!"
 
-set /p TICKS="  Ticks to check [5000]: "
+set /p TICKS="  Cycles to check [5000]: "
 if "%TICKS%"=="" set TICKS=5000
 
 REM Build both binaries
@@ -282,7 +282,7 @@ echo   Starting debugger...
 start /b "" "%DEBUGGER%" -i "%CSS%"
 timeout /t 4 /nobreak >nul
 
-echo   Running diagnosis (%TICKS% ticks)...
+echo   Running diagnosis (%TICKS% cycles)...
 echo.
 node tools\diagnose.mjs "%EXEC%" "%BIOSBIN%" --ticks=%TICKS%
 
@@ -301,10 +301,8 @@ set _CSS=%~2
 set _TYPE=%~3
 set _DIR=%~4
 
-REM Use cached CSS if it exists and is large enough (>1MB = valid)
-if exist "%_CSS%" (
-    for %%a in ("%_CSS%") do if %%~za GTR 1000000 goto :eof
-)
+REM Always regenerate — transpiler changes must take effect immediately
+if exist "%_CSS%" del "%_CSS%"
 
 echo.
 echo   Generating CSS for %~nx1 via DOS...

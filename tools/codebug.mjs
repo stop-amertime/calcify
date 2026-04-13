@@ -68,7 +68,7 @@ const evalSource = js8086Source.replace("'use strict';", '').replace('let CPU_18
 const Intel8086 = new Function(evalSource + '\nreturn Intel8086;')();
 
 const cssDir = resolve(__dirname, '..', '..', 'CSS-DOS');
-const biosBin = readFileSync(resolve(cssDir, 'build', 'gossamer-dos.bin'));
+const biosBin = readFileSync(resolve(cssDir, 'legacy', 'gossamer-dos.bin'));
 const kernelBin = readFileSync(resolve(cssDir, 'dos', 'bin', 'kernel.sys'));
 const diskBin = readFileSync(resolve(cssDir, 'dos', 'disk.img'));
 

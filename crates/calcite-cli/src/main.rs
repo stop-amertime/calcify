@@ -276,21 +276,33 @@ fn main() {
 
             let t2 = std::time::Instant::now();
 
+            // Real 8086 ran at 4.77 MHz. We measure instructions/sec against this.
+            const REAL_8086_IPS: f64 = 500_000.0; // ~0.5 MIPS typical throughput
+
             // Render the screen based on BDA video mode (0x0449).
             // Text modes: render in-terminal using ANSI. Mode 13h: status line.
-            let render_screen = |state: &calcite_core::State, tick: u32, first: bool| {
+            //
+            // insns/ticks = totals; delta_insns/delta_ticks/delta_secs = since last render
+            let render_screen = |state: &calcite_core::State, insns: u64, ticks: u32,
+                                  delta_insns: u64, delta_ticks: u32, delta_secs: f64,
+                                  first: bool| {
+                let ips = if delta_secs > 0.0 { delta_insns as f64 / delta_secs } else { 0.0 };
+                let uops_per_sec = if delta_secs > 0.0 { delta_ticks as f64 / delta_secs } else { 0.0 };
+                let pct = ips / REAL_8086_IPS * 100.0;
+                let uops_per_insn = if delta_insns > 0 { delta_ticks as f64 / delta_insns as f64 } else { 0.0 };
+                let status = format!(
+                    " {} insns ({} uops, {:.1} uops/insn) | {:.0} insn/s ({:.0} uop/s) | {:.1}% of 8086",
+                    insns, ticks, uops_per_insn, ips, uops_per_sec, pct
+                );
                 let video_mode = state.read_mem(0x0449) as u8;
                 if video_mode == 0x13 {
-                    // Mode 13h — can't draw pixels in a terminal.
-                    // Just show a status line so the user knows it's running.
                     if first {
                         eprint!("\x1b[2J\x1b[H\x1b[?25l");
                     } else {
                         eprint!("\x1b[H");
                     }
-                    eprint!("[Mode 13h 320x200 graphics]\r\n tick {tick}\r\n");
+                    eprint!("[Mode 13h 320x200 graphics]\r\n{status}\r\n");
                 } else {
-                    // Text mode: infer dimensions from BDA columns byte.
                     let cols = state.read_mem(0x044A) as usize;
                     let (width, height) = if cols == 40 { (40, 25) } else { (80, 25) };
                     if first {
@@ -304,7 +316,7 @@ fn main() {
                         eprint!("│{line}│\r\n");
                     }
                     eprint!("└{}┘\r\n", "─".repeat(width));
-                    eprint!(" tick {tick} \r\n");
+                    eprint!("{status}\r\n");
                 }
             };
 
@@ -400,9 +412,15 @@ fn main() {
 
 
             let mut ticks_run: u32 = 0;
+            let mut insn_count: u64 = 0;   // instructions started (ticks where uOp==0)
             let mut first_frame = true;
             let screen_interval = cli.screen_interval;
             let needs_per_tick = cli.verbose || halt_addr.is_some() || (interactive && screen_interval > 0) || !key_events.is_empty();
+
+            // Rolling speed measurement: track ticks/insns at the last render
+            let mut last_render_time = t2;
+            let mut last_render_ticks: u32 = 0;
+            let mut last_render_insns: u64 = 0;
 
             // Enable raw terminal mode for keyboard input
             if interactive {
@@ -492,6 +510,13 @@ fn main() {
                     evaluator.tick(&mut state);
                     ticks_run = tick + 1;
 
+                    // Count instructions: uOp==0 means this tick is the first
+                    // microop of a new instruction (i.e. an instruction boundary).
+                    let cur_uop = state.get_var("uOp").unwrap_or(0);
+                    if cur_uop == 0 {
+                        insn_count += 1;
+                    }
+
                     if cli.verbose {
                         print!("Tick {tick}:");
                         for (i, name) in state.state_var_names.iter().enumerate() {
@@ -502,7 +527,15 @@ fn main() {
 
                     // Periodic screen rendering
                     if interactive && screen_interval > 0 && ticks_run % screen_interval == 0 {
-                        render_screen(&state, ticks_run, first_frame);
+                        let now = std::time::Instant::now();
+                        let delta_secs = now.duration_since(last_render_time).as_secs_f64();
+                        let delta_ticks = ticks_run - last_render_ticks;
+                        let delta_insns = insn_count - last_render_insns;
+                        render_screen(&state, insn_count, ticks_run,
+                                      delta_insns, delta_ticks, delta_secs, first_frame);
+                        last_render_time = now;
+                        last_render_ticks = ticks_run;
+                        last_render_insns = insn_count;
                         first_frame = false;
                     }
 
@@ -525,20 +558,26 @@ fn main() {
             let tick_time = t2.elapsed();
 
             if !cli.verbose && cli.dump_tick.is_none() && !cli.trace_json {
-                let ax = state.get_var("AX").unwrap_or(0);
-                let cx = state.get_var("CX").unwrap_or(0);
                 let ip = state.get_var("IP").unwrap_or(0);
+                let elapsed = tick_time.as_secs_f64();
+                let ips = if elapsed > 0.0 { insn_count as f64 / elapsed } else { 0.0 };
+                let pct = ips / REAL_8086_IPS * 100.0;
+                let uops_per_insn = if insn_count > 0 { ticks_run as f64 / insn_count as f64 } else { 0.0 };
                 println!(
-                    "Ran {} ticks | AX={} CX={} IP={}",
+                    "{} insns ({} uops, {:.1} uops/insn) | {:.0} insn/s | {:.1}% of 8086 | IP={}",
+                    insn_count,
                     ticks_run,
-                    ax,
-                    cx,
+                    uops_per_insn,
+                    ips,
+                    pct,
                     ip,
                 );
             }
             eprintln!(
-                "Ticks: {:.3}s ({:.0} ticks/sec)",
+                "Elapsed: {:.3}s ({} insns, {} uops, {:.0} uops/sec)",
                 tick_time.as_secs_f64(),
+                insn_count,
+                ticks_run,
                 ticks_run as f64 / tick_time.as_secs_f64(),
             );
 
@@ -553,7 +592,12 @@ fn main() {
             if interactive {
                 let just_rendered = screen_interval > 0 && ticks_run % screen_interval == 0;
                 if !just_rendered {
-                    render_screen(&state, ticks_run, first_frame);
+                    let now = std::time::Instant::now();
+                    let delta_secs = now.duration_since(last_render_time).as_secs_f64();
+                    let delta_ticks = ticks_run - last_render_ticks;
+                    let delta_insns = insn_count - last_render_insns;
+                    render_screen(&state, insn_count, ticks_run,
+                                  delta_insns, delta_ticks, delta_secs, first_frame);
                 }
                 // Restore cursor visibility
                 eprint!("\x1b[?25h");

@@ -1,9 +1,17 @@
-NOTE: this workspace covers: 
-./ calcite (usually the cwd)
-../i8086-css (the next folder over)
-more subfolders/repos for individual other games like doom.css eventually
+NOTE: this workspace covers multiple repos:
+- `./` — calcite (usually the cwd)
+- `../CSS-DOS/` — the CSS-DOS transpiler, BIOS, and tools
+- `../doom.css/` — Doom port (future)
 
-As an agent, you are working in all three. If a fix needs to go in i8086-css (hopefully soon to be CSS-DOS) put it there. Just because you are in the calcite cwd doesn't mean you can only work on calcite. 
+You may need to work in CSS-DOS when fixing transpiler bugs or updating BIOS
+handlers. **If you do, read `../CSS-DOS/CLAUDE.md` first.** It has critical
+rules about the architecture, the cardinal rule (CSS is source of truth), and
+the canonical PC memory layout. Do not guess at how CSS-DOS works — read its docs.
+
+Similarly, if a CSS-DOS agent needs calcite changes, they should read this file
+first. The repos are independent (no code dependency) but tightly coupled in
+practice: CSS-DOS generates CSS, calcite runs it.
+
 
 # calc(ite)
 
@@ -42,7 +50,8 @@ site/
   programs/            Pre-compiled .css.gz program files for the site
 programs/
   *.com, *.exe         DOS programs to run
-  .cache/              Auto-generated CSS (via generate-dos.mjs)
+output/
+  *.css                Pre-built CSS files (run directly, no regeneration)
 tools/
   js8086.js            Reference 8086 emulator (vendored from emu8)
   fulldiff.mjs         Primary: first-divergence finder (REP-aware, full FLAGS)
@@ -51,7 +60,7 @@ tools/
   ref-emu.mjs          Standalone reference emulator (simple BIOS programs)
   ref-dos.mjs          Standalone reference emulator (DOS boot mode)
 tests/
-  fixtures/            Pre-compiled CSS from i8086-css
+  fixtures/            Pre-compiled CSS from CSS-DOS
 run.bat                Interactive menu to run/diagnose DOS programs
 ```
 
@@ -123,7 +132,7 @@ What this means in practice:
   dispatch tables), but it cannot skip, remove, or alter what the CSS
   expresses — just like V8 can't skip your JavaScript, only run it faster.
 - **Never suggest CSS changes to help calcite.** The CSS is written to work
-  in Chrome. Telling i8086-css to "not emit properties" or restructure
+  in Chrome. Telling CSS-DOS to "not emit properties" or restructure
   things for calcite's benefit is backwards — like telling a JS developer
   to write worse code so V8 can optimise it.
 - **No features that don't exist in CSS.** If Chrome can't evaluate it,
@@ -134,12 +143,12 @@ What this means in practice:
   assignments all check the same property and converting them to a HashMap
   lookup is exactly what a JIT does. Same results, faster. That's the job.
 
-### Relationship to CSS-DOS (formerly i8086-css)
+### Relationship to CSS-DOS
 
-[CSS-DOS](../i8086-css) is a sibling repo that generates 8086 CSS. It is
-undergoing an architecture pivot from a JSON instruction database approach
-(now in `legacy/`) to a JS→CSS transpiler (see `transpiler/`). See its
-`CLAUDE.md` for details.
+[CSS-DOS](../CSS-DOS) is a sibling repo that generates 8086 CSS. It uses a
+JS→CSS transpiler (`transpiler/`) with a v3 cycle-accurate microcode execution
+model. BIOS handlers are microcode (not assembly). See its `CLAUDE.md` and
+`V3-PLAN-1.md` for the full architecture.
 
 Calcite's only interface with CSS-DOS is the `.css` output — test fixtures in
 `tests/fixtures/` are pre-compiled CSS. There is no crate dependency and must
@@ -157,19 +166,20 @@ The key principles:
   disagree, calcite is wrong (or the CSS is wrong). Never assume calcite is
   correct — always verify with the reference.
 - **Bugs are often in the CSS generator**, not calcite. When compiled and
-  interpreted paths agree but diverge from the reference, it's a CSS bug —
-  fix it in i8086-css.
+  interpreted paths agree but diverge from the reference, it's a transpiler
+  bug — fix it in `../CSS-DOS/transpiler/`. Read CSS-DOS's CLAUDE.md first.
 - **Use the debugger** (`docs/debugger.md`) to inspect calcite's internal
   state at any tick, compare compiled vs interpreted paths, and read memory.
 
 ### Running programs
 
-Drop any `.com` file into `programs/` and use `run.bat`:
+Drop any `.com` or `.exe` file into `programs/` and use `run.bat`:
 
 ```
 run.bat              Interactive menu — pick a program by number
 run.bat diagnose     Conformance diagnosis menu
 ```
 
-CSS is auto-generated via the DOS transpiler pipeline and cached in
-`programs/.cache/`. The generator lives at `../i8086-css/transpiler/generate-dos.mjs`.
+CSS is regenerated from source on every run via the DOS transpiler pipeline
+(`../CSS-DOS/transpiler/generate-dos.mjs`). Pre-built `.css` files in `output/`
+can also be run directly from the menu without regeneration.
