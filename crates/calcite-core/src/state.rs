@@ -214,6 +214,52 @@ impl State {
         lines.join("\n")
     }
 
+    /// Render text-mode video memory with ANSI 24-bit color escapes.
+    ///
+    /// Reads char+attribute pairs; the attribute byte is
+    /// `BBBFFFFF` where the low nibble is foreground (0-15) and the high
+    /// nibble's low 3 bits are background (0-7). Bit 7 is treated as the
+    /// bright-background (no blink). Only emits a color-change escape when
+    /// the attribute changes, so the output stays compact.
+    pub fn render_screen_ansi(&self, base_addr: usize, width: usize, height: usize) -> String {
+        let mut out = String::with_capacity(width * height * 4);
+        let mut last_attr: Option<u8> = None;
+        for y in 0..height {
+            for x in 0..width {
+                let addr = base_addr + (y * width + x) * 2;
+                let (ch, attr) = if addr + 1 < self.memory.len() {
+                    (self.memory[addr], self.memory[addr + 1])
+                } else {
+                    (b' ', 0x07)
+                };
+                if last_attr != Some(attr) {
+                    let fg_idx = (attr & 0x0F) as usize;
+                    // High bit often means "blink"; most programs really want
+                    // bright BG, so treat bits 4-7 as a 4-bit BG index.
+                    let bg_idx = ((attr >> 4) & 0x0F) as usize;
+                    let (fr, fg, fb) = CGA_PALETTE[fg_idx];
+                    let (br, bg_, bb) = CGA_PALETTE[bg_idx];
+                    use std::fmt::Write;
+                    let _ = write!(
+                        out,
+                        "\x1b[38;2;{};{};{};48;2;{};{};{}m",
+                        fr, fg, fb, br, bg_, bb
+                    );
+                    last_attr = Some(attr);
+                }
+                out.push(cp437_to_unicode(ch));
+            }
+            // Reset before newline so the trailing background doesn't bleed
+            // across the whole terminal line.
+            out.push_str("\x1b[0m");
+            last_attr = None;
+            if y + 1 < height {
+                out.push('\n');
+            }
+        }
+        out
+    }
+
     /// Render a graphics-mode framebuffer as a PPM P6 image.
     ///
     /// Reads `width * height` bytes from `base_addr` where each byte is a

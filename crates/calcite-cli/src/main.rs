@@ -371,10 +371,10 @@ fn main() {
                     } else {
                         eprint!("\x1b[H");
                     }
-                    let screen = state.render_screen(0xB8000, width, height);
+                    let screen = state.render_screen_ansi(0xB8000, width, height);
                     eprint!("┌{}┐\r\n", "─".repeat(width));
                     for line in screen.lines() {
-                        eprint!("│{line}│\r\n");
+                        eprint!("│{line}\x1b[0m│\r\n");
                     }
                     eprint!("└{}┘\r\n", "─".repeat(width));
                     eprint!("{status}\r\n");
