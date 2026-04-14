@@ -486,11 +486,14 @@ fn main() {
                 crossterm::terminal::enable_raw_mode().ok();
             }
 
-            // Keyboard state: hold each key for at least KEY_HOLD_TICKS so the
-            // CPU has time to read it via INT 16h polling.
-            const KEY_HOLD_TICKS: u32 = 50;
-            let mut key_hold_remaining: u32 = 0;
-            let mut held_key: i32 = 0; // the key currently being held
+            // Keyboard model: one BDA buffer push per physical key press event.
+            // The OS already fires key-press events repeatedly while a key is
+            // held (Windows autorepeat), so the terminal event stream handles
+            // "hold to repeat" for us. We don't simulate any additional repeat
+            // inside the loop — that caused games to receive multiple moves per
+            // press. A future improvement is a proper simulated autorepeat
+            // (500 ms initial delay, 100 ms interval) that watches for release
+            // via a last-seen timer, but the naïve version is fine for now.
 
             if needs_per_tick {
                 // Verbose mode prints every tick so it must stay per-tick; batch
@@ -541,10 +544,8 @@ fn main() {
                                         break;
                                     }
                                     let dos_key = key_to_dos(&key_event);
-                                    if dos_key != 0 && key_hold_remaining == 0 {
+                                    if dos_key != 0 {
                                         state.bda_push_key(dos_key);
-                                        held_key = dos_key;
-                                        key_hold_remaining = KEY_HOLD_TICKS;
                                     }
                                 }
                             }
@@ -570,21 +571,12 @@ fn main() {
                         }
                     }
 
-                    // Refill held key once per batch — cheap insurance that BIOS
-                    // busy-spin on INT 16h sees the key in the buffer.
-                    if key_hold_remaining > 0 {
-                        let head = state.read_mem16(0x41A);
-                        let tail = state.read_mem16(0x41C);
-                        if head == tail {
-                            state.bda_push_key(held_key);
-                        }
-                        if key_hold_remaining <= batch {
-                            key_hold_remaining = 0;
-                            held_key = 0;
-                        } else {
-                            key_hold_remaining -= batch;
-                        }
-                    }
+                    // We push keys exactly once on press (in the event loop
+                    // above). Re-pushing here would look like a repeat —
+                    // rogue's INT 16h consumes the key each poll, so any refill
+                    // registers as another keypress. Games handle their own key
+                    // repeat; the CLI just delivers one press per physical key
+                    // event.
 
                     evaluator.run_batch(&mut state, batch);
                     tick += batch;

@@ -162,7 +162,7 @@ if errorlevel 1 (pause & goto :menu)
 
 title CSS-DOS: %NAME%
 cls
-"%CALCITE%" --input "%CSS%" --ticks 4294967295 --interactive-batch 150000 --speed 1.0
+"%CALCITE%" --input "%CSS%" --ticks 4294967295 --interactive-batch 50000 --speed 1.0
 
 echo.
 echo   Program exited. Press any key to return to menu...
