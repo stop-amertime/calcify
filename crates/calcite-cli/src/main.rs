@@ -42,6 +42,15 @@ struct Cli {
     #[arg(long, value_name = "N", default_value = "50000")]
     interactive_batch: u32,
 
+    /// Throttle execution to this multiple of real 8086 speed (4.77 MHz).
+    ///
+    /// 1.0 = real 8086 timing (default). 2.0 = double speed. 0 = unlimited
+    /// (run as fast as the machine can). Throttling uses the 8086 cycleCount,
+    /// not wall-ticks, so programs with variable cycles-per-instruction feel
+    /// correct.
+    #[arg(long, value_name = "MULT", default_value = "1.0")]
+    speed: f64,
+
     /// Dump all computed slot values at a specific tick for debugging.
     ///
     /// Runs to the specified tick, then prints every property name and its
@@ -509,6 +518,14 @@ fn main() {
                     base_batch
                 }.max(1);
 
+                // Speed throttling: pace execution to cli.speed × 4.77 MHz using
+                // the accumulated cycleCount as the "sim time" clock. After each
+                // batch, sleep if we've outrun the schedule. speed=0 disables.
+                let throttle = cli.speed > 0.0;
+                let throttle_start_wall = std::time::Instant::now();
+                let throttle_start_cycles = state.get_var("cycleCount").unwrap_or(0) as u64;
+                let sim_hz = REAL_8086_HZ * cli.speed;
+
                 let mut quit = false;
                 let mut tick = verbose_skip;
                 while tick < cli.ticks {
@@ -572,6 +589,17 @@ fn main() {
                     evaluator.run_batch(&mut state, batch);
                     tick += batch;
                     ticks_run = tick;
+
+                    if throttle {
+                        let cycles_now = state.get_var("cycleCount").unwrap_or(0) as u64;
+                        let sim_cycles = cycles_now.saturating_sub(throttle_start_cycles);
+                        let target_wall = sim_cycles as f64 / sim_hz;
+                        let actual_wall = throttle_start_wall.elapsed().as_secs_f64();
+                        if target_wall > actual_wall {
+                            let sleep_secs = target_wall - actual_wall;
+                            std::thread::sleep(std::time::Duration::from_secs_f64(sleep_secs));
+                        }
+                    }
 
                     if cli.verbose {
                         print!("Tick {}:", tick - 1);
