@@ -162,9 +162,25 @@ pub enum Op {
         cond: Slot,
         target: u32,
     },
+    /// Fused compare-and-branch: if slot[a] != val, jump to target.
+    /// Replaces LoadLit + CmpEq + BranchIfZero triplet.
+    BranchIfNotEqLit {
+        a: Slot,
+        val: i32,
+        target: u32,
+    },
     /// Unconditional jump to target op index
     Jump {
         target: u32,
+    },
+    /// Dispatch chain: look up slot[a] in chain_tables[chain_id]; if found,
+    /// jump to the matching body PC, else jump to miss_target. Replaces a run
+    /// of BranchIfNotEqLit ops all testing the same slot against different
+    /// literals (the dominant pattern in CSS-DOS bytecode).
+    DispatchChain {
+        a: Slot,
+        chain_id: u32,
+        miss_target: u32,
     },
 
     // --- Dispatch table ---
@@ -211,8 +227,19 @@ pub struct CompiledProgram {
     pub broadcast_writes: Vec<CompiledBroadcastWrite>,
     /// Dispatch table data (kept for Dispatch op lookups at runtime).
     pub dispatch_tables: Vec<CompiledDispatchTable>,
+    /// Dispatch chain tables (for DispatchChain op — runs of same-slot BranchIfNotEqLit).
+    pub chain_tables: Vec<DispatchChainTable>,
     /// Mapping from property name → slot index (for reading computed values after execution).
     pub property_slots: HashMap<String, Slot>,
+}
+
+/// A dispatch chain table — maps an i32 key to a body PC.
+/// Used by the `DispatchChain` op to skip past linear runs of
+/// `BranchIfNotEqLit` that all test the same slot.
+#[derive(Debug, Default)]
+pub struct DispatchChainTable {
+    /// Key → target op index (body start).
+    pub entries: HashMap<i32, u32>,
 }
 
 /// A compiled broadcast write.
@@ -911,6 +938,7 @@ impl<'a> Compiler<'a> {
         if let Some(table) = dispatch_table::recognise_dispatch(branches, fallback) {
             return self.compile_inline_dispatch(&table, ops);
         }
+
 
         // Fall back to linear branch chain
         self.compile_style_condition_linear(branches, fallback, ops)
@@ -1663,6 +1691,7 @@ pub fn compile(
     log::info!("[compile detail] assignments ({} items): {:.2}s, {} ops, {} dispatch tables",
         assignments.len(), _ct.elapsed().as_secs_f64(), ops.len(), compiler.compiled_dispatches.len());
 
+
     let _ct = web_time::Instant::now();
     // Compile broadcast writes
     let compiled_bw: Vec<_> = broadcast_writes
@@ -1685,14 +1714,253 @@ pub fn compile(
         writeback,
         broadcast_writes: compiled_bw,
         dispatch_tables: compiler.compiled_dispatches,
+        chain_tables: Vec::new(),
         property_slots: compiler.property_slots,
     };
+
+    let _ct = web_time::Instant::now();
+    let fused = fuse_cmp_branch(&mut program);
+    log::info!("[compile detail] fuse_cmp_branch: {} fused, {:.2}s", fused, _ct.elapsed().as_secs_f64());
+
+    let _ct = web_time::Instant::now();
+    let chains = build_dispatch_chains(&mut program);
+    log::info!("[compile detail] dispatch chains: {} chains built, {:.2}s", chains, _ct.elapsed().as_secs_f64());
 
     let _ct = web_time::Instant::now();
     compact_slots(&mut program);
     log::info!("[compile detail] slot compaction: {:.2}s", _ct.elapsed().as_secs_f64());
 
     program
+}
+
+// ---------------------------------------------------------------------------
+// Peephole: fuse LoadLit + CmpEq + BranchIfZero → BranchIfNotEqLit
+// ---------------------------------------------------------------------------
+
+/// Fuse `LoadLit(dst=X, val=N) + CmpEq(dst=Y, a=P, b=X) + BranchIfZero(cond=Y, target=T)`
+/// into a single `BranchIfNotEqLit(a=P, val=N, target=T)`.
+///
+/// The fused op skips two intermediate slot writes and two match-dispatch cycles
+/// in the interpreter, which matters because these triplets make up ~99% of ops
+/// in CSS-DOS v4 programs.
+///
+/// Also applies to dispatch table entry ops and broadcast write value ops.
+///
+/// Returns the number of triplets fused.
+fn fuse_cmp_branch(program: &mut CompiledProgram) -> usize {
+    let mut total = 0;
+    total += fuse_ops(&mut program.ops);
+    for table in &mut program.dispatch_tables {
+        for (_key, (entry_ops, _slot)) in &mut table.entries {
+            total += fuse_ops(entry_ops);
+        }
+        total += fuse_ops(&mut table.fallback_ops);
+    }
+    for bw in &mut program.broadcast_writes {
+        total += fuse_ops(&mut bw.value_ops);
+        if let Some(ref mut spillover) = bw.spillover {
+            for (_key, (spill_ops, _slot)) in &mut spillover.entries {
+                total += fuse_ops(spill_ops);
+            }
+        }
+    }
+    total
+}
+
+/// Fuse triplets in a single ops array. Returns number fused.
+///
+/// After fusion, the three original ops are replaced by:
+///   [BranchIfNotEqLit, Nop(LoadLit 0→0), Nop(LoadLit 0→0)]
+/// The nops are then stripped in a second pass, with branch targets adjusted.
+fn fuse_ops(ops: &mut Vec<Op>) -> usize {
+    if ops.len() < 3 {
+        return 0;
+    }
+
+    // Pass 1: identify fusable triplets and mark them
+    let mut fused_at: Vec<usize> = Vec::new(); // indices of the LoadLit in each triplet
+
+    let mut i = 0;
+    while i + 2 < ops.len() {
+        // Pattern: LoadLit(dst=X, val=N), CmpEq(dst=Y, a=P, b=X), BranchIfZero(cond=Y, target=T)
+        if let (
+            Op::LoadLit { dst: lit_dst, val },
+            Op::CmpEq { dst: cmp_dst, a: cmp_a, b: cmp_b },
+            Op::BranchIfZero { cond, target },
+        ) = (&ops[i], &ops[i + 1], &ops[i + 2])
+        {
+            if cmp_b == lit_dst && cond == cmp_dst {
+                // Fusable! Replace with BranchIfNotEqLit
+                let a = *cmp_a;
+                let v = *val;
+                let t = *target;
+                ops[i] = Op::BranchIfNotEqLit { a, val: v, target: t };
+                // Mark the other two as nops (LoadLit 0→slot 0 is harmless but we'll strip them)
+                ops[i + 1] = Op::LoadLit { dst: 0, val: 0 };
+                ops[i + 2] = Op::LoadLit { dst: 0, val: 0 };
+                fused_at.push(i);
+                i += 3;
+                continue;
+            }
+        }
+        i += 1;
+    }
+
+    if fused_at.is_empty() {
+        return 0;
+    }
+
+    let fused_count = fused_at.len();
+
+    // Pass 2: strip the nop slots (indices i+1 and i+2 for each fused triplet)
+    // Build a set of indices to remove
+    let mut remove_set = Vec::with_capacity(fused_count * 2);
+    for &idx in &fused_at {
+        remove_set.push(idx + 1);
+        remove_set.push(idx + 2);
+    }
+    remove_set.sort();
+
+    // Build old→new index mapping for branch target adjustment
+    let mut new_indices = vec![0u32; ops.len()];
+    let mut offset: u32 = 0;
+    let mut remove_pos = 0;
+    for old_idx in 0..ops.len() {
+        if remove_pos < remove_set.len() && remove_set[remove_pos] == old_idx {
+            remove_pos += 1;
+            // This op is being removed — map to next valid op
+            new_indices[old_idx] = old_idx as u32 - offset;
+            offset += 1;
+        } else {
+            new_indices[old_idx] = old_idx as u32 - offset;
+        }
+    }
+    // For targets pointing past the end
+    let new_end = ops.len() as u32 - offset;
+
+    // Pass 3: adjust all branch/jump targets
+    for op in ops.iter_mut() {
+        match op {
+            Op::BranchIfZero { target, .. }
+            | Op::BranchIfNotEqLit { target, .. }
+            | Op::Jump { target } => {
+                let old = *target as usize;
+                *target = if old < new_indices.len() {
+                    new_indices[old]
+                } else {
+                    new_end
+                };
+            }
+            _ => {}
+        }
+    }
+
+    // Pass 4: actually remove the nop ops
+    let mut write = 0;
+    let mut remove_pos = 0;
+    for read in 0..ops.len() {
+        if remove_pos < remove_set.len() && remove_set[remove_pos] == read {
+            remove_pos += 1;
+            continue; // skip
+        }
+        if write != read {
+            ops.swap(write, read);
+        }
+        write += 1;
+    }
+    ops.truncate(write);
+
+    fused_count
+}
+
+// ---------------------------------------------------------------------------
+// Dispatch-chain recognition — collapse runs of same-slot BranchIfNotEqLit
+// ---------------------------------------------------------------------------
+
+/// Detect runs of `BranchIfNotEqLit` ops all testing the same slot against
+/// different literals, chained such that each branch's miss target points
+/// directly to the next branch. Replace the first op with `DispatchChain`
+/// which does a single HashMap lookup and jumps to the matching body (or
+/// to the chain-end miss target).
+///
+/// Safety: intermediate `BranchIfNotEqLit` ops are left in place (as dead
+/// code) so any external jumps that land on them still work correctly.
+fn build_dispatch_chains(program: &mut CompiledProgram) -> usize {
+    let mut total = 0;
+    // Main ops
+    total += chains_in_ops(&mut program.ops, &mut program.chain_tables);
+    // Dispatch table entries and fallbacks
+    for table in &mut program.dispatch_tables {
+        for (_k, (entry_ops, _s)) in &mut table.entries {
+            total += chains_in_ops(entry_ops, &mut program.chain_tables);
+        }
+        total += chains_in_ops(&mut table.fallback_ops, &mut program.chain_tables);
+    }
+    // Broadcast value ops and spillovers
+    for bw in &mut program.broadcast_writes {
+        total += chains_in_ops(&mut bw.value_ops, &mut program.chain_tables);
+        if let Some(ref mut sp) = bw.spillover {
+            for (_k, (spill_ops, _s)) in &mut sp.entries {
+                total += chains_in_ops(spill_ops, &mut program.chain_tables);
+            }
+        }
+    }
+    total
+}
+
+/// Minimum chain length to convert. Below this, linear BranchIfNotEqLit
+/// is probably faster than a HashMap lookup (which costs ~30ns vs ~5ns/op).
+const MIN_CHAIN_LEN: usize = 6;
+
+fn chains_in_ops(ops: &mut [Op], chain_tables: &mut Vec<DispatchChainTable>) -> usize {
+    let mut built = 0;
+    let len = ops.len();
+    let mut i = 0;
+
+    while i < len {
+        // Is this a potential chain start?
+        let (key_slot, first_val, first_target) = match &ops[i] {
+            Op::BranchIfNotEqLit { a, val, target } => (*a, *val, *target),
+            _ => { i += 1; continue; }
+        };
+
+        // Walk the chain: at each step, if the previous target points at another
+        // BranchIfNotEqLit on the same slot, extend; else that's the miss target.
+        let mut entries: Vec<(i32, u32)> = vec![(first_val, (i as u32) + 1)];
+        let mut miss = first_target;
+        let mut last_branch_pc = i;
+
+        loop {
+            let next_pc = miss as usize;
+            if next_pc >= len { break; }
+            match &ops[next_pc] {
+                Op::BranchIfNotEqLit { a, val, target } if *a == key_slot => {
+                    entries.push((*val, (next_pc as u32) + 1));
+                    miss = *target;
+                    last_branch_pc = next_pc;
+                }
+                _ => break,
+            }
+        }
+
+        if entries.len() >= MIN_CHAIN_LEN {
+            // Build the table.
+            let mut table = DispatchChainTable::default();
+            for (v, pc) in &entries {
+                // If there are duplicate keys (shouldn't normally happen), first wins.
+                table.entries.entry(*v).or_insert(*pc);
+            }
+            let chain_id = chain_tables.len() as u32;
+            chain_tables.push(table);
+            ops[i] = Op::DispatchChain { a: key_slot, chain_id, miss_target: miss };
+            built += 1;
+            // Advance past the whole chain so we don't nest chains.
+            i = last_branch_pc + 1;
+        } else {
+            i += 1;
+        }
+    }
+    built
 }
 
 // ---------------------------------------------------------------------------
@@ -1797,7 +2065,6 @@ fn compact_slots(program: &mut CompiledProgram) {
     // from a progressively higher base, so each nesting level gets its own
     // non-overlapping slot range.
 
-    // Compute nesting depth: which table IDs does each table reference?
     let num_tables = program.dispatch_tables.len();
     let mut refs_tables: Vec<Vec<usize>> = Vec::with_capacity(num_tables);
     for table in &program.dispatch_tables {
@@ -1840,9 +2107,7 @@ fn compact_slots(program: &mut CompiledProgram) {
 
     let max_depth = depth.iter().copied().max().unwrap_or(0);
 
-    // Compact layer by layer: depth 0 first (leaf tables), then depth 1, etc.
-    // Each layer's base = previous layer's high-water mark, so nested dispatch
-    // entries at different depths never share slot ranges.
+    // Compact layer by layer
     let mut layer_base = main_high;
     for d in 0..=max_depth {
         let mut layer_high: Slot = layer_base;
@@ -2234,7 +2499,9 @@ fn op_slots_read(op: &Op) -> Vec<Slot> {
         Op::Bit { val, idx, .. } => vec![*val, *idx],
         Op::CmpEq { a, b, .. } => vec![*a, *b],
         Op::BranchIfZero { cond, .. } => vec![*cond],
+        Op::BranchIfNotEqLit { a, .. } => vec![*a],
         Op::Jump { .. } => vec![],
+        Op::DispatchChain { a, .. } => vec![*a],
         Op::Dispatch { key, .. } => vec![*key],
         Op::StoreState { src, .. } => vec![*src],
         Op::StoreMem { addr_slot, src, .. } => vec![*addr_slot, *src],
@@ -2269,7 +2536,7 @@ fn op_dst(op: &Op) -> Option<Slot> {
         | Op::Bit { dst, .. }
         | Op::CmpEq { dst, .. }
         | Op::Dispatch { dst, .. } => Some(*dst),
-        Op::BranchIfZero { .. } | Op::Jump { .. } | Op::StoreState { .. } | Op::StoreMem { .. } => {
+        Op::BranchIfZero { .. } | Op::BranchIfNotEqLit { .. } | Op::Jump { .. } | Op::DispatchChain { .. } | Op::StoreState { .. } | Op::StoreMem { .. } => {
             None
         }
     }
@@ -2352,6 +2619,12 @@ fn map_op_slots(op: &mut Op, slot_map: &mut HashMap<Slot, Slot>, alloc: &mut Slo
         Op::BranchIfZero { cond, .. } => {
             *cond = alloc.get_or_alloc(*cond, slot_map);
         }
+        Op::BranchIfNotEqLit { a, .. } => {
+            *a = alloc.get_or_alloc(*a, slot_map);
+        }
+        Op::DispatchChain { a, .. } => {
+            *a = alloc.get_or_alloc(*a, slot_map);
+        }
         Op::Jump { .. } => {}
         Op::Dispatch { dst, key, .. } => {
             *key = alloc.get_or_alloc(*key, slot_map);
@@ -2404,6 +2677,8 @@ fn seed_from_parent(
         Op::Clamp { min, val, max, .. } => { seed(*min); seed(*val); seed(*max); }
         Op::Round { val, interval, .. } => { seed(*val); seed(*interval); }
         Op::BranchIfZero { cond, .. } => { seed(*cond); }
+        Op::BranchIfNotEqLit { a, .. } => { seed(*a); }
+        Op::DispatchChain { a, .. } => { seed(*a); }
         Op::Jump { .. } => {}
         Op::Dispatch { key, .. } => { seed(*key); }
         Op::StoreState { src, .. } => { seed(*src); }
@@ -2481,7 +2756,7 @@ pub fn execute(program: &CompiledProgram, state: &mut State, slots: &mut Vec<i32
     slots.resize(program.slot_count as usize, 0);
 
     // Execute main ops
-    exec_ops(&program.ops, &program.dispatch_tables, state, slots);
+    exec_ops(&program.ops, &program.dispatch_tables, &program.chain_tables, state, slots);
 
     // Writeback: apply computed values to state
     for &(slot, addr) in &program.writeback {
@@ -2497,7 +2772,7 @@ pub fn execute(program: &CompiledProgram, state: &mut State, slots: &mut Vec<i32
         let dest = slots[bw.dest_slot as usize];
         let dest_i64 = dest as i64;
         if bw.address_map.contains_key(&dest_i64) {
-            exec_ops(&bw.value_ops, &program.dispatch_tables, state, slots);
+            exec_ops(&bw.value_ops, &program.dispatch_tables, &program.chain_tables, state, slots);
             let value = slots[bw.value_slot as usize];
             state.write_mem(dest, value);
         }
@@ -2506,7 +2781,7 @@ pub fn execute(program: &CompiledProgram, state: &mut State, slots: &mut Vec<i32
             let guard = slots[spillover.guard_slot as usize];
             if guard == 1 {
                 if let Some((ref spill_ops, spill_slot)) = spillover.entries.get(&dest_i64) {
-                    exec_ops(spill_ops, &program.dispatch_tables, state, slots);
+                    exec_ops(spill_ops, &program.dispatch_tables, &program.chain_tables, state, slots);
                     let value = slots[*spill_slot as usize];
                     state.write_mem(dest + 1, value);
                 }
@@ -2516,31 +2791,323 @@ pub fn execute(program: &CompiledProgram, state: &mut State, slots: &mut Vec<i32
 }
 
 /// Execute a sequence of ops against the slot array.
+///
+/// Hot path: uses unchecked slot indexing. Safety invariants, established by the
+/// compiler:
+/// - All slot indices in ops are < slots.len() (compiler allocates monotonically
+///   then slot-compaction never introduces out-of-range indices).
+/// - All branch/jump targets are <= ops.len() (fuse_cmp_branch adjusts them,
+///   compile_style_condition_linear uses placeholders patched after the fact).
+/// - Dispatch table_id is always a valid index into dispatch_tables.
 fn exec_ops(
     ops: &[Op],
     dispatch_tables: &[CompiledDispatchTable],
+    chain_tables: &[DispatchChainTable],
     state: &mut State,
     slots: &mut [i32],
 ) {
     let len = ops.len();
     let mut pc: usize = 0;
 
+    // Shorthand helpers. All indices come from the compiler and are in-range;
+    // debug builds still check via assert.
+    macro_rules! sload {
+        ($i:expr) => {{
+            let idx = $i as usize;
+            debug_assert!(idx < slots.len());
+            unsafe { *slots.get_unchecked(idx) }
+        }};
+    }
+    macro_rules! sstore {
+        ($i:expr, $v:expr) => {{
+            let idx = $i as usize;
+            let v = $v;
+            debug_assert!(idx < slots.len());
+            unsafe { *slots.get_unchecked_mut(idx) = v; }
+        }};
+    }
+
     while pc < len {
+        // Safety: pc < len checked by loop condition.
+        let op = unsafe { ops.get_unchecked(pc) };
+        match op {
+            // Hot path: 96%+ of ops in CSS-DOS programs are this one variant.
+            // Keep it first so the compiler can (hopefully) lay out the jump table
+            // with this case at the predicted target.
+            Op::BranchIfNotEqLit { a, val, target } => {
+                if sload!(*a) != *val {
+                    pc = *target as usize;
+                    continue;
+                }
+            }
+            Op::LoadLit { dst, val } => {
+                sstore!(*dst, *val);
+            }
+            Op::LoadSlot { dst, src } => {
+                sstore!(*dst, sload!(*src));
+            }
+            Op::LoadState { dst, addr } => {
+                sstore!(*dst, state.read_mem(*addr));
+            }
+            Op::LoadMem { dst, addr_slot } => {
+                let addr = sload!(*addr_slot);
+                sstore!(*dst, state.read_mem(addr));
+            }
+            Op::LoadMem16 { dst, addr_slot } => {
+                let addr = sload!(*addr_slot);
+                let v = if addr < 0 { state.read_mem(addr) } else { state.read_mem16(addr) };
+                sstore!(*dst, v);
+            }
+            Op::Add { dst, a, b } => {
+                sstore!(*dst, sload!(*a).wrapping_add(sload!(*b)));
+            }
+            Op::Sub { dst, a, b } => {
+                sstore!(*dst, sload!(*a).wrapping_sub(sload!(*b)));
+            }
+            Op::Mul { dst, a, b } => {
+                sstore!(*dst, sload!(*a).wrapping_mul(sload!(*b)));
+            }
+            Op::Div { dst, a, b } => {
+                let divisor = sload!(*b);
+                let v = if divisor == 0 { 0 } else { sload!(*a) / divisor };
+                sstore!(*dst, v);
+            }
+            Op::Mod { dst, a, b } => {
+                let divisor = sload!(*b);
+                let v = if divisor == 0 { 0 } else { sload!(*a) % divisor };
+                sstore!(*dst, v);
+            }
+            Op::Neg { dst, src } => {
+                sstore!(*dst, sload!(*src).wrapping_neg());
+            }
+            Op::Abs { dst, src } => {
+                sstore!(*dst, sload!(*src).wrapping_abs());
+            }
+            Op::Sign { dst, src } => {
+                let v = sload!(*src);
+                sstore!(*dst, if v > 0 { 1 } else if v < 0 { -1 } else { 0 });
+            }
+            Op::Pow { dst, base, exp } => {
+                let b = sload!(*base);
+                let e = sload!(*exp);
+                sstore!(*dst, if e < 0 { 0 } else { b.wrapping_pow(e as u32) });
+            }
+            Op::Min { dst, args } => {
+                let mut v = i32::MAX;
+                for &a in args {
+                    v = v.min(sload!(a));
+                }
+                sstore!(*dst, v);
+            }
+            Op::Max { dst, args } => {
+                let mut v = i32::MIN;
+                for &a in args {
+                    v = v.max(sload!(a));
+                }
+                sstore!(*dst, v);
+            }
+            Op::Clamp { dst, min, val, max } => {
+                let min_v = sload!(*min);
+                let val_v = sload!(*val);
+                let max_v = sload!(*max);
+                sstore!(*dst, val_v.clamp(min_v, max_v));
+            }
+            Op::Round { dst, strategy, val, interval } => {
+                let v = sload!(*val);
+                let i = sload!(*interval);
+                let r = if i == 0 {
+                    v
+                } else {
+                    match strategy {
+                        RoundStrategy::Down => v.div_euclid(i) * i,
+                        RoundStrategy::Up => (v + i - 1).div_euclid(i) * i,
+                        RoundStrategy::Nearest => ((v + i / 2).div_euclid(i)) * i,
+                        RoundStrategy::ToZero => (v / i) * i,
+                    }
+                };
+                sstore!(*dst, r);
+            }
+            Op::Floor { dst, src } => {
+                sstore!(*dst, sload!(*src));
+            }
+            Op::And { dst, a, b } => {
+                let av = sload!(*a);
+                let bv = sload!(*b) as u32;
+                sstore!(*dst, if bv >= 32 { av } else { av & ((1i32 << bv) - 1) });
+            }
+            Op::Shr { dst, a, b } => {
+                let av = sload!(*a);
+                let bv = sload!(*b) as u32;
+                sstore!(*dst, if bv >= 32 { 0 } else { av >> bv });
+            }
+            Op::Shl { dst, a, b } => {
+                let av = sload!(*a);
+                let bv = sload!(*b) as u32;
+                sstore!(*dst, if bv >= 32 { 0 } else { av << bv });
+            }
+            Op::Bit { dst, val, idx } => {
+                let v = sload!(*val);
+                let i = sload!(*idx) as u32;
+                sstore!(*dst, if i >= 32 { 0 } else { (v >> i) & 1 });
+            }
+            Op::CmpEq { dst, a, b } => {
+                sstore!(*dst, if sload!(*a) == sload!(*b) { 1 } else { 0 });
+            }
+            Op::BranchIfZero { cond, target } => {
+                if sload!(*cond) == 0 {
+                    pc = *target as usize;
+                    continue;
+                }
+            }
+            Op::Jump { target } => {
+                pc = *target as usize;
+                continue;
+            }
+            Op::DispatchChain { a, chain_id, miss_target } => {
+                let key = sload!(*a);
+                let table = unsafe { chain_tables.get_unchecked(*chain_id as usize) };
+                match table.entries.get(&key) {
+                    Some(&body_pc) => { pc = body_pc as usize; }
+                    None => { pc = *miss_target as usize; }
+                }
+                continue;
+            }
+            Op::Dispatch { dst, key, table_id, .. } => {
+                let key_val = sload!(*key) as i64;
+                let table = unsafe { dispatch_tables.get_unchecked(*table_id as usize) };
+                if let Some((entry_ops, result_slot)) = table.entries.get(&key_val) {
+                    exec_ops(entry_ops, dispatch_tables, chain_tables, state, slots);
+                    sstore!(*dst, sload!(*result_slot));
+                } else {
+                    exec_ops(&table.fallback_ops, dispatch_tables, chain_tables, state, slots);
+                    sstore!(*dst, sload!(table.fallback_slot));
+                }
+            }
+            Op::StoreState { addr, src } => {
+                state.write_mem(*addr, sload!(*src));
+            }
+            Op::StoreMem { addr_slot, src } => {
+                state.write_mem(sload!(*addr_slot), sload!(*src));
+            }
+        }
+        pc += 1;
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// Profiled execution — granular timing within execute()
+// ---------------------------------------------------------------------------
+
+use crate::eval::TickProfile;
+
+/// Execute with granular profiling. Fills in the execute-related fields of TickProfile.
+pub fn execute_profiled(
+    program: &CompiledProgram,
+    state: &mut State,
+    slots: &mut Vec<i32>,
+    profile: &mut TickProfile,
+) {
+    use web_time::Instant;
+
+    // Slot reset
+    let t0 = Instant::now();
+    slots.clear();
+    slots.resize(program.slot_count as usize, 0);
+    let t1 = Instant::now();
+    profile.slot_reset += t1.duration_since(t0).as_secs_f64();
+
+    // Main ops (profiled — fills dispatch_time, counts, etc. directly)
+    exec_ops_profiled(&program.ops, &program.dispatch_tables, &program.chain_tables, state, slots, profile);
+    let t2 = Instant::now();
+    profile.main_ops += t2.duration_since(t1).as_secs_f64();
+    profile.linear_ops = profile.main_ops - profile.dispatch_time;
+
+    // Writeback
+    let mut wb_changed: u64 = 0;
+    for &(slot, addr) in &program.writeback {
+        let value = slots[slot as usize];
+        let old = state.read_mem(addr);
+        if old != value {
+            state.write_mem(addr, value);
+            wb_changed += 1;
+        }
+    }
+    let t3 = Instant::now();
+    profile.writeback += t3.duration_since(t2).as_secs_f64();
+    profile.writeback_count += program.writeback.len() as u64;
+    profile.writeback_changed_count += wb_changed;
+
+    // Broadcast writes
+    let mut bw_fired: u64 = 0;
+    for bw in &program.broadcast_writes {
+        let dest = slots[bw.dest_slot as usize];
+        let dest_i64 = dest as i64;
+        if bw.address_map.contains_key(&dest_i64) {
+            exec_ops(&bw.value_ops, &program.dispatch_tables, &program.chain_tables, state, slots);
+            let value = slots[bw.value_slot as usize];
+            state.write_mem(dest, value);
+            bw_fired += 1;
+        }
+        if let Some(ref spillover) = bw.spillover {
+            let guard = slots[spillover.guard_slot as usize];
+            if guard == 1 {
+                if let Some((ref spill_ops, spill_slot)) = spillover.entries.get(&dest_i64) {
+                    exec_ops(spill_ops, &program.dispatch_tables, &program.chain_tables, state, slots);
+                    let value = slots[*spill_slot as usize];
+                    state.write_mem(dest + 1, value);
+                }
+            }
+        }
+    }
+    let t4 = Instant::now();
+    profile.broadcast += t4.duration_since(t3).as_secs_f64();
+    profile.broadcast_fire_count += bw_fired;
+    profile.broadcast_total_count += program.broadcast_writes.len() as u64;
+}
+
+/// Like exec_ops but fills profile with granular counters and timings.
+fn exec_ops_profiled(
+    ops: &[Op],
+    dispatch_tables: &[CompiledDispatchTable],
+    chain_tables: &[DispatchChainTable],
+    state: &mut State,
+    slots: &mut [i32],
+    profile: &mut TickProfile,
+) {
+    use web_time::Instant;
+
+    macro_rules! count_op {
+        ($profile:expr, $name:expr) => {
+            *$profile.op_counts.entry($name).or_insert(0) += 1;
+        };
+    }
+
+    let len = ops.len();
+    let mut pc: usize = 0;
+
+    while pc < len {
+        profile.main_ops_count += 1;
         match &ops[pc] {
             Op::LoadLit { dst, val } => {
+                count_op!(profile, "LoadLit");
                 slots[*dst as usize] = *val;
             }
             Op::LoadSlot { dst, src } => {
+                count_op!(profile, "LoadSlot");
                 slots[*dst as usize] = slots[*src as usize];
             }
             Op::LoadState { dst, addr } => {
+                count_op!(profile, "LoadState");
                 slots[*dst as usize] = state.read_mem(*addr);
             }
             Op::LoadMem { dst, addr_slot } => {
+                count_op!(profile, "LoadMem");
                 let addr = slots[*addr_slot as usize];
                 slots[*dst as usize] = state.read_mem(addr);
             }
             Op::LoadMem16 { dst, addr_slot } => {
+                count_op!(profile, "LoadMem16");
                 let addr = slots[*addr_slot as usize];
                 if addr < 0 {
                     slots[*dst as usize] = state.read_mem(addr);
@@ -2549,15 +3116,19 @@ fn exec_ops(
                 }
             }
             Op::Add { dst, a, b } => {
+                count_op!(profile, "Add");
                 slots[*dst as usize] = slots[*a as usize].wrapping_add(slots[*b as usize]);
             }
             Op::Sub { dst, a, b } => {
+                count_op!(profile, "Sub");
                 slots[*dst as usize] = slots[*a as usize].wrapping_sub(slots[*b as usize]);
             }
             Op::Mul { dst, a, b } => {
+                count_op!(profile, "Mul");
                 slots[*dst as usize] = slots[*a as usize].wrapping_mul(slots[*b as usize]);
             }
             Op::Div { dst, a, b } => {
+                count_op!(profile, "Div");
                 let divisor = slots[*b as usize];
                 slots[*dst as usize] = if divisor == 0 {
                     0
@@ -2566,6 +3137,7 @@ fn exec_ops(
                 };
             }
             Op::Mod { dst, a, b } => {
+                count_op!(profile, "Mod");
                 let divisor = slots[*b as usize];
                 slots[*dst as usize] = if divisor == 0 {
                     0
@@ -2574,12 +3146,15 @@ fn exec_ops(
                 };
             }
             Op::Neg { dst, src } => {
+                count_op!(profile, "Neg");
                 slots[*dst as usize] = slots[*src as usize].wrapping_neg();
             }
             Op::Abs { dst, src } => {
+                count_op!(profile, "Abs");
                 slots[*dst as usize] = slots[*src as usize].wrapping_abs();
             }
             Op::Sign { dst, src } => {
+                count_op!(profile, "Sign");
                 let v = slots[*src as usize];
                 slots[*dst as usize] = if v > 0 {
                     1
@@ -2590,11 +3165,13 @@ fn exec_ops(
                 };
             }
             Op::Pow { dst, base, exp } => {
+                count_op!(profile, "Pow");
                 let b = slots[*base as usize];
                 let e = slots[*exp as usize];
                 slots[*dst as usize] = if e < 0 { 0 } else { b.wrapping_pow(e as u32) };
             }
             Op::Min { dst, args } => {
+                count_op!(profile, "Min");
                 let mut v = i32::MAX;
                 for &a in args {
                     v = v.min(slots[a as usize]);
@@ -2602,6 +3179,7 @@ fn exec_ops(
                 slots[*dst as usize] = v;
             }
             Op::Max { dst, args } => {
+                count_op!(profile, "Max");
                 let mut v = i32::MIN;
                 for &a in args {
                     v = v.max(slots[a as usize]);
@@ -2609,6 +3187,7 @@ fn exec_ops(
                 slots[*dst as usize] = v;
             }
             Op::Clamp { dst, min, val, max } => {
+                count_op!(profile, "Clamp");
                 let min_v = slots[*min as usize];
                 let val_v = slots[*val as usize];
                 let max_v = slots[*max as usize];
@@ -2620,12 +3199,12 @@ fn exec_ops(
                 val,
                 interval,
             } => {
+                count_op!(profile, "Round");
                 let v = slots[*val as usize];
                 let i = slots[*interval as usize];
                 slots[*dst as usize] = if i == 0 {
                     v
                 } else {
-                    // Integer rounding: round(down, v/i, 1)*i is just floor-div
                     match strategy {
                         RoundStrategy::Down => v.div_euclid(i) * i,
                         RoundStrategy::Up => (v + i - 1).div_euclid(i) * i,
@@ -2635,10 +3214,11 @@ fn exec_ops(
                 };
             }
             Op::Floor { dst, src } => {
-                // No-op for integers — value is already floored
+                count_op!(profile, "Floor");
                 slots[*dst as usize] = slots[*src as usize];
             }
             Op::And { dst, a, b } => {
+                count_op!(profile, "And");
                 let av = slots[*a as usize];
                 let bv = slots[*b as usize] as u32;
                 slots[*dst as usize] = if bv >= 32 {
@@ -2648,21 +3228,25 @@ fn exec_ops(
                 };
             }
             Op::Shr { dst, a, b } => {
+                count_op!(profile, "Shr");
                 let av = slots[*a as usize];
                 let bv = slots[*b as usize] as u32;
                 slots[*dst as usize] = if bv >= 32 { 0 } else { av >> bv };
             }
             Op::Shl { dst, a, b } => {
+                count_op!(profile, "Shl");
                 let av = slots[*a as usize];
                 let bv = slots[*b as usize] as u32;
                 slots[*dst as usize] = if bv >= 32 { 0 } else { av << bv };
             }
             Op::Bit { dst, val, idx } => {
+                count_op!(profile, "Bit");
                 let v = slots[*val as usize];
                 let i = slots[*idx as usize] as u32;
                 slots[*dst as usize] = if i >= 32 { 0 } else { (v >> i) & 1 };
             }
             Op::CmpEq { dst, a, b } => {
+                count_op!(profile, "CmpEq");
                 slots[*dst as usize] = if slots[*a as usize] == slots[*b as usize] {
                     1
                 } else {
@@ -2670,32 +3254,65 @@ fn exec_ops(
                 };
             }
             Op::BranchIfZero { cond, target } => {
+                count_op!(profile, "BranchIfZero");
                 if slots[*cond as usize] == 0 {
+                    profile.branches_taken += 1;
                     pc = *target as usize;
                     continue;
+                } else {
+                    profile.branches_not_taken += 1;
+                }
+            }
+            Op::BranchIfNotEqLit { a, val, target } => {
+                count_op!(profile, "BranchIfNotEqLit");
+                if slots[*a as usize] != *val {
+                    profile.branches_taken += 1;
+                    pc = *target as usize;
+                    continue;
+                } else {
+                    profile.branches_not_taken += 1;
                 }
             }
             Op::Jump { target } => {
+                count_op!(profile, "Jump");
                 pc = *target as usize;
+                continue;
+            }
+            Op::DispatchChain { a, chain_id, miss_target } => {
+                count_op!(profile, "DispatchChain");
+                let key = slots[*a as usize];
+                let table = &chain_tables[*chain_id as usize];
+                match table.entries.get(&key) {
+                    Some(&body_pc) => { pc = body_pc as usize; }
+                    None => { pc = *miss_target as usize; }
+                }
                 continue;
             }
             Op::Dispatch {
                 dst, key, table_id, ..
             } => {
+                count_op!(profile, "Dispatch");
+                profile.dispatch_count += 1;
+                let td = Instant::now();
                 let key_val = slots[*key as usize] as i64;
                 let table = &dispatch_tables[*table_id as usize];
                 if let Some((entry_ops, result_slot)) = table.entries.get(&key_val) {
-                    exec_ops(entry_ops, dispatch_tables, state, slots);
+                    profile.dispatch_sub_ops_count += entry_ops.len() as u64;
+                    exec_ops(entry_ops, dispatch_tables, chain_tables, state, slots);
                     slots[*dst as usize] = slots[*result_slot as usize];
                 } else {
-                    exec_ops(&table.fallback_ops, dispatch_tables, state, slots);
+                    profile.dispatch_sub_ops_count += table.fallback_ops.len() as u64;
+                    exec_ops(&table.fallback_ops, dispatch_tables, chain_tables, state, slots);
                     slots[*dst as usize] = slots[table.fallback_slot as usize];
                 }
+                profile.dispatch_time += td.elapsed().as_secs_f64();
             }
             Op::StoreState { addr, src } => {
+                count_op!(profile, "StoreState");
                 state.write_mem(*addr, slots[*src as usize]);
             }
             Op::StoreMem { addr_slot, src } => {
+                count_op!(profile, "StoreMem");
                 state.write_mem(slots[*addr_slot as usize], slots[*src as usize]);
             }
         }
@@ -2733,6 +3350,7 @@ pub struct TraceEntry {
 pub fn exec_ops_traced(
     ops: &[Op],
     dispatch_tables: &[CompiledDispatchTable],
+    chain_tables: &[DispatchChainTable],
     state: &mut State,
     slots: &mut [i32],
     op_range: Option<(usize, usize)>,
@@ -2959,6 +3577,21 @@ pub fn exec_ops_traced(
                     continue;
                 }
             }
+            Op::BranchIfNotEqLit { a, val, target } => {
+                let a_val = slots[*a as usize];
+                let taken = a_val != *val;
+                if should_trace {
+                    trace.push(TraceEntry {
+                        pc, op: format!("BranchIfNotEqLit a={} val={} target={}", a, val, target),
+                        dst_slot: None, dst_value: None,
+                        inputs: vec![(*a, a_val)], branch_taken: Some(taken), depth,
+                    });
+                }
+                if taken {
+                    pc = *target as usize;
+                    continue;
+                }
+            }
             Op::Jump { target } => {
                 if should_trace {
                     trace.push(TraceEntry {
@@ -2970,12 +3603,29 @@ pub fn exec_ops_traced(
                 pc = *target as usize;
                 continue;
             }
+            Op::DispatchChain { a, chain_id, miss_target } => {
+                let key = slots[*a as usize];
+                let table = &chain_tables[*chain_id as usize];
+                let (next_pc, hit) = match table.entries.get(&key) {
+                    Some(&body_pc) => (body_pc as usize, true),
+                    None => (*miss_target as usize, false),
+                };
+                if should_trace {
+                    trace.push(TraceEntry {
+                        pc, op: format!("DispatchChain a={}({}) chain={} → {} ({})", a, key, chain_id, next_pc, if hit { "hit" } else { "miss" }),
+                        dst_slot: None, dst_value: None,
+                        inputs: vec![(*a, key)], branch_taken: Some(hit), depth,
+                    });
+                }
+                pc = next_pc;
+                continue;
+            }
             Op::Dispatch { dst, key, table_id, .. } => {
                 let key_val = slots[*key as usize] as i64;
                 let table = &dispatch_tables[*table_id as usize];
                 if let Some((entry_ops, result_slot)) = table.entries.get(&key_val) {
                     if should_trace {
-                        let mut sub = exec_ops_traced(entry_ops, dispatch_tables, state, slots, None, depth + 1);
+                        let mut sub = exec_ops_traced(entry_ops, dispatch_tables, chain_tables, state, slots, None, depth + 1);
                         trace.push(TraceEntry {
                             pc, op: format!("Dispatch dst={} key={}({}) table={} → entry (result_slot={}={})", dst, key, key_val, table_id, result_slot, slots[*result_slot as usize]),
                             dst_slot: Some(*dst), dst_value: Some(slots[*result_slot as usize]),
@@ -2983,13 +3633,13 @@ pub fn exec_ops_traced(
                         });
                         trace.append(&mut sub);
                     } else {
-                        exec_ops(entry_ops, dispatch_tables, state, slots);
+                        exec_ops(entry_ops, dispatch_tables, chain_tables, state, slots);
                     }
                     slots[*dst as usize] = slots[*result_slot as usize];
                 } else {
                     if should_trace {
-                        let mut sub = exec_ops_traced(&table.fallback_ops, dispatch_tables, state, slots, None, depth + 1);
-                        exec_ops(&table.fallback_ops, dispatch_tables, state, slots);
+                        let mut sub = exec_ops_traced(&table.fallback_ops, dispatch_tables, chain_tables, state, slots, None, depth + 1);
+                        exec_ops(&table.fallback_ops, dispatch_tables, chain_tables, state, slots);
                         trace.push(TraceEntry {
                             pc, op: format!("Dispatch dst={} key={}({}) table={} → fallback (fallback_slot={}={})", dst, key, key_val, table_id, table.fallback_slot, slots[table.fallback_slot as usize]),
                             dst_slot: Some(*dst), dst_value: Some(slots[table.fallback_slot as usize]),
@@ -2997,7 +3647,7 @@ pub fn exec_ops_traced(
                         });
                         trace.append(&mut sub);
                     } else {
-                        exec_ops(&table.fallback_ops, dispatch_tables, state, slots);
+                        exec_ops(&table.fallback_ops, dispatch_tables, chain_tables, state, slots);
                     }
                     slots[*dst as usize] = slots[table.fallback_slot as usize];
                 }
@@ -3044,6 +3694,7 @@ pub fn trace_property(
     let trace = exec_ops_traced(
         &program.ops,
         &program.dispatch_tables,
+        &program.chain_tables,
         state,
         slots,
         None, // trace all ops
@@ -3127,7 +3778,7 @@ mod tests {
 
         let mut state = State::default();
         let mut slots = vec![0i32; compiler.next_slot as usize];
-        exec_ops(&ops, &[], &mut state, &mut slots);
+        exec_ops(&ops, &[], &[], &mut state, &mut slots);
         assert_eq!(slots[slot as usize], 42);
     }
 
@@ -3145,7 +3796,7 @@ mod tests {
 
         let mut state = State::default();
         let mut slots = vec![0i32; compiler.next_slot as usize];
-        exec_ops(&ops, &[], &mut state, &mut slots);
+        exec_ops(&ops, &[], &[], &mut state, &mut slots);
         assert_eq!(slots[slot as usize], 30);
     }
 
@@ -3164,7 +3815,7 @@ mod tests {
 
         state.set_var("AX", 0x1234);
         let mut slots = vec![0i32; compiler.next_slot as usize];
-        exec_ops(&ops, &[], &mut state, &mut slots);
+        exec_ops(&ops, &[], &[], &mut state, &mut slots);
         assert_eq!(slots[slot as usize], 0x1234);
     }
 
@@ -3198,7 +3849,7 @@ mod tests {
 
         state.set_var("AX", 2);
         let mut slots = vec![0i32; compiler.next_slot as usize];
-        exec_ops(&ops, &[], &mut state, &mut slots);
+        exec_ops(&ops, &[], &[], &mut state, &mut slots);
         assert_eq!(slots[slot as usize], 200);
     }
 
@@ -3265,7 +3916,7 @@ mod tests {
 
         state.set_var("AX", 42);
         let mut slots = vec![0i32; compiler.next_slot as usize];
-        exec_ops(&ops, &compiler.compiled_dispatches, &mut state, &mut slots);
+        exec_ops(&ops, &compiler.compiled_dispatches, &[], &mut state, &mut slots);
         assert_eq!(slots[slot as usize], 42);
     }
 
@@ -3316,7 +3967,7 @@ mod tests {
 
         let mut state = State::default();
         let mut slots = vec![0i32; compiler.next_slot as usize];
-        exec_ops(&ops, &[], &mut state, &mut slots);
+        exec_ops(&ops, &[], &[], &mut state, &mut slots);
         assert_eq!(slots[slot as usize], 15);
     }
 
@@ -3376,7 +4027,7 @@ mod tests {
 
         let mut state = State::default();
         let mut slots = vec![0i32; compiler.next_slot as usize];
-        exec_ops(&ops, &[], &mut state, &mut slots);
+        exec_ops(&ops, &[], &[], &mut state, &mut slots);
         assert_eq!(slots[slot as usize], 42);
     }
 

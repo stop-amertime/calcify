@@ -33,6 +33,15 @@ struct Cli {
     #[arg(long, value_name = "N", default_value = "500")]
     screen_interval: u32,
 
+    /// Ticks per batch inside the interactive loop.
+    ///
+    /// The interactive loop polls keyboard, checks halt, and re-renders between
+    /// batches. At 4.77 MHz 8086 timing, 50000 ticks ≈ 10.5 ms ≈ 95 fps, so
+    /// keyboard latency at this batch size is imperceptible. Smaller values
+    /// give finer-grained input at the cost of throughput.
+    #[arg(long, value_name = "N", default_value = "50000")]
+    interactive_batch: u32,
+
     /// Dump all computed slot values at a specific tick for debugging.
     ///
     /// Runs to the specified tick, then prints every property name and its
@@ -276,24 +285,67 @@ fn main() {
 
             let t2 = std::time::Instant::now();
 
-            // Real 8086 ran at 4.77 MHz. We measure instructions/sec against this.
-            const REAL_8086_IPS: f64 = 500_000.0; // ~0.5 MIPS typical throughput
+            // Real 8086 clock: 4.77 MHz. We derive CPU speed from cycleCount
+            // (accumulated 8086 cycle costs per instruction) divided by wall time.
+            const REAL_8086_HZ: f64 = 4_772_727.0;
+
+            // Format a frequency at a fixed width so the status line doesn't
+            // glitch back and forth. Always MHz with 2 decimals for the rolling
+            // status display (1.00 KHz == 0.00 MHz, still readable).
+            fn format_hz(hz: f64) -> String {
+                if hz >= 1_000_000.0 {
+                    format!("{:.2} MHz", hz / 1_000_000.0)
+                } else if hz >= 1_000.0 {
+                    format!("{:.1} KHz", hz / 1_000.0)
+                } else {
+                    format!("{:.0} Hz", hz)
+                }
+            }
+            fn format_hz_fixed(hz: f64) -> String {
+                // Always "X.XX MHz" — 8 chars wide. At low speeds this reads
+                // "0.04 MHz" etc., which stays aligned column-wise across
+                // repaints.
+                format!("{:5.2} MHz", hz / 1_000_000.0)
+            }
 
             // Render the screen based on BDA video mode (0x0449).
             // Text modes: render in-terminal using ANSI. Mode 13h: status line.
             //
-            // insns/ticks = totals; delta_insns/delta_ticks/delta_secs = since last render
-            let render_screen = |state: &calcite_core::State, insns: u64, ticks: u32,
-                                  delta_insns: u64, delta_ticks: u32, delta_secs: f64,
+            // ticks = CSS ticks (= instructions in V4 single-cycle arch)
+            // cycles = accumulated 8086 clock cycles from cycleCount
+            //
+            // Status line throttling: the speed readout only refreshes every
+            // ~500ms of wall time so the digits don't thrash between repaints.
+            // We also EMA-smooth ticks/s to make it calmer.
+            let mut smoothed_tps: f64 = 0.0;
+            let mut last_status_update = std::time::Instant::now();
+            let mut cached_status = String::new();
+            let mut render_screen = |state: &calcite_core::State, ticks: u32,
+                                  delta_ticks: u32, delta_secs: f64,
                                   first: bool| {
-                let ips = if delta_secs > 0.0 { delta_insns as f64 / delta_secs } else { 0.0 };
-                let uops_per_sec = if delta_secs > 0.0 { delta_ticks as f64 / delta_secs } else { 0.0 };
-                let pct = ips / REAL_8086_IPS * 100.0;
-                let uops_per_insn = if delta_insns > 0 { delta_ticks as f64 / delta_insns as f64 } else { 0.0 };
-                let status = format!(
-                    " {} insns ({} uops, {:.1} uops/insn) | {:.0} insn/s ({:.0} uop/s) | {:.1}% of 8086",
-                    insns, ticks, uops_per_insn, ips, uops_per_sec, pct
-                );
+                let cycles = state.get_var("cycleCount").unwrap_or(0) as u64;
+                let instant_tps = if delta_secs > 0.0 { delta_ticks as f64 / delta_secs } else { 0.0 };
+                // Exponential moving average — alpha 0.3 feels smooth but still
+                // responsive.
+                if smoothed_tps == 0.0 {
+                    smoothed_tps = instant_tps;
+                } else {
+                    smoothed_tps = 0.3 * instant_tps + 0.7 * smoothed_tps;
+                }
+                let now = std::time::Instant::now();
+                let since_update = now.duration_since(last_status_update).as_secs_f64();
+                if first || since_update >= 0.5 {
+                    let avg_cpt = if ticks > 0 { cycles as f64 / ticks as f64 } else { 10.0 };
+                    let cycles_per_sec = smoothed_tps * avg_cpt;
+                    let pct = cycles_per_sec / REAL_8086_HZ * 100.0;
+                    // Fixed-width fields so the line doesn't jitter.
+                    cached_status = format!(
+                        " {:>10} ticks | {} | {:>5.1}% of 8086 | {:>9.0} ticks/s",
+                        ticks, format_hz_fixed(cycles_per_sec), pct, smoothed_tps
+                    );
+                    last_status_update = now;
+                }
+                let status = &cached_status;
                 let video_mode = state.read_mem(0x0449) as u8;
                 if video_mode == 0x13 {
                     if first {
@@ -412,15 +464,13 @@ fn main() {
 
 
             let mut ticks_run: u32 = 0;
-            let mut insn_count: u64 = 0;   // instructions started (ticks where uOp==0)
             let mut first_frame = true;
             let screen_interval = cli.screen_interval;
             let needs_per_tick = cli.verbose || halt_addr.is_some() || (interactive && screen_interval > 0) || !key_events.is_empty();
 
-            // Rolling speed measurement: track ticks/insns at the last render
+            // Rolling speed measurement: track ticks at the last render
             let mut last_render_time = t2;
             let mut last_render_ticks: u32 = 0;
-            let mut last_render_insns: u64 = 0;
 
             // Enable raw terminal mode for keyboard input
             if interactive {
@@ -428,114 +478,117 @@ fn main() {
             }
 
             // Keyboard state: hold each key for at least KEY_HOLD_TICKS so the
-            // CPU (which takes many ticks per instruction) has time to read it.
+            // CPU has time to read it via INT 16h polling.
             const KEY_HOLD_TICKS: u32 = 50;
             let mut key_hold_remaining: u32 = 0;
             let mut held_key: i32 = 0; // the key currently being held
 
             if needs_per_tick {
-                // When verbose, batch early ticks then show tail
-                let batch_skip = if cli.verbose && cli.ticks > 100 {
+                // Verbose mode prints every tick so it must stay per-tick; batch
+                // early and show the tail.
+                let verbose_skip = if cli.verbose && cli.ticks > 100 {
                     cli.ticks.saturating_sub(20)
                 } else {
                     0
                 };
-                if batch_skip > 0 {
-                    evaluator.run_batch(&mut state, batch_skip);
-                    ticks_run = batch_skip;
-                    if cli.verbose {
-                        let ip = state.get_var("IP").unwrap_or(0);
-                        eprintln!(
-                            "(batch: {} ticks, IP={})",
-                            batch_skip,
-                            ip
-                        );
-                    }
+                if verbose_skip > 0 {
+                    evaluator.run_batch(&mut state, verbose_skip);
+                    ticks_run = verbose_skip;
+                    let ip = state.get_var("IP").unwrap_or(0);
+                    eprintln!("(batch: {} ticks, IP={})", verbose_skip, ip);
                 }
-                let mut quit = false;
-                for tick in batch_skip..cli.ticks {
-                    // Poll keyboard (non-blocking) in interactive mode
-                    if interactive {
-                        // On every tick while a key is held, ensure the BDA ring buffer
-                        // contains that key. The CSS INT 16h AH=00h handler busy-spins
-                        // on head==tail (empty), so we must keep the buffer non-empty for
-                        // the entire hold window — the BIOS may consume the entry each tick.
-                        if key_hold_remaining > 0 {
-                            key_hold_remaining -= 1;
-                            if key_hold_remaining == 0 {
-                                held_key = 0;
-                            } else {
-                                // Re-fill if the BIOS consumed last tick's entry.
-                                let head = state.read_mem16(0x41A);
-                                let tail = state.read_mem16(0x41C);
-                                if head == tail {
-                                    state.bda_push_key(held_key);
-                                }
-                            }
-                        }
 
+                // Batch size between keyboard polls / renders / halt checks.
+                // At 4.77 MHz, 50K ticks ≈ 10.5 ms — well under human perception
+                // for input latency. Clamp to screen_interval so renders still
+                // happen when requested.
+                let base_batch = if cli.interactive_batch == 0 { 50_000 } else { cli.interactive_batch };
+                let batch_cap = if screen_interval > 0 {
+                    base_batch.min(screen_interval)
+                } else {
+                    base_batch
+                }.max(1);
+
+                let mut quit = false;
+                let mut tick = verbose_skip;
+                while tick < cli.ticks {
+                    if interactive {
+                        // Poll keyboard non-blocking.
                         while event::poll(std::time::Duration::ZERO).unwrap_or(false) {
-                            match event::read() {
-                                Ok(Event::Key(key_event)) => {
-                                    if key_event.kind == crossterm::event::KeyEventKind::Press {
-                                        // Ctrl+C to quit
-                                        if key_event.modifiers.contains(KeyModifiers::CONTROL)
-                                            && key_event.code == KeyCode::Char('c')
-                                        {
-                                            quit = true;
-                                            break;
-                                        }
-                                        let dos_key = key_to_dos(&key_event);
-                                        if dos_key != 0 && key_hold_remaining == 0 {
-                                            state.bda_push_key(dos_key);
-                                            held_key = dos_key;
-                                            key_hold_remaining = KEY_HOLD_TICKS;
-                                        }
+                            if let Ok(Event::Key(key_event)) = event::read() {
+                                if key_event.kind == crossterm::event::KeyEventKind::Press {
+                                    if key_event.modifiers.contains(KeyModifiers::CONTROL)
+                                        && key_event.code == KeyCode::Char('c')
+                                    {
+                                        quit = true;
+                                        break;
                                     }
-                                    // Release events are ignored — we use the hold timer instead
+                                    let dos_key = key_to_dos(&key_event);
+                                    if dos_key != 0 && key_hold_remaining == 0 {
+                                        state.bda_push_key(dos_key);
+                                        held_key = dos_key;
+                                        key_hold_remaining = KEY_HOLD_TICKS;
+                                    }
                                 }
-                                _ => {}
                             }
                         }
                         if quit { break; }
                     }
 
-                    // Inject scripted keyboard events (--key-events)
+                    // Determine this batch's size: capped by remaining ticks and
+                    // by the next scripted key_event (if any).
+                    let mut batch = batch_cap.min(cli.ticks - tick);
+                    for &(ev_tick, _) in &key_events {
+                        if ev_tick >= tick && ev_tick < tick + batch {
+                            batch = ev_tick - tick;
+                            if batch == 0 { batch = 1; break; } // fire this tick immediately
+                        }
+                    }
+                    if batch == 0 { batch = 1; }
+
+                    // Fire any scripted keyboard events scheduled for this tick.
                     for &(ev_tick, ev_val) in &key_events {
                         if ev_tick == tick {
                             state.set_var("keyboard", ev_val);
                         }
                     }
 
-                    evaluator.tick(&mut state);
-                    ticks_run = tick + 1;
-
-                    // Count instructions: uOp==0 means this tick is the first
-                    // microop of a new instruction (i.e. an instruction boundary).
-                    let cur_uop = state.get_var("uOp").unwrap_or(0);
-                    if cur_uop == 0 {
-                        insn_count += 1;
+                    // Refill held key once per batch — cheap insurance that BIOS
+                    // busy-spin on INT 16h sees the key in the buffer.
+                    if key_hold_remaining > 0 {
+                        let head = state.read_mem16(0x41A);
+                        let tail = state.read_mem16(0x41C);
+                        if head == tail {
+                            state.bda_push_key(held_key);
+                        }
+                        if key_hold_remaining <= batch {
+                            key_hold_remaining = 0;
+                            held_key = 0;
+                        } else {
+                            key_hold_remaining -= batch;
+                        }
                     }
 
+                    evaluator.run_batch(&mut state, batch);
+                    tick += batch;
+                    ticks_run = tick;
+
                     if cli.verbose {
-                        print!("Tick {tick}:");
+                        print!("Tick {}:", tick - 1);
                         for (i, name) in state.state_var_names.iter().enumerate() {
                             print!(" {}={}", name, state.state_vars[i]);
                         }
                         println!();
                     }
 
-                    // Periodic screen rendering
                     if interactive && screen_interval > 0 && ticks_run % screen_interval == 0 {
                         let now = std::time::Instant::now();
                         let delta_secs = now.duration_since(last_render_time).as_secs_f64();
                         let delta_ticks = ticks_run - last_render_ticks;
-                        let delta_insns = insn_count - last_render_insns;
-                        render_screen(&state, insn_count, ticks_run,
-                                      delta_insns, delta_ticks, delta_secs, first_frame);
+                        render_screen(&state, ticks_run,
+                                      delta_ticks, delta_secs, first_frame);
                         last_render_time = now;
                         last_render_ticks = ticks_run;
-                        last_render_insns = insn_count;
                         first_frame = false;
                     }
 
@@ -559,24 +612,24 @@ fn main() {
 
             if !cli.verbose && cli.dump_tick.is_none() && !cli.trace_json {
                 let ip = state.get_var("IP").unwrap_or(0);
+                let cycles = state.get_var("cycleCount").unwrap_or(0) as u64;
                 let elapsed = tick_time.as_secs_f64();
-                let ips = if elapsed > 0.0 { insn_count as f64 / elapsed } else { 0.0 };
-                let pct = ips / REAL_8086_IPS * 100.0;
-                let uops_per_insn = if insn_count > 0 { ticks_run as f64 / insn_count as f64 } else { 0.0 };
+                let tps = if elapsed > 0.0 { ticks_run as f64 / elapsed } else { 0.0 };
+                let cps = if elapsed > 0.0 { cycles as f64 / elapsed } else { 0.0 };
+                let pct = cps / REAL_8086_HZ * 100.0;
                 println!(
-                    "{} insns ({} uops, {:.1} uops/insn) | {:.0} insn/s | {:.1}% of 8086 | IP={}",
-                    insn_count,
+                    "{} ticks | {} cycles | {} ({:.1}% of 4.77 MHz) | {:.0} ticks/s | IP={}",
                     ticks_run,
-                    uops_per_insn,
-                    ips,
+                    cycles,
+                    format_hz(cps),
                     pct,
+                    tps,
                     ip,
                 );
             }
             eprintln!(
-                "Elapsed: {:.3}s ({} insns, {} uops, {:.0} uops/sec)",
+                "Elapsed: {:.3}s ({} ticks, {:.0} ticks/sec)",
                 tick_time.as_secs_f64(),
-                insn_count,
                 ticks_run,
                 ticks_run as f64 / tick_time.as_secs_f64(),
             );
@@ -595,9 +648,8 @@ fn main() {
                     let now = std::time::Instant::now();
                     let delta_secs = now.duration_since(last_render_time).as_secs_f64();
                     let delta_ticks = ticks_run - last_render_ticks;
-                    let delta_insns = insn_count - last_render_insns;
-                    render_screen(&state, insn_count, ticks_run,
-                                  delta_insns, delta_ticks, delta_secs, first_frame);
+                    render_screen(&state, ticks_run,
+                                  delta_ticks, delta_secs, first_frame);
                 }
                 // Restore cursor visibility
                 eprint!("\x1b[?25h");

@@ -17,7 +17,7 @@ set CALCITE=target\release\calcite-cli.exe
 set DEBUGGER=target\release\calcite-debugger.exe
 set CSSDIR=..\CSS-DOS
 set GENERATOR=%CSSDIR%\transpiler\generate-dos.mjs
-set BIOSBIN=%CSSDIR%\legacy\gossamer-dos.bin
+set BIOSBIN=%CSSDIR%\bios\css-emu-bios.bin
 set PROGDIR=programs
 set OUTPUTDIR=output
 
@@ -162,7 +162,7 @@ if errorlevel 1 (pause & goto :menu)
 
 title CSS-DOS: %NAME%
 cls
-"%CALCITE%" --input "%CSS%" --ticks 4294967295 --halt halt
+"%CALCITE%" --input "%CSS%" --ticks 4294967295
 
 echo.
 echo   Program exited. Press any key to return to menu...
@@ -257,7 +257,7 @@ set "NAME=!NAME_%CHOICE%!"
 set "EXEC=!EXEC_%CHOICE%!"
 set "PTYPE=!TYPE_%CHOICE%!"
 
-set /p TICKS="  Cycles to check [5000]: "
+set /p TICKS="  Ticks to check [5000]: "
 if "%TICKS%"=="" set TICKS=5000
 
 REM Build both binaries
@@ -282,7 +282,7 @@ echo   Starting debugger...
 start /b "" "%DEBUGGER%" -i "%CSS%"
 timeout /t 4 /nobreak >nul
 
-echo   Running diagnosis (%TICKS% cycles)...
+echo   Running diagnosis (%TICKS% ticks)...
 echo.
 node tools\diagnose.mjs "%EXEC%" "%BIOSBIN%" --ticks=%TICKS%
 
