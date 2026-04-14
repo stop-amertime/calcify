@@ -28,6 +28,11 @@ just check                      # all three
 cargo bench -p calcite-core     # criterion benchmarks (needs fixture)
 wasm-pack build crates/calcite-wasm --target web --out-dir ../../web/pkg
 
+# Benchmark: headless speed measurement + profiling
+cargo run --release --bin calcite-bench -- -i output/rogue.css -n 5000 --warmup 500
+cargo run --release --bin calcite-bench -- -i output/rogue.css -n 2000 --profile
+# See docs/benchmarking.md for full flag reference
+
 # Debug server: parse once, step/inspect/compare via HTTP
 cargo run --release -p calcite-debugger -- -i program.css
 # Then: curl localhost:3333/state, /tick, /seek, /compare-paths, etc.
@@ -39,7 +44,7 @@ cargo run --release -p calcite-debugger -- -i program.css
 ```
 crates/
   calcite-core/      Core engine: parser, pattern compiler, evaluator, state
-  calcite-cli/       CLI tool for running CSS through the engine
+  calcite-cli/       CLI tool (calcite-cli) + benchmark runner (calcite-bench)
   calcite-debugger/  HTTP debug server — see docs/debugger.md
   calcite-wasm/      WASM bindings (wasm-bindgen) for browser Web Worker
 web/
@@ -153,6 +158,22 @@ model. BIOS handlers are microcode (not assembly). See its `CLAUDE.md` and
 Calcite's only interface with CSS-DOS is the `.css` output — test fixtures in
 `tests/fixtures/` are pre-compiled CSS. There is no crate dependency and must
 never be one.
+
+### Performance — the main optimisation workflow
+
+**Read `docs/log.md` for the current bottleneck analysis and optimisation
+roadmap.** It has profiling results, op frequency data, and the specific
+patterns that dominate execution time.
+
+**Read `docs/benchmarking.md` for the full benchmarking tool reference.**
+The primary tool is `calcite-bench` — a headless binary with `--profile`
+for granular per-phase and per-op-type breakdown.
+
+Key facts (2026-04-14, v4 CSS):
+- ~6050 ticks/s on rogue (1.1% of 8086 speed), goal: much faster
+- 96% of bytecode ops are `BranchIfNotEqLit` (fused compare-and-branch)
+- 34K branches/tick, 99.9% taken (dead code skip)
+- Main bottleneck: linear if-chains inside dispatch table entries
 
 ### Conformance testing — the main debugging workflow
 

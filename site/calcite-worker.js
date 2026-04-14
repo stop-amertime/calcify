@@ -114,6 +114,7 @@ self.onmessage = async function (event) {
           type: 'tick-result',
           videoBytes,
           ticks: count,
+          cycleCount: engine.get_state_var('cycleCount'),
         }, videoBytes ? [videoBytes.buffer] : []);
         break;
       }

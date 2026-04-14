@@ -317,6 +317,68 @@ impl DebugSession {
         }
     }
 
+    fn watchpoint(&mut self, addr: i32, max_ticks: u32, expected: Option<i32>) -> serde_json::Value {
+        let initial = self.state.read_mem(addr);
+        let start_tick = self.current_tick();
+        let t0 = std::time::Instant::now();
+
+        for _ in 0..max_ticks {
+            // Auto-snapshot at interval boundaries
+            if self.snapshot_interval > 0
+                && self.current_tick() > 0
+                && self.current_tick() % self.snapshot_interval == 0
+            {
+                let tick = self.current_tick();
+                if !self.snapshots.iter().any(|(t, _)| *t == tick) {
+                    self.snapshots.push((tick, self.state.clone()));
+                }
+            }
+            self.evaluator.tick(&mut self.state);
+            let current = self.state.read_mem(addr);
+            let matched = if let Some(exp) = expected {
+                current == exp
+            } else {
+                current != initial
+            };
+            if matched {
+                let elapsed = t0.elapsed();
+                let regs = self.registers();
+                let mem_addr_val = self.state.get_var("memAddr").unwrap_or(-1) as i64;
+                let mem_val_val = self.state.get_var("memVal").unwrap_or(0) as i64;
+                let ctx = self.read_memory(addr - 8, 24);
+                eprintln!(
+                    "[watchpoint] addr=0x{:x} changed at tick {} ({:.3}s, {} ticks)",
+                    addr, self.current_tick(), elapsed.as_secs_f64(),
+                    self.current_tick() - start_tick
+                );
+                return serde_json::json!({
+                    "hit": true,
+                    "tick": self.current_tick(),
+                    "addr": addr,
+                    "old_value": initial,
+                    "new_value": current,
+                    "memAddr": mem_addr_val,
+                    "memVal": mem_val_val,
+                    "registers": regs,
+                    "context": ctx,
+                });
+            }
+        }
+
+        let elapsed = t0.elapsed();
+        eprintln!(
+            "[watchpoint] addr=0x{:x} no change after {} ticks ({:.3}s)",
+            addr, max_ticks, elapsed.as_secs_f64()
+        );
+        serde_json::json!({
+            "hit": false,
+            "tick": self.current_tick(),
+            "addr": addr,
+            "value": self.state.read_mem(addr),
+            "ticks_checked": max_ticks,
+        })
+    }
+
     fn read_memory(&self, addr: i32, len: usize) -> MemoryResponse {
         let mut bytes = Vec::with_capacity(len);
         for i in 0..len {
@@ -930,6 +992,31 @@ fn main() {
                 match s.evaluator.get_ops_for_property(&prop) {
                     Some(lines) => json_response(&serde_json::json!({ "property": prop, "ops": lines })),
                     None => error_response(404, &format!("Property {} not found", prop)),
+                }
+            }
+
+            // Memory watchpoint: run forward until a byte changes.
+            // POST /watchpoint {"addr": N, "max_ticks": M}
+            // Optionally: "from_tick": T to seek first, "expected": V to watch for a specific value.
+            (Method::Post, "/watchpoint") => {
+                let body = read_body(&mut request);
+                #[derive(Deserialize)]
+                struct WatchReq {
+                    addr: i32,
+                    max_ticks: Option<u32>,
+                    from_tick: Option<u32>,
+                    expected: Option<i32>,
+                }
+                match serde_json::from_str::<WatchReq>(&body) {
+                    Ok(r) => {
+                        let mut s = session.lock().unwrap();
+                        if let Some(from) = r.from_tick {
+                            s.seek(from);
+                        }
+                        let resp = s.watchpoint(r.addr, r.max_ticks.unwrap_or(100_000), r.expected);
+                        json_response(&resp)
+                    }
+                    Err(e) => error_response(400, &format!("Bad JSON: {e}")),
                 }
             }
 

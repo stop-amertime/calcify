@@ -99,6 +99,12 @@ impl CalciteEngine {
         }
     }
 
+    /// Get a state variable by name (e.g. "cycleCount", "IP", "AX").
+    /// Returns 0 if the variable doesn't exist.
+    pub fn get_state_var(&self, name: &str) -> i32 {
+        self.state.get_var(name).unwrap_or(0)
+    }
+
     /// Read text-mode video memory (character bytes only).
     ///
     /// Returns `width * height` bytes from video memory at `base_addr`.

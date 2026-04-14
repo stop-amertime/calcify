@@ -60,13 +60,8 @@ if (ext === 'exe') {
   programMem = 0x100 + fileSize + 0x1000; // PSP + code + 4KB stack
 }
 
-// Total = kernel overhead + program needs
-let memBytes = KERNEL_OVERHEAD + programMem;
-
-// Round up to 16KB boundary
-memBytes = Math.ceil(memBytes / PAGE_SIZE) * PAGE_SIZE;
-
-// Cap at 640KB (no point going higher)
-memBytes = Math.min(memBytes, 0xA0000);
-
-console.log('0x' + memBytes.toString(16));
+// V4 architecture uses contiguous memory (0 to memBytes). The kernel
+// relocates to the top of conventional memory and needs the full 640KB.
+// Always return 0xA0000 — the split-memory optimization from V3 doesn't
+// apply to V4's contiguous layout.
+console.log('0xA0000');

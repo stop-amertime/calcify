@@ -102,6 +102,54 @@ pub struct Evaluator {
     slots: Vec<i32>,
 }
 
+/// Granular timing breakdown from [`Evaluator::tick_profiled`].
+#[derive(Debug, Clone, Default)]
+pub struct TickProfile {
+    // --- Top-level phases ---
+    /// Time in pre-tick hooks (seconds).
+    pub hooks: f64,
+    /// Time cloning state vars for change detection (seconds).
+    pub snapshot: f64,
+    /// Time detecting state variable changes (seconds).
+    pub change_detect: f64,
+    /// Time evaluating string assignments via interpreter (seconds).
+    pub string_eval: f64,
+
+    // --- Inside execute (the 98% chunk) ---
+    /// Time resetting/resizing the slot array.
+    pub slot_reset: f64,
+    /// Time executing the main ops bytecode stream (total).
+    pub main_ops: f64,
+    /// Time spent inside dispatch table lookups (subset of main_ops).
+    pub dispatch_time: f64,
+    /// Time spent on linear ops excluding dispatches (main_ops - dispatch_time).
+    pub linear_ops: f64,
+    /// Time in the writeback loop (slots → state).
+    pub writeback: f64,
+    /// Time in broadcast write evaluation.
+    pub broadcast: f64,
+    /// Number of main-stream ops stepped (excluding dispatch sub-ops).
+    pub main_ops_count: u64,
+    /// Number of dispatch table lookups.
+    pub dispatch_count: u64,
+    /// Number of ops executed inside dispatch sub-programs.
+    pub dispatch_sub_ops_count: u64,
+    /// Number of branches taken (BranchIfZero that jumped).
+    pub branches_taken: u64,
+    /// Number of branches not taken.
+    pub branches_not_taken: u64,
+    /// Number of broadcast writes that fired (dest in address_map).
+    pub broadcast_fire_count: u64,
+    /// Total number of broadcast writes checked.
+    pub broadcast_total_count: u64,
+    /// Number of writeback entries.
+    pub writeback_count: u64,
+    /// Number of writeback entries that actually changed state.
+    pub writeback_changed_count: u64,
+    /// Per-op-type execution counts (op discriminant name → count).
+    pub op_counts: HashMap<&'static str, u64>,
+}
+
 /// The result of running a batch of ticks.
 #[derive(Debug, Clone, Default)]
 pub struct TickResult {
@@ -344,6 +392,78 @@ impl Evaluator {
             changes,
             ticks_executed: 1,
         }
+    }
+
+    /// Run a single tick with phase timing breakdown.
+    ///
+    /// Returns the normal TickResult plus timing for each phase:
+    /// (hooks, snapshot, execute, string_eval, change_detect) in seconds.
+    pub fn tick_profiled(&mut self, state: &mut State) -> (TickResult, TickProfile) {
+        let mut profile = TickProfile::default();
+
+        let t0 = Instant::now();
+
+        // Pre-tick hooks
+        for hook in &self.pre_tick_hooks {
+            hook(state);
+        }
+        let t1 = Instant::now();
+        profile.hooks += t1.duration_since(t0).as_secs_f64();
+
+        // Snapshot
+        let prev_vars = state.state_vars.clone();
+        let t2 = Instant::now();
+        profile.snapshot += t2.duration_since(t1).as_secs_f64();
+
+        // Execute compiled bytecode — granular profiling inside
+        compile::execute_profiled(&self.compiled, state, &mut self.slots, &mut profile);
+
+        // String assignments
+        let t3 = Instant::now();
+        if !self.string_assignments.is_empty() {
+            self.properties.clear();
+            self.call_depth = 0;
+            for (name, &slot) in &self.compiled.property_slots {
+                if (slot as usize) < self.slots.len() {
+                    self.properties.insert(
+                        name.clone(),
+                        Value::Number(self.slots[slot as usize] as f64),
+                    );
+                }
+            }
+            for i in 0..self.string_assignments.len() {
+                let assignment = &self.string_assignments[i] as *const Assignment;
+                let assignment = unsafe { &*assignment };
+                let value = self.eval_expr(&assignment.value, state);
+                let bare = to_bare_name(&assignment.property);
+                if let Value::Str(ref s) = value {
+                    state.string_properties.insert(bare.to_string(), s.clone());
+                }
+                self.properties.insert(assignment.property.clone(), value);
+            }
+        }
+        let t4 = Instant::now();
+        profile.string_eval += t4.duration_since(t3).as_secs_f64();
+
+        // Change detection
+        let mut changes = Vec::new();
+        for (i, name) in state.state_var_names.iter().enumerate() {
+            if i < prev_vars.len() && state.state_vars[i] != prev_vars[i] {
+                changes.push((format!("--{}", name), state.state_vars[i].to_string()));
+            }
+        }
+        let t5 = Instant::now();
+        profile.change_detect += t5.duration_since(t4).as_secs_f64();
+
+        state.frame_counter += 1;
+
+        (
+            TickResult {
+                changes,
+                ticks_executed: 1,
+            },
+            profile,
+        )
     }
 
     /// Run a single tick using the interpreted path (for comparison testing).

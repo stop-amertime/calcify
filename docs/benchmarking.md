@@ -1,87 +1,171 @@
 # Benchmarking
 
-## Running benchmarks
+## calcite-bench (primary tool)
 
-```bash
+Headless benchmark runner — no terminal rendering, no keyboard input,
+pure evaluation speed measurement. Lives in `crates/calcite-cli/src/bench.rs`.
+
+### Quick start
+
+```sh
+# Basic speed measurement (ticks/sec, cycles/sec, % of 8086)
+cargo run --release --bin calcite-bench -- -i output/rogue.css -n 5000
+
+# With warmup (skip BIOS init overhead)
+cargo run --release --bin calcite-bench -- -i output/rogue.css -n 5000 --warmup 500
+
+# Granular profiling: where time goes inside each tick
+cargo run --release --bin calcite-bench -- -i output/rogue.css -n 2000 --warmup 200 --profile
+
+# Per-tick histogram (variance analysis)
+cargo run --release --bin calcite-bench -- -i output/rogue.css -n 5000 --warmup 500 --histogram
+
+# Statistical multi-run (mean +/- stddev)
+cargo run --release --bin calcite-bench -- -i output/rogue.css -n 2000 --warmup 200 --iterations 5
+
+# Parse + compile timing
+cargo run --release --bin calcite-bench -- -i output/rogue.css -n 2000 --phase-breakdown
+
+# Halt on flag (useful for "time to boot" benchmarks)
+cargo run --release --bin calcite-bench -- -i output/rogue.css -n 999999 --halt 0xFFFF0
+```
+
+### Flags
+
+| Flag | Description |
+|---|---|
+| `-i, --input PATH` | CSS file to benchmark |
+| `-n, --ticks N` | Number of ticks to run (default: 10000) |
+| `--warmup N` | Ticks to run before measurement starts |
+| `--profile` | Granular per-phase + per-op-type breakdown |
+| `--histogram` | Per-tick timing distribution (min/p50/p90/p99/max) |
+| `--phase-breakdown` | Show parse/compile/warmup timing |
+| `--iterations N` | Run N times and report mean +/- stddev |
+| `--batch N` | Use `run_batch(N)` instead of single ticks (faster, less profiling visibility) |
+| `--halt ADDR` | Stop when memory at ADDR becomes non-zero |
+
+### Reading `--profile` output
+
+The profile breaks the tick into granular phases:
+
+```
+--- Per-phase breakdown (2000 ticks) ---
+  Phase                     Total   Avg/tick      %
+    Linear ops             463ms     231us     91.8%  ← main bytecode loop
+    Dispatch lookups        26ms      13us      5.1%  ← HashMap table lookups
+  Change detect             11ms       5us      2.2%
+  Broadcast writes           3ms       1us      0.5%
+  Writeback                  1ms      0.4us     0.2%
+```
+
+Below the timing table you get **op counters** (per-tick averages) and an
+**op frequency table** showing which bytecode instructions dominate:
+
+```
+--- Op frequency (per tick avg, sorted) ---
+  LoadLit             34475  33.3%
+  BranchIfZero        34140  33.0%
+  CmpEq               34118  33.0%
+  ...
+```
+
+And derived metrics:
+
+```
+--- Derived ---
+  ns/linear-op:         2.3    ← time per bytecode op (excluding dispatches)
+  us/dispatch:          0.6    ← time per dispatch table lookup
+```
+
+**Note:** `--profile` adds overhead from per-op HashMap counting (~10-15x
+slower than unprofiled). Use it for analysis, not for measuring absolute
+speed. For speed measurement, run without `--profile`.
+
+### What to track
+
+When measuring the impact of a change, use unprofiled mode:
+
+```sh
+# Before your change
+cargo run --release --bin calcite-bench -- -i output/rogue.css -n 5000 --warmup 500
+# ... make changes, rebuild ...
+# After your change
+cargo run --release --bin calcite-bench -- -i output/rogue.css -n 5000 --warmup 500
+```
+
+Key metrics:
+- **ticks/s** — primary throughput (higher = better)
+- **% of 4.77 MHz** — how close to real 8086 speed
+- **us/tick** — latency per evaluation cycle
+
+Test with multiple programs to check for regressions:
+
+```sh
+for css in output/rogue.css output/fib.css output/bootle.css; do
+  echo "=== $css ==="
+  cargo run --release --bin calcite-bench -- -i "$css" -n 5000 --warmup 500
+done
+```
+
+## Criterion benchmarks
+
+Micro-benchmarks for parse/compile/tick using the legacy v1 fixture
+(`tests/fixtures/x86css-main.css`). Also supports v4 CSS from `output/`
+if available.
+
+```sh
 cargo bench -p calcite-core
 ```
 
-This runs [criterion](https://github.com/bhavsec/criterion.rs) benchmarks against the x86CSS fixture (`tests/fixtures/x86css-main.css`). Results are saved to `target/criterion/` with HTML reports. Subsequent runs automatically show percentage change from the previous baseline.
-
-### Benchmarks
+Results saved to `target/criterion/` with HTML reports. Subsequent runs
+show percentage change from previous baseline.
 
 | Benchmark | What it measures |
 |---|---|
-| `parse_x86css` | CSS text to `ParsedProgram` (tokenisation, @property, @function, assignment parsing) |
-| `evaluator_from_parsed` | `ParsedProgram` to `Evaluator` (dispatch table recognition, broadcast write detection) |
-| `single_tick` | One tick on a pre-warmed state (the hot path) |
-| `batch_ticks/10_ticks` | 10 ticks from cold start |
-| `batch_ticks/100_ticks` | 100 ticks from cold start |
+| `parse_x86css` | CSS text → `ParsedProgram` |
+| `evaluator_from_parsed` | `ParsedProgram` → `Evaluator` (pattern recognition + compilation) |
+| `single_tick` | One tick on pre-warmed state (v1 fixture) |
+| `batch_ticks/{10,100}` | N ticks from cold start (v1 fixture) |
+| `v4/single_tick` | One tick on v4 CSS (if available in `output/`) |
+| `v4/batch/{10,100}` | N ticks on v4 CSS |
 
-## Current numbers (2026-04-06)
+## Flamegraphs
 
-Measured on Windows 11, release build (`cargo bench`):
+`cargo-flamegraph` is installed for sampling profiling. On Windows it
+requires an **admin terminal** (ETW tracing):
 
-| Benchmark | Time |
-|---|---|
-| parse_x86css | 10.8 ms |
-| evaluator_from_parsed | 2.1 ms |
-| **single_tick** | **2.85 ms** |
-| batch 10 ticks | 29.3 ms |
-| batch 100 ticks | 297 ms |
-
-## Chrome comparison
-
-Chrome's x86CSS runs as CSS animations at [lyra.horse/x86css](https://lyra.horse/x86css/). The two engines are not directly comparable per-tick because Chrome uses a triple-buffer animation pipeline where most ticks cycle through buffer phases without advancing the CPU state. Calcite eliminates the triple buffer and directly mutates state, so each calcite tick does real work.
-
-The fair comparison is **observable instruction throughput** — how fast each engine executes actual x86 instructions as measured by register changes.
-
-### Methodology
-
-**Chrome**: Playwright captures SI register transitions over 60 seconds via `setInterval` sampling at 50ms. SI increments by 8 each time the main loop completes one iteration (one x86 instruction batch). Timestamps on each transition give wall-clock time per instruction.
-
-**Calcite**: `--verbose` output shows SI changing every 7 ticks. Criterion measures 2.85ms/tick, giving wall-clock time per instruction.
-
-### Results (2026-04-06)
-
-Chrome 146, lyra.horse/x86css, headless via Playwright (2026-04-06):
-
-| Metric | Chrome | Calcite |
-|---|---|---|
-| Wall time per x86 instruction cycle | ~2.0 s | ~20 ms |
-| Instruction cycles per second | ~0.5 | ~50 |
-
-**Calcite is ~100x faster than Chrome at executing x86 instructions.**
-
-### Why the gap
-
-Chrome does ~1,000 CSS animation iterations per second (1ms animation duration), but only ~0.5 of those produce an observable state change. The triple-buffer pipeline (`--__0`, `--__1`, `--__2` prefixes) means each value takes multiple animation cycles to propagate from the write buffer through to the read buffer. Chrome's style engine recalculates all ~3,200 custom properties on every animation iteration regardless.
-
-Calcite skips the triple buffer entirely — one tick = one style recalculation = one state change. It evaluates ~3,200 assignments per tick at 2.85ms/tick, where Chrome's style engine takes ~1ms per recalc but needs ~4,000 recalcs to achieve the same result.
-
-### Raw Chrome data
-
-18 SI transitions observed over 60 seconds. Transition timestamps (ms from start) and SI values:
-
-```
-  1839  1235 → 1243
-  3694  1243 → 1251
-  5235  1251 → 0      (string boundary wrap)
-  5685  0    → 1120
-  8682  1120 → 1128
- 10997  1128 → 1136
- 12816  1136 → 1144
- 14850  1144 → 1152
- 16955  1152 → 1160
- 18925  1160 → 1168
- 21058  1168 → 1176
- 23071  1176 → 1184
- 25042  1184 → 1192
- 27091  1192 → 1200
- 29092  1200 → 1208
- 31334  1208 → 1216
- 33911  1216 → 1224
- 35497  1224 → 1120   (loop restart)
+```sh
+# In an admin terminal:
+cargo flamegraph --release --bin calcite-bench -- -i output/fib.css -n 5000 --warmup 500
+# Produces flamegraph.svg in the repo root
 ```
 
-Chrome baseline captured from lyra.horse/x86css/ — snapshots in `tests/fixtures/chrome-baseline.json`.
+Debug symbols are enabled in release builds (`profile.release.debug = true`
+in workspace `Cargo.toml`) so function names appear in flamegraphs.
+
+## Profiled tick API
+
+The evaluator exposes `tick_profiled()` which returns a `TickProfile` struct
+alongside the normal `TickResult`. This is what `calcite-bench --profile`
+uses internally. You can also call it directly:
+
+```rust
+let (result, profile) = evaluator.tick_profiled(&mut state);
+// profile.main_ops     — time in bytecode execution
+// profile.dispatch_time — time in dispatch table lookups
+// profile.linear_ops   — main_ops minus dispatch_time
+// profile.broadcast    — time in broadcast writes
+// profile.writeback    — time in slot→state writeback
+// profile.op_counts    — HashMap<&str, u64> of per-op-type counts
+```
+
+## Baseline numbers (2026-04-14, post BranchIfNotEqLit fusion)
+
+| Program | Ticks/s | % of 8086 | us/tick |
+|---|---|---|---|
+| rogue.css | ~6050 | 1.1% | ~165 |
+| fib.css | ~7070 | 1.3% | ~142 |
+| bootle.css | ~7210 | 1.3% | ~139 |
+
+See [docs/log.md](log.md) for the full bottleneck analysis and
+optimisation roadmap.

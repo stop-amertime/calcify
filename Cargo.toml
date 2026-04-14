@@ -18,3 +18,7 @@ calcite-core = { path = "crates/calcite-core" }
 cssparser = "0.37"
 log = "0.4"
 thiserror = "2"
+
+# Enable debug symbols in release builds for profiling (flamegraphs, perf, etc.)
+[profile.release]
+debug = true

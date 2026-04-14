@@ -214,8 +214,16 @@ const worker = new Worker('calcite-worker.js');
 let running = false;
 let paused = false;
 let totalTicks = 0;
+let totalCycles = 0;
 let lastPerfTime = performance.now();
 let lastPerfTicks = 0;
+
+const REAL_8086_HZ = 4_772_727;
+function formatHz(hz) {
+  if (hz >= 1_000_000) return `${(hz / 1_000_000).toFixed(2)} MHz`;
+  if (hz >= 1_000) return `${(hz / 1_000).toFixed(1)} KHz`;
+  return `${hz.toFixed(0)} Hz`;
+}
 
 worker.onmessage = (e) => {
   const msg = e.data;
@@ -236,6 +244,7 @@ worker.onmessage = (e) => {
       lastPerfTime = performance.now();
       lastPerfTicks = 0;
       totalTicks = 0;
+      totalCycles = 0;
       // Kick off the tick loop
       worker.postMessage({ type: 'tick', count: 500 });
       break;
@@ -255,12 +264,17 @@ worker.onmessage = (e) => {
         console.warn('[tick-result] no videoBytes received');
       }
       totalTicks += msg.ticks;
+      totalCycles = msg.cycleCount || 0;
       // Perf counter
       const now = performance.now();
       if (now - lastPerfTime > 500) {
         const elapsed = (now - lastPerfTime) / 1000;
         const tps = (totalTicks - lastPerfTicks) / elapsed;
-        perfEl.textContent = `${(tps / 1000).toFixed(0)}k ticks/s | ${totalTicks.toLocaleString()} total`;
+        // Estimate cycles/sec from ticks/sec and average cycles per tick
+        const avgCpt = totalTicks > 0 ? totalCycles / totalTicks : 10;
+        const cps = tps * avgCpt;
+        const pct = (cps / REAL_8086_HZ * 100).toFixed(1);
+        perfEl.textContent = `${totalTicks.toLocaleString()} ticks | ${totalCycles.toLocaleString()} cycles | ${formatHz(cps)} (${pct}% of 4.77 MHz)`;
         lastPerfTime = now;
         lastPerfTicks = totalTicks;
       }

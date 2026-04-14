@@ -1,4 +1,4 @@
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion, BenchmarkId};
 
 use calcite_core::eval::Evaluator;
 use calcite_core::parser::parse_css;
@@ -7,6 +7,22 @@ use calcite_core::State;
 fn load_css() -> String {
     std::fs::read_to_string("../../tests/fixtures/x86css-main.css")
         .expect("x86css-main.css fixture required for benchmarks")
+}
+
+/// Try to load a v4 CSS file from output/ for realistic benchmarks.
+/// Returns None if no v4 file is available (they're large and not in git).
+fn load_v4_css() -> Option<String> {
+    // Try smallest first
+    for path in &[
+        "../../output/fib.css",
+        "../../output/bootle.css",
+        "../../output/rogue.css",
+    ] {
+        if let Ok(css) = std::fs::read_to_string(path) {
+            return Some(css);
+        }
+    }
+    None
 }
 
 fn bench_parse(c: &mut Criterion) {
@@ -64,5 +80,42 @@ fn bench_batch(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_parse, bench_setup, bench_tick, bench_batch);
+/// Benchmark tick execution with v4 CSS (realistic DOS program).
+/// Only runs if a v4 CSS file is available in output/.
+fn bench_v4_tick(c: &mut Criterion) {
+    let css = match load_v4_css() {
+        Some(css) => css,
+        None => {
+            eprintln!("Skipping v4 benchmarks: no CSS files in output/");
+            return;
+        }
+    };
+
+    let parsed = parse_css(&css).unwrap();
+    let mut state = State::default();
+    state.load_properties(&parsed.properties);
+    let mut evaluator = Evaluator::from_parsed(&parsed);
+
+    // Warm up: 100 ticks to get past BIOS init
+    for _ in 0..100 {
+        evaluator.tick(&mut state);
+    }
+
+    let mut group = c.benchmark_group("v4");
+    group.sample_size(20); // fewer samples since each tick is slower
+
+    group.bench_function("single_tick", |b| {
+        b.iter(|| evaluator.tick(&mut state));
+    });
+
+    for &count in &[10, 100] {
+        group.bench_function(BenchmarkId::new("batch", count), |b| {
+            b.iter(|| evaluator.run_batch(&mut state, count));
+        });
+    }
+
+    group.finish();
+}
+
+criterion_group!(benches, bench_parse, bench_setup, bench_tick, bench_batch, bench_v4_tick);
 criterion_main!(benches);
