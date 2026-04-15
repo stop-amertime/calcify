@@ -170,17 +170,26 @@ fn run_bench(
     let start = Instant::now();
     let mut ticks_run: u32 = 0;
 
-    if batch > 0 && halt_addr.is_none() && !collect_histogram && !collect_profile {
-        // Batch mode: minimal overhead
+    if batch > 0 && !collect_histogram && !collect_profile {
+        // Batch mode: minimal overhead. Halt (if set) is checked between
+        // batches — still near full speed, small overshoot bounded by `batch`.
         let full_batches = ticks / batch;
         let remainder = ticks % batch;
+        let mut halted = false;
         for _ in 0..full_batches {
             evaluator.run_batch(state, batch);
+            ticks_run += batch;
+            if let Some(addr) = halt_addr {
+                if state.read_mem(addr) != 0 {
+                    halted = true;
+                    break;
+                }
+            }
         }
-        if remainder > 0 {
+        if !halted && remainder > 0 {
             evaluator.run_batch(state, remainder);
+            ticks_run += remainder;
         }
-        ticks_run = ticks;
     } else if collect_profile {
         // Profile mode: use tick_profiled for per-phase timing
         for _ in 0..ticks {

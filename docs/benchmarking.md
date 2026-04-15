@@ -42,7 +42,7 @@ cargo run --release --bin calcite-bench -- -i output/rogue.css -n 999999 --halt 
 | `--phase-breakdown` | Show parse/compile/warmup timing |
 | `--iterations N` | Run N times and report mean +/- stddev |
 | `--batch N` | Use `run_batch(N)` instead of single ticks (faster, less profiling visibility) |
-| `--halt ADDR` | Stop when memory at ADDR becomes non-zero |
+| `--halt ADDR` | Stop when memory at ADDR becomes non-zero. Compatible with `--batch`: checked between batches, so granularity-bounded overshoot up to `batch` ticks |
 
 ### Reading `--profile` output
 
@@ -106,6 +106,42 @@ for css in output/rogue.css output/fib.css output/bootle.css; do
   cargo run --release --bin calcite-bench -- -i "$css" -n 5000 --warmup 500
 done
 ```
+
+## Splash-fill benchmark (mode 13h grey-fill)
+
+**The primary end-to-end number** for optimisation work on the pixel-blit
+path. Measures wall-clock time for the C BIOS splash to fill the 320x200
+mode 13h framebuffer grey (colour 8).
+
+`bootle-ctest.css` is the fixture: it uses the C-variant BIOS which runs
+the `splash_show()` routine (see `../CSS-DOS/bios/splash.c`). The fill is
+64000 calls to `vga_pixel` — a triple-nested C for loop, not REP STOSB —
+which is exactly the workload we're optimising.
+
+The halt address is the last pixel of the framebuffer: physical
+0xA0000 + 320*200 - 1 = **719359**. When that byte transitions from 0
+to 8, the fill is done.
+
+```sh
+cargo run --release --bin calcite-bench -- \
+    -i output/bootle-ctest.css \
+    -n 5000000 --halt 719359 --batch 50000
+```
+
+Expected output includes `Ticks:`, `Elapsed:`, and `Ticks/sec:`. The fill
+completes at tick **1,828,538** (invariant — do not optimise this number;
+it is the conformant op count). What we're driving down is `Elapsed`.
+
+Recorded results:
+
+| Commit | Change | Elapsed | Ticks/sec |
+|---|---|---|---|
+| 6acc696 | pre-(a) baseline | ~27 s | ~70 K |
+| ba11194 | (a) native bitwise | ~9 s | ~210 K |
+
+Overshoot: `--halt` is checked between batches, so `Ticks` may report
+slightly more than 1,828,538 (up to `batch - 1` over). Elapsed is
+unaffected because `run_batch` stops on the batch that tripped the halt.
 
 ## Criterion benchmarks
 
