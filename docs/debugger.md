@@ -51,6 +51,14 @@ curl -X POST localhost:3333/shutdown
 | POST | `/screen` | `{"addr": N, "width": N, "height": N}` | Render text-mode video memory. Auto-detects config. |
 | POST | `/compare` | `{"reference": [...], "stop_at_first": bool}` | Diff registers against a reference trace (JSON array of tick objects). |
 | GET | `/compare-paths` | — | Run current tick through BOTH compiled and interpreted paths, diff all registers + memory. |
+| POST | `/compare-state` | `{"registers": {...}, "memory": [{"addr": N, "len": N, "bytes": [...]}]}` | Diff current state against expected register values and/or memory byte ranges. |
+| POST | `/dump-ops` | `{"start": N, "end": N}` | Dump a range of compiled bytecode ops as human-readable lines. |
+| POST | `/ops` | `{"property": "--NAME"}` | Dump compiled ops for a single property. Returns 404 if the property isn't compiled or doesn't exist. |
+| GET | `/slot-map` | — | List every compiled slot with its property name and current value. Useful for decoding `/dump-ops` output. |
+| POST | `/trace-property` | `{"property": "--NAME"}` | Step forward one tick and report every op that wrote to the given property's slot. |
+| POST | `/watchpoint` | `{"addr": N, "max_ticks": M, "from_tick": T?, "expected": V?}` | Run forward until the byte at `addr` changes (or reaches `expected` if set). Stops at `max_ticks`. |
+| POST | `/key` | `{"value": N}` | Push a raw scancode/ASCII value directly into the BDA keyboard buffer. |
+| POST | `/keyboard` | `{"value": N}` | Set the `--keyboard` CSS state variable (v3 microcode path: edge-detected → IRQ 1 → INT 09h). Use `(scancode<<8)\|ascii` for press, `0` for release. |
 | POST | `/snapshot` | — | Create a manual checkpoint at the current tick. |
 | GET | `/snapshots` | — | List all checkpoint ticks. |
 | POST | `/shutdown` | — | Stop the server. |
@@ -87,6 +95,23 @@ curl -s localhost:3333/compare-paths | python3 -m json.tool
 The debugger is the backbone of conformance testing — tools like
 `fulldiff.mjs` and `diagnose.mjs` drive it via HTTP. See
 `docs/conformance-testing.md` for the full tool reference and workflows.
+
+### Inspecting bytecode shape (for optimisation work)
+
+```sh
+# List every slot and its current value
+curl -s localhost:3333/slot-map | python3 -m json.tool
+
+# Dump the compiled ops for a specific property
+curl -sX POST localhost:3333/ops -d '{"property":"--memory_A0000"}' | python3 -m json.tool
+
+# Dump a range of ops from the global stream (use with /slot-map to decode)
+curl -sX POST localhost:3333/dump-ops -d '{"start":0,"end":200}' | python3 -m json.tool
+
+# Land on the tick where a specific memory address first changes,
+# then inspect the ops that ran around that point
+curl -sX POST localhost:3333/watchpoint -d '{"addr":655360,"max_ticks":200000}'
+```
 
 ### Inspecting memory regions
 

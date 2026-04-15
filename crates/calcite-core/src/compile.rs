@@ -162,6 +162,17 @@ pub enum Op {
         idx: Slot,
     },
 
+    /// Native 16-bit bitwise AND: slot[dst] = (slot[a] & slot[b]) & 0xFFFF.
+    /// Emitted by `try_compile_by_body_pattern` when a function body is the
+    /// canonical 32-local bit-decomposition form.
+    BitAnd16 { dst: Slot, a: Slot, b: Slot },
+    /// Native 16-bit bitwise OR.
+    BitOr16 { dst: Slot, a: Slot, b: Slot },
+    /// Native 16-bit bitwise XOR.
+    BitXor16 { dst: Slot, a: Slot, b: Slot },
+    /// Native 16-bit bitwise NOT (one's complement within 16 bits).
+    BitNot16 { dst: Slot, a: Slot },
+
     // --- Comparisons & control flow ---
     /// slot[dst] = (slot[a] == slot[b]) as i64  (integer comparison)
     CmpEq {
@@ -487,6 +498,200 @@ pub(crate) fn is_bit_extract(
         }
     }
     false
+}
+
+/// Which bitwise op a function body implements.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BitwiseKind {
+    And,
+    Or,
+    Xor,
+    Not,
+}
+
+/// True if `expr` is exactly `Literal(v)` for the given f64.
+fn is_literal(expr: &Expr, v: f64) -> bool {
+    matches!(expr, Expr::Literal(x) if (*x - v).abs() < f64::EPSILON)
+}
+
+/// True if `expr` extracts bit `i` of `var(param)` in the canonical form
+/// `mod(var(param), 2)` (i == 0) or `mod(round(down, var(param)/2^i, 1), 2)` otherwise.
+/// The divisor can be `Literal(2^i)` or `pow(2, Literal(i))`.
+fn is_bit_i_of(expr: &Expr, param: &str, i: u32) -> bool {
+    // Top level is mod(_, 2).
+    let Expr::Calc(CalcOp::Mod(inner, modulus)) = expr else { return false; };
+    if !is_literal(modulus, 2.0) { return false; }
+    if i == 0 {
+        return is_var_ref(inner, param);
+    }
+    // inner = round(down, var(param) / 2^i, 1)  (interval may be omitted or 1)
+    let Expr::Calc(CalcOp::Round(RoundStrategy::Down, val, interval)) = inner.as_ref() else {
+        return false;
+    };
+    if !is_literal(interval, 1.0) { return false; }
+    let Expr::Calc(CalcOp::Div(num, den)) = val.as_ref() else { return false; };
+    if !is_var_ref(num, param) { return false; }
+    let expected = (1u64 << i) as f64;
+    // Accept either Literal(2^i) or pow(2, Literal(i)).
+    if is_literal(den, expected) { return true; }
+    if let Expr::Calc(CalcOp::Pow(base, exp)) = den.as_ref() {
+        if is_literal(base, 2.0) && is_literal(exp, i as f64) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Flatten an N-ary Add tree into a Vec of leaf terms.
+fn flatten_add(expr: &Expr, out: &mut Vec<Expr>) {
+    if let Expr::Calc(CalcOp::Add(lhs, rhs)) = expr {
+        flatten_add(lhs, out);
+        flatten_add(rhs, out);
+    } else {
+        out.push(expr.clone());
+    }
+}
+
+/// If `term` is `inner * factor` or `factor * inner` (both literal factor), return (inner, factor).
+/// A bare `inner` with factor=1.0 also matches.
+fn split_scaled_term(term: &Expr) -> (&Expr, f64) {
+    if let Expr::Calc(CalcOp::Mul(lhs, rhs)) = term {
+        if let Expr::Literal(f) = rhs.as_ref() {
+            return (lhs.as_ref(), *f);
+        }
+        if let Expr::Literal(f) = lhs.as_ref() {
+            return (rhs.as_ref(), *f);
+        }
+    }
+    (term, 1.0)
+}
+
+/// True if `expr` is a reference to local name `local` (Var { name == local }).
+fn is_local_ref(expr: &Expr, local: &str) -> bool {
+    is_var_ref(expr, local)
+}
+
+/// Classify the per-bit combine of two locals `an`, `bn` into a bitwise kind:
+/// - And: `var(an) * var(bn)`
+/// - Or:  `min(1, var(an) + var(bn))`
+/// - Xor: `min(1, var(an) + var(bn)) - var(an) * var(bn)`
+/// Returns None if shape doesn't match any of these.
+fn classify_pair_combine(expr: &Expr, an: &str, bn: &str) -> Option<BitwiseKind> {
+    // AND: an * bn (either order)
+    if let Expr::Calc(CalcOp::Mul(lhs, rhs)) = expr {
+        if (is_local_ref(lhs, an) && is_local_ref(rhs, bn))
+            || (is_local_ref(lhs, bn) && is_local_ref(rhs, an))
+        {
+            return Some(BitwiseKind::And);
+        }
+    }
+    // OR: min(1, an + bn)
+    if is_min_1_add(expr, an, bn) {
+        return Some(BitwiseKind::Or);
+    }
+    // XOR: min(1, an + bn) - an * bn
+    if let Expr::Calc(CalcOp::Sub(lhs, rhs)) = expr {
+        if is_min_1_add(lhs, an, bn) {
+            if let Expr::Calc(CalcOp::Mul(ma, mb)) = rhs.as_ref() {
+                if (is_local_ref(ma, an) && is_local_ref(mb, bn))
+                    || (is_local_ref(ma, bn) && is_local_ref(mb, an))
+                {
+                    return Some(BitwiseKind::Xor);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// True if `expr` is `min(1, var(an) + var(bn))` (either arg order for + and min).
+fn is_min_1_add(expr: &Expr, an: &str, bn: &str) -> bool {
+    let Expr::Calc(CalcOp::Min(args)) = expr else { return false; };
+    if args.len() != 2 { return false; }
+    let (one_arg, add_arg) = if is_literal(&args[0], 1.0) {
+        (&args[0], &args[1])
+    } else if is_literal(&args[1], 1.0) {
+        (&args[1], &args[0])
+    } else {
+        return false;
+    };
+    let _ = one_arg;
+    let Expr::Calc(CalcOp::Add(lhs, rhs)) = add_arg else { return false; };
+    (is_local_ref(lhs, an) && is_local_ref(rhs, bn))
+        || (is_local_ref(lhs, bn) && is_local_ref(rhs, an))
+}
+
+/// True if `expr` is `1 - var(an)` (NOT of a single bit local).
+fn is_one_minus_local(expr: &Expr, an: &str) -> bool {
+    if let Expr::Calc(CalcOp::Sub(lhs, rhs)) = expr {
+        return is_literal(lhs, 1.0) && is_local_ref(rhs, an);
+    }
+    false
+}
+
+/// Attempt to classify a function body as a canonical 16-bit bitwise op
+/// (AND/OR/XOR/NOT) implemented as bit decomposition + reassembly.
+///
+/// Returns `Some(kind)` if the body matches; `None` otherwise.
+///
+/// Genericity: this never looks at the function name, only at body shape.
+/// Any 2-param (or 1-param for NOT) function with the right locals and result
+/// tree is detected, regardless of what the user named it.
+pub(crate) fn classify_bitwise_decomposition(func: &FunctionDef) -> Option<BitwiseKind> {
+    let params = &func.parameters;
+
+    // Case 1: 2-param, 32 locals → AND / OR / XOR.
+    if params.len() == 2 && func.locals.len() == 32 {
+        let pa = &params[0].name;
+        let pb = &params[1].name;
+        // Locals must be a1..a16 then b1..b16 (by order), each a bit-extract
+        // of the corresponding param. We don't require exact names — we match
+        // by position: first 16 locals decompose param 0, next 16 decompose param 1.
+        let a_names: Vec<&str> = func.locals[..16].iter().map(|l| l.name.as_str()).collect();
+        let b_names: Vec<&str> = func.locals[16..].iter().map(|l| l.name.as_str()).collect();
+        for i in 0..16 {
+            if !is_bit_i_of(&func.locals[i].value, pa, i as u32) { return None; }
+            if !is_bit_i_of(&func.locals[16 + i].value, pb, i as u32) { return None; }
+        }
+        // Result: sum of 16 terms, each (a_i OP b_i) scaled by 2^i.
+        let mut terms = Vec::new();
+        flatten_add(&func.result, &mut terms);
+        if terms.len() != 16 { return None; }
+        let mut kind: Option<BitwiseKind> = None;
+        for (i, term) in terms.iter().enumerate() {
+            let (inner, factor) = split_scaled_term(term);
+            let expected = (1u64 << i) as f64;
+            if (factor - expected).abs() > f64::EPSILON { return None; }
+            let this_kind = classify_pair_combine(inner, a_names[i], b_names[i])?;
+            match kind {
+                None => kind = Some(this_kind),
+                Some(k) if k == this_kind => {}
+                _ => return None,
+            }
+        }
+        return kind.filter(|k| matches!(k, BitwiseKind::And | BitwiseKind::Or | BitwiseKind::Xor));
+    }
+
+    // Case 2: 1-param, 16 locals → NOT.
+    if params.len() == 1 && func.locals.len() == 16 {
+        let pa = &params[0].name;
+        let a_names: Vec<&str> = func.locals.iter().map(|l| l.name.as_str()).collect();
+        for i in 0..16 {
+            if !is_bit_i_of(&func.locals[i].value, pa, i as u32) { return None; }
+        }
+        let mut terms = Vec::new();
+        flatten_add(&func.result, &mut terms);
+        if terms.len() != 16 { return None; }
+        for (i, term) in terms.iter().enumerate() {
+            let (inner, factor) = split_scaled_term(term);
+            let expected = (1u64 << i) as f64;
+            if (factor - expected).abs() > f64::EPSILON { return None; }
+            if !is_one_minus_local(inner, a_names[i]) { return None; }
+        }
+        return Some(BitwiseKind::Not);
+    }
+
+    None
 }
 
 /// Check if a dispatch table is an identity-read: every entry maps key K → state[K].
@@ -1047,13 +1252,40 @@ impl<'a> Compiler<'a> {
         let mut jump_to_end: Vec<usize> = Vec::new();
 
         for branch in branches {
-            let cond_slot = self.compile_style_test(&branch.condition, ops);
-            // If condition is false (0), skip this branch
-            let branch_idx = ops.len();
-            ops.push(Op::BranchIfZero {
-                cond: cond_slot,
-                target: 0,
-            }); // target patched later
+            // Fast path: if the condition is a conjunction of `style(--prop: literal)`
+            // singletons, emit a chain of BranchIfNotEqLit ops going straight to the
+            // next-branch target. Avoids the generic style_test machinery (Mul, intermediate
+            // bool slots) and skips the fuse pass entirely. Covers the dominant BIOS
+            // pattern `style(--opcode: N) and style(--uOp: K)`.
+            let mut fast_branch_idxs: Vec<usize> = Vec::new();
+            let used_fast = collect_literal_and_tests(&branch.condition)
+                .map(|tests| {
+                    for (prop, lit) in &tests {
+                        let prop_slot = self.compile_var(prop, None, ops);
+                        fast_branch_idxs.push(ops.len());
+                        ops.push(Op::BranchIfNotEqLit {
+                            a: prop_slot,
+                            val: *lit,
+                            target: 0, // patched after branch body emitted
+                        });
+                    }
+                    true
+                })
+                .unwrap_or(false);
+
+            let branch_idx = if used_fast {
+                usize::MAX // sentinel; fast_branch_idxs handles patching
+            } else {
+                let cond_slot = self.compile_style_test(&branch.condition, ops);
+                let idx = ops.len();
+                ops.push(Op::BranchIfZero {
+                    cond: cond_slot,
+                    target: 0,
+                });
+                idx
+            };
+            // keep the original `branch_idx` name working below
+            let _ = ();
 
             // Save and restore property_slots around each branch to prevent
             // cross-branch slot aliasing. Without this, a function call in
@@ -1091,10 +1323,16 @@ impl<'a> Compiler<'a> {
             jump_to_end.push(ops.len());
             ops.push(Op::Jump { target: 0 }); // target patched later
 
-            // Patch the branch-if-zero to jump here (the next branch)
+            // Patch the branch(s) to jump here (the next branch / fallback)
             let next_idx = ops.len() as u32;
-            if let Op::BranchIfZero { target, .. } = &mut ops[branch_idx] {
-                *target = next_idx;
+            if used_fast {
+                for idx in fast_branch_idxs.iter().copied() {
+                    if let Op::BranchIfNotEqLit { target, .. } = &mut ops[idx] {
+                        *target = next_idx;
+                    }
+                }
+            } else if let Some(Op::BranchIfZero { target: tgt, .. }) = ops.get_mut(branch_idx) {
+                *tgt = next_idx;
             }
         }
 
@@ -1330,6 +1568,35 @@ impl<'a> Compiler<'a> {
                     val: sv,
                     idx: si,
                 });
+                return Some(dst);
+            }
+        }
+
+        // 16-bit bitwise decomposition (AND/OR/XOR) — 2-param, 32-local form.
+        // Pattern: per-bit extract of each param, result = sum of per-bit
+        // combine * 2^i. See classify_bitwise_decomposition for the shape.
+        if params.len() == 2 && func.locals.len() == 32 {
+            if let Some(kind) = classify_bitwise_decomposition(func) {
+                let sa = self.compile_expr(&args[0], ops);
+                let sb = self.compile_expr(&args[1], ops);
+                let dst = self.alloc();
+                let op = match kind {
+                    BitwiseKind::And => Op::BitAnd16 { dst, a: sa, b: sb },
+                    BitwiseKind::Or => Op::BitOr16 { dst, a: sa, b: sb },
+                    BitwiseKind::Xor => Op::BitXor16 { dst, a: sa, b: sb },
+                    BitwiseKind::Not => unreachable!("NOT is 1-param"),
+                };
+                ops.push(op);
+                return Some(dst);
+            }
+        }
+
+        // 16-bit bitwise NOT — 1-param, 16-local form.
+        if params.len() == 1 && func.locals.len() == 16 {
+            if let Some(BitwiseKind::Not) = classify_bitwise_decomposition(func) {
+                let sa = self.compile_expr(&args[0], ops);
+                let dst = self.alloc();
+                ops.push(Op::BitNot16 { dst, a: sa });
                 return Some(dst);
             }
         }
@@ -1798,6 +2065,37 @@ impl<'a> Compiler<'a> {
         }
 
         result_slot
+    }
+}
+
+/// If `test` is a (possibly nested) `And` of `Single { value: integer literal }` tests,
+/// return a flat list of (property, literal) pairs. Otherwise `None`.
+///
+/// Used by `compile_style_condition_linear` to emit direct BranchIfNotEqLit chains
+/// in place of the generic compile_style_test machinery (which emits Mul/CmpEq/branch
+/// per term and never fuses). Covers the dominant BIOS pattern:
+/// `style(--opcode: N) and style(--uOp: K)`.
+fn collect_literal_and_tests(test: &StyleTest) -> Option<Vec<(String, i32)>> {
+    let mut out: Vec<(String, i32)> = Vec::new();
+    fn walk(t: &StyleTest, out: &mut Vec<(String, i32)>) -> bool {
+        match t {
+            StyleTest::Single { property, value } => {
+                if let Expr::Literal(v) = value {
+                    if v.fract() == 0.0 && *v >= i32::MIN as f64 && *v <= i32::MAX as f64 {
+                        out.push((property.clone(), *v as i32));
+                        return true;
+                    }
+                }
+                false
+            }
+            StyleTest::And(tests) => tests.iter().all(|t| walk(t, out)),
+            StyleTest::Or(_) => false,
+        }
+    }
+    if walk(test, &mut out) && !out.is_empty() {
+        Some(out)
+    } else {
+        None
     }
 }
 
@@ -2687,6 +2985,8 @@ fn op_slots_read(op: &Op) -> Vec<Slot> {
         Op::Clamp { min, val, max, .. } => vec![*min, *val, *max],
         Op::Round { val, interval, .. } => vec![*val, *interval],
         Op::Bit { val, idx, .. } => vec![*val, *idx],
+        Op::BitAnd16 { a, b, .. } | Op::BitOr16 { a, b, .. } | Op::BitXor16 { a, b, .. } => vec![*a, *b],
+        Op::BitNot16 { a, .. } => vec![*a],
         Op::CmpEq { a, b, .. } => vec![*a, *b],
         Op::BranchIfZero { cond, .. } => vec![*cond],
         Op::BranchIfNotEqLit { a, .. } => vec![*a],
@@ -2725,6 +3025,10 @@ fn op_dst(op: &Op) -> Option<Slot> {
         | Op::Shr { dst, .. }
         | Op::Shl { dst, .. }
         | Op::Bit { dst, .. }
+        | Op::BitAnd16 { dst, .. }
+        | Op::BitOr16 { dst, .. }
+        | Op::BitXor16 { dst, .. }
+        | Op::BitNot16 { dst, .. }
         | Op::CmpEq { dst, .. }
         | Op::Dispatch { dst, .. }
         | Op::DispatchFlatArray { dst, .. } => Some(*dst),
@@ -2803,6 +3107,15 @@ fn map_op_slots(op: &mut Op, slot_map: &mut HashMap<Slot, Slot>, alloc: &mut Slo
             *idx = alloc.get_or_alloc(*idx, slot_map);
             *dst = alloc.get_or_alloc(*dst, slot_map);
         }
+        Op::BitAnd16 { dst, a, b } | Op::BitOr16 { dst, a, b } | Op::BitXor16 { dst, a, b } => {
+            *a = alloc.get_or_alloc(*a, slot_map);
+            *b = alloc.get_or_alloc(*b, slot_map);
+            *dst = alloc.get_or_alloc(*dst, slot_map);
+        }
+        Op::BitNot16 { dst, a } => {
+            *a = alloc.get_or_alloc(*a, slot_map);
+            *dst = alloc.get_or_alloc(*dst, slot_map);
+        }
         Op::CmpEq { dst, a, b } => {
             *a = alloc.get_or_alloc(*a, slot_map);
             *b = alloc.get_or_alloc(*b, slot_map);
@@ -2868,6 +3181,8 @@ fn seed_from_parent(
         | Op::Floor { src, .. } => { seed(*src); }
         Op::Pow { base, exp, .. } => { seed(*base); seed(*exp); }
         Op::Bit { val, idx, .. } => { seed(*val); seed(*idx); }
+        Op::BitAnd16 { a, b, .. } | Op::BitOr16 { a, b, .. } | Op::BitXor16 { a, b, .. } => { seed(*a); seed(*b); }
+        Op::BitNot16 { a, .. } => { seed(*a); }
         Op::CmpEq { a, b, .. } => { seed(*a); seed(*b); }
         Op::Min { args, .. } | Op::Max { args, .. } => { for a in args { seed(*a); } }
         Op::Clamp { min, val, max, .. } => { seed(*min); seed(*val); seed(*max); }
@@ -3147,6 +3462,25 @@ fn exec_ops(
                 let v = sload!(*val);
                 let i = sload!(*idx) as u32;
                 sstore!(*dst, if i >= 32 { 0 } else { (v >> i) & 1 });
+            }
+            Op::BitAnd16 { dst, a, b } => {
+                let av = sload!(*a) as u32 & 0xFFFF;
+                let bv = sload!(*b) as u32 & 0xFFFF;
+                sstore!(*dst, (av & bv) as i32);
+            }
+            Op::BitOr16 { dst, a, b } => {
+                let av = sload!(*a) as u32 & 0xFFFF;
+                let bv = sload!(*b) as u32 & 0xFFFF;
+                sstore!(*dst, (av | bv) as i32);
+            }
+            Op::BitXor16 { dst, a, b } => {
+                let av = sload!(*a) as u32 & 0xFFFF;
+                let bv = sload!(*b) as u32 & 0xFFFF;
+                sstore!(*dst, (av ^ bv) as i32);
+            }
+            Op::BitNot16 { dst, a } => {
+                let av = sload!(*a) as u32 & 0xFFFF;
+                sstore!(*dst, ((!av) & 0xFFFF) as i32);
             }
             Op::CmpEq { dst, a, b } => {
                 sstore!(*dst, if sload!(*a) == sload!(*b) { 1 } else { 0 });
@@ -3454,6 +3788,29 @@ fn exec_ops_profiled(
                 let v = slots[*val as usize];
                 let i = slots[*idx as usize] as u32;
                 slots[*dst as usize] = if i >= 32 { 0 } else { (v >> i) & 1 };
+            }
+            Op::BitAnd16 { dst, a, b } => {
+                count_op!(profile, "BitAnd16");
+                let av = slots[*a as usize] as u32 & 0xFFFF;
+                let bv = slots[*b as usize] as u32 & 0xFFFF;
+                slots[*dst as usize] = (av & bv) as i32;
+            }
+            Op::BitOr16 { dst, a, b } => {
+                count_op!(profile, "BitOr16");
+                let av = slots[*a as usize] as u32 & 0xFFFF;
+                let bv = slots[*b as usize] as u32 & 0xFFFF;
+                slots[*dst as usize] = (av | bv) as i32;
+            }
+            Op::BitXor16 { dst, a, b } => {
+                count_op!(profile, "BitXor16");
+                let av = slots[*a as usize] as u32 & 0xFFFF;
+                let bv = slots[*b as usize] as u32 & 0xFFFF;
+                slots[*dst as usize] = (av ^ bv) as i32;
+            }
+            Op::BitNot16 { dst, a } => {
+                count_op!(profile, "BitNot16");
+                let av = slots[*a as usize] as u32 & 0xFFFF;
+                slots[*dst as usize] = ((!av) & 0xFFFF) as i32;
             }
             Op::CmpEq { dst, a, b } => {
                 count_op!(profile, "CmpEq");
@@ -3772,6 +4129,33 @@ pub fn exec_ops_traced(
                 let val_r = if i >= 32 { 0 } else { (v >> i) & 1 };
                 slots[*dst as usize] = val_r;
                 if should_trace { trace.push(TraceEntry { pc, op: format!("Bit dst={} → {}", dst, val_r), dst_slot: Some(*dst), dst_value: Some(val_r), inputs: vec![], branch_taken: None, depth }); }
+            }
+            Op::BitAnd16 { dst, a, b } => {
+                let av = slots[*a as usize] as u32 & 0xFFFF;
+                let bv = slots[*b as usize] as u32 & 0xFFFF;
+                let r = (av & bv) as i32;
+                slots[*dst as usize] = r;
+                if should_trace { trace.push(TraceEntry { pc, op: format!("BitAnd16 dst={} → {}", dst, r), dst_slot: Some(*dst), dst_value: Some(r), inputs: vec![(*a, av as i32), (*b, bv as i32)], branch_taken: None, depth }); }
+            }
+            Op::BitOr16 { dst, a, b } => {
+                let av = slots[*a as usize] as u32 & 0xFFFF;
+                let bv = slots[*b as usize] as u32 & 0xFFFF;
+                let r = (av | bv) as i32;
+                slots[*dst as usize] = r;
+                if should_trace { trace.push(TraceEntry { pc, op: format!("BitOr16 dst={} → {}", dst, r), dst_slot: Some(*dst), dst_value: Some(r), inputs: vec![(*a, av as i32), (*b, bv as i32)], branch_taken: None, depth }); }
+            }
+            Op::BitXor16 { dst, a, b } => {
+                let av = slots[*a as usize] as u32 & 0xFFFF;
+                let bv = slots[*b as usize] as u32 & 0xFFFF;
+                let r = (av ^ bv) as i32;
+                slots[*dst as usize] = r;
+                if should_trace { trace.push(TraceEntry { pc, op: format!("BitXor16 dst={} → {}", dst, r), dst_slot: Some(*dst), dst_value: Some(r), inputs: vec![(*a, av as i32), (*b, bv as i32)], branch_taken: None, depth }); }
+            }
+            Op::BitNot16 { dst, a } => {
+                let av = slots[*a as usize] as u32 & 0xFFFF;
+                let r = ((!av) & 0xFFFF) as i32;
+                slots[*dst as usize] = r;
+                if should_trace { trace.push(TraceEntry { pc, op: format!("BitNot16 dst={} → {}", dst, r), dst_slot: Some(*dst), dst_value: Some(r), inputs: vec![(*a, av as i32)], branch_taken: None, depth }); }
             }
             Op::CmpEq { dst, a, b } => {
                 let av = slots[*a as usize]; let bv = slots[*b as usize];

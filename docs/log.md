@@ -11,6 +11,45 @@ and the Criterion benchmarks.
 
 ---
 
+## Current priority: Mode 13h blitting is painfully slow
+
+Filling the 320×200 framebuffer once takes roughly a minute — you can
+watch the pixels scroll into place. Even after the compound-AND fuser
+landed (3× overall speedup, see below), the mode 13h splash in
+`bootle-ctest.css` is nowhere near usable. We need something like a 100×
+improvement on tight inner loops like this.
+
+Working through candidates in [docs/optimisation-ideas.md](optimisation-ideas.md).
+Stacking order: ~~native bitwise recognition~~ (done) → dead LoadLit
+sinking → wider dispatch-chain recognition → change-gated ops → affine
+self-loop fixed-point recognition (the big structural move) →
+value-keyed region memoisation.
+
+---
+
+## 2026-04-15: Native 16-bit bitwise recognition (idea (a))
+
+CSS-DOS `--and`, `--or`, `--xor`, `--not` are 32-local bit-decomposition
+functions (16 `mod(round(down, var/2^k), 2)` ops per input, then a
+16-term reconstruction sum). Each call compiled to ~100 ops.
+
+Added a body-shape recogniser `classify_bitwise_decomposition` and four
+native ops `BitAnd16` / `BitOr16` / `BitXor16` / `BitNot16`. The
+recogniser never looks at function names — it matches on the bit-extract
+shape of the locals and the per-bit combine pattern in the result sum
+(`a*b` → AND, `min(1,a+b)` → OR, `min(1,a+b)-a*b` → XOR, `1-a` → NOT).
+
+Result on bootle-ctest cold (300K ticks):
+
+- Previous baseline: 134K ticks/s (17.1% of 8086), 2472 main-stream ops/tick.
+- After: **259K ticks/s** (32.3% of 8086), **1342 main-stream ops/tick**.
+- 1.9× speedup; 45% fewer ops per tick.
+- Conformance: compile vs interpret diffs at ticks 500K/1M/2M are
+  unchanged (6/10/3) vs baseline — those are a pre-existing divergence,
+  not introduced by this change.
+
+---
+
 ## 2026-04-15: Flat-array fast path for single-param literal dispatch
 
 ### Context
