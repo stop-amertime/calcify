@@ -98,7 +98,7 @@ netstat -ano | findstr ":%PORT% " | findstr LISTENING >nul
 if errorlevel 1 (
     echo.
     echo === Starting HTTP server on port %PORT% ===
-    start "calcite-http" /MIN python -m http.server %PORT%
+    start "calcite-http" /MIN python serve.py %PORT%
     timeout /t 1 /nobreak >nul
 ) else (
     echo.
