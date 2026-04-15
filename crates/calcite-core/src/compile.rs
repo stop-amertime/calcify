@@ -23,6 +23,18 @@ use crate::types::*;
 /// Slot index type — widened to u32 to support large programs (>64K slots).
 pub type Slot = u32;
 
+/// Convert a literal `f64` to `i32` if it is a whole number in range.
+/// Used by dispatch-table fast paths that require integer-valued literals.
+fn lit_as_i32(v: f64) -> Option<i32> {
+    if !v.is_finite() || v.fract() != 0.0 {
+        return None;
+    }
+    if v < i32::MIN as f64 || v > i32::MAX as f64 {
+        return None;
+    }
+    Some(v as i32)
+}
+
 /// A single operation in the compiled bytecode.
 ///
 /// All operands are `Slot` (u32) indices into a flat `Vec<i32>` array.
@@ -193,6 +205,18 @@ pub enum Op {
         fallback_target: u32,
     },
 
+    /// Flat-array dispatch fast path: slot[dst] = flat_dispatch_arrays[array_id]
+    /// indexed by (slot[key] - base_key). Out-of-range keys yield `default`.
+    /// Emitted when every dispatch-table entry is an integer literal and the
+    /// key range is dense enough to fit in a contiguous Vec<i32>.
+    DispatchFlatArray {
+        dst: Slot,
+        key: Slot,
+        array_id: u32,
+        base_key: i32,
+        default: i32,
+    },
+
     // --- Stores ---
     /// state.write_mem(addr, slot[src]) — compile-time-known address
     StoreState {
@@ -229,6 +253,8 @@ pub struct CompiledProgram {
     pub dispatch_tables: Vec<CompiledDispatchTable>,
     /// Dispatch chain tables (for DispatchChain op — runs of same-slot BranchIfNotEqLit).
     pub chain_tables: Vec<DispatchChainTable>,
+    /// Flat-array dispatch tables (for DispatchFlatArray op — dense literal-only lookups).
+    pub flat_dispatch_arrays: Vec<FlatDispatchArray>,
     /// Mapping from property name → slot index (for reading computed values after execution).
     pub property_slots: HashMap<String, Slot>,
 }
@@ -264,6 +290,16 @@ pub struct CompiledSpillover {
     pub guard_slot: Slot,
     /// Map from dest address → (ops to compute high byte, result slot).
     pub entries: HashMap<i64, (Vec<Op>, Slot)>,
+}
+
+/// A flat-array dispatch table — dense `Vec<i32>` keyed by (key - base_key).
+/// Used by the `DispatchFlatArray` op when every dispatch entry is an integer
+/// literal and the key range is small enough to fit in contiguous memory.
+#[derive(Debug)]
+pub struct FlatDispatchArray {
+    /// Values indexed by (key - base_key). Out-of-range indices yield the
+    /// default value baked into the op.
+    pub values: Vec<i32>,
 }
 
 /// A compiled dispatch table — kept for runtime HashMap lookup.
@@ -721,8 +757,12 @@ struct Compiler<'a> {
     dispatch_tables: HashMap<String, DispatchTable>,
     /// Compiled dispatch table data (populated during compilation).
     compiled_dispatches: Vec<CompiledDispatchTable>,
+    /// Compiled flat-array dispatch tables (fast path for literal-only dispatches).
+    compiled_flat_arrays: Vec<FlatDispatchArray>,
     /// Cache: dispatch table name → compiled table_id.
     dispatch_cache: HashMap<String, Slot>,
+    /// Cache: dispatch table name → (array_id, base_key, default) for the flat fast path.
+    flat_dispatch_cache: HashMap<String, (u32, i32, i32)>,
     /// Cache: dispatch table name → identity-read classification result.
     identity_read_cache: HashMap<String, bool>,
     /// Cache: dispatch table name → near-identity exception keys (or None).
@@ -740,7 +780,9 @@ impl<'a> Compiler<'a> {
             functions,
             dispatch_tables: dispatch_tables.clone(),
             compiled_dispatches: Vec::new(),
+            compiled_flat_arrays: Vec::new(),
             dispatch_cache: HashMap::new(),
+            flat_dispatch_cache: HashMap::new(),
             identity_read_cache: HashMap::new(),
             near_identity_cache: HashMap::new(),
         }
@@ -1466,6 +1508,83 @@ impl<'a> Compiler<'a> {
         dst
     }
 
+    /// Maximum span (max_key - min_key + 1) permitted for the flat-array
+    /// dispatch fast path. Chosen so that each flat array stays under
+    /// ~40 MB (10M * 4 bytes) even in the worst case.
+    const FLAT_DISPATCH_MAX_SPAN: i64 = 10_000_000;
+
+    /// Try to build a flat-array dispatch representation of `table`.
+    ///
+    /// Returns `Some((array_id, base_key, default))` if every entry is a
+    /// literal integer representable as i32, the fallback is a literal
+    /// representable as i32, and the key range is dense enough. The
+    /// resulting array is stored in `self.compiled_flat_arrays`, indexed
+    /// by (key - base_key).
+    ///
+    /// Parameterless calls are cached — subsequent calls to the same
+    /// dispatch table reuse the same `array_id`.
+    fn try_build_flat_dispatch(
+        &mut self,
+        name: &str,
+        table: &DispatchTable,
+    ) -> Option<(u32, i32, i32)> {
+        // Fallback must be a literal.
+        let default = match &table.fallback {
+            Expr::Literal(v) => lit_as_i32(*v)?,
+            _ => return None,
+        };
+
+        // Every entry must be a literal integer fitting in i32, and the
+        // key must fit in i32.
+        let mut min_key: i64 = i64::MAX;
+        let mut max_key: i64 = i64::MIN;
+        for (&k, expr) in &table.entries {
+            if k < i32::MIN as i64 || k > i32::MAX as i64 {
+                return None;
+            }
+            match expr {
+                Expr::Literal(v) => {
+                    if lit_as_i32(*v).is_none() {
+                        return None;
+                    }
+                }
+                _ => return None,
+            }
+            if k < min_key { min_key = k; }
+            if k > max_key { max_key = k; }
+        }
+
+        let span = max_key - min_key + 1;
+        if span <= 0 || span > Self::FLAT_DISPATCH_MAX_SPAN {
+            return None;
+        }
+
+        // Reuse cached result by function name. The flat array depends only
+        // on the dispatch table entries (all literals), not on the runtime
+        // parameter value — so caching by name is safe even for parameterized
+        // dispatches. At runtime the key slot varies per call site; the array
+        // is shared.
+        if let Some(&cached) = self.flat_dispatch_cache.get(name) {
+            return Some(cached);
+        }
+
+        let base_key = min_key as i32;
+        let mut values = vec![default; span as usize];
+        for (&k, expr) in &table.entries {
+            if let Expr::Literal(v) = expr {
+                // Safe: bounds and conversion validated above.
+                let idx = (k - min_key) as usize;
+                values[idx] = lit_as_i32(*v).unwrap();
+            }
+        }
+
+        let array_id = self.compiled_flat_arrays.len() as u32;
+        self.compiled_flat_arrays.push(FlatDispatchArray { values });
+        let result = (array_id, base_key, default);
+        self.flat_dispatch_cache.insert(name.to_string(), result);
+        Some(result)
+    }
+
     /// Compile a dispatch table function call.
     ///
     /// Large dispatch tables (≥100 entries) are compiled once and cached — subsequent
@@ -1516,6 +1635,38 @@ impl<'a> Compiler<'a> {
 
         // Compile the key lookup
         let key_slot = self.compile_var(&table.key_property, None, ops);
+
+        // ---- Flat-byte-array fast path ----
+        //
+        // When every dispatch entry is an integer literal and the key range is
+        // dense, compile the whole table to a single `Vec<i32>` lookup. Avoids
+        // the O(N) per-entry bytecode emission (and matching per-entry runtime
+        // HashMap lookup) that dominates compile time and memory for very large
+        // literal dispatch tables (hundreds of thousands of entries or more).
+        let single_param = func.map_or(true, |f| f.parameters.len() <= 1);
+        if single_param && !table.entries.is_empty() {
+            if let Some((array_id, base_key, default)) =
+                self.try_build_flat_dispatch(name, &table)
+            {
+                // Restore and emit single op.
+                self.dispatch_tables.insert(name.to_string(), table);
+                for (param_name, old) in saved {
+                    match old {
+                        Some(s) => { self.property_slots.insert(param_name, s); }
+                        None => { self.property_slots.remove(&param_name); }
+                    }
+                }
+                let dst = self.alloc();
+                ops.push(Op::DispatchFlatArray {
+                    dst,
+                    key: key_slot,
+                    array_id,
+                    base_key,
+                    default,
+                });
+                return dst;
+            }
+        }
 
         // Check cache for large tables — compile entries only once.
         // IMPORTANT: Only use cache for parameterless functions. If the function
@@ -1655,6 +1806,20 @@ impl<'a> Compiler<'a> {
 // ---------------------------------------------------------------------------
 
 /// Compile the evaluator's assignments and broadcast writes into a `CompiledProgram`.
+pub fn render_progress(phase: &str, done: usize, total: usize, elapsed: f64) {
+    let pct = if total > 0 { (done as f64 / total as f64 * 100.0).min(100.0) } else { 0.0 };
+    let width = 30usize;
+    let filled = ((pct / 100.0) * width as f64) as usize;
+    let bar: String = (0..width)
+        .map(|i| if i < filled { '=' } else if i == filled { '>' } else { ' ' })
+        .collect();
+    eprint!(
+        "\r{phase} [{bar}] {pct:5.1}%  {done}/{total}  {elapsed:.1}s                    ",
+        phase = phase, bar = bar, pct = pct, done = done, total = total, elapsed = elapsed
+    );
+    let _ = std::io::Write::flush(&mut std::io::stderr());
+}
+
 pub fn compile(
     assignments: &[Assignment],
     broadcast_writes: &[BroadcastWrite],
@@ -1667,9 +1832,18 @@ pub fn compile(
     let mut ops = Vec::new();
     let mut writeback = Vec::new();
 
+    // ---- Progress meter ----
+    let bw_total: usize = broadcast_writes.iter().map(|bw| bw.address_map.len()).sum();
+    let total_work = assignments.len() + bw_total;
+    let show_progress = std::env::var_os("CALCITE_NO_PROGRESS").is_none()
+        && total_work >= 10_000;
+    let progress_start = web_time::Instant::now();
+    let mut last_render = web_time::Instant::now();
+    let mut work_done: usize = 0;
+
     let _ct = web_time::Instant::now();
-    // Compile each assignment
-    for assignment in assignments {
+    // Compile each assignment.
+    for assignment in assignments.iter() {
         let _at = web_time::Instant::now();
         let result_slot = compiler.compile_expr(&assignment.value, &mut ops);
         let elapsed = _at.elapsed();
@@ -1687,6 +1861,12 @@ pub fn compile(
                 writeback.push((result_slot, addr));
             }
         }
+
+        work_done += 1;
+        if show_progress && last_render.elapsed().as_millis() >= 100 {
+            render_progress("Compiling", work_done, total_work, progress_start.elapsed().as_secs_f64());
+            last_render = web_time::Instant::now();
+        }
     }
     log::info!("[compile detail] assignments ({} items): {:.2}s, {} ops, {} dispatch tables",
         assignments.len(), _ct.elapsed().as_secs_f64(), ops.len(), compiler.compiled_dispatches.len());
@@ -1702,9 +1882,18 @@ pub fn compile(
             log::info!("[compile detail] broadcast write {}: {:.2}s ({} addrs, {} spillover)",
                 bw.dest_property, _bt.elapsed().as_secs_f64(),
                 bw.address_map.len(), bw.spillover_map.len());
+            work_done += bw.address_map.len();
+            if show_progress && last_render.elapsed().as_millis() >= 100 {
+                render_progress("Compiling", work_done, total_work, progress_start.elapsed().as_secs_f64());
+                last_render = web_time::Instant::now();
+            }
             result
         })
         .collect();
+    if show_progress {
+        render_progress("Compiling", total_work, total_work, progress_start.elapsed().as_secs_f64());
+        eprintln!();
+    }
     log::info!("[compile detail] broadcast writes total ({} items): {:.2}s",
         broadcast_writes.len(), _ct.elapsed().as_secs_f64());
 
@@ -1715,6 +1904,7 @@ pub fn compile(
         broadcast_writes: compiled_bw,
         dispatch_tables: compiler.compiled_dispatches,
         chain_tables: Vec::new(),
+        flat_dispatch_arrays: compiler.compiled_flat_arrays,
         property_slots: compiler.property_slots,
     };
 
@@ -2503,6 +2693,7 @@ fn op_slots_read(op: &Op) -> Vec<Slot> {
         Op::Jump { .. } => vec![],
         Op::DispatchChain { a, .. } => vec![*a],
         Op::Dispatch { key, .. } => vec![*key],
+        Op::DispatchFlatArray { key, .. } => vec![*key],
         Op::StoreState { src, .. } => vec![*src],
         Op::StoreMem { addr_slot, src, .. } => vec![*addr_slot, *src],
     }
@@ -2535,7 +2726,8 @@ fn op_dst(op: &Op) -> Option<Slot> {
         | Op::Shl { dst, .. }
         | Op::Bit { dst, .. }
         | Op::CmpEq { dst, .. }
-        | Op::Dispatch { dst, .. } => Some(*dst),
+        | Op::Dispatch { dst, .. }
+        | Op::DispatchFlatArray { dst, .. } => Some(*dst),
         Op::BranchIfZero { .. } | Op::BranchIfNotEqLit { .. } | Op::Jump { .. } | Op::DispatchChain { .. } | Op::StoreState { .. } | Op::StoreMem { .. } => {
             None
         }
@@ -2630,6 +2822,10 @@ fn map_op_slots(op: &mut Op, slot_map: &mut HashMap<Slot, Slot>, alloc: &mut Slo
             *key = alloc.get_or_alloc(*key, slot_map);
             *dst = alloc.get_or_alloc(*dst, slot_map);
         }
+        Op::DispatchFlatArray { dst, key, .. } => {
+            *key = alloc.get_or_alloc(*key, slot_map);
+            *dst = alloc.get_or_alloc(*dst, slot_map);
+        }
         Op::StoreState { src, .. } => {
             *src = alloc.get_or_alloc(*src, slot_map);
         }
@@ -2681,6 +2877,7 @@ fn seed_from_parent(
         Op::DispatchChain { a, .. } => { seed(*a); }
         Op::Jump { .. } => {}
         Op::Dispatch { key, .. } => { seed(*key); }
+        Op::DispatchFlatArray { key, .. } => { seed(*key); }
         Op::StoreState { src, .. } => { seed(*src); }
         Op::StoreMem { addr_slot, src } => { seed(*addr_slot); seed(*src); }
     }
@@ -2756,7 +2953,7 @@ pub fn execute(program: &CompiledProgram, state: &mut State, slots: &mut Vec<i32
     slots.resize(program.slot_count as usize, 0);
 
     // Execute main ops
-    exec_ops(&program.ops, &program.dispatch_tables, &program.chain_tables, state, slots);
+    exec_ops(&program.ops, &program.dispatch_tables, &program.chain_tables, &program.flat_dispatch_arrays, state, slots);
 
     // Writeback: apply computed values to state
     for &(slot, addr) in &program.writeback {
@@ -2772,7 +2969,7 @@ pub fn execute(program: &CompiledProgram, state: &mut State, slots: &mut Vec<i32
         let dest = slots[bw.dest_slot as usize];
         let dest_i64 = dest as i64;
         if bw.address_map.contains_key(&dest_i64) {
-            exec_ops(&bw.value_ops, &program.dispatch_tables, &program.chain_tables, state, slots);
+            exec_ops(&bw.value_ops, &program.dispatch_tables, &program.chain_tables, &program.flat_dispatch_arrays, state, slots);
             let value = slots[bw.value_slot as usize];
             state.write_mem(dest, value);
         }
@@ -2781,7 +2978,7 @@ pub fn execute(program: &CompiledProgram, state: &mut State, slots: &mut Vec<i32
             let guard = slots[spillover.guard_slot as usize];
             if guard == 1 {
                 if let Some((ref spill_ops, spill_slot)) = spillover.entries.get(&dest_i64) {
-                    exec_ops(spill_ops, &program.dispatch_tables, &program.chain_tables, state, slots);
+                    exec_ops(spill_ops, &program.dispatch_tables, &program.chain_tables, &program.flat_dispatch_arrays, state, slots);
                     let value = slots[*spill_slot as usize];
                     state.write_mem(dest + 1, value);
                 }
@@ -2803,6 +3000,7 @@ fn exec_ops(
     ops: &[Op],
     dispatch_tables: &[CompiledDispatchTable],
     chain_tables: &[DispatchChainTable],
+    flat_dispatch_arrays: &[FlatDispatchArray],
     state: &mut State,
     slots: &mut [i32],
 ) {
@@ -2976,12 +3174,23 @@ fn exec_ops(
                 let key_val = sload!(*key) as i64;
                 let table = unsafe { dispatch_tables.get_unchecked(*table_id as usize) };
                 if let Some((entry_ops, result_slot)) = table.entries.get(&key_val) {
-                    exec_ops(entry_ops, dispatch_tables, chain_tables, state, slots);
+                    exec_ops(entry_ops, dispatch_tables, chain_tables, flat_dispatch_arrays, state, slots);
                     sstore!(*dst, sload!(*result_slot));
                 } else {
-                    exec_ops(&table.fallback_ops, dispatch_tables, chain_tables, state, slots);
+                    exec_ops(&table.fallback_ops, dispatch_tables, chain_tables, flat_dispatch_arrays, state, slots);
                     sstore!(*dst, sload!(table.fallback_slot));
                 }
+            }
+            Op::DispatchFlatArray { dst, key, array_id, base_key, default } => {
+                let key_val = sload!(*key);
+                let arr = unsafe { flat_dispatch_arrays.get_unchecked(*array_id as usize) };
+                let idx = key_val.wrapping_sub(*base_key);
+                let v = if idx < 0 || (idx as usize) >= arr.values.len() {
+                    *default
+                } else {
+                    unsafe { *arr.values.get_unchecked(idx as usize) }
+                };
+                sstore!(*dst, v);
             }
             Op::StoreState { addr, src } => {
                 state.write_mem(*addr, sload!(*src));
@@ -3018,7 +3227,7 @@ pub fn execute_profiled(
     profile.slot_reset += t1.duration_since(t0).as_secs_f64();
 
     // Main ops (profiled — fills dispatch_time, counts, etc. directly)
-    exec_ops_profiled(&program.ops, &program.dispatch_tables, &program.chain_tables, state, slots, profile);
+    exec_ops_profiled(&program.ops, &program.dispatch_tables, &program.chain_tables, &program.flat_dispatch_arrays, state, slots, profile);
     let t2 = Instant::now();
     profile.main_ops += t2.duration_since(t1).as_secs_f64();
     profile.linear_ops = profile.main_ops - profile.dispatch_time;
@@ -3044,7 +3253,7 @@ pub fn execute_profiled(
         let dest = slots[bw.dest_slot as usize];
         let dest_i64 = dest as i64;
         if bw.address_map.contains_key(&dest_i64) {
-            exec_ops(&bw.value_ops, &program.dispatch_tables, &program.chain_tables, state, slots);
+            exec_ops(&bw.value_ops, &program.dispatch_tables, &program.chain_tables, &program.flat_dispatch_arrays, state, slots);
             let value = slots[bw.value_slot as usize];
             state.write_mem(dest, value);
             bw_fired += 1;
@@ -3053,7 +3262,7 @@ pub fn execute_profiled(
             let guard = slots[spillover.guard_slot as usize];
             if guard == 1 {
                 if let Some((ref spill_ops, spill_slot)) = spillover.entries.get(&dest_i64) {
-                    exec_ops(spill_ops, &program.dispatch_tables, &program.chain_tables, state, slots);
+                    exec_ops(spill_ops, &program.dispatch_tables, &program.chain_tables, &program.flat_dispatch_arrays, state, slots);
                     let value = slots[*spill_slot as usize];
                     state.write_mem(dest + 1, value);
                 }
@@ -3071,6 +3280,7 @@ fn exec_ops_profiled(
     ops: &[Op],
     dispatch_tables: &[CompiledDispatchTable],
     chain_tables: &[DispatchChainTable],
+    flat_dispatch_arrays: &[FlatDispatchArray],
     state: &mut State,
     slots: &mut [i32],
     profile: &mut TickProfile,
@@ -3298,14 +3508,26 @@ fn exec_ops_profiled(
                 let table = &dispatch_tables[*table_id as usize];
                 if let Some((entry_ops, result_slot)) = table.entries.get(&key_val) {
                     profile.dispatch_sub_ops_count += entry_ops.len() as u64;
-                    exec_ops(entry_ops, dispatch_tables, chain_tables, state, slots);
+                    exec_ops(entry_ops, dispatch_tables, chain_tables, flat_dispatch_arrays, state, slots);
                     slots[*dst as usize] = slots[*result_slot as usize];
                 } else {
                     profile.dispatch_sub_ops_count += table.fallback_ops.len() as u64;
-                    exec_ops(&table.fallback_ops, dispatch_tables, chain_tables, state, slots);
+                    exec_ops(&table.fallback_ops, dispatch_tables, chain_tables, flat_dispatch_arrays, state, slots);
                     slots[*dst as usize] = slots[table.fallback_slot as usize];
                 }
                 profile.dispatch_time += td.elapsed().as_secs_f64();
+            }
+            Op::DispatchFlatArray { dst, key, array_id, base_key, default } => {
+                count_op!(profile, "DispatchFlatArray");
+                let key_val = slots[*key as usize];
+                let arr = &flat_dispatch_arrays[*array_id as usize];
+                let idx = key_val.wrapping_sub(*base_key);
+                let v = if idx < 0 || (idx as usize) >= arr.values.len() {
+                    *default
+                } else {
+                    arr.values[idx as usize]
+                };
+                slots[*dst as usize] = v;
             }
             Op::StoreState { addr, src } => {
                 count_op!(profile, "StoreState");
@@ -3351,6 +3573,7 @@ pub fn exec_ops_traced(
     ops: &[Op],
     dispatch_tables: &[CompiledDispatchTable],
     chain_tables: &[DispatchChainTable],
+    flat_dispatch_arrays: &[FlatDispatchArray],
     state: &mut State,
     slots: &mut [i32],
     op_range: Option<(usize, usize)>,
@@ -3625,7 +3848,7 @@ pub fn exec_ops_traced(
                 let table = &dispatch_tables[*table_id as usize];
                 if let Some((entry_ops, result_slot)) = table.entries.get(&key_val) {
                     if should_trace {
-                        let mut sub = exec_ops_traced(entry_ops, dispatch_tables, chain_tables, state, slots, None, depth + 1);
+                        let mut sub = exec_ops_traced(entry_ops, dispatch_tables, chain_tables, flat_dispatch_arrays, state, slots, None, depth + 1);
                         trace.push(TraceEntry {
                             pc, op: format!("Dispatch dst={} key={}({}) table={} → entry (result_slot={}={})", dst, key, key_val, table_id, result_slot, slots[*result_slot as usize]),
                             dst_slot: Some(*dst), dst_value: Some(slots[*result_slot as usize]),
@@ -3633,13 +3856,13 @@ pub fn exec_ops_traced(
                         });
                         trace.append(&mut sub);
                     } else {
-                        exec_ops(entry_ops, dispatch_tables, chain_tables, state, slots);
+                        exec_ops(entry_ops, dispatch_tables, chain_tables, flat_dispatch_arrays, state, slots);
                     }
                     slots[*dst as usize] = slots[*result_slot as usize];
                 } else {
                     if should_trace {
-                        let mut sub = exec_ops_traced(&table.fallback_ops, dispatch_tables, chain_tables, state, slots, None, depth + 1);
-                        exec_ops(&table.fallback_ops, dispatch_tables, chain_tables, state, slots);
+                        let mut sub = exec_ops_traced(&table.fallback_ops, dispatch_tables, chain_tables, flat_dispatch_arrays, state, slots, None, depth + 1);
+                        exec_ops(&table.fallback_ops, dispatch_tables, chain_tables, flat_dispatch_arrays, state, slots);
                         trace.push(TraceEntry {
                             pc, op: format!("Dispatch dst={} key={}({}) table={} → fallback (fallback_slot={}={})", dst, key, key_val, table_id, table.fallback_slot, slots[table.fallback_slot as usize]),
                             dst_slot: Some(*dst), dst_value: Some(slots[table.fallback_slot as usize]),
@@ -3647,9 +3870,27 @@ pub fn exec_ops_traced(
                         });
                         trace.append(&mut sub);
                     } else {
-                        exec_ops(&table.fallback_ops, dispatch_tables, chain_tables, state, slots);
+                        exec_ops(&table.fallback_ops, dispatch_tables, chain_tables, flat_dispatch_arrays, state, slots);
                     }
                     slots[*dst as usize] = slots[table.fallback_slot as usize];
+                }
+            }
+            Op::DispatchFlatArray { dst, key, array_id, base_key, default } => {
+                let key_val = slots[*key as usize];
+                let arr = &flat_dispatch_arrays[*array_id as usize];
+                let idx = key_val.wrapping_sub(*base_key);
+                let v = if idx < 0 || (idx as usize) >= arr.values.len() {
+                    *default
+                } else {
+                    arr.values[idx as usize]
+                };
+                slots[*dst as usize] = v;
+                if should_trace {
+                    trace.push(TraceEntry {
+                        pc, op: format!("DispatchFlatArray dst={} key={}({}) array={} base={} default={} → {}", dst, key, key_val, array_id, base_key, default, v),
+                        dst_slot: Some(*dst), dst_value: Some(v),
+                        inputs: vec![(*key, key_val)], branch_taken: None, depth,
+                    });
                 }
             }
             Op::StoreState { addr, src } => {
@@ -3695,6 +3936,7 @@ pub fn trace_property(
         &program.ops,
         &program.dispatch_tables,
         &program.chain_tables,
+        &program.flat_dispatch_arrays,
         state,
         slots,
         None, // trace all ops
@@ -3778,7 +4020,7 @@ mod tests {
 
         let mut state = State::default();
         let mut slots = vec![0i32; compiler.next_slot as usize];
-        exec_ops(&ops, &[], &[], &mut state, &mut slots);
+        exec_ops(&ops, &[], &[], &[], &mut state, &mut slots);
         assert_eq!(slots[slot as usize], 42);
     }
 
@@ -3796,7 +4038,7 @@ mod tests {
 
         let mut state = State::default();
         let mut slots = vec![0i32; compiler.next_slot as usize];
-        exec_ops(&ops, &[], &[], &mut state, &mut slots);
+        exec_ops(&ops, &[], &[], &[], &mut state, &mut slots);
         assert_eq!(slots[slot as usize], 30);
     }
 
@@ -3815,7 +4057,7 @@ mod tests {
 
         state.set_var("AX", 0x1234);
         let mut slots = vec![0i32; compiler.next_slot as usize];
-        exec_ops(&ops, &[], &[], &mut state, &mut slots);
+        exec_ops(&ops, &[], &[], &[], &mut state, &mut slots);
         assert_eq!(slots[slot as usize], 0x1234);
     }
 
@@ -3849,7 +4091,7 @@ mod tests {
 
         state.set_var("AX", 2);
         let mut slots = vec![0i32; compiler.next_slot as usize];
-        exec_ops(&ops, &[], &[], &mut state, &mut slots);
+        exec_ops(&ops, &[], &[], &[], &mut state, &mut slots);
         assert_eq!(slots[slot as usize], 200);
     }
 
@@ -3916,7 +4158,7 @@ mod tests {
 
         state.set_var("AX", 42);
         let mut slots = vec![0i32; compiler.next_slot as usize];
-        exec_ops(&ops, &compiler.compiled_dispatches, &[], &mut state, &mut slots);
+        exec_ops(&ops, &compiler.compiled_dispatches, &[], &compiler.compiled_flat_arrays, &mut state, &mut slots);
         assert_eq!(slots[slot as usize], 42);
     }
 
@@ -3967,7 +4209,7 @@ mod tests {
 
         let mut state = State::default();
         let mut slots = vec![0i32; compiler.next_slot as usize];
-        exec_ops(&ops, &[], &[], &mut state, &mut slots);
+        exec_ops(&ops, &[], &[], &[], &mut state, &mut slots);
         assert_eq!(slots[slot as usize], 15);
     }
 
@@ -4027,7 +4269,7 @@ mod tests {
 
         let mut state = State::default();
         let mut slots = vec![0i32; compiler.next_slot as usize];
-        exec_ops(&ops, &[], &[], &mut state, &mut slots);
+        exec_ops(&ops, &[], &[], &[], &mut state, &mut slots);
         assert_eq!(slots[slot as usize], 42);
     }
 
@@ -4114,6 +4356,102 @@ mod tests {
         // --result is not a state-mapped property, so check the slot directly
         // Find the result slot from writeback — it won't be there since --result
         // isn't a register. Check by looking at dispatch result.
-        assert_eq!(program.dispatch_tables.len(), 1);
+        //
+        // Because every entry here is an integer literal and the key range is
+        // dense, compile_dispatch_call takes the flat-array fast path and
+        // emits a single `DispatchFlatArray` op (no `CompiledDispatchTable`
+        // entry is created). Assert the fast path fired instead.
+        assert_eq!(program.dispatch_tables.len(), 0);
+        assert_eq!(program.flat_dispatch_arrays.len(), 1);
+        let arr = &program.flat_dispatch_arrays[0];
+        // Span is 0..=42 → 43 slots; spot-check a few values.
+        assert_eq!(arr.values.len(), 43);
+        assert_eq!(arr.values[0], 100);
+        assert_eq!(arr.values[1], 200);
+        assert_eq!(arr.values[2], 300);
+        assert_eq!(arr.values[42], 999);
+        // Gap entries default to 0.
+        assert_eq!(arr.values[5], 0);
+    }
+
+    #[test]
+    fn dispatch_flat_array_literal_fast_path() {
+        // Single-parameter dispatch where every entry is an integer literal
+        // and keys are dense → should compile to DispatchFlatArray and return
+        // the correct value both in range and out of range.
+        use crate::pattern::dispatch_table::DispatchTable;
+
+        let mut functions = HashMap::new();
+        functions.insert(
+            "--readByte".to_string(),
+            FunctionDef {
+                name: "--readByte".to_string(),
+                parameters: vec![FunctionParam {
+                    name: "--idx".to_string(),
+                    syntax: PropertySyntax::Integer,
+                }],
+                locals: vec![],
+                result: Expr::Literal(0.0),
+            },
+        );
+
+        let mut entries = HashMap::new();
+        for i in 0..16i64 {
+            entries.insert(i, Expr::Literal((i * 7 + 3) as f64));
+        }
+        let mut dispatch_tables = HashMap::new();
+        dispatch_tables.insert(
+            "--readByte".to_string(),
+            DispatchTable {
+                key_property: "--idx".to_string(),
+                entries,
+                fallback: Expr::Literal(-1.0),
+            },
+        );
+
+        // Build a compiler and compile a call manually so we can inspect ops.
+        let expr = Expr::FunctionCall {
+            name: "--readByte".to_string(),
+            args: vec![Expr::Literal(5.0)],
+        };
+        let mut compiler = Compiler::new(&functions, &dispatch_tables);
+        let mut ops = Vec::new();
+        let slot = compiler.compile_expr(&expr, &mut ops);
+        assert!(
+            ops.iter().any(|o| matches!(o, Op::DispatchFlatArray { .. })),
+            "expected DispatchFlatArray op in {:?}",
+            ops
+        );
+
+        // Execute and check the value.
+        let mut state = State::default();
+        let mut slots = vec![0i32; compiler.next_slot as usize];
+        exec_ops(
+            &ops,
+            &compiler.compiled_dispatches,
+            &[],
+            &compiler.compiled_flat_arrays,
+            &mut state,
+            &mut slots,
+        );
+        assert_eq!(slots[slot as usize], 5 * 7 + 3);
+
+        // Out-of-range key falls back to the default.
+        let expr2 = Expr::FunctionCall {
+            name: "--readByte".to_string(),
+            args: vec![Expr::Literal(999.0)],
+        };
+        let mut ops2 = Vec::new();
+        let slot2 = compiler.compile_expr(&expr2, &mut ops2);
+        let mut slots2 = vec![0i32; compiler.next_slot as usize];
+        exec_ops(
+            &ops2,
+            &compiler.compiled_dispatches,
+            &[],
+            &compiler.compiled_flat_arrays,
+            &mut state,
+            &mut slots2,
+        );
+        assert_eq!(slots2[slot2 as usize], -1);
     }
 }

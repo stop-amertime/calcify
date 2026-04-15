@@ -2,6 +2,10 @@ use clap::Parser;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use std::path::PathBuf;
 
+mod calcite_logo;
+mod cssdos_logo;
+mod menu;
+
 /// calc(ite) — JIT compiler for computational CSS.
 ///
 /// Parses CSS files, recognises computational patterns, and evaluates
@@ -10,12 +14,14 @@ use std::path::PathBuf;
 #[command(name = "calcite", version, about)]
 struct Cli {
     /// Path to the CSS file to evaluate.
+    ///
+    /// If omitted, launches the interactive CSS-DOS program picker.
     #[arg(short, long)]
-    input: PathBuf,
+    input: Option<PathBuf>,
 
-    /// Number of ticks to run.
-    #[arg(short = 'n', long, default_value = "1")]
-    ticks: u32,
+    /// Number of ticks to run. Omit for unlimited (interactive).
+    #[arg(short = 'n', long)]
+    ticks: Option<u32>,
 
     /// Print register state after each tick.
     #[arg(short, long)]
@@ -205,10 +211,48 @@ fn main() {
     env_logger::init();
     let cli = Cli::parse();
 
-    let css = match std::fs::read_to_string(&cli.input) {
+    // Resolve input path: direct --input, or interactive menu.
+    let input_path: PathBuf = match cli.input.clone() {
+        Some(p) => p,
+        None => {
+            // Interactive menu mode. Root is the current working directory
+            // (run.bat already cd's to calcite/; direct users should invoke
+            // from the calcite repo root).
+            let root = PathBuf::from(r"C:\Users\AdmT9N0CX01V65438A\Documents\src\calcite");
+            let entries = menu::discover(&root);
+            let selected = match menu::run(&entries) {
+                Ok(Some(i)) => i,
+                Ok(None) => {
+                    eprintln!();
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    eprintln!("Menu error: {e}");
+                    std::process::exit(1);
+                }
+            };
+            // Clear after the menu exits so the generator output starts fresh.
+            print!("\x1b[2J\x1b[H");
+            cssdos_logo::print();
+            match menu::resolve_to_css(&entries[selected], &root) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("Failed to generate CSS: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+    };
+
+    // Transition into the calcite half of the experience: fresh screen,
+    // calcite banner, parse/compile bars, video.
+    print!("\x1b[2J\x1b[H");
+    calcite_logo::print();
+
+    let css = match std::fs::read_to_string(&input_path) {
         Ok(content) => content,
         Err(e) => {
-            eprintln!("Error reading {}: {e}", cli.input.display());
+            eprintln!("Error reading {}: {e}", input_path.display());
             std::process::exit(1);
         }
     };
@@ -216,7 +260,7 @@ fn main() {
     log::info!(
         "Read {} bytes of CSS from {}",
         css.len(),
-        cli.input.display()
+        input_path.display()
     );
 
     let t0 = std::time::Instant::now();
@@ -244,7 +288,9 @@ fn main() {
             let mut evaluator = calcite_core::Evaluator::from_parsed(&parsed);
             let compile_time = t1.elapsed();
 
-            let interactive = cli.ticks > 1;
+            // Interactive iff --ticks is omitted; in that case run unlimited.
+            let interactive = cli.ticks.is_none();
+            let ticks_limit: u32 = cli.ticks.unwrap_or(u32::MAX);
             eprintln!(
                 "Compiled: {:.2}s (parse {:.2}s + compile {:.2}s), memory: {} KB",
                 (parse_time + compile_time).as_secs_f64(),
@@ -357,12 +403,29 @@ fn main() {
                 let status = &cached_status;
                 let video_mode = state.read_mem(0x0449) as u8;
                 if video_mode == 0x13 {
+                    // Render 320x200 mode 13h via ANSI half-block chars.
+                    // Each '▀' cell shows two vertical pixels: fg=upper, bg=lower.
+                    // Downsample horizontally 2:1 so 320-wide fits typical terminals.
                     if first {
                         eprint!("\x1b[2J\x1b[H\x1b[?25l");
                     } else {
                         eprint!("\x1b[H");
                     }
-                    eprint!("[Mode 13h 320x200 graphics]\r\n{status}\r\n");
+                    let mut out = String::with_capacity(320 * 100 * 24);
+                    for y in (0..200).step_by(2) {
+                        for x in 0..320 {
+                            let top = state.read_mem(0xA0000 + y * 320 + x) as usize & 0x0F;
+                            let bot = state.read_mem(0xA0000 + (y + 1) * 320 + x) as usize & 0x0F;
+                            let (tr, tg, tb) = calcite_core::state::CGA_PALETTE[top];
+                            let (br, bg_, bb) = calcite_core::state::CGA_PALETTE[bot];
+                            out.push_str(&format!(
+                                "\x1b[38;2;{};{};{}m\x1b[48;2;{};{};{}m▀",
+                                tr, tg, tb, br, bg_, bb
+                            ));
+                        }
+                        out.push_str("\x1b[0m\r\n");
+                    }
+                    eprint!("{out}{status}\r\n");
                 } else {
                     let cols = state.read_mem(0x044A) as usize;
                     let (width, height) = if cols == 40 { (40, 25) } else { (80, 25) };
@@ -445,7 +508,7 @@ fn main() {
             if cli.trace_json {
                 let halt_check = halt_addr;
                 print!("[");
-                for tick in 0..cli.ticks {
+                for tick in 0..ticks_limit {
                     // Inject keyboard events at the right tick
                     for &(ev_tick, ev_val) in &key_events {
                         if ev_tick == tick {
@@ -498,8 +561,8 @@ fn main() {
             if needs_per_tick {
                 // Verbose mode prints every tick so it must stay per-tick; batch
                 // early and show the tail.
-                let verbose_skip = if cli.verbose && cli.ticks > 100 {
-                    cli.ticks.saturating_sub(20)
+                let verbose_skip = if cli.verbose && ticks_limit > 100 {
+                    ticks_limit.saturating_sub(20)
                 } else {
                     0
                 };
@@ -531,7 +594,7 @@ fn main() {
 
                 let mut quit = false;
                 let mut tick = verbose_skip;
-                while tick < cli.ticks {
+                while tick < ticks_limit {
                     if interactive {
                         // Poll keyboard non-blocking.
                         while event::poll(std::time::Duration::ZERO).unwrap_or(false) {
@@ -555,7 +618,7 @@ fn main() {
 
                     // Determine this batch's size: capped by remaining ticks and
                     // by the next scripted key_event (if any).
-                    let mut batch = batch_cap.min(cli.ticks - tick);
+                    let mut batch = batch_cap.min(ticks_limit - tick);
                     for &(ev_tick, _) in &key_events {
                         if ev_tick >= tick && ev_tick < tick + batch {
                             batch = ev_tick - tick;
@@ -620,8 +683,8 @@ fn main() {
                     }
                 }
             } else {
-                evaluator.run_batch(&mut state, cli.ticks);
-                ticks_run = cli.ticks;
+                evaluator.run_batch(&mut state, ticks_limit);
+                ticks_run = ticks_limit;
             }
 
             // Restore terminal

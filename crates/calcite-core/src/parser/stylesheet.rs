@@ -320,6 +320,12 @@ fn parse_declarations<'i, 't>(input: &mut Parser<'i, 't>) -> Vec<Assignment> {
 
 /// Parse a full CSS stylesheet into a `ParsedProgram`.
 pub fn parse_stylesheet(css: &str) -> Result<ParsedProgram> {
+    let total_bytes = css.len();
+    let show_progress = std::env::var_os("CALCITE_NO_PROGRESS").is_none()
+        && total_bytes >= 1_000_000;
+    let progress_start = web_time::Instant::now();
+    let mut last_render = web_time::Instant::now();
+
     let mut input = cssparser::ParserInput::new(css);
     let mut parser = Parser::new(&mut input);
     let mut rule_parser = CalciteRuleParser;
@@ -328,8 +334,8 @@ pub fn parse_stylesheet(css: &str) -> Result<ParsedProgram> {
     let mut functions = Vec::new();
     let mut assignments = Vec::new();
 
-    let sheet = StyleSheetParser::new(&mut parser, &mut rule_parser);
-    for result in sheet {
+    let mut sheet = StyleSheetParser::new(&mut parser, &mut rule_parser);
+    while let Some(result) = sheet.next() {
         match result {
             Ok(CssRule::Property(prop)) => {
                 properties.push(prop);
@@ -344,6 +350,25 @@ pub fn parse_stylesheet(css: &str) -> Result<ParsedProgram> {
                 log::debug!("skipping unparseable rule: {err:?}");
             }
         }
+        if show_progress && last_render.elapsed().as_millis() >= 100 {
+            let pos = sheet.input.position().byte_index();
+            crate::compile::render_progress(
+                "Parsing",
+                pos,
+                total_bytes,
+                progress_start.elapsed().as_secs_f64(),
+            );
+            last_render = web_time::Instant::now();
+        }
+    }
+    if show_progress {
+        crate::compile::render_progress(
+            "Parsing",
+            total_bytes,
+            total_bytes,
+            progress_start.elapsed().as_secs_f64(),
+        );
+        eprintln!();
     }
 
     Ok(ParsedProgram {

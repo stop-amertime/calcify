@@ -11,6 +11,72 @@ and the Criterion benchmarks.
 
 ---
 
+## 2026-04-15: Flat-array fast path for single-param literal dispatch
+
+### Context
+
+CSS-DOS's rom-disk feature emits `@function --readDiskByte(--idx)` with
+one branch per disk byte — ~68K branches for a ~68 KB floppy, ~1.5M
+for Doom8088 (future). The generic dispatch compile path at
+`compile_dispatch_call` walks every entry and produces a per-entry
+`Vec<Op>` sequence, which froze compile for tens of minutes and blew
+through 48 GB of RAM on bootle+rom-disk.
+
+### Change
+
+Wired up `Op::DispatchFlatArray`, a pre-existing-but-inert op. The
+builder (`try_build_flat_dispatch`) fires when a dispatch has:
+
+- ≤1 parameter, non-empty,
+- every entry is an integer literal representable as i32,
+- fallback is an integer literal,
+- `max_key - min_key + 1 ≤ 10_000_000` (caps worst-case array at ~40 MB).
+
+When all guards pass, the whole table compiles to a single `Vec<i32>`
+stored on the program, and the call site becomes a single op doing a
+bounds-checked array index. Multi-parameter, non-literal, and sparse
+dispatches fall through to the old path unchanged.
+
+Also added a name-keyed cache: repeated call sites of the same function
+share the same array. Critical because the rom-disk window has 512
+dispatch sites (one per byte in the 0xD0000–0xD01FF window), each
+calling `--readDiskByte`.
+
+### Results
+
+Rogue (unrelated to rom-disk, just the standard benchmark):
+- Compile: unchanged (no literal single-param dispatches in plain rogue).
+
+Bootle + rom-disk (457 MB CSS, 723K properties, 1.45M assignments,
+65 functions including the 56794-entry `--readDiskByte`):
+- Parse: 4.7s
+- Compile: **29s → 16s** after the name-keyed cache fix; was previously
+  frozen indefinitely with the 48 GB allocation on the 2-parameter
+  form, and ~79s on the first 1-parameter form before the cache.
+- 1 tick: 74 µs.
+- Bootle boots end-to-end through the rom-disk path, verified live in
+  the interactive CLI.
+
+### Open follow-ups
+
+- Profile the runtime cost of the array lookup under heavy INT 13h load
+  (REP MOVSW through the window does 256 reads per sector). Should be
+  negligible vs. the slow-path HashMap it replaces.
+- Retest Zork+FROTZ (~284 KB disk → ~284K dispatch branches); within
+  the i32 literal + 10M span guards, so should take the fast path.
+
+### Other changes bundled with this
+
+Unrelated to the fast path but shipped together:
+- `calcite-cli` gained an interactive program picker (grid menu,
+  arrow-key navigation) when invoked without `--input`.
+- Parse and compile phases now render progress bars to stderr (can be
+  disabled with `CALCITE_NO_PROGRESS=1`).
+- `--ticks` is now optional; omitting it runs indefinitely in
+  interactive mode.
+
+---
+
 ## 2026-04-14: V4 baseline + bottleneck analysis
 
 ### Context
