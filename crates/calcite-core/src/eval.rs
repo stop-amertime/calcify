@@ -1123,8 +1123,11 @@ pub fn detect_video_regions() -> VideoRegions {
         let map = m.borrow();
         let text_base = 0xB8000i32;
         let gfx_base = 0xA0000i32;
-        // Graphics upper bound: just below text base, so we don't accidentally
-        // pick up the text region when scanning the gfx range.
+        // Text upper bound: end of VGA text segment (0xC0000). Addresses
+        // above this belong to option ROMs / BIOS ROM / ROM-disk windows,
+        // not text video memory.
+        let text_upper = 0xC0000i32;
+        // Graphics upper bound: just below text base.
         let gfx_upper = text_base;
 
         let mut text_min = i32::MAX;
@@ -1136,7 +1139,7 @@ pub fn detect_video_regions() -> VideoRegions {
         let mut gfx_count = 0usize;
 
         for &addr in map.values() {
-            if addr >= text_base {
+            if addr >= text_base && addr < text_upper {
                 text_min = text_min.min(addr);
                 text_max = text_max.max(addr);
                 text_count += 1;

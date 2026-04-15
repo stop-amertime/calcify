@@ -256,7 +256,10 @@
     // Cached ImageData for the gfx canvas, sized on first use.
     let gfxImageData = null;
     // Last known video mode byte from BDA 0x0449. Used to switch display.
-    let currentVideoMode = 0x03; // start in text mode
+    // Undefined so the first tick-result always flips the visible element on.
+    // (Starting at 0x03 and receiving 0x03 made the toggle a no-op, leaving
+    // both canvas and output hidden → zero-height container.)
+    let currentVideoMode = null;
 
     worker.onmessage = ({ data }) => {
       switch (data.type) {
@@ -302,8 +305,8 @@
           // A program that switches from text to Mode 13h mid-run is handled
           // correctly because we check every tick, not just at init.
           const isGfxMode = (data.videoMode === 0x13);
-          if (isGfxMode !== (currentVideoMode === 0x13)) {
-            currentVideoMode = data.videoMode;
+          const wasGfxMode = (currentVideoMode === 0x13);
+          if (currentVideoMode === null || isGfxMode !== wasGfxMode) {
             if (isGfxMode) {
               canvas.style.display = '';
               output.style.display = 'none';
@@ -322,9 +325,9 @@
             ctx.putImageData(gfxImageData, 0, 0);
           }
 
-          // Text mode: write the rendered screen string.
+          // Text mode: write the rendered screen HTML (with CGA color spans).
           if (!isGfxMode && data.screen != null) {
-            output.textContent = data.screen;
+            output.innerHTML = data.screen;
           } else if (!isGfxMode && !video.text && data.stringProperties) {
             // Legacy path: string-property output (only used when neither
             // text nor gfx regions were detected).

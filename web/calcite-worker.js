@@ -69,10 +69,11 @@ self.onmessage = async function (event) {
         const isGfxMode = videoMode === 0x13; // Mode 13h: 320x200x256
 
         // Text-mode screen: only rendered when not in a graphics mode.
+        // HTML variant includes CGA color spans; the UI sets innerHTML.
         let screen = null;
         if (!isGfxMode && videoRegions.text) {
           const t = videoRegions.text;
-          screen = engine.render_screen(t.addr, t.width, t.height);
+          screen = engine.render_screen_html(t.addr, t.width, t.height);
         }
 
         // Graphics-mode framebuffer: only read when in a graphics mode.

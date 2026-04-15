@@ -118,6 +118,11 @@ impl CalciteEngine {
         self.state.render_screen(base_addr, width, height)
     }
 
+    /// Render text-mode video memory as HTML with CGA color spans.
+    pub fn render_screen_html(&self, base_addr: usize, width: usize, height: usize) -> String {
+        self.state.render_screen_html(base_addr, width, height)
+    }
+
     /// Render a graphics-mode framebuffer as a PPM P6 image.
     ///
     /// Each byte at `base_addr + i` is a palette index; the returned buffer

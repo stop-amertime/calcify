@@ -260,6 +260,58 @@ impl State {
         out
     }
 
+    /// Render text-mode video memory as HTML with inline color spans.
+    ///
+    /// Same attribute decoding as [`Self::render_screen_ansi`]; emits a
+    /// `<span style="color:#rrggbb;background:#rrggbb">` run whenever the
+    /// attribute changes. Characters are CP437→Unicode translated, with
+    /// `<`, `>`, `&` HTML-escaped. Rows are separated by `<br>`.
+    pub fn render_screen_html(&self, base_addr: usize, width: usize, height: usize) -> String {
+        use std::fmt::Write;
+        let mut out = String::with_capacity(width * height * 8);
+        let mut last_attr: Option<u8> = None;
+        for y in 0..height {
+            for x in 0..width {
+                let addr = base_addr + (y * width + x) * 2;
+                let (ch, attr) = if addr + 1 < self.memory.len() {
+                    (self.memory[addr], self.memory[addr + 1])
+                } else {
+                    (b' ', 0x07)
+                };
+                if last_attr != Some(attr) {
+                    if last_attr.is_some() {
+                        out.push_str("</span>");
+                    }
+                    let fg_idx = (attr & 0x0F) as usize;
+                    let bg_idx = ((attr >> 4) & 0x0F) as usize;
+                    let (fr, fg, fb) = CGA_PALETTE[fg_idx];
+                    let (br, bg_, bb) = CGA_PALETTE[bg_idx];
+                    let _ = write!(
+                        out,
+                        "<span style=\"color:#{:02x}{:02x}{:02x};background:#{:02x}{:02x}{:02x}\">",
+                        fr, fg, fb, br, bg_, bb
+                    );
+                    last_attr = Some(attr);
+                }
+                let c = cp437_to_unicode(ch);
+                match c {
+                    '<' => out.push_str("&lt;"),
+                    '>' => out.push_str("&gt;"),
+                    '&' => out.push_str("&amp;"),
+                    _ => out.push(c),
+                }
+            }
+            if last_attr.is_some() {
+                out.push_str("</span>");
+                last_attr = None;
+            }
+            if y + 1 < height {
+                out.push_str("<br>");
+            }
+        }
+        out
+    }
+
     /// Render a graphics-mode framebuffer as a PPM P6 image.
     ///
     /// Reads `width * height` bytes from `base_addr` where each byte is a
