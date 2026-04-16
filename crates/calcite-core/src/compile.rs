@@ -161,17 +161,41 @@ pub enum Op {
         a: Slot,
         b: Slot,
     },
+    /// slot[dst] = slot[a] & ((1 << val) - 1)
+    AndLit {
+        dst: Slot,
+        a: Slot,
+        val: i32,
+    },
     /// rightShift(a, b) → a >> b
     Shr {
         dst: Slot,
         a: Slot,
         b: Slot,
     },
+    /// slot[dst] = slot[a] >> val
+    ShrLit {
+        dst: Slot,
+        a: Slot,
+        val: i32,
+    },
     /// leftShift(a, b) → a << b
     Shl {
         dst: Slot,
         a: Slot,
         b: Slot,
+    },
+    /// slot[dst] = slot[a] << val
+    ShlLit {
+        dst: Slot,
+        a: Slot,
+        val: i32,
+    },
+    /// slot[dst] = slot[a] % val
+    ModLit {
+        dst: Slot,
+        a: Slot,
+        val: i32,
     },
     /// bit(val, idx) → (val >> idx) & 1
     Bit {
@@ -1176,6 +1200,16 @@ impl<'a> Compiler<'a> {
                 dst
             }
             CalcOp::Mod(a, b) => {
+                if let Expr::Literal(lv) = b.as_ref() {
+                    if let Some(val) = lit_as_i32(*lv) {
+                        if val != 0 {
+                            let sa = self.compile_expr(a, ops);
+                            let dst = self.alloc();
+                            ops.push(Op::ModLit { dst, a: sa, val });
+                            return dst;
+                        }
+                    }
+                }
                 let sa = self.compile_expr(a, ops);
                 let sb = self.compile_expr(b, ops);
                 let dst = self.alloc();
@@ -1614,6 +1648,18 @@ impl<'a> Compiler<'a> {
 
             // Bitmask: mod(a, pow(2, b)) → And
             if is_mod_pow2(&func.result, p0, p1) {
+                // If b is a literal, emit AndLit with precomputed mask.
+                if let Expr::Literal(lv) = &args[1] {
+                    if let Some(bits) = lit_as_i32(*lv) {
+                        if (0..=31).contains(&bits) {
+                            let mask = ((1i64 << bits) - 1) as i32;
+                            let sa = self.compile_expr(&args[0], ops);
+                            let dst = self.alloc();
+                            ops.push(Op::AndLit { dst, a: sa, val: mask });
+                            return Some(dst);
+                        }
+                    }
+                }
                 let sa = self.compile_expr(&args[0], ops);
                 let sb = self.compile_expr(&args[1], ops);
                 let dst = self.alloc();
@@ -1623,6 +1669,16 @@ impl<'a> Compiler<'a> {
 
             // Right shift: round(down, a / pow(2, b), 1) → Shr
             if is_right_shift(&func.result, p0, p1) {
+                if let Expr::Literal(lv) = &args[1] {
+                    if let Some(val) = lit_as_i32(*lv) {
+                        if (0..32).contains(&val) {
+                            let sa = self.compile_expr(&args[0], ops);
+                            let dst = self.alloc();
+                            ops.push(Op::ShrLit { dst, a: sa, val });
+                            return Some(dst);
+                        }
+                    }
+                }
                 let sa = self.compile_expr(&args[0], ops);
                 let sb = self.compile_expr(&args[1], ops);
                 let dst = self.alloc();
@@ -1632,6 +1688,16 @@ impl<'a> Compiler<'a> {
 
             // Left shift: a * pow(2, b) → Shl
             if is_left_shift(&func.result, p0, p1) {
+                if let Expr::Literal(lv) = &args[1] {
+                    if let Some(val) = lit_as_i32(*lv) {
+                        if (0..32).contains(&val) {
+                            let sa = self.compile_expr(&args[0], ops);
+                            let dst = self.alloc();
+                            ops.push(Op::ShlLit { dst, a: sa, val });
+                            return Some(dst);
+                        }
+                    }
+                }
                 let sa = self.compile_expr(&args[0], ops);
                 let sb = self.compile_expr(&args[1], ops);
                 let dst = self.alloc();
@@ -3260,7 +3326,9 @@ fn op_slots_read(op: &Op) -> Vec<Slot> {
         | Op::And { a, b, .. }
         | Op::Shr { a, b, .. }
         | Op::Shl { a, b, .. } => vec![*a, *b],
-        Op::AddLit { a, .. } | Op::SubLit { a, .. } | Op::MulLit { a, .. } => vec![*a],
+        Op::AddLit { a, .. } | Op::SubLit { a, .. } | Op::MulLit { a, .. }
+        | Op::AndLit { a, .. } | Op::ShrLit { a, .. } | Op::ShlLit { a, .. }
+        | Op::ModLit { a, .. } => vec![*a],
         Op::Neg { src, .. }
         | Op::Abs { src, .. }
         | Op::Sign { src, .. }
@@ -3320,7 +3388,9 @@ fn op_dst(op: &Op) -> Option<Slot> {
         | Op::CmpEq { dst, .. }
         | Op::Dispatch { dst, .. }
         | Op::DispatchFlatArray { dst, .. } => Some(*dst),
-        Op::AddLit { dst, .. } | Op::SubLit { dst, .. } | Op::MulLit { dst, .. } => Some(*dst),
+        Op::AddLit { dst, .. } | Op::SubLit { dst, .. } | Op::MulLit { dst, .. }
+        | Op::AndLit { dst, .. } | Op::ShrLit { dst, .. } | Op::ShlLit { dst, .. }
+        | Op::ModLit { dst, .. } => Some(*dst),
         Op::LoadStateAndBranchIfNotEqLit { dst, .. } => Some(*dst),
         Op::BranchIfZero { .. } | Op::BranchIfNotEqLit { .. } | Op::Jump { .. } | Op::DispatchChain { .. } | Op::StoreState { .. } | Op::StoreMem { .. } => {
             None
@@ -3361,7 +3431,9 @@ fn map_op_slots(op: &mut Op, slot_map: &mut HashMap<Slot, Slot>, alloc: &mut Slo
             *b = alloc.get_or_alloc(*b, slot_map);
             *dst = alloc.get_or_alloc(*dst, slot_map);
         }
-        Op::AddLit { dst, a, .. } | Op::SubLit { dst, a, .. } | Op::MulLit { dst, a, .. } => {
+        Op::AddLit { dst, a, .. } | Op::SubLit { dst, a, .. } | Op::MulLit { dst, a, .. }
+        | Op::AndLit { dst, a, .. } | Op::ShrLit { dst, a, .. } | Op::ShlLit { dst, a, .. }
+        | Op::ModLit { dst, a, .. } => {
             *a = alloc.get_or_alloc(*a, slot_map);
             *dst = alloc.get_or_alloc(*dst, slot_map);
         }
@@ -3474,7 +3546,9 @@ fn seed_from_parent(
         Op::Add { a, b, .. } | Op::Sub { a, b, .. } | Op::Mul { a, b, .. }
         | Op::Div { a, b, .. } | Op::Mod { a, b, .. } | Op::And { a, b, .. }
         | Op::Shr { a, b, .. } | Op::Shl { a, b, .. } => { seed(*a); seed(*b); }
-        Op::AddLit { a, .. } | Op::SubLit { a, .. } | Op::MulLit { a, .. } => { seed(*a); }
+        Op::AddLit { a, .. } | Op::SubLit { a, .. } | Op::MulLit { a, .. }
+        | Op::AndLit { a, .. } | Op::ShrLit { a, .. } | Op::ShlLit { a, .. }
+        | Op::ModLit { a, .. } => { seed(*a); }
         Op::Neg { src, .. } | Op::Abs { src, .. } | Op::Sign { src, .. }
         | Op::Floor { src, .. } => { seed(*src); }
         Op::Pow { base, exp, .. } => { seed(*base); seed(*exp); }
@@ -3768,15 +3842,30 @@ fn exec_ops(
                 let bv = sload!(*b) as u32;
                 sstore!(*dst, if bv >= 32 { av } else { av & ((1i32 << bv) - 1) });
             }
+            Op::AndLit { dst, a, val } => {
+                // val is precomputed mask (not shift count) — see emit.
+                sstore!(*dst, sload!(*a) & *val);
+            }
             Op::Shr { dst, a, b } => {
                 let av = sload!(*a);
                 let bv = sload!(*b) as u32;
                 sstore!(*dst, if bv >= 32 { 0 } else { av >> bv });
             }
+            Op::ShrLit { dst, a, val } => {
+                // val is shift count (0..32). Compiler validates at emit.
+                sstore!(*dst, sload!(*a) >> *val);
+            }
             Op::Shl { dst, a, b } => {
                 let av = sload!(*a);
                 let bv = sload!(*b) as u32;
                 sstore!(*dst, if bv >= 32 { 0 } else { av << bv });
+            }
+            Op::ShlLit { dst, a, val } => {
+                sstore!(*dst, sload!(*a) << *val);
+            }
+            Op::ModLit { dst, a, val } => {
+                let divisor = *val;
+                sstore!(*dst, if divisor == 0 { 0 } else { sload!(*a) % divisor });
             }
             Op::Bit { dst, val, idx } => {
                 let v = sload!(*val);
@@ -4129,6 +4218,23 @@ fn exec_ops_profiled(
                 let bv = slots[*b as usize] as u32;
                 slots[*dst as usize] = if bv >= 32 { 0 } else { av << bv };
             }
+            Op::AndLit { dst, a, val } => {
+                count_op!(profile, "AndLit");
+                slots[*dst as usize] = slots[*a as usize] & *val;
+            }
+            Op::ShrLit { dst, a, val } => {
+                count_op!(profile, "ShrLit");
+                slots[*dst as usize] = slots[*a as usize] >> *val;
+            }
+            Op::ShlLit { dst, a, val } => {
+                count_op!(profile, "ShlLit");
+                slots[*dst as usize] = slots[*a as usize] << *val;
+            }
+            Op::ModLit { dst, a, val } => {
+                count_op!(profile, "ModLit");
+                let divisor = *val;
+                slots[*dst as usize] = if divisor == 0 { 0 } else { slots[*a as usize] % divisor };
+            }
             Op::Bit { dst, val, idx } => {
                 count_op!(profile, "Bit");
                 let v = slots[*val as usize];
@@ -4421,6 +4527,30 @@ pub fn exec_ops_traced(
                 if should_trace {
                     trace.push(TraceEntry { pc, op: format!("MulLit dst={} a={}({}) *{} → {}", dst, a, av, val, r), dst_slot: Some(*dst), dst_value: Some(r), inputs: vec![(*a, av)], branch_taken: None, depth });
                 }
+            }
+            Op::AndLit { dst, a, val } => {
+                let av = slots[*a as usize];
+                let r = av & *val;
+                slots[*dst as usize] = r;
+                if should_trace { trace.push(TraceEntry { pc, op: format!("AndLit dst={} a={}({}) &{} → {}", dst, a, av, val, r), dst_slot: Some(*dst), dst_value: Some(r), inputs: vec![(*a, av)], branch_taken: None, depth }); }
+            }
+            Op::ShrLit { dst, a, val } => {
+                let av = slots[*a as usize];
+                let r = av >> *val;
+                slots[*dst as usize] = r;
+                if should_trace { trace.push(TraceEntry { pc, op: format!("ShrLit dst={} a={}({}) >>{} → {}", dst, a, av, val, r), dst_slot: Some(*dst), dst_value: Some(r), inputs: vec![(*a, av)], branch_taken: None, depth }); }
+            }
+            Op::ShlLit { dst, a, val } => {
+                let av = slots[*a as usize];
+                let r = av << *val;
+                slots[*dst as usize] = r;
+                if should_trace { trace.push(TraceEntry { pc, op: format!("ShlLit dst={} a={}({}) <<{} → {}", dst, a, av, val, r), dst_slot: Some(*dst), dst_value: Some(r), inputs: vec![(*a, av)], branch_taken: None, depth }); }
+            }
+            Op::ModLit { dst, a, val } => {
+                let av = slots[*a as usize];
+                let r = if *val == 0 { 0 } else { av % *val };
+                slots[*dst as usize] = r;
+                if should_trace { trace.push(TraceEntry { pc, op: format!("ModLit dst={} a={}({}) %{} → {}", dst, a, av, val, r), dst_slot: Some(*dst), dst_value: Some(r), inputs: vec![(*a, av)], branch_taken: None, depth }); }
             }
             Op::Div { dst, a, b } => {
                 let av = slots[*a as usize]; let bv = slots[*b as usize];
