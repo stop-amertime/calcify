@@ -211,5 +211,17 @@ let (result, profile) = evaluator.tick_profiled(&mut state);
 | fib.css | ~7070 | 1.3% | ~142 |
 | bootle.css | ~7210 | 1.3% | ~139 |
 
+## Updated numbers (2026-04-16, post bench round of optimizations)
+
+After: LoadState+BranchIfNotEqLit fusion, dense-array DispatchChain,
+Lit-operand arithmetic/bitwise variants, and per-tick overhead skipping.
+
+| Program | Ticks/s | % of 8086 | us/tick | vs 2026-04-14 |
+|---|---|---|---|---|
+| rogue.css | ~293 K | 53 % | 3.4 | ~48× |
+| fib.css | ~346 K | 63 % | 2.9 | ~49× |
+| bootle.css | ~192 K | 35 % | 5.2 | ~27× |
+| bootle-ctest.css splash-fill | ~430 K | 90 % | 2.3 | — |
+
 See [docs/log.md](log.md) for the full bottleneck analysis and
 optimisation roadmap.
