@@ -3463,9 +3463,13 @@ fn compile_broadcast_write(bw: &BroadcastWrite, compiler: &mut Compiler) -> Comp
 
 /// Execute a compiled program for one tick.
 pub fn execute(program: &CompiledProgram, state: &mut State, slots: &mut Vec<i32>) {
-    // Reset slots (reuse allocation)
-    slots.clear();
-    slots.resize(program.slot_count as usize, 0);
+    // Size slots appropriately; keep stale values between ticks. The compiler
+    // guarantees slots are written before being read within a tick (every read
+    // is dominated by a write on every control-flow path reaching it), so the
+    // initial value doesn't matter.
+    if slots.len() != program.slot_count as usize {
+        slots.resize(program.slot_count as usize, 0);
+    }
 
     // Execute main ops
     exec_ops(&program.ops, &program.dispatch_tables, &program.chain_tables, &program.flat_dispatch_arrays, state, slots);
