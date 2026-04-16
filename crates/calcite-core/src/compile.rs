@@ -288,6 +288,18 @@ pub struct CompiledProgram {
 pub struct DispatchChainTable {
     /// Key → target op index (body start).
     pub entries: HashMap<i32, u32>,
+    /// Optional dense-array fast path. When the key range is contiguous (or
+    /// nearly so), we populate a `Vec<u32>` indexed by `key - flat_base`.
+    /// `u32::MAX` sentinel means "no entry — fall through to HashMap or miss".
+    /// Enabled when `flat_range()` below the density threshold.
+    pub flat_table: Option<FlatChainTable>,
+}
+
+#[derive(Debug)]
+pub struct FlatChainTable {
+    pub base: i32,
+    /// `targets[i] = u32::MAX` means key (base+i) is not in the table.
+    pub targets: Vec<u32>,
 }
 
 /// A compiled broadcast write.
@@ -2632,6 +2644,27 @@ fn chains_in_ops(ops: &mut [Op], chain_tables: &mut Vec<DispatchChainTable>) -> 
                 // If there are duplicate keys (shouldn't normally happen), first wins.
                 table.entries.entry(*v).or_insert(*pc);
             }
+            // Build a dense-array fast path when the key range is small enough.
+            // Density threshold: range / count <= 2 (i.e., at least half the
+            // indices are real entries, rest are misses).
+            if !table.entries.is_empty() {
+                let mut min_k = i32::MAX;
+                let mut max_k = i32::MIN;
+                for &k in table.entries.keys() {
+                    if k < min_k { min_k = k; }
+                    if k > max_k { max_k = k; }
+                }
+                let range = (max_k as i64) - (min_k as i64) + 1;
+                let count = table.entries.len() as i64;
+                // Cap absolute range to avoid huge sparse tables for outlier keys.
+                if range <= 256 && range <= count * 3 {
+                    let mut targets = vec![u32::MAX; range as usize];
+                    for (&k, &pc) in &table.entries {
+                        targets[(k - min_k) as usize] = pc;
+                    }
+                    table.flat_table = Some(FlatChainTable { base: min_k, targets });
+                }
+            }
             let chain_id = chain_tables.len() as u32;
             chain_tables.push(table);
             ops[i] = Op::DispatchChain { a: key_slot, chain_id, miss_target: miss };
@@ -3710,6 +3743,20 @@ fn exec_ops(
             Op::DispatchChain { a, chain_id, miss_target } => {
                 let key = sload!(*a);
                 let table = unsafe { chain_tables.get_unchecked(*chain_id as usize) };
+                // Fast path: flat-array lookup if available.
+                if let Some(ref flat) = table.flat_table {
+                    let idx = key.wrapping_sub(flat.base);
+                    if (idx as u32) < flat.targets.len() as u32 {
+                        let t = unsafe { *flat.targets.get_unchecked(idx as usize) };
+                        if t != u32::MAX {
+                            pc = t as usize;
+                            continue;
+                        }
+                    }
+                    pc = *miss_target as usize;
+                    continue;
+                }
+                // Fallback: HashMap lookup.
                 match table.entries.get(&key) {
                     Some(&body_pc) => { pc = body_pc as usize; }
                     None => { pc = *miss_target as usize; }
