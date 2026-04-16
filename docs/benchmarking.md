@@ -137,7 +137,12 @@ Recorded results:
 | Commit | Change | Elapsed | Ticks/sec |
 |---|---|---|---|
 | 6acc696 | pre-(a) baseline | ~27 s | ~70 K |
-| ba11194 | (a) native bitwise | ~9 s | ~210 K |
+| ba11194 | (a) native bitwise | ~16 s | ~120 K |
+| (pending) | fuse LoadState+BranchIfNotEqLit | ~12 s | ~145 K |
+
+(Earlier rows updated: the ~9s number for ba11194 was a single-best run on a
+cold machine. Rerunning three-at-a-time in warm state gives ~15–17 s — a
+fairer baseline for subsequent comparisons.)
 
 Overshoot: `--halt` is checked between batches, so `Ticks` may report
 slightly more than 1,828,538 (up to `batch - 1` over). Elapsed is

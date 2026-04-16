@@ -192,6 +192,17 @@ pub enum Op {
         val: i32,
         target: u32,
     },
+    /// Fused LoadState + BranchIfNotEqLit:
+    ///   slot[dst] = state.read_mem(addr);
+    ///   if slot[dst] != val { pc = target }
+    /// Eliminates one dispatch cycle vs the two-op sequence. The LoadState
+    /// still writes `dst` so downstream ops reading that slot are unaffected.
+    LoadStateAndBranchIfNotEqLit {
+        dst: Slot,
+        addr: i32,
+        val: i32,
+        target: u32,
+    },
     /// Unconditional jump to target op index
     Jump {
         target: u32,
@@ -2215,6 +2226,10 @@ pub fn compile(
     log::info!("[compile detail] dispatch chains: {} chains built, {:.2}s", chains, _ct.elapsed().as_secs_f64());
 
     let _ct = web_time::Instant::now();
+    let lsfused = fuse_loadstate_branch(&mut program);
+    log::info!("[compile detail] fuse_loadstate_branch: {} fused, {:.2}s", lsfused, _ct.elapsed().as_secs_f64());
+
+    let _ct = web_time::Instant::now();
     compact_slots(&mut program);
     log::info!("[compile detail] slot compaction: {:.2}s", _ct.elapsed().as_secs_f64());
 
@@ -2350,6 +2365,185 @@ fn fuse_ops(ops: &mut Vec<Op>) -> usize {
         if remove_pos < remove_set.len() && remove_set[remove_pos] == read {
             remove_pos += 1;
             continue; // skip
+        }
+        if write != read {
+            ops.swap(write, read);
+        }
+        write += 1;
+    }
+    ops.truncate(write);
+
+    fused_count
+}
+
+// ---------------------------------------------------------------------------
+// Peephole: fuse LoadState + BranchIfNotEqLit → LoadStateAndBranchIfNotEqLit
+// ---------------------------------------------------------------------------
+
+/// Fuse `LoadState(dst=X, addr=A) + BranchIfNotEqLit(a=X, val=N, target=T)`
+/// into a single `LoadStateAndBranchIfNotEqLit(dst=X, addr=A, val=N, target=T)`.
+///
+/// The fused op still writes slot X so downstream code reading X is unaffected.
+/// Saves one dispatch cycle in the interpreter hot loop.
+///
+/// Must run AFTER `build_dispatch_chains` so we only fuse isolated BranchIfNotEqLit
+/// ops left behind after chain collapsing.
+fn fuse_loadstate_branch(program: &mut CompiledProgram) -> usize {
+    // Gather chain-table body PCs that point into each ops array so we
+    // can remap them after fusion. chain_tables are shared across all
+    // op arrays (indexed by chain_id via DispatchChain), so we pair each
+    // ops array with the subset of chain tables reachable from it.
+    // Simpler approach: remap chain_tables in-place per ops array, using
+    // the ops array's own DispatchChain references.
+    let mut total = 0;
+    total += fuse_ls_ops(&mut program.ops, &mut program.chain_tables);
+    for table in &mut program.dispatch_tables {
+        for (_k, (entry_ops, _s)) in &mut table.entries {
+            total += fuse_ls_ops(entry_ops, &mut program.chain_tables);
+        }
+        total += fuse_ls_ops(&mut table.fallback_ops, &mut program.chain_tables);
+    }
+    for bw in &mut program.broadcast_writes {
+        total += fuse_ls_ops(&mut bw.value_ops, &mut program.chain_tables);
+        if let Some(ref mut sp) = bw.spillover {
+            for (_k, (spill_ops, _s)) in &mut sp.entries {
+                total += fuse_ls_ops(spill_ops, &mut program.chain_tables);
+            }
+        }
+    }
+    total
+}
+
+fn fuse_ls_ops(ops: &mut Vec<Op>, chain_tables: &mut [DispatchChainTable]) -> usize {
+    if ops.len() < 2 {
+        return 0;
+    }
+
+    // Collect the chain_ids referenced from THIS ops array so we can remap
+    // their body PCs after fusion. DispatchChain ops encode the chain_id.
+    let mut referenced_chain_ids: Vec<u32> = ops.iter().filter_map(|op| {
+        if let Op::DispatchChain { chain_id, .. } = op { Some(*chain_id) } else { None }
+    }).collect();
+    referenced_chain_ids.sort();
+    referenced_chain_ids.dedup();
+
+    // Identify any op index that is a branch/jump target — we can't fuse
+    // if the BranchIfNotEqLit is a jump target (fusing would skip the LoadState
+    // when landed on directly).
+    let mut is_target = vec![false; ops.len() + 1];
+    for op in ops.iter() {
+        match op {
+            Op::BranchIfZero { target, .. }
+            | Op::BranchIfNotEqLit { target, .. }
+            | Op::LoadStateAndBranchIfNotEqLit { target, .. }
+            | Op::Jump { target } => {
+                let t = *target as usize;
+                if t < is_target.len() { is_target[t] = true; }
+            }
+            Op::DispatchChain { miss_target, .. } => {
+                let t = *miss_target as usize;
+                if t < is_target.len() { is_target[t] = true; }
+            }
+            Op::Dispatch { fallback_target, .. } => {
+                let t = *fallback_target as usize;
+                if t < is_target.len() { is_target[t] = true; }
+            }
+            _ => {}
+        }
+    }
+    // Also mark chain-table body PCs — these point INTO this ops array.
+    for &cid in &referenced_chain_ids {
+        for (_v, body_pc) in &chain_tables[cid as usize].entries {
+            let t = *body_pc as usize;
+            if t < is_target.len() { is_target[t] = true; }
+        }
+    }
+
+    let mut fused_at: Vec<usize> = Vec::new();
+    let mut i = 0;
+    while i + 1 < ops.len() {
+        let pair = (&ops[i], &ops[i + 1]);
+        if let (
+            Op::LoadState { dst: ls_dst, addr },
+            Op::BranchIfNotEqLit { a: br_a, val, target },
+        ) = pair
+        {
+            if ls_dst == br_a && !is_target[i + 1] {
+                let dst = *ls_dst;
+                let addr = *addr;
+                let val = *val;
+                let target = *target;
+                ops[i] = Op::LoadStateAndBranchIfNotEqLit { dst, addr, val, target };
+                // Mark the second slot for removal by replacing with a no-op placeholder.
+                // We strip it in a second pass.
+                ops[i + 1] = Op::LoadLit { dst: 0, val: 0 };
+                fused_at.push(i + 1);
+                i += 2;
+                continue;
+            }
+        }
+        i += 1;
+    }
+
+    if fused_at.is_empty() {
+        return 0;
+    }
+
+    let fused_count = fused_at.len();
+
+    // Strip removed slots and remap branch targets
+    let mut remove_set: Vec<usize> = fused_at;
+    remove_set.sort();
+
+    let mut new_indices = vec![0u32; ops.len()];
+    let mut offset: u32 = 0;
+    let mut remove_pos = 0;
+    for old_idx in 0..ops.len() {
+        if remove_pos < remove_set.len() && remove_set[remove_pos] == old_idx {
+            remove_pos += 1;
+            new_indices[old_idx] = old_idx as u32 - offset;
+            offset += 1;
+        } else {
+            new_indices[old_idx] = old_idx as u32 - offset;
+        }
+    }
+    let new_end = ops.len() as u32 - offset;
+
+    for op in ops.iter_mut() {
+        match op {
+            Op::BranchIfZero { target, .. }
+            | Op::BranchIfNotEqLit { target, .. }
+            | Op::LoadStateAndBranchIfNotEqLit { target, .. }
+            | Op::Jump { target } => {
+                let old = *target as usize;
+                *target = if old < new_indices.len() { new_indices[old] } else { new_end };
+            }
+            Op::DispatchChain { miss_target, .. } => {
+                let old = *miss_target as usize;
+                *miss_target = if old < new_indices.len() { new_indices[old] } else { new_end };
+            }
+            Op::Dispatch { fallback_target, .. } => {
+                let old = *fallback_target as usize;
+                *fallback_target = if old < new_indices.len() { new_indices[old] } else { new_end };
+            }
+            _ => {}
+        }
+    }
+
+    // Remap chain-table body PCs that point into this ops array.
+    for &cid in &referenced_chain_ids {
+        for (_v, body_pc) in chain_tables[cid as usize].entries.iter_mut() {
+            let old = *body_pc as usize;
+            *body_pc = if old < new_indices.len() { new_indices[old] } else { new_end };
+        }
+    }
+
+    let mut write = 0;
+    let mut remove_pos = 0;
+    for read in 0..ops.len() {
+        if remove_pos < remove_set.len() && remove_set[remove_pos] == read {
+            remove_pos += 1;
+            continue;
         }
         if write != read {
             ops.swap(write, read);
@@ -2990,6 +3184,7 @@ fn op_slots_read(op: &Op) -> Vec<Slot> {
         Op::CmpEq { a, b, .. } => vec![*a, *b],
         Op::BranchIfZero { cond, .. } => vec![*cond],
         Op::BranchIfNotEqLit { a, .. } => vec![*a],
+        Op::LoadStateAndBranchIfNotEqLit { .. } => vec![],
         Op::Jump { .. } => vec![],
         Op::DispatchChain { a, .. } => vec![*a],
         Op::Dispatch { key, .. } => vec![*key],
@@ -3032,6 +3227,7 @@ fn op_dst(op: &Op) -> Option<Slot> {
         | Op::CmpEq { dst, .. }
         | Op::Dispatch { dst, .. }
         | Op::DispatchFlatArray { dst, .. } => Some(*dst),
+        Op::LoadStateAndBranchIfNotEqLit { dst, .. } => Some(*dst),
         Op::BranchIfZero { .. } | Op::BranchIfNotEqLit { .. } | Op::Jump { .. } | Op::DispatchChain { .. } | Op::StoreState { .. } | Op::StoreMem { .. } => {
             None
         }
@@ -3127,6 +3323,9 @@ fn map_op_slots(op: &mut Op, slot_map: &mut HashMap<Slot, Slot>, alloc: &mut Slo
         Op::BranchIfNotEqLit { a, .. } => {
             *a = alloc.get_or_alloc(*a, slot_map);
         }
+        Op::LoadStateAndBranchIfNotEqLit { dst, .. } => {
+            *dst = alloc.get_or_alloc(*dst, slot_map);
+        }
         Op::DispatchChain { a, .. } => {
             *a = alloc.get_or_alloc(*a, slot_map);
         }
@@ -3189,6 +3388,7 @@ fn seed_from_parent(
         Op::Round { val, interval, .. } => { seed(*val); seed(*interval); }
         Op::BranchIfZero { cond, .. } => { seed(*cond); }
         Op::BranchIfNotEqLit { a, .. } => { seed(*a); }
+        Op::LoadStateAndBranchIfNotEqLit { .. } => {}
         Op::DispatchChain { a, .. } => { seed(*a); }
         Op::Jump { .. } => {}
         Op::Dispatch { key, .. } => { seed(*key); }
@@ -3349,6 +3549,14 @@ fn exec_ops(
             // with this case at the predicted target.
             Op::BranchIfNotEqLit { a, val, target } => {
                 if sload!(*a) != *val {
+                    pc = *target as usize;
+                    continue;
+                }
+            }
+            Op::LoadStateAndBranchIfNotEqLit { dst, addr, val, target } => {
+                let v = state.read_mem(*addr);
+                sstore!(*dst, v);
+                if v != *val {
                     pc = *target as usize;
                     continue;
                 }
@@ -3840,6 +4048,18 @@ fn exec_ops_profiled(
                     profile.branches_not_taken += 1;
                 }
             }
+            Op::LoadStateAndBranchIfNotEqLit { dst, addr, val, target } => {
+                count_op!(profile, "LoadStateAndBranchIfNotEqLit");
+                let v = state.read_mem(*addr);
+                slots[*dst as usize] = v;
+                if v != *val {
+                    profile.branches_taken += 1;
+                    pc = *target as usize;
+                    continue;
+                } else {
+                    profile.branches_not_taken += 1;
+                }
+            }
             Op::Jump { target } => {
                 count_op!(profile, "Jump");
                 pc = *target as usize;
@@ -4192,6 +4412,22 @@ pub fn exec_ops_traced(
                         pc, op: format!("BranchIfNotEqLit a={} val={} target={}", a, val, target),
                         dst_slot: None, dst_value: None,
                         inputs: vec![(*a, a_val)], branch_taken: Some(taken), depth,
+                    });
+                }
+                if taken {
+                    pc = *target as usize;
+                    continue;
+                }
+            }
+            Op::LoadStateAndBranchIfNotEqLit { dst, addr, val, target } => {
+                let v = state.read_mem(*addr);
+                slots[*dst as usize] = v;
+                let taken = v != *val;
+                if should_trace {
+                    trace.push(TraceEntry {
+                        pc, op: format!("LoadStateAndBranchIfNotEqLit dst={} addr={} val={} target={}", dst, addr, val, target),
+                        dst_slot: Some(*dst), dst_value: Some(v),
+                        inputs: vec![], branch_taken: Some(taken), depth,
                     });
                 }
                 if taken {
