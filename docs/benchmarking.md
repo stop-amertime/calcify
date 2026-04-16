@@ -138,7 +138,10 @@ Recorded results:
 |---|---|---|---|
 | 6acc696 | pre-(a) baseline | ~27 s | ~70 K |
 | ba11194 | (a) native bitwise | ~16 s | ~120 K |
-| (pending) | fuse LoadState+BranchIfNotEqLit | ~12 s | ~145 K |
+| 8e2ccd8 | fuse LoadState+BranchIfNotEqLit | ~12 s | ~145 K |
+| 32e8479 | skip per-tick state_vars clone | — | — |
+| 1930b52 | skip per-tick slot zeroing | — | — |
+| a7b1625 | dense-array DispatchChain fast path | ~10 s | ~175 K |
 
 (Earlier rows updated: the ~9s number for ba11194 was a single-best run on a
 cold machine. Rerunning three-at-a-time in warm state gives ~15–17 s — a
