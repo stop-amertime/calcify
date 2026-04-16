@@ -141,7 +141,8 @@ Recorded results:
 | 8e2ccd8 | fuse LoadState+BranchIfNotEqLit | ~12 s | ~145 K |
 | 32e8479 | skip per-tick state_vars clone | — | — |
 | 1930b52 | skip per-tick slot zeroing | — | — |
-| a7b1625 | dense-array DispatchChain fast path | ~10 s | ~175 K |
+| a7b1625 | dense-array DispatchChain (buggy — halt missed) | — | — |
+| ae1ae51 | fix DispatchChain flat_table target remap | ~11 s | ~170 K |
 
 (Earlier rows updated: the ~9s number for ba11194 was a single-best run on a
 cold machine. Rerunning three-at-a-time in warm state gives ~15–17 s — a
@@ -218,10 +219,14 @@ Lit-operand arithmetic/bitwise variants, and per-tick overhead skipping.
 
 | Program | Ticks/s | % of 8086 | us/tick | vs 2026-04-14 |
 |---|---|---|---|---|
-| rogue.css | ~293 K | 53 % | 3.4 | ~48× |
-| fib.css | ~346 K | 63 % | 2.9 | ~49× |
-| bootle.css | ~192 K | 35 % | 5.2 | ~27× |
-| bootle-ctest.css splash-fill | ~430 K | 90 % | 2.3 | — |
+| rogue.css | ~190 K | 32 % | 5.3 | ~32× |
+| fib.css | ~280 K | 51 % | 3.6 | ~40× |
+| bootle.css | ~190 K | 35 % | 5.3 | ~26× |
+| splash-fill (bootle-ctest.css) | ~170 K | 19 % | 6.0 | — |
+
+(Initial post-optimization numbers overstated by a correctness bug in
+dense-array DispatchChain; fixed in ae1ae51. The table above reflects
+real speeds after the fix.)
 
 See [docs/log.md](log.md) for the full bottleneck analysis and
 optimisation roadmap.

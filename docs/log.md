@@ -17,18 +17,25 @@ Cumulative commits:
 - 8e2ccd8 — fuse LoadState + BranchIfNotEqLit
 - 32e8479 — skip per-tick state_vars.clone() in run_batch
 - 1930b52 — skip per-tick slot zeroing in execute()
-- a7b1625 — dense-array fast path for DispatchChain (~3× alone)
+- a7b1625 — dense-array fast path for DispatchChain (had latent bug)
 - cb4cbae — AddLit/SubLit/MulLit variants
 - 2ccceb2 — AndLit/ShrLit/ShlLit/ModLit variants
+- ae1ae51 — fix: flat_table targets weren't remapped in fuse_loadstate_branch
 
-Measured rogue.css: ~6K → ~293K ticks/s (**~48×**).
-Measured fib.css: ~7K → ~346K ticks/s (**~49×**).
-Measured bootle.css: ~7K → ~192K ticks/s (**~27×**).
-Measured splash-fill (bootle-ctest.css): ~17s → ~4s (**~4×** since
-ba11194; **~7×** since the 6acc696 pre-(a) baseline).
+Measured rogue.css: ~6K → ~190K ticks/s (**~32×**).
+Measured fib.css: ~7K → ~280K ticks/s (**~40×**).
+Measured bootle.css: ~7K → ~190K ticks/s (**~26×**).
+Measured splash-fill (bootle-ctest.css): ~17s → ~11s (1,828,538 conformant
+ticks at ~170K t/s).
 
-Biggest single win was the dense-array DispatchChain — ~3× on splash-fill.
-Most other wins are 5–15% each.
+Biggest single win was the dense-array DispatchChain. Most other wins are
+5–15% each.
+
+**Lesson: verify halt/conformance on every perf commit.** The dense-array
+bug was invisible from pure ticks/s numbers (they got better) but the
+program was producing wrong results post-fusion. Caught only when I
+noticed `Cycles: 0` in the final bench writeup. Add cycleCount/halt
+sanity checks to the perf workflow.
 
 Session notes (meta): most "regressions" of smaller changes were
 thermal-throttle noise; once the machine cooled down, several were
