@@ -74,15 +74,33 @@ pub enum Op {
         a: Slot,
         b: Slot,
     },
+    /// slot[dst] = slot[a] + val
+    AddLit {
+        dst: Slot,
+        a: Slot,
+        val: i32,
+    },
     Sub {
         dst: Slot,
         a: Slot,
         b: Slot,
     },
+    /// slot[dst] = slot[a] - val
+    SubLit {
+        dst: Slot,
+        a: Slot,
+        val: i32,
+    },
     Mul {
         dst: Slot,
         a: Slot,
         b: Slot,
+    },
+    /// slot[dst] = slot[a] * val
+    MulLit {
+        dst: Slot,
+        a: Slot,
+        val: i32,
     },
     Div {
         dst: Slot,
@@ -1089,6 +1107,23 @@ impl<'a> Compiler<'a> {
     fn compile_calc(&mut self, op: &CalcOp, ops: &mut Vec<Op>) -> Slot {
         match op {
             CalcOp::Add(a, b) => {
+                // Lit-operand fast path: if either side is a literal, emit AddLit.
+                if let Expr::Literal(lv) = b.as_ref() {
+                    if let Some(val) = lit_as_i32(*lv) {
+                        let sa = self.compile_expr(a, ops);
+                        let dst = self.alloc();
+                        ops.push(Op::AddLit { dst, a: sa, val });
+                        return dst;
+                    }
+                }
+                if let Expr::Literal(lv) = a.as_ref() {
+                    if let Some(val) = lit_as_i32(*lv) {
+                        let sb = self.compile_expr(b, ops);
+                        let dst = self.alloc();
+                        ops.push(Op::AddLit { dst, a: sb, val });
+                        return dst;
+                    }
+                }
                 let sa = self.compile_expr(a, ops);
                 let sb = self.compile_expr(b, ops);
                 let dst = self.alloc();
@@ -1096,6 +1131,14 @@ impl<'a> Compiler<'a> {
                 dst
             }
             CalcOp::Sub(a, b) => {
+                if let Expr::Literal(lv) = b.as_ref() {
+                    if let Some(val) = lit_as_i32(*lv) {
+                        let sa = self.compile_expr(a, ops);
+                        let dst = self.alloc();
+                        ops.push(Op::SubLit { dst, a: sa, val });
+                        return dst;
+                    }
+                }
                 let sa = self.compile_expr(a, ops);
                 let sb = self.compile_expr(b, ops);
                 let dst = self.alloc();
@@ -1103,6 +1146,22 @@ impl<'a> Compiler<'a> {
                 dst
             }
             CalcOp::Mul(a, b) => {
+                if let Expr::Literal(lv) = b.as_ref() {
+                    if let Some(val) = lit_as_i32(*lv) {
+                        let sa = self.compile_expr(a, ops);
+                        let dst = self.alloc();
+                        ops.push(Op::MulLit { dst, a: sa, val });
+                        return dst;
+                    }
+                }
+                if let Expr::Literal(lv) = a.as_ref() {
+                    if let Some(val) = lit_as_i32(*lv) {
+                        let sb = self.compile_expr(b, ops);
+                        let dst = self.alloc();
+                        ops.push(Op::MulLit { dst, a: sb, val });
+                        return dst;
+                    }
+                }
                 let sa = self.compile_expr(a, ops);
                 let sb = self.compile_expr(b, ops);
                 let dst = self.alloc();
@@ -3201,6 +3260,7 @@ fn op_slots_read(op: &Op) -> Vec<Slot> {
         | Op::And { a, b, .. }
         | Op::Shr { a, b, .. }
         | Op::Shl { a, b, .. } => vec![*a, *b],
+        Op::AddLit { a, .. } | Op::SubLit { a, .. } | Op::MulLit { a, .. } => vec![*a],
         Op::Neg { src, .. }
         | Op::Abs { src, .. }
         | Op::Sign { src, .. }
@@ -3260,6 +3320,7 @@ fn op_dst(op: &Op) -> Option<Slot> {
         | Op::CmpEq { dst, .. }
         | Op::Dispatch { dst, .. }
         | Op::DispatchFlatArray { dst, .. } => Some(*dst),
+        Op::AddLit { dst, .. } | Op::SubLit { dst, .. } | Op::MulLit { dst, .. } => Some(*dst),
         Op::LoadStateAndBranchIfNotEqLit { dst, .. } => Some(*dst),
         Op::BranchIfZero { .. } | Op::BranchIfNotEqLit { .. } | Op::Jump { .. } | Op::DispatchChain { .. } | Op::StoreState { .. } | Op::StoreMem { .. } => {
             None
@@ -3298,6 +3359,10 @@ fn map_op_slots(op: &mut Op, slot_map: &mut HashMap<Slot, Slot>, alloc: &mut Slo
         | Op::Shl { dst, a, b } => {
             *a = alloc.get_or_alloc(*a, slot_map);
             *b = alloc.get_or_alloc(*b, slot_map);
+            *dst = alloc.get_or_alloc(*dst, slot_map);
+        }
+        Op::AddLit { dst, a, .. } | Op::SubLit { dst, a, .. } | Op::MulLit { dst, a, .. } => {
+            *a = alloc.get_or_alloc(*a, slot_map);
             *dst = alloc.get_or_alloc(*dst, slot_map);
         }
         Op::Neg { dst, src }
@@ -3409,6 +3474,7 @@ fn seed_from_parent(
         Op::Add { a, b, .. } | Op::Sub { a, b, .. } | Op::Mul { a, b, .. }
         | Op::Div { a, b, .. } | Op::Mod { a, b, .. } | Op::And { a, b, .. }
         | Op::Shr { a, b, .. } | Op::Shl { a, b, .. } => { seed(*a); seed(*b); }
+        Op::AddLit { a, .. } | Op::SubLit { a, .. } | Op::MulLit { a, .. } => { seed(*a); }
         Op::Neg { src, .. } | Op::Abs { src, .. } | Op::Sign { src, .. }
         | Op::Floor { src, .. } => { seed(*src); }
         Op::Pow { base, exp, .. } => { seed(*base); seed(*exp); }
@@ -3619,11 +3685,20 @@ fn exec_ops(
             Op::Add { dst, a, b } => {
                 sstore!(*dst, sload!(*a).wrapping_add(sload!(*b)));
             }
+            Op::AddLit { dst, a, val } => {
+                sstore!(*dst, sload!(*a).wrapping_add(*val));
+            }
             Op::Sub { dst, a, b } => {
                 sstore!(*dst, sload!(*a).wrapping_sub(sload!(*b)));
             }
+            Op::SubLit { dst, a, val } => {
+                sstore!(*dst, sload!(*a).wrapping_sub(*val));
+            }
             Op::Mul { dst, a, b } => {
                 sstore!(*dst, sload!(*a).wrapping_mul(sload!(*b)));
+            }
+            Op::MulLit { dst, a, val } => {
+                sstore!(*dst, sload!(*a).wrapping_mul(*val));
             }
             Op::Div { dst, a, b } => {
                 let divisor = sload!(*b);
@@ -3922,13 +3997,25 @@ fn exec_ops_profiled(
                 count_op!(profile, "Add");
                 slots[*dst as usize] = slots[*a as usize].wrapping_add(slots[*b as usize]);
             }
+            Op::AddLit { dst, a, val } => {
+                count_op!(profile, "AddLit");
+                slots[*dst as usize] = slots[*a as usize].wrapping_add(*val);
+            }
             Op::Sub { dst, a, b } => {
                 count_op!(profile, "Sub");
                 slots[*dst as usize] = slots[*a as usize].wrapping_sub(slots[*b as usize]);
             }
+            Op::SubLit { dst, a, val } => {
+                count_op!(profile, "SubLit");
+                slots[*dst as usize] = slots[*a as usize].wrapping_sub(*val);
+            }
             Op::Mul { dst, a, b } => {
                 count_op!(profile, "Mul");
                 slots[*dst as usize] = slots[*a as usize].wrapping_mul(slots[*b as usize]);
+            }
+            Op::MulLit { dst, a, val } => {
+                count_op!(profile, "MulLit");
+                slots[*dst as usize] = slots[*a as usize].wrapping_mul(*val);
             }
             Op::Div { dst, a, b } => {
                 count_op!(profile, "Div");
@@ -4309,6 +4396,30 @@ pub fn exec_ops_traced(
                         dst_slot: Some(*dst), dst_value: Some(val),
                         inputs: vec![(*a, av), (*b, bv)], branch_taken: None, depth,
                     });
+                }
+            }
+            Op::AddLit { dst, a, val } => {
+                let av = slots[*a as usize];
+                let r = av.wrapping_add(*val);
+                slots[*dst as usize] = r;
+                if should_trace {
+                    trace.push(TraceEntry { pc, op: format!("AddLit dst={} a={}({}) +{} → {}", dst, a, av, val, r), dst_slot: Some(*dst), dst_value: Some(r), inputs: vec![(*a, av)], branch_taken: None, depth });
+                }
+            }
+            Op::SubLit { dst, a, val } => {
+                let av = slots[*a as usize];
+                let r = av.wrapping_sub(*val);
+                slots[*dst as usize] = r;
+                if should_trace {
+                    trace.push(TraceEntry { pc, op: format!("SubLit dst={} a={}({}) -{} → {}", dst, a, av, val, r), dst_slot: Some(*dst), dst_value: Some(r), inputs: vec![(*a, av)], branch_taken: None, depth });
+                }
+            }
+            Op::MulLit { dst, a, val } => {
+                let av = slots[*a as usize];
+                let r = av.wrapping_mul(*val);
+                slots[*dst as usize] = r;
+                if should_trace {
+                    trace.push(TraceEntry { pc, op: format!("MulLit dst={} a={}({}) *{} → {}", dst, a, av, val, r), dst_slot: Some(*dst), dst_value: Some(r), inputs: vec![(*a, av)], branch_taken: None, depth });
                 }
             }
             Op::Div { dst, a, b } => {
