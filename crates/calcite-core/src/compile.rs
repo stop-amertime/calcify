@@ -2673,6 +2673,14 @@ fn fuse_ls_ops(ops: &mut Vec<Op>, chain_tables: &mut [DispatchChainTable]) -> us
             let old = *body_pc as usize;
             *body_pc = if old < new_indices.len() { new_indices[old] } else { new_end };
         }
+        // Also remap flat_table targets if present.
+        if let Some(ref mut flat) = chain_tables[cid as usize].flat_table {
+            for t in flat.targets.iter_mut() {
+                if *t == u32::MAX { continue; }
+                let old = *t as usize;
+                *t = if old < new_indices.len() { new_indices[old] } else { new_end };
+            }
+        }
     }
 
     let mut write = 0;
