@@ -11,6 +11,42 @@ and the Criterion benchmarks.
 
 ---
 
+## 2026-04-16: big round of peephole/specialization wins
+
+Cumulative commits:
+- 8e2ccd8 — fuse LoadState + BranchIfNotEqLit
+- 32e8479 — skip per-tick state_vars.clone() in run_batch
+- 1930b52 — skip per-tick slot zeroing in execute()
+- a7b1625 — dense-array fast path for DispatchChain (~3× alone)
+- cb4cbae — AddLit/SubLit/MulLit variants
+- 2ccceb2 — AndLit/ShrLit/ShlLit/ModLit variants
+
+Measured rogue.css: ~6K → ~293K ticks/s (**~48×**).
+Measured fib.css: ~7K → ~346K ticks/s (**~49×**).
+Measured bootle.css: ~7K → ~192K ticks/s (**~27×**).
+Measured splash-fill (bootle-ctest.css): ~17s → ~4s (**~4×** since
+ba11194; **~7×** since the 6acc696 pre-(a) baseline).
+
+Biggest single win was the dense-array DispatchChain — ~3× on splash-fill.
+Most other wins are 5–15% each.
+
+Session notes (meta): most "regressions" of smaller changes were
+thermal-throttle noise; once the machine cooled down, several were
+actually neutral. Consistently alternating change/baseline runs
+interleaved is the only reliable way to separate signal from noise
+on this laptop. Three runs per side, take the mean.
+
+### Things that didn't work (saved for reference)
+- LoadSlot + BranchIfNotEqLit fusion: only 682 fusions found, neutral.
+- Shrinking Op enum (Box<Vec<Slot>> for Min/Max): 32→24 bytes regressed bench.
+- LTO=thin: neutral; LTO=fat: -30%.
+- MIN_CHAIN_LEN=3: regression (3-chain lookup slower than linear compare).
+- LoadStateVar specialization: regressed (match dispatch pressure outweighed).
+- Local copy-propagation / dead LoadSlot elim: either neutral (no dead-code
+  pass) or broke or-conditions test (too aggressive liveness heuristic).
+
+---
+
 ## Current priority: Mode 13h blitting is painfully slow
 
 Filling the 320×200 framebuffer once takes roughly a minute — you can
