@@ -394,6 +394,40 @@ impl Evaluator {
         }
     }
 
+    /// Execute one tick without change detection — for use from run_batch where
+    /// the outer routine does a single diff against the snapshot at the end.
+    /// Skips the per-tick state_vars.clone() and the post-tick diff loop.
+    #[inline]
+    fn tick_no_diff(&mut self, state: &mut State) {
+        for hook in &self.pre_tick_hooks {
+            hook(state);
+        }
+        compile::execute(&self.compiled, state, &mut self.slots);
+        if !self.string_assignments.is_empty() {
+            self.properties.clear();
+            self.call_depth = 0;
+            for (name, &slot) in &self.compiled.property_slots {
+                if (slot as usize) < self.slots.len() {
+                    self.properties.insert(
+                        name.clone(),
+                        Value::Number(self.slots[slot as usize] as f64),
+                    );
+                }
+            }
+            for i in 0..self.string_assignments.len() {
+                let assignment = &self.string_assignments[i] as *const Assignment;
+                let assignment = unsafe { &*assignment };
+                let value = self.eval_expr(&assignment.value, state);
+                let bare = to_bare_name(&assignment.property);
+                if let Value::Str(ref s) = value {
+                    state.string_properties.insert(bare.to_string(), s.clone());
+                }
+                self.properties.insert(assignment.property.clone(), value);
+            }
+        }
+        state.frame_counter += 1;
+    }
+
     /// Run a single tick with phase timing breakdown.
     ///
     /// Returns the normal TickResult plus timing for each phase:
@@ -683,16 +717,18 @@ impl Evaluator {
     /// Takes a snapshot before the batch and diffs at the end, so callers
     /// see every register/memory change — not just the final tick's delta.
     pub fn run_batch(&mut self, state: &mut State, count: u32) -> TickResult {
-        let snapshot = state.clone();
+        // Snapshot only state_vars for diff (full state.clone() is expensive
+        // and unused — we only diff state_vars here).
+        let snapshot_vars = state.state_vars.clone();
         for _ in 0..count {
-            self.tick(state);
+            self.tick_no_diff(state);
         }
 
         // Diff state vars
         let mut changes = Vec::new();
         for (i, name) in state.state_var_names.iter().enumerate() {
-            if i < state.state_vars.len() && i < snapshot.state_vars.len()
-                && state.state_vars[i] != snapshot.state_vars[i]
+            if i < state.state_vars.len() && i < snapshot_vars.len()
+                && state.state_vars[i] != snapshot_vars[i]
             {
                 changes.push((format!("--{}", name), state.state_vars[i].to_string()));
             }
