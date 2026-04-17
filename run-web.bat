@@ -81,37 +81,45 @@ set "SEL_PATH=!PATH_%CHOICE%!"
 set "SEL_TYPE=!TYPE_%CHOICE%!"
 
 REM ─── Determine the CSS file to serve ──────────────────────────────────
-REM cmd-batch quirk: variables referenced inside a parenthesised block must
-REM use !delayed! expansion when they were set in the same block above; using
-REM %percent% expansion captures the value at parse time (often empty).
-if "!SEL_TYPE!"=="css" (
-    set "CSS_PATH=!SEL_PATH!"
-    for %%f in ("!SEL_PATH!") do set "CSS_NAME=%%~nxf"
-    echo.
-    echo Using pre-built CSS: !SEL_PATH!
-    echo ^(BIOS is baked into the file; toggle has no effect here^)
-) else (
-    for %%f in ("!SEL_PATH!") do set "BASE=%%~nf"
-    set "CSS_NAME=!BASE!.css"
-    set "CSS_PATH=!OUTPUTDIR!\!BASE!.css"
+REM Nested if/else blocks with set+for inside parens are fragile in cmd.
+REM Use linear flow with goto-labels instead.
+if /i "!SEL_TYPE!"=="css" goto :prebuilt
+goto :build
 
-    if "!BIOS!"=="C" (
-        echo.
-        echo === Building C BIOS (bios.bin) ===
-        call node "!CSSDIR!\bios\build.mjs"
-        if errorlevel 1 goto :fail
+:prebuilt
+set "CSS_PATH=!SEL_PATH!"
+for %%f in ("!SEL_PATH!") do set "CSS_NAME=%%~nxf"
+echo.
+echo Using pre-built CSS: !SEL_PATH!
+echo (BIOS is baked into the file; toggle has no effect here)
+goto :launch
 
-        echo.
-        echo === Regenerating CSS from !SEL_NAME! (C BIOS) ===
-        call node "!CSSDIR!\transpiler\generate-dos-c.mjs" "%CD%\!SEL_PATH!" -o "%CD%\!OUTPUTDIR!\!BASE!.css"
-        if errorlevel 1 goto :fail
-    ) else (
-        echo.
-        echo === Regenerating CSS from !SEL_NAME! (ASM BIOS) ===
-        call node "!CSSDIR!\transpiler\generate-dos.mjs" "%CD%\!SEL_PATH!" -o "%CD%\!OUTPUTDIR!\!BASE!.css"
-        if errorlevel 1 goto :fail
-    )
-)
+:build
+for %%f in ("!SEL_PATH!") do set "BASE=%%~nf"
+set "CSS_NAME=!BASE!.css"
+set "CSS_PATH=!OUTPUTDIR!\!BASE!.css"
+if /i "!BIOS!"=="C" goto :build_c
+goto :build_asm
+
+:build_c
+echo.
+echo === Building C BIOS (bios.bin) ===
+call node "!CSSDIR!\bios\build.mjs"
+if errorlevel 1 goto :fail
+echo.
+echo === Regenerating CSS from !SEL_NAME! (C BIOS) ===
+call node "!CSSDIR!\transpiler\generate-dos-c.mjs" "%CD%\!SEL_PATH!" -o "%CD%\!CSS_PATH!"
+if errorlevel 1 goto :fail
+goto :launch
+
+:build_asm
+echo.
+echo === Regenerating CSS from !SEL_NAME! (ASM BIOS) ===
+call node "!CSSDIR!\transpiler\generate-dos.mjs" "%CD%\!SEL_PATH!" -o "%CD%\!CSS_PATH!"
+if errorlevel 1 goto :fail
+goto :launch
+
+:launch
 
 REM ─── Start HTTP server (if not already running on %PORT%) ─────────────
 REM Simple check: try to claim the port. If netstat shows it in LISTENING,
