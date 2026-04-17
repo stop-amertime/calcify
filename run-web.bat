@@ -7,10 +7,11 @@ REM at the web UI pointed at the CSS.
 setlocal enabledelayedexpansion
 cd /d "%~dp0"
 
-set WORKTREE=C:\Users\AdmT9N0CX01V65438A\AppData\Local\Temp\css-dos-bios-splash
+set CSSDIR=..\CSS-DOS
 set OUTPUTDIR=output
 set PROGRAMDIR=programs
 set PORT=8765
+set BIOS=C
 
 REM ─── Build list of programs + pre-built CSS ───────────────────────────
 set COUNT=0
@@ -42,16 +43,26 @@ if %COUNT%==0 (
 cls
 echo.
 echo === CSS-DOS — run in browser ===
+if "%BIOS%"=="C" (
+    echo BIOS: C   ^(press 'b' to switch to ASM^)
+) else (
+    echo BIOS: ASM ^(press 'b' to switch to C^)
+)
 echo.
 for /L %%i in (1,1,%COUNT%) do (
     echo   %%i. !NAME_%%i!
 )
 echo.
+echo   b. Toggle BIOS
 echo   q. Quit
 echo.
 set /p CHOICE=Pick a number:
 
 if /i "%CHOICE%"=="q" goto :eof
+if /i "%CHOICE%"=="b" (
+    if "%BIOS%"=="C" ( set BIOS=ASM ) else ( set BIOS=C )
+    goto :menu
+)
 if "%CHOICE%"=="" goto :menu
 
 REM Validate numeric selection
@@ -80,15 +91,22 @@ if "%SEL_TYPE%"=="css" (
     set "CSS_NAME=!BASE!.css"
     set "CSS_PATH=%OUTPUTDIR%\!CSS_NAME!"
 
-    echo.
-    echo === Building C BIOS (bios.bin) ===
-    call node "%WORKTREE%\bios\build.mjs"
-    if errorlevel 1 goto :fail
+    if "%BIOS%"=="C" (
+        echo.
+        echo === Building C BIOS (bios.bin) ===
+        call node "%CSSDIR%\bios\build.mjs"
+        if errorlevel 1 goto :fail
 
-    echo.
-    echo === Regenerating CSS from !SEL_NAME! ===
-    call node "%WORKTREE%\transpiler\generate-dos.mjs" "%CD%\%SEL_PATH%" -o "%CD%\!CSS_PATH!"
-    if errorlevel 1 goto :fail
+        echo.
+        echo === Regenerating CSS from !SEL_NAME! (C BIOS) ===
+        call node "%CSSDIR%\transpiler\generate-dos-c.mjs" "%CD%\%SEL_PATH%" -o "%CD%\!CSS_PATH!"
+        if errorlevel 1 goto :fail
+    ) else (
+        echo.
+        echo === Regenerating CSS from !SEL_NAME! (ASM BIOS) ===
+        call node "%CSSDIR%\transpiler\generate-dos.mjs" "%CD%\%SEL_PATH%" -o "%CD%\!CSS_PATH!"
+        if errorlevel 1 goto :fail
+    )
 )
 
 REM ─── Start HTTP server (if not already running on %PORT%) ─────────────
