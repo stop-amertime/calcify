@@ -44,9 +44,9 @@ cls
 echo.
 echo === CSS-DOS — run in browser ===
 if "%BIOS%"=="C" (
-    echo BIOS: C   ^(press 'b' to switch to ASM^)
+    echo BIOS: C   ^(press 'b' to switch to ASM; affects .com/.exe builds only^)
 ) else (
-    echo BIOS: ASM ^(press 'b' to switch to C^)
+    echo BIOS: ASM ^(press 'b' to switch to C; affects .com/.exe builds only^)
 )
 echo.
 for /L %%i in (1,1,%COUNT%) do (
@@ -81,30 +81,34 @@ set "SEL_PATH=!PATH_%CHOICE%!"
 set "SEL_TYPE=!TYPE_%CHOICE%!"
 
 REM ─── Determine the CSS file to serve ──────────────────────────────────
-if "%SEL_TYPE%"=="css" (
-    set "CSS_PATH=%SEL_PATH%"
-    for %%f in ("%SEL_PATH%") do set "CSS_NAME=%%~nxf"
+REM cmd-batch quirk: variables referenced inside a parenthesised block must
+REM use !delayed! expansion when they were set in the same block above; using
+REM %percent% expansion captures the value at parse time (often empty).
+if "!SEL_TYPE!"=="css" (
+    set "CSS_PATH=!SEL_PATH!"
+    for %%f in ("!SEL_PATH!") do set "CSS_NAME=%%~nxf"
     echo.
-    echo Using pre-built CSS: %SEL_PATH%
+    echo Using pre-built CSS: !SEL_PATH!
+    echo ^(BIOS is baked into the file; toggle has no effect here^)
 ) else (
-    for %%f in ("%SEL_PATH%") do set "BASE=%%~nf"
+    for %%f in ("!SEL_PATH!") do set "BASE=%%~nf"
     set "CSS_NAME=!BASE!.css"
-    set "CSS_PATH=%OUTPUTDIR%\!CSS_NAME!"
+    set "CSS_PATH=!OUTPUTDIR!\!BASE!.css"
 
-    if "%BIOS%"=="C" (
+    if "!BIOS!"=="C" (
         echo.
         echo === Building C BIOS (bios.bin) ===
-        call node "%CSSDIR%\bios\build.mjs"
+        call node "!CSSDIR!\bios\build.mjs"
         if errorlevel 1 goto :fail
 
         echo.
         echo === Regenerating CSS from !SEL_NAME! (C BIOS) ===
-        call node "%CSSDIR%\transpiler\generate-dos-c.mjs" "%CD%\%SEL_PATH%" -o "%CD%\!CSS_PATH!"
+        call node "!CSSDIR!\transpiler\generate-dos-c.mjs" "%CD%\!SEL_PATH!" -o "%CD%\!OUTPUTDIR!\!BASE!.css"
         if errorlevel 1 goto :fail
     ) else (
         echo.
         echo === Regenerating CSS from !SEL_NAME! (ASM BIOS) ===
-        call node "%CSSDIR%\transpiler\generate-dos.mjs" "%CD%\%SEL_PATH%" -o "%CD%\!CSS_PATH!"
+        call node "!CSSDIR!\transpiler\generate-dos.mjs" "%CD%\!SEL_PATH!" -o "%CD%\!OUTPUTDIR!\!BASE!.css"
         if errorlevel 1 goto :fail
     )
 )
