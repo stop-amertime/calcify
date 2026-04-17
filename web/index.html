@@ -177,6 +177,38 @@
       pointer-events: none;
     }
 
+    /* ── On-screen keyboard (CSS-only; buttons' :active drives --keyboard) ── */
+    key-board {
+      display: grid;
+      grid-template-columns: repeat(10, 1fr);
+      gap: 2px;
+      margin-top: 6px;
+      /* Touch + mouse only — disable user text selection so drags don't highlight. */
+      user-select: none;
+    }
+
+    key-board button {
+      /* Reuse the DOS button look but smaller + no min-width. */
+      background: #c0c0c0;
+      border-top: 2px solid #fff;
+      border-left: 2px solid #fff;
+      border-right: 2px solid #808080;
+      border-bottom: 2px solid #808080;
+      font-family: inherit;
+      font-size: 12px;
+      padding: 4px 0;
+      cursor: pointer;
+      color: #000;
+    }
+
+    key-board button:active {
+      border-top: 2px solid #808080;
+      border-left: 2px solid #808080;
+      border-right: 2px solid #fff;
+      border-bottom: 2px solid #fff;
+      padding: 5px 0 3px 0;
+    }
+
     /* ── Group box ── */
     .group {
       border: 1px solid #808080;
@@ -265,6 +297,20 @@
         <div class="speed-tick" style="left:50%"></div>
         <div class="speed-tick" style="left:100%"></div>
       </div>
+
+      <!--
+        On-screen keyboard. Each <button> corresponds by position (:nth-child)
+        to a CSS rule emitted by CSS-DOS (transpiler/src/template.mjs
+        KEYBOARD_KEYS). ORDER MUST MATCH. If KEYBOARD_KEYS changes, update
+        both here AND the HTML footer in template.mjs.
+      -->
+      <key-board>
+        <button>0</button><button>1</button><button>2</button><button>3</button><button>4</button><button>5</button><button>6</button><button>7</button><button>8</button><button>9</button>
+        <button>Q</button><button>W</button><button>E</button><button>R</button><button>T</button><button>Y</button><button>U</button><button>I</button><button>O</button><button>P</button>
+        <button>A</button><button>S</button><button>D</button><button>F</button><button>G</button><button>H</button><button>J</button><button>K</button><button>L</button><button>&#x21B5;</button>
+        <button>Z</button><button>X</button><button>C</button><button>V</button><button>B</button><button>N</button><button>M</button><button>&#x2423;</button><button>Esc</button><button>&#x2190;</button>
+        <button>&#x2193;</button><button>&#x2191;</button><button>&#x2192;</button><button>Tab</button><button>Bksp</button>
+      </key-board>
 
     </div>
   </div>
@@ -517,39 +563,7 @@
       if (file) readFileAndLoad(file);
     });
 
-    // ── Keyboard input ──
-    const dosKeyMap = {
-      'ArrowUp': 0x4800,    'ArrowDown': 0x5000,
-      'ArrowLeft': 0x4B00,  'ArrowRight': 0x4D00,
-      'Escape': 0x011B,     'Enter': 0x1C0D,
-      'Backspace': 0x0E08,  'Tab': 0x0F09,
-      ' ': 0x3920,
-    };
-
-    function keyToCode(e) {
-      if (dosKeyMap[e.key]) return dosKeyMap[e.key];
-      const c = e.key.length === 1 ? e.key.charCodeAt(0) : 0;
-      if (c >= 0x20 && c <= 0x7E) return c;
-      return 0;
-    }
-
-    document.addEventListener('keydown', (e) => {
-      if (!engineReady || !running) return;
-      if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
-      const code = keyToCode(e);
-      if (code) {
-        worker.postMessage({ type: 'keyboard', key: code });
-        e.preventDefault();
-      }
-    });
-
-    document.addEventListener('keyup', (e) => {
-      if (!engineReady) return;
-      if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
-      worker.postMessage({ type: 'keyboard', key: 0 });
-    });
-
-    // Auto-load from ?css=filename URL param
+// Auto-load from ?css=filename URL param
     const cssParam = new URLSearchParams(location.search).get('css');
     if (cssParam) {
       fileName.textContent = cssParam;
