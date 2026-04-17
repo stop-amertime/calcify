@@ -146,6 +146,37 @@
       color: #000;
     }
 
+    /* ── Speed meter (ticks/sec relative to 4.77 MHz 8086) ── */
+    .speed-meter {
+      position: relative;
+      height: 8px;
+      margin-top: 2px;
+      border-top: 1px solid #808080;
+      border-left: 1px solid #808080;
+      border-right: 1px solid #fff;
+      border-bottom: 1px solid #fff;
+      background: #000;
+      overflow: hidden;
+    }
+
+    .speed-bar {
+      height: 100%;
+      width: 0%;
+      background: #00a000;
+      transition: width 100ms linear, background-color 200ms linear;
+    }
+
+    /* 100% marker — 1px vertical line at the "real 8086" threshold. */
+    .speed-tick {
+      position: absolute;
+      top: 0;
+      bottom: 0;
+      width: 1px;
+      background: #fff;
+      opacity: 0.5;
+      pointer-events: none;
+    }
+
     /* ── Group box ── */
     .group {
       border: 1px solid #808080;
@@ -229,6 +260,11 @@
         <span id="status">Drop a .css file to begin</span>
         <span style="float:right" id="stats"></span>
       </div>
+      <div class="speed-meter" title="Emulation speed relative to a 4.77 MHz 8086 (100% = real hardware)">
+        <div class="speed-bar" id="speed-bar"></div>
+        <div class="speed-tick" style="left:50%"></div>
+        <div class="speed-tick" style="left:100%"></div>
+      </div>
 
     </div>
   </div>
@@ -240,6 +276,7 @@
     const canvas = document.getElementById('screen-canvas');
     const ctx = canvas.getContext('2d');
     const stats = document.getElementById('stats');
+    const speedBar = document.getElementById('speed-bar');
     const btnStart = document.getElementById('btn-start');
     const btnStop = document.getElementById('btn-stop');
     const batchInput = document.getElementById('batch-size');
@@ -247,8 +284,25 @@
     const fileName = document.getElementById('file-name');
     const modeBadge = document.getElementById('mode-badge');
 
+    // Real 4.77 MHz 8086 clock rate — the reference the speed meter compares to.
+    const REAL_8086_HZ = 4_772_727;
+
+    function formatHz(hz) {
+      if (hz >= 1_000_000) return (hz / 1_000_000).toFixed(2) + ' MHz';
+      if (hz >= 1_000)     return (hz / 1_000).toFixed(1) + ' KHz';
+      return hz.toFixed(0) + ' Hz';
+    }
+
+    // Map speed ratio [0, ∞) to a bar colour: green ≤0.5, yellow ≤1.0, red >1.0.
+    function speedColor(ratio) {
+      if (ratio < 0.5) return '#00a000';
+      if (ratio < 1.0) return '#c0a000';
+      return '#c02020';
+    }
+
     let running = false;
     let totalTicks = 0;
+    let totalCycles = 0;
     let startTime = 0;
     let engineReady = false;
     // Detected video regions: { text: {...}|null, gfx: {...}|null }
@@ -298,8 +352,23 @@
 
         case 'tick-result': {
           totalTicks += data.ticks;
+          // Worker sends absolute cycleCount each batch — take it directly.
+          totalCycles = data.cycles != null ? data.cycles : totalCycles;
           const elapsed = (performance.now() - startTime) / 1000;
-          stats.textContent = `${totalTicks.toLocaleString()} ticks | ${(totalTicks / elapsed).toFixed(0)} t/s`;
+          const tps = elapsed > 0 ? totalTicks / elapsed : 0;
+          const cps = elapsed > 0 ? totalCycles / elapsed : 0;
+          const pct = cps / REAL_8086_HZ * 100;
+          const cpt = totalTicks > 0 ? totalCycles / totalTicks : 0;
+          stats.textContent =
+            `${totalTicks.toLocaleString()} ticks | ${tps.toFixed(0)} t/s | ` +
+            `${formatHz(cps)} (${pct.toFixed(1)}% of 4.77 MHz) | ${cpt.toFixed(1)} cyc/tick`;
+
+          // Speed bar: width = min(ratio, 1) * 100%; colour shifts past thresholds.
+          // Past 100% we pin at full width but keep the colour red.
+          const ratio = cps / REAL_8086_HZ;
+          const widthPct = Math.min(ratio, 1) * 100;
+          speedBar.style.width = widthPct.toFixed(2) + '%';
+          speedBar.style.backgroundColor = speedColor(ratio);
 
           // Switch display based on BDA video mode byte (runtime source of truth).
           // A program that switches from text to Mode 13h mid-run is handled
@@ -363,6 +432,7 @@
       running = true;
       startTime = performance.now();
       totalTicks = 0;
+      totalCycles = 0;
       btnStart.disabled = true;
       btnStop.disabled = false;
       status.textContent = 'Running...';
@@ -396,11 +466,13 @@
       video = { text: null, gfx: null };
       gfxImageData = null;
       totalTicks = 0;
+      totalCycles = 0;
       btnStart.disabled = true;
       btnStop.disabled = true;
       output.textContent = '';
       canvas.style.display = 'none';
       stats.textContent = '';
+      speedBar.style.width = '0%';
       modeBadge.style.display = 'none';
       status.textContent = `Compiling ${(cssText.length / 1024).toFixed(0)} KB...`;
       worker.postMessage({ type: 'init', css: cssText });
