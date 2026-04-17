@@ -5,6 +5,14 @@
  *   Main → Worker:
  *     { type: 'init', css: string }       — parse and compile CSS
  *     { type: 'tick', count: number }      — run N ticks, return output
+ *     { type: 'keyboard', key: number }    — JS-bridge keypress (see note)
+ *
+ *   NOTE on keyboard: the CSS-DOS output has pure-CSS `:has(button:active)`
+ *   rules that drive --keyboard in Chrome. Calcite can't evaluate selector
+ *   matching (no DOM, no :active) so for the web runner we bridge the
+ *   on-screen buttons through JS — pointerdown/pointerup on each button
+ *   post a message here, and we write the key into BDA via set_keyboard().
+ *   The pure-CSS path still works when the .css is opened in Chrome directly.
  *
  *   Worker → Main:
  *     { type: 'ready', video: { text, gfx } }
@@ -102,6 +110,13 @@ self.onmessage = async function (event) {
           },
           transfer,
         );
+        break;
+      }
+
+      case 'keyboard': {
+        if (engine) {
+          engine.set_keyboard(data.key || 0);
+        }
         break;
       }
 

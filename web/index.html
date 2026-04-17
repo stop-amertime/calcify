@@ -146,68 +146,76 @@
       color: #000;
     }
 
-    /* ── Speed meter (ticks/sec relative to 4.77 MHz 8086) ── */
-    .speed-meter {
-      position: relative;
-      height: 8px;
-      margin-top: 2px;
-      border-top: 1px solid #808080;
-      border-left: 1px solid #808080;
-      border-right: 1px solid #fff;
-      border-bottom: 1px solid #fff;
-      background: #000;
-      overflow: hidden;
-    }
-
-    .speed-bar {
-      height: 100%;
-      width: 0%;
-      background: #00a000;
-      transition: width 100ms linear, background-color 200ms linear;
-    }
-
-    /* 100% marker — 1px vertical line at the "real 8086" threshold. */
-    .speed-tick {
-      position: absolute;
-      top: 0;
-      bottom: 0;
-      width: 1px;
-      background: #fff;
-      opacity: 0.5;
-      pointer-events: none;
-    }
-
-    /* ── On-screen keyboard (CSS-only; buttons' :active drives --keyboard) ── */
-    key-board {
+    /* ── On-screen keyboard ──
+       Three column sections side by side: main (letters + numbers + space),
+       modifier stack (Esc above Enter above Tab), arrow cluster (up row,
+       then left/down/right).
+       Buttons are wired to the calcite wasm engine via JS pointer events
+       (see script block). The generated CSS also has :has(button:active)
+       rules — those only matter when the .css is opened in Chrome directly. */
+    .keyboard {
       display: grid;
-      grid-template-columns: repeat(10, 1fr);
-      gap: 2px;
-      margin-top: 6px;
-      /* Touch + mouse only — disable user text selection so drags don't highlight. */
+      grid-template-columns: auto auto auto;
+      gap: 8px;
+      margin-top: 8px;
+      justify-content: start;
       user-select: none;
+      -webkit-user-select: none;
     }
 
-    key-board button {
-      /* Reuse the DOS button look but smaller + no min-width. */
+    .kb-main {
+      display: grid;
+      grid-template-columns: repeat(10, 34px);
+      gap: 2px;
+    }
+
+    .kb-modifiers {
+      display: grid;
+      grid-template-columns: 80px;
+      gap: 2px;
+      align-content: start;
+    }
+
+    .kb-arrows {
+      display: grid;
+      grid-template-columns: repeat(3, 44px);
+      grid-template-rows: 34px 34px;
+      gap: 2px;
+      align-content: start;
+    }
+
+    .kb-key {
       background: #c0c0c0;
       border-top: 2px solid #fff;
       border-left: 2px solid #fff;
       border-right: 2px solid #808080;
       border-bottom: 2px solid #808080;
       font-family: inherit;
-      font-size: 12px;
-      padding: 4px 0;
+      font-size: 13px;
+      padding: 0;
+      height: 34px;
       cursor: pointer;
       color: #000;
+      touch-action: none;
     }
 
-    key-board button:active {
+    .kb-key:active,
+    .kb-key.pressed {
       border-top: 2px solid #808080;
       border-left: 2px solid #808080;
       border-right: 2px solid #fff;
       border-bottom: 2px solid #fff;
-      padding: 5px 0 3px 0;
     }
+
+    /* Space bar spans the main-section row. */
+    .kb-space { grid-column: 1 / -1; height: 28px; font-size: 11px; }
+
+    /* Arrow cluster placement: Up centered on row 1; Left/Down/Right on row 2. */
+    .kb-up    { grid-column: 2; grid-row: 1; }
+    .kb-left  { grid-column: 1; grid-row: 2; }
+    .kb-down  { grid-column: 2; grid-row: 2; }
+    .kb-right { grid-column: 3; grid-row: 2; }
+    .kb-arrow { font-size: 16px; }
 
     /* ── Group box ── */
     .group {
@@ -292,25 +300,73 @@
         <span id="status">Drop a .css file to begin</span>
         <span style="float:right" id="stats"></span>
       </div>
-      <div class="speed-meter" title="Emulation speed relative to a 4.77 MHz 8086 (100% = real hardware)">
-        <div class="speed-bar" id="speed-bar"></div>
-        <div class="speed-tick" style="left:50%"></div>
-        <div class="speed-tick" style="left:100%"></div>
-      </div>
-
       <!--
-        On-screen keyboard. Each <button> corresponds by position (:nth-child)
-        to a CSS rule emitted by CSS-DOS (transpiler/src/template.mjs
-        KEYBOARD_KEYS). ORDER MUST MATCH. If KEYBOARD_KEYS changes, update
-        both here AND the HTML footer in template.mjs.
+        On-screen keyboard. Each button has a data-key attribute set to the
+        16-bit BDA key code (scancode<<8 | ascii). The JS block below wires
+        pointerdown/pointerup → worker 'keyboard' messages.
       -->
-      <key-board>
-        <button>0</button><button>1</button><button>2</button><button>3</button><button>4</button><button>5</button><button>6</button><button>7</button><button>8</button><button>9</button>
-        <button>Q</button><button>W</button><button>E</button><button>R</button><button>T</button><button>Y</button><button>U</button><button>I</button><button>O</button><button>P</button>
-        <button>A</button><button>S</button><button>D</button><button>F</button><button>G</button><button>H</button><button>J</button><button>K</button><button>L</button><button>&#x21B5;</button>
-        <button>Z</button><button>X</button><button>C</button><button>V</button><button>B</button><button>N</button><button>M</button><button>&#x2423;</button><button>Esc</button><button>&#x2190;</button>
-        <button>&#x2193;</button><button>&#x2191;</button><button>&#x2192;</button><button>Tab</button><button>Bksp</button>
-      </key-board>
+      <div class="keyboard">
+        <div class="kb-main">
+          <button class="kb-key" data-key="0x0231">1</button>
+          <button class="kb-key" data-key="0x0332">2</button>
+          <button class="kb-key" data-key="0x0433">3</button>
+          <button class="kb-key" data-key="0x0534">4</button>
+          <button class="kb-key" data-key="0x0635">5</button>
+          <button class="kb-key" data-key="0x0736">6</button>
+          <button class="kb-key" data-key="0x0837">7</button>
+          <button class="kb-key" data-key="0x0938">8</button>
+          <button class="kb-key" data-key="0x0A39">9</button>
+          <button class="kb-key" data-key="0x0B30">0</button>
+
+          <button class="kb-key" data-key="0x1071">Q</button>
+          <button class="kb-key" data-key="0x1177">W</button>
+          <button class="kb-key" data-key="0x1265">E</button>
+          <button class="kb-key" data-key="0x1372">R</button>
+          <button class="kb-key" data-key="0x1474">T</button>
+          <button class="kb-key" data-key="0x1579">Y</button>
+          <button class="kb-key" data-key="0x1675">U</button>
+          <button class="kb-key" data-key="0x1769">I</button>
+          <button class="kb-key" data-key="0x186F">O</button>
+          <button class="kb-key" data-key="0x1970">P</button>
+
+          <button class="kb-key" data-key="0x1E61">A</button>
+          <button class="kb-key" data-key="0x1F73">S</button>
+          <button class="kb-key" data-key="0x2064">D</button>
+          <button class="kb-key" data-key="0x2166">F</button>
+          <button class="kb-key" data-key="0x2267">G</button>
+          <button class="kb-key" data-key="0x2368">H</button>
+          <button class="kb-key" data-key="0x246A">J</button>
+          <button class="kb-key" data-key="0x256B">K</button>
+          <button class="kb-key" data-key="0x266C">L</button>
+          <button class="kb-key" data-key="0x0E08">Bksp</button>
+
+          <button class="kb-key" data-key="0x2C7A">Z</button>
+          <button class="kb-key" data-key="0x2D78">X</button>
+          <button class="kb-key" data-key="0x2E63">C</button>
+          <button class="kb-key" data-key="0x2F76">V</button>
+          <button class="kb-key" data-key="0x3062">B</button>
+          <button class="kb-key" data-key="0x316E">N</button>
+          <button class="kb-key" data-key="0x326D">M</button>
+          <button class="kb-key" data-key="0x332C">,</button>
+          <button class="kb-key" data-key="0x342E">.</button>
+          <button class="kb-key" data-key="0x352F">/</button>
+
+          <button class="kb-key kb-space" data-key="0x3920">&#x2423;</button>
+        </div>
+
+        <div class="kb-modifiers">
+          <button class="kb-key" data-key="0x011B">Esc</button>
+          <button class="kb-key" data-key="0x0F09">Tab</button>
+          <button class="kb-key" data-key="0x1C0D">Enter</button>
+        </div>
+
+        <div class="kb-arrows">
+          <button class="kb-key kb-arrow kb-up"    data-key="0x4800">&#x2191;</button>
+          <button class="kb-key kb-arrow kb-left"  data-key="0x4B00">&#x2190;</button>
+          <button class="kb-key kb-arrow kb-down"  data-key="0x5000">&#x2193;</button>
+          <button class="kb-key kb-arrow kb-right" data-key="0x4D00">&#x2192;</button>
+        </div>
+      </div>
 
     </div>
   </div>
@@ -322,7 +378,6 @@
     const canvas = document.getElementById('screen-canvas');
     const ctx = canvas.getContext('2d');
     const stats = document.getElementById('stats');
-    const speedBar = document.getElementById('speed-bar');
     const btnStart = document.getElementById('btn-start');
     const btnStop = document.getElementById('btn-stop');
     const batchInput = document.getElementById('batch-size');
@@ -337,13 +392,6 @@
       if (hz >= 1_000_000) return (hz / 1_000_000).toFixed(2) + ' MHz';
       if (hz >= 1_000)     return (hz / 1_000).toFixed(1) + ' KHz';
       return hz.toFixed(0) + ' Hz';
-    }
-
-    // Map speed ratio [0, ∞) to a bar colour: green ≤0.5, yellow ≤1.0, red >1.0.
-    function speedColor(ratio) {
-      if (ratio < 0.5) return '#00a000';
-      if (ratio < 1.0) return '#c0a000';
-      return '#c02020';
     }
 
     let running = false;
@@ -408,13 +456,6 @@
           stats.textContent =
             `${totalTicks.toLocaleString()} ticks | ${tps.toFixed(0)} t/s | ` +
             `${formatHz(cps)} (${pct.toFixed(1)}% of 4.77 MHz) | ${cpt.toFixed(1)} cyc/tick`;
-
-          // Speed bar: width = min(ratio, 1) * 100%; colour shifts past thresholds.
-          // Past 100% we pin at full width but keep the colour red.
-          const ratio = cps / REAL_8086_HZ;
-          const widthPct = Math.min(ratio, 1) * 100;
-          speedBar.style.width = widthPct.toFixed(2) + '%';
-          speedBar.style.backgroundColor = speedColor(ratio);
 
           // Switch display based on BDA video mode byte (runtime source of truth).
           // A program that switches from text to Mode 13h mid-run is handled
@@ -518,7 +559,6 @@
       output.textContent = '';
       canvas.style.display = 'none';
       stats.textContent = '';
-      speedBar.style.width = '0%';
       modeBadge.style.display = 'none';
       status.textContent = `Compiling ${(cssText.length / 1024).toFixed(0)} KB...`;
       worker.postMessage({ type: 'init', css: cssText });
@@ -563,7 +603,38 @@
       if (file) readFileAndLoad(file);
     });
 
-// Auto-load from ?css=filename URL param
+    // ── On-screen keyboard ──
+    // Calcite can't evaluate :has(:active) selector matching, so we bridge
+    // the buttons to the wasm engine via JS. Each button has data-key set
+    // to (scancode<<8 | ascii); pointerdown sends the key, pointerup clears.
+    // Multi-touch: track active pointers so releasing one finger doesn't
+    // clear the key while another is still down.
+    const activePointers = new Map(); // pointerId → key code
+    function sendKey(code) {
+      if (!engineReady) return;
+      worker.postMessage({ type: 'keyboard', key: code });
+    }
+    for (const btn of document.querySelectorAll('.kb-key')) {
+      const code = parseInt(btn.dataset.key, 16);
+      btn.addEventListener('pointerdown', (e) => {
+        e.preventDefault();
+        btn.setPointerCapture(e.pointerId);
+        activePointers.set(e.pointerId, code);
+        sendKey(code);
+      });
+      const release = (e) => {
+        if (!activePointers.has(e.pointerId)) return;
+        activePointers.delete(e.pointerId);
+        if (activePointers.size === 0) sendKey(0);
+      };
+      btn.addEventListener('pointerup', release);
+      btn.addEventListener('pointercancel', release);
+      btn.addEventListener('pointerleave', release);
+      // Block browser context menu on long-press (mobile).
+      btn.addEventListener('contextmenu', (e) => e.preventDefault());
+    }
+
+    // Auto-load from ?css=filename URL param
     const cssParam = new URLSearchParams(location.search).get('css');
     if (cssParam) {
       fileName.textContent = cssParam;
