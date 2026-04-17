@@ -170,12 +170,22 @@
       gap: 2px;
     }
 
-    /* Right-hand stack: modifiers row on top, arrow cluster below. */
+    /* Right-hand stack: modifiers row on top, arrow cluster pinned to
+       the bottom-right of the available vertical space. */
     .kb-right-stack {
       display: grid;
-      grid-template-rows: auto auto;
+      grid-template-rows: auto 1fr auto;
       gap: 2px;
-      align-content: start;
+      justify-items: end;
+    }
+
+    /* Slight amber tint for Enter so it reads as a primary action. */
+    .kb-enter {
+      background: #d8c898;
+    }
+    .kb-enter:active,
+    .kb-enter.pressed {
+      background: #b8a878;
     }
 
     /* Esc | Tab | Enter in one row, spanning the same width as the arrows. */
@@ -191,6 +201,7 @@
       grid-template-rows: 34px 34px;
       gap: 2px;
       width: 165px; /* fixed so the row stays clickable even on narrow screens */
+      grid-row: 3; /* bottom of the right-stack */
     }
 
     .kb-key {
@@ -347,7 +358,7 @@
           <button class="kb-key" data-key="0x246A">J</button>
           <button class="kb-key" data-key="0x256B">K</button>
           <button class="kb-key" data-key="0x266C">L</button>
-          <button class="kb-key" data-key="0x0E08">Bksp</button>
+          <button class="kb-key kb-enter" data-key="0x1C0D">Enter</button>
 
           <button class="kb-key" data-key="0x2C7A">Z</button>
           <button class="kb-key" data-key="0x2D78">X</button>
@@ -367,7 +378,7 @@
           <div class="kb-modifiers">
             <button class="kb-key" data-key="0x011B">Esc</button>
             <button class="kb-key" data-key="0x0F09">Tab</button>
-            <button class="kb-key" data-key="0x1C0D">Enter</button>
+            <button class="kb-key" data-key="0x0E08">Bksp</button>
           </div>
 
           <div class="kb-arrows">
