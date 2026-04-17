@@ -5,12 +5,11 @@
  *   Main → Worker:
  *     { type: 'init', css: string }       — parse and compile CSS
  *     { type: 'tick', count: number }      — run N ticks, return output
- *     { type: 'keyboard', key: number }    — update keyboard state
  *
  *   Worker → Main:
  *     { type: 'ready', video: { text, gfx } }
  *         text/gfx: {addr,size,width,height}|null
- *     { type: 'tick-result', stringProperties, screen, gfxBytes, ticks }
+ *     { type: 'tick-result', stringProperties, screen, gfxBytes, ticks, cycles, videoMode }
  *         screen  : text-mode rendered string (if text mode detected)
  *         gfxBytes: Uint8ClampedArray.buffer of RGBA pixels (if gfx mode)
  *     { type: 'error', message: string }
@@ -61,6 +60,7 @@ self.onmessage = async function (event) {
         }
         engine.tick_batch(data.count || 1);
         const stringProps = JSON.parse(engine.get_string_properties());
+        const cycles = engine.get_state_var('cycleCount') >>> 0;
 
         // Read current video mode from BDA (0x0449). This is the runtime
         // source of truth: what INT 10h AH=00h last wrote. The runner uses
@@ -98,16 +98,10 @@ self.onmessage = async function (event) {
             gfxBytes,
             videoMode,
             ticks: data.count || 1,
+            cycles,
           },
           transfer,
         );
-        break;
-      }
-
-      case 'keyboard': {
-        if (engine) {
-          engine.set_keyboard(data.key || 0);
-        }
         break;
       }
 
