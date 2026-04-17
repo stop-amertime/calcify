@@ -153,35 +153,44 @@
        Buttons are wired to the calcite wasm engine via JS pointer events
        (see script block). The generated CSS also has :has(button:active)
        rules — those only matter when the .css is opened in Chrome directly. */
+    /* Two columns: main letter block on the left flexes to fill remaining
+       width; right column stacks modifiers above the arrow cluster. */
     .keyboard {
       display: grid;
-      grid-template-columns: auto auto auto;
+      grid-template-columns: 1fr auto;
       gap: 8px;
       margin-top: 8px;
-      justify-content: start;
       user-select: none;
       -webkit-user-select: none;
     }
 
     .kb-main {
       display: grid;
-      grid-template-columns: repeat(10, 34px);
+      grid-template-columns: repeat(10, 1fr);
       gap: 2px;
     }
 
-    .kb-modifiers {
+    /* Right-hand stack: modifiers row on top, arrow cluster below. */
+    .kb-right-stack {
       display: grid;
-      grid-template-columns: 80px;
+      grid-template-rows: auto auto;
       gap: 2px;
       align-content: start;
+    }
+
+    /* Esc | Tab | Enter in one row, spanning the same width as the arrows. */
+    .kb-modifiers {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 2px;
     }
 
     .kb-arrows {
       display: grid;
-      grid-template-columns: repeat(3, 44px);
+      grid-template-columns: repeat(3, 1fr);
       grid-template-rows: 34px 34px;
       gap: 2px;
-      align-content: start;
+      width: 165px; /* fixed so the row stays clickable even on narrow screens */
     }
 
     .kb-key {
@@ -354,17 +363,19 @@
           <button class="kb-key kb-space" data-key="0x3920">&#x2423;</button>
         </div>
 
-        <div class="kb-modifiers">
-          <button class="kb-key" data-key="0x011B">Esc</button>
-          <button class="kb-key" data-key="0x0F09">Tab</button>
-          <button class="kb-key" data-key="0x1C0D">Enter</button>
-        </div>
+        <div class="kb-right-stack">
+          <div class="kb-modifiers">
+            <button class="kb-key" data-key="0x011B">Esc</button>
+            <button class="kb-key" data-key="0x0F09">Tab</button>
+            <button class="kb-key" data-key="0x1C0D">Enter</button>
+          </div>
 
-        <div class="kb-arrows">
-          <button class="kb-key kb-arrow kb-up"    data-key="0x4800">&#x2191;</button>
-          <button class="kb-key kb-arrow kb-left"  data-key="0x4B00">&#x2190;</button>
-          <button class="kb-key kb-arrow kb-down"  data-key="0x5000">&#x2193;</button>
-          <button class="kb-key kb-arrow kb-right" data-key="0x4D00">&#x2192;</button>
+          <div class="kb-arrows">
+            <button class="kb-key kb-arrow kb-up"    data-key="0x4800">&#x2191;</button>
+            <button class="kb-key kb-arrow kb-left"  data-key="0x4B00">&#x2190;</button>
+            <button class="kb-key kb-arrow kb-down"  data-key="0x5000">&#x2193;</button>
+            <button class="kb-key kb-arrow kb-right" data-key="0x4D00">&#x2192;</button>
+          </div>
         </div>
       </div>
 
