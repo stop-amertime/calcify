@@ -22,6 +22,8 @@ pub mod pattern;
 pub mod state;
 /// Runtime loop-period detector and affine projector.
 pub mod tick_period;
+/// Signature-based cycle detector (experimental, WIP — projection bug).
+pub mod cycle_tracker;
 /// IR type definitions — expressions, assignments, programs.
 pub mod types;
 

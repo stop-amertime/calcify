@@ -292,6 +292,24 @@ pub enum Op {
         addr_slot: Slot,
         src: Slot,
     },
+
+    /// Bulk byte-fill:
+    ///   state.memory[slots[dst_slot] .. slots[dst_slot] + slots[count_slot]]
+    ///     = (slots[val_slot] & 0xFF) as u8
+    /// After executing:
+    ///   slots[dst_slot] += slots[count_slot];
+    ///   slots[count_slot] = 0;
+    ///   pc = exit_target;
+    ///
+    /// Emitted by the memory-fill peephole / CSS-level pattern in place of
+    /// a recognised byte-fill loop. The bulk path skips write_log
+    /// instrumentation (diagnostic-only; documented in the design spec).
+    MemoryFill {
+        dst_slot: Slot,
+        val_slot: Slot,
+        count_slot: Slot,
+        exit_target: u32,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -3360,6 +3378,7 @@ fn op_slots_read(op: &Op) -> Vec<Slot> {
         Op::DispatchFlatArray { key, .. } => vec![*key],
         Op::StoreState { src, .. } => vec![*src],
         Op::StoreMem { addr_slot, src, .. } => vec![*addr_slot, *src],
+        Op::MemoryFill { dst_slot, val_slot, count_slot, .. } => vec![*dst_slot, *val_slot, *count_slot],
     }
 }
 
@@ -3400,7 +3419,7 @@ fn op_dst(op: &Op) -> Option<Slot> {
         | Op::AndLit { dst, .. } | Op::ShrLit { dst, .. } | Op::ShlLit { dst, .. }
         | Op::ModLit { dst, .. } => Some(*dst),
         Op::LoadStateAndBranchIfNotEqLit { dst, .. } => Some(*dst),
-        Op::BranchIfZero { .. } | Op::BranchIfNotEqLit { .. } | Op::Jump { .. } | Op::DispatchChain { .. } | Op::StoreState { .. } | Op::StoreMem { .. } => {
+        Op::BranchIfZero { .. } | Op::BranchIfNotEqLit { .. } | Op::Jump { .. } | Op::DispatchChain { .. } | Op::StoreState { .. } | Op::StoreMem { .. } | Op::MemoryFill { .. } => {
             None
         }
     }
@@ -3523,6 +3542,11 @@ fn map_op_slots(op: &mut Op, slot_map: &mut HashMap<Slot, Slot>, alloc: &mut Slo
             *addr_slot = alloc.get_or_alloc(*addr_slot, slot_map);
             *src = alloc.get_or_alloc(*src, slot_map);
         }
+        Op::MemoryFill { dst_slot, val_slot, count_slot, .. } => {
+            *dst_slot = alloc.get_or_alloc(*dst_slot, slot_map);
+            *val_slot = alloc.get_or_alloc(*val_slot, slot_map);
+            *count_slot = alloc.get_or_alloc(*count_slot, slot_map);
+        }
     }
 }
 
@@ -3576,6 +3600,7 @@ fn seed_from_parent(
         Op::DispatchFlatArray { key, .. } => { seed(*key); }
         Op::StoreState { src, .. } => { seed(*src); }
         Op::StoreMem { addr_slot, src } => { seed(*addr_slot); seed(*src); }
+        Op::MemoryFill { dst_slot, val_slot, count_slot, .. } => { seed(*dst_slot); seed(*val_slot); seed(*count_slot); }
     }
 }
 
@@ -3696,6 +3721,18 @@ pub fn execute(program: &CompiledProgram, state: &mut State, slots: &mut Vec<i32
 /// - All branch/jump targets are <= ops.len() (fuse_cmp_branch adjusts them,
 ///   compile_style_condition_linear uses placeholders patched after the fact).
 /// - Dispatch table_id is always a valid index into dispatch_tables.
+/// Thin wrapper around `exec_ops` with empty ancillary tables. Used by
+/// tests that drive the evaluator with a hand-constructed op stream,
+/// bypassing parse/compile. Exposed via `#[doc(hidden)]` rather than
+/// `#[cfg(test)]` so integration tests in `tests/` can call it.
+#[doc(hidden)]
+pub fn exec_ops_for_test(ops: &[Op], state: &mut State, slots: &mut [i32]) {
+    let dispatch_tables: Vec<CompiledDispatchTable> = Vec::new();
+    let chain_tables: Vec<DispatchChainTable> = Vec::new();
+    let flat_dispatch_arrays: Vec<FlatDispatchArray> = Vec::new();
+    exec_ops(ops, &dispatch_tables, &chain_tables, &flat_dispatch_arrays, state, slots);
+}
+
 fn exec_ops(
     ops: &[Op],
     dispatch_tables: &[CompiledDispatchTable],
@@ -3962,6 +3999,23 @@ fn exec_ops(
             }
             Op::StoreMem { addr_slot, src } => {
                 state.write_mem(sload!(*addr_slot), sload!(*src));
+            }
+            Op::MemoryFill { dst_slot, val_slot, count_slot, exit_target } => {
+                let dst = sload!(*dst_slot);
+                let count = sload!(*count_slot);
+                let val_byte = (sload!(*val_slot) & 0xFF) as u8;
+                let mem_len = state.memory.len();
+                if count > 0 && dst >= 0 && (dst as usize) < mem_len {
+                    let lo = dst as usize;
+                    let hi = (dst as i64 + count as i64).min(mem_len as i64) as usize;
+                    if hi > lo {
+                        state.memory[lo..hi].fill(val_byte);
+                    }
+                }
+                sstore!(*dst_slot, dst.wrapping_add(count));
+                sstore!(*count_slot, 0i32);
+                pc = *exit_target as usize;
+                continue;
             }
         }
         pc += 1;
@@ -4365,6 +4419,24 @@ fn exec_ops_profiled(
             Op::StoreMem { addr_slot, src } => {
                 count_op!(profile, "StoreMem");
                 state.write_mem(slots[*addr_slot as usize], slots[*src as usize]);
+            }
+            Op::MemoryFill { dst_slot, val_slot, count_slot, exit_target } => {
+                count_op!(profile, "MemoryFill");
+                let dst = slots[*dst_slot as usize];
+                let count = slots[*count_slot as usize];
+                let val_byte = (slots[*val_slot as usize] & 0xFF) as u8;
+                let mem_len = state.memory.len();
+                if count > 0 && dst >= 0 && (dst as usize) < mem_len {
+                    let lo = dst as usize;
+                    let hi = (dst as i64 + count as i64).min(mem_len as i64) as usize;
+                    if hi > lo {
+                        state.memory[lo..hi].fill(val_byte);
+                    }
+                }
+                slots[*dst_slot as usize] = dst.wrapping_add(count);
+                slots[*count_slot as usize] = 0;
+                pc = *exit_target as usize;
+                continue;
             }
         }
         pc += 1;
@@ -4822,6 +4894,37 @@ pub fn exec_ops_traced(
                 let addr = slots[*addr_slot as usize]; let val = slots[*src as usize];
                 state.write_mem(addr, val);
                 if should_trace { trace.push(TraceEntry { pc, op: format!("StoreMem addr={}({}) src={}({})", addr_slot, addr, src, val), dst_slot: None, dst_value: None, inputs: vec![(*addr_slot, addr), (*src, val)], branch_taken: None, depth }); }
+            }
+            Op::MemoryFill { dst_slot, val_slot, count_slot, exit_target } => {
+                let dst = slots[*dst_slot as usize];
+                let count = slots[*count_slot as usize];
+                let val = slots[*val_slot as usize];
+                let val_byte = (val & 0xFF) as u8;
+                let mem_len = state.memory.len();
+                if count > 0 && dst >= 0 && (dst as usize) < mem_len {
+                    let lo = dst as usize;
+                    let hi = (dst as i64 + count as i64).min(mem_len as i64) as usize;
+                    if hi > lo {
+                        state.memory[lo..hi].fill(val_byte);
+                    }
+                }
+                let new_dst = dst.wrapping_add(count);
+                slots[*dst_slot as usize] = new_dst;
+                slots[*count_slot as usize] = 0;
+                if should_trace {
+                    trace.push(TraceEntry {
+                        pc,
+                        op: format!("MemoryFill dst={}({}) val={}({:#x}) count={}({}) → exit={}",
+                            dst_slot, dst, val_slot, val_byte, count_slot, count, exit_target),
+                        dst_slot: Some(*dst_slot),
+                        dst_value: Some(new_dst),
+                        inputs: vec![(*dst_slot, dst), (*val_slot, val), (*count_slot, count)],
+                        branch_taken: None,
+                        depth,
+                    });
+                }
+                pc = *exit_target as usize;
+                continue;
             }
         }
         pc += 1;
