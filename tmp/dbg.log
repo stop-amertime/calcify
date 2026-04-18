@@ -1,0 +1,57 @@
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.08s
+     Running `target\release\calcite-debugger.exe -i output/bootle-ctest.css`
+Loading output/bootle-ctest.css...
+Parsing [=>                            ]   6.3%  16750550/266259078  0.1s                    Parsing [===>                          ]  12.9%  34411252/266259078  0.2s                    Parsing [=====>                        ]  19.3%  51307844/266259078  0.3s                    Parsing [=======>                      ]  26.1%  69617908/266259078  0.4s                    Parsing [============>                 ]  40.2%  106944896/266259078  0.9s                    Parsing [=======================>      ]  77.3%  205818878/266259078  2.5s                    Parsing [=============================>] 100.0%  266258991/266259078  2.6s                    Parsing [==============================] 100.0%  266259078/266259078  2.6s                    
+Parsed: 820163 @property, 65 @function, 1640419 assignments (2.58s)
+Compiling [>                             ]   0.0%  12/820259  0.2s                    Compiling [>                             ]   0.0%  109/820259  0.3s                    Compiling [>                             ]   0.0%  115/820259  0.4s                    Compiling [==============================] 100.0%  820259/820259  0.8s                    Compiling [==============================] 100.0%  820259/820259  0.8s                    
+Compiled in 5.57s
+Video memory detected at 0xB8000 (4000 bytes)
+Debug server listening on http://localhost:3333
+
+Endpoints:
+  GET  /info              — session info and available endpoints
+  GET  /state             — current registers + computed properties
+  POST /tick              — advance ticks: {"count": N}
+  POST /seek              — seek to tick: {"tick": N}
+  POST /memory            — read memory: {"addr": N, "len": N}
+  POST /screen            — render screen: {"addr": 0xB8000, "width": 80, "height": 25}
+  POST /compare           — compare vs reference: {"reference": [...]}
+  POST /compare-state     — diff current state vs supplied registers/memory
+  POST /key               — set keyboard buffer (BDA): {"value": (scancode<<8)|ascii}
+  POST /keyboard          — set --keyboard CSS property: {"value": (scancode<<8)|ascii}
+  GET  /compare-paths     — diff compiled vs interpreted for current tick
+  POST /trace-property    — trace compiled ops for a property: {"property": "--memAddr"}
+  POST /snapshot          — create snapshot at current tick
+  GET  /snapshots         — list all snapshots
+[seek] 0 -> 1000000 (5.124s)
+[seek] 1000000 -> 1000001 (0.000s)
+[seek] 1000001 -> 1000002 (0.000s)
+[seek] 1000002 -> 1000003 (0.000s)
+[seek] 1000003 -> 1000004 (0.000s)
+[seek] 1000004 -> 1000005 (0.000s)
+[seek] 1000005 -> 1000006 (0.000s)
+[seek] 1000006 -> 1000007 (0.000s)
+[seek] 1000007 -> 1000008 (0.000s)
+[seek] 1000008 -> 1000009 (0.000s)
+[seek] 1000009 -> 1000010 (0.000s)
+[seek] 1000010 -> 1000011 (0.000s)
+[seek] 1000011 -> 1000012 (0.000s)
+[seek] 1000012 -> 1000013 (0.000s)
+[seek] 1000013 -> 1000014 (0.000s)
+[seek] 1000014 -> 1000015 (0.000s)
+[seek] 1000015 -> 1000016 (0.000s)
+[seek] 1000016 -> 1000017 (0.000s)
+[seek] 1000017 -> 1000018 (0.000s)
+[seek] 1000018 -> 1000019 (0.000s)
+[seek] 1000019 -> 1000020 (0.000s)
+[seek] 1000020 -> 1000021 (0.000s)
+[seek] 1000021 -> 1000022 (0.000s)
+[seek] 1000022 -> 1000023 (0.000s)
+[seek] 1000023 -> 1000024 (0.000s)
+[seek] 1000024 -> 1000025 (0.000s)
+[seek] 1000025 -> 1000026 (0.000s)
+[seek] 1000026 -> 1000027 (0.000s)
+[seek] 1000027 -> 1000028 (0.000s)
+[seek] 1000028 -> 1000029 (0.000s)
+[seek] 1000029 -> 1000030 (0.000s)
+Shutdown requested

@@ -1,0 +1,27 @@
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.07s
+     Running `target\release\calcite-debugger.exe -i output/bootle-ctest.css`
+Loading output/bootle-ctest.css...
+Parsing [==>                           ]   6.7%  17900714/266259078  0.1s                    Parsing [===>                          ]  13.3%  35499668/266259078  0.2s                    Parsing [=====>                        ]  20.0%  53212314/266259078  0.3s                    Parsing [============>                 ]  40.2%  106944896/266259078  0.8s                    Parsing [=======================>      ]  77.3%  205818878/266259078  2.3s                    Parsing [=============================>] 100.0%  266258991/266259078  2.5s                    Parsing [==============================] 100.0%  266259078/266259078  2.5s                    
+Parsed: 820163 @property, 65 @function, 1640419 assignments (2.46s)
+Compiling [>                             ]   0.0%  12/820259  0.1s                    Compiling [>                             ]   0.0%  108/820259  0.2s                    Compiling [>                             ]   0.0%  115/820259  0.4s                    Compiling [==============================] 100.0%  820259/820259  0.7s                    Compiling [==============================] 100.0%  820259/820259  0.7s                    
+Compiled in 4.71s
+Video memory detected at 0xB8000 (4000 bytes)
+Debug server listening on http://localhost:3333
+
+Endpoints:
+  GET  /info              — session info and available endpoints
+  GET  /state             — current registers + computed properties
+  POST /tick              — advance ticks: {"count": N}
+  POST /seek              — seek to tick: {"tick": N}
+  POST /memory            — read memory: {"addr": N, "len": N}
+  POST /screen            — render screen: {"addr": 0xB8000, "width": 80, "height": 25}
+  POST /compare           — compare vs reference: {"reference": [...]}
+  POST /compare-state     — diff current state vs supplied registers/memory
+  POST /key               — set keyboard buffer (BDA): {"value": (scancode<<8)|ascii}
+  POST /keyboard          — set --keyboard CSS property: {"value": (scancode<<8)|ascii}
+  GET  /compare-paths     — diff compiled vs interpreted for current tick
+  POST /trace-property    — trace compiled ops for a property: {"property": "--memAddr"}
+  POST /snapshot          — create snapshot at current tick
+  GET  /snapshots         — list all snapshots
+[watchpoint] addr=0xaf9ff changed at tick 1828538 (26.503s, 1828538 ticks)
+Shutdown requested
