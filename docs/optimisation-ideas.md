@@ -270,7 +270,147 @@ If chasing the 100× systematically:
    against a clean baseline.
 6. (e) value-keyed memoisation — only if (c) turns out not to generalise
    well, or as an additional layer beneath it.
+7. (g) predictive event scheduling — extends PR-1-class bulk-op
+   collapse to work even when periodic interrupts interleave.
+   Additive to whatever bulk-op detectors ship (fill, memcpy, blit).
+   Deferred until after PR 1–3 land and we have real numbers to
+   measure a speculation framework against.
 
 Each step has its own verification plan (register-state diff at fixed
 ticks, plus conformance comparison against a reference emulator where
 the CSS boots cleanly with `fulldiff.mjs`).
+
+---
+
+## (g) Predictive event-driven scheduling: enmesh bulk ops with periodic interrupts
+
+**Status**: idea. 2026-04-18.
+
+**The observation.** The program isn't running "N cycles of A, then 1
+cycle of B, then N cycles of A." It's running **two deterministic
+processes concurrently, interleaved**. For a splash clear with a timer
+IRQ on:
+
+- **A**: a tight fill loop. Each iteration writes one byte at a known
+  address offset and costs a known number of CPU cycles (modulo minor
+  variance from memory-access timing).
+- **B**: a timer IRQ. Fires every T PIT cycles. Runs `int 8` (increment
+  BDA tick count, EOI, iret) — also deterministic, also known cost.
+
+The interleaving — *which byte of A gets written between which pair of
+B invocations* — is algebra, not simulation. If A writes byte `i` at
+global cycle `c0 + i·k` and B fires at cycles `T, 2T, 3T, …`, the
+positions where A yields to B are computable in closed form.
+
+Today's bulk-fill detector (PR 1 of `2026-04-18-bulk-ops.md`) is the
+degenerate case: "assume B never fires during A, do A natively,
+resume." It works for the splash because the fill typically completes
+inside one timer window. The generalisation is: **keep the bulk-fill
+collapse, but allow B to slot into it at predicted cycle offsets**.
+
+**Prior art.** This is "event-driven scheduling" / "lazy synchronisation"
+from emulator design. FCEUX runs the NES CPU forward to the next PPU
+event, then catches the PPU up, rather than stepping both in lockstep.
+MAME does the same with subordinate chips. In JIT terms it's also a
+cousin of trace speculation (PyPy, LuaJIT): trace the hot path
+assuming nothing interesting happens, bail out if something does.
+
+**Mechanism sketch.**
+
+1. Detector recognises a bulk op (today: fill) — same as PR 1.
+2. Evaluator, on each tick where `--bulkOpKind` is active, asks: "how
+   many *logical* fill iterations can happen before the next scheduled
+   event?"
+   - Scheduled events come from `cycle_tracker.rs` / `tick_period.rs`:
+     the PIT period, any pending masked-unmask transitions, DMA
+     deadlines, etc. Whatever periodic state already exists as
+     observable CSS state.
+   - "Logical iteration cost" comes from the CSS cycle cost of the
+     bulk op — already tracked.
+3. Run the fill natively for that many iterations (a slice of
+   `memory.fill`, not the whole range).
+4. Advance the cycle counter by `n · k`, fire the next event (run the
+   IRQ handler's bytecode as normal), return.
+5. Repeat until the fill completes.
+
+**Why this matters beyond "fill faster with IRQs on."** It generalises:
+
+- memcpy / blit vs. scan-line ticks in mode-change programs.
+- Any tight compute loop with a periodic external observer
+  (keyboard poll, timer, vertical-retrace flag).
+- The framework for PR 2 / PR 3 to remain fast even when the guest
+  turns IRQs on during graphics setup.
+
+It's the difference between "we made one loop faster when it's
+isolated" and "the JIT stops pretending it has to simulate time
+linearly whenever anything interrupts anything."
+
+**Hard parts, in order of gnarliness.**
+
+1. **Cost-of-iteration estimation.** The bulk-fill detector sees a CSS
+   *shape*, not the original REP STOSB. To know "each logical byte
+   costs C CPU cycles" we'd need either (a) a per-binding
+   cycle-cost annotation emitted structurally by the CSS (risk: cardinal
+   rule — probably fine because cycle cost is an honest observable),
+   or (b) a measurement from running the same fill cold once and
+   extrapolating. (b) is hacky but genericity-safe.
+
+2. **Event-set stability.** "Next event at cycle E" requires the set
+   of pending events not to change during the bulk run. The obvious
+   stabilisers are PIT register writes (would change T), PIC mask
+   writes (would enable/disable interrupts), or the guest changing IF.
+   All observable as state-var writes. Approach: speculation + bailout.
+   Assume stable, run the slice, verify nothing that affects event
+   timing was touched during the slice. If it was, bail out and run
+   those ticks normally. This is standard trace-JIT deopt.
+
+3. **IRQ handler side effects into the bulk region.** If the IRQ
+   handler writes to the VGA buffer the fill is targeting, the fill's
+   speculation is invalidated for that overlap. Detectable: the
+   handler's bytecode has StoreMem / broadcast writes whose target
+   slots intersect the binding's `addr_range`. Approach: pre-analyse
+   the handler's write footprint at compile time; if it overlaps any
+   known bulk-fill range, disable speculation for that (binding,
+   handler) pair. Again structural, not x86-specific.
+
+4. **Nested events.** Two periodic interrupts with different periods
+   (timer + keyboard, say) mean the "next event" changes on every
+   iteration. Priority-queue scheduling, same as any discrete-event
+   simulator.
+
+**Genericity check.**
+
+- Does the mechanism reference x86 specifics? No — it references
+  "scheduled events" (observable CSS state transitions at known
+  cycles) and "bulk ops" (already-detected CSS patterns). Whether
+  the event is an IRQ or a DMA completion or a video-mode change is
+  opaque to the scheduler.
+- Does it work on bytecode shape? Yes — the bulk-op bindings are
+  shape-derived, the event schedule comes from the existing
+  `cycle_tracker` / `tick_period` infrastructure which is also
+  shape-derived.
+- Could it fire on an unrelated CSS program? In principle yes —
+  any CSS with a bulk op + a periodic state driver has the same
+  shape. (No such program exists yet, but that's a popularity problem,
+  not a genericity one.)
+
+**Why this is NOT PR 1.** PR 1 is the zero-speculation case and ships
+a measurable speedup on its own. Predictive scheduling is strictly
+additive: it extends PR 1's fast path from "isolated bulk op" to
+"bulk op enmeshed with scheduled events." Build PR 1, PR 2, PR 3 first
+— measurable numbers matter — then reach for this. The intellectual
+payoff is large enough that it deserves its own design doc when we
+pick it up: speculation policy, bailout triggers, handler-footprint
+analysis, and the cost-model for iteration time.
+
+**Verification plan sketch.**
+
+- Microbenchmark: synthetic CSS with a bulk fill + a fake periodic
+  state-var driver ("every 1000 ticks, increment `--fakeIrq`").
+  Confirm: (a) bulk collapses, (b) fakeIrq increments at the right
+  positions during the collapsed range, (c) final memory matches a
+  tick-by-tick reference run bit-exactly.
+- Real workload: splash clear with timer IRQ enabled. Measure halt
+  tick before/after and register-state-diff vs. `fulldiff.mjs`.
+- Stress: same workload but with the guest writing to the PIT
+  mid-fill, to exercise the bailout path.
