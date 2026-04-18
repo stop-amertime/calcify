@@ -258,6 +258,149 @@ reads by address when the address is a compile-time literal.
 
 ---
 
+---
+
+## (h) Multi-thread independent components of the CSS graph
+
+**Status**: idea. 2026-04-18.
+
+**The conceptual framing.** Interrupts exist because a real 8086 has
+one execution unit. Two logically concurrent things (CPU work + timer
+counting + keyboard scanning + CRTC scan-out + Adlib synthesis) have
+to be time-sliced onto that one unit, and the IRQ mechanism is the
+compatibility wrapper around it. On a modern host with 8+ cores, that
+fiction is avoidable. The CSS graph already expresses all of these as
+independent per-tick assignments; the physical parallelism is there,
+calcite just evaluates it serially.
+
+This is a **different idea** from (g). (g) keeps one logical execution
+thread and recovers speed by not simulating time linearly. (h) is
+architectural: partition the assignment graph into groups that touch
+disjoint state, run each group on a host thread, join at tick end.
+
+**Where it pays off.** Coarse-grained independent components. In a DOS
+system the CPU, timer, keyboard controller, CRTC, and Adlib (if
+present) are physically separate chips with disjoint read/write
+footprints in CSS. Today they're all in one serially-evaluated graph;
+the CRTC's per-tick scan update runs before the CPU's per-tick
+instruction step even though neither reads the other's outputs.
+Threading them lets those evaluations overlap.
+
+**Where it does NOT pay off.**
+
+- Bulk-op collapse (PR 1–3). Native `memory.fill` is already
+  memory-bandwidth-limited; parallelism adds lock overhead without
+  asymptotic gain. Use (g) for bulk-op + IRQ enmeshing, not threads.
+- The hot CPU-instruction path itself. It's a single logical thread of
+  execution inside the CSS — the opcode dispatch, ALU update, flag
+  compute, state write all feed into each other. No internal
+  parallelism to exploit.
+- Programs with only a CPU and no peripherals running concurrently
+  (e.g. a pure-compute `.com` with interrupts masked).
+
+**Mechanism sketch.**
+
+1. After parsing + pattern recognition, partition the assignment DAG
+   into "components": maximal subgraphs whose assignments' read/write
+   footprints are disjoint from every other component's within the
+   same tick.
+   - Component identification is purely structural: take the
+     dependency graph calcite already builds for topological sort;
+     find weakly-connected components keyed on memory-region overlap
+     rather than just Var references.
+   - Typical partition on CSS-DOS output: `{CPU core + memory cells
+     touched by it}`, `{timer state}`, `{keyboard state}`,
+     `{CRTC/VGA scan}`, `{each Adlib voice}`. Empirically 3–6
+     components for a typical program.
+2. Compile each component into its own `CompiledProgram`-equivalent.
+3. Per tick: spawn N threads (or use a fixed pool), each runs one
+   component's ops against its share of the state, join.
+4. Cross-component communication happens only at tick boundaries,
+   same as Chrome's "all @property assignments resolve together."
+
+**Genericity check.**
+
+- Does the mechanism reference x86 specifics? No — it references
+  assignment read/write footprints, which are bytecode-structural.
+- Does it work on any CSS? Yes — a CSS program with only one
+  component gets one thread and degrades gracefully to today's serial
+  behaviour.
+- Does the partition algorithm bake in DOS knowledge? No — it runs on
+  the dependency graph, not on property names like `--PIT0` or
+  `--vgaAddr`.
+
+**Hard parts, in order of gnarliness.**
+
+1. **Footprint analysis accuracy.** The partition is only safe if
+   per-component write footprints really are disjoint. Static
+   footprints are conservative but may over-connect (treating a
+   broadcast-write port as "touches all of memory" would collapse
+   everything into one component). Need the same
+   dispatch-table/broadcast-write analysis that's already there, plus
+   a notion of "this op writes address X where X is a compile-time
+   constant or a slot with a bounded range."
+
+2. **Thread-pool overhead vs. per-tick cost.** A typical tick in
+   bootle-ctest executes ~6000 ops in microseconds. Spawning and
+   joining threads every tick is probably more expensive than the
+   work. Mitigation: persistent worker threads, lock-free tick-start
+   broadcasts (condvar or futex-based barrier). This is standard
+   thread-pool territory but gets the design right or it loses.
+
+3. **Memory layout for false-sharing avoidance.** If two components
+   write into adjacent bytes of `state.memory`, the host CPU's cache
+   lines ping-pong between cores and throughput collapses. The
+   partition should ideally align component footprints to cache-line
+   boundaries — non-trivial because calcite doesn't control the CSS
+   memory layout.
+
+4. **Shared-read hot spots.** The PIT tick counter, for example, is
+   read by many consumers and written by one. Classic reader-writer
+   pattern. Fine in principle, but in practice means (a) the PIT is
+   its own component, (b) its writes happen at tick boundaries so
+   readers in the next tick see a consistent value.
+
+5. **Conformance debugging gets harder.** When calcite and Chrome
+   disagree, serial evaluation at least makes the divergence
+   reproducible. Threaded evaluation is deterministic only if the
+   join barrier is airtight and no component observes another's
+   mid-tick state. A bug in the partition could manifest as
+   non-deterministic test failures — the worst kind.
+
+**Why this is NOT PR 1 or (g).** PR 1 ships a concrete speedup on a
+known bottleneck. (g) extends it additively. (h) is an architectural
+shift that touches the evaluator's core execution model. It should be
+gated on: (a) a demonstration that some real program has enough
+independent components for threading to help more than it hurts
+(probably something with active Adlib music), (b) a benchmark showing
+thread-pool overhead is amortised across meaningful per-component
+work.
+
+**Philosophical note.** (h) is the cleanest expression of "calcite as
+a JIT that recovers the parallelism the CSS graph already describes."
+Chrome evaluates ~1 M property assignments per tick in parallel
+natively; calcite today linearises them. Threading the independent
+components is the first step toward recovering that parallelism on
+the host side. The asymptotic end-state isn't "a fast serial emulator"
+— it's "a multi-core evaluator whose per-tick cost scales with the
+deepest dependency chain rather than the total op count."
+
+**Verification plan sketch.**
+
+- Microbenchmark: synthetic CSS with two disjoint compute-bound
+  components. Confirm: (a) partition identifies two components,
+  (b) threaded execution is ~1.7×+ faster than serial on a 2+ core
+  host, (c) tick-by-tick state matches the serial run bit-exactly
+  over 100K ticks.
+- Real workload: a DOS program with active timer + keyboard polling +
+  CRTC scan (any long-boot program, really). Measure: component
+  count, per-component op distribution, threaded vs serial
+  throughput, host CPU utilisation.
+- Stress: run with ThreadSanitizer / LLVM race detector for a
+  sustained session to catch any unintended cross-component reads.
+
+---
+
 ## Stacking order
 
 If chasing the 100× systematically:
@@ -275,6 +418,12 @@ If chasing the 100× systematically:
    Additive to whatever bulk-op detectors ship (fill, memcpy, blit).
    Deferred until after PR 1–3 land and we have real numbers to
    measure a speculation framework against.
+8. (h) multi-thread independent components — architectural shift,
+   recovers the parallelism the CSS graph already describes. Orthogonal
+   to the serial-path work above; gate on a real workload that proves
+   coarse-grained independence exists in emulated-chip CSS (timer +
+   keyboard + CRTC + Adlib all running at once). Biggest conceptual
+   payoff, highest risk of non-deterministic bugs.
 
 Each step has its own verification plan (register-state diff at fixed
 ticks, plus conformance comparison against a reference emulator where
