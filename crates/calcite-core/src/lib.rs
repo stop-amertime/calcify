@@ -20,6 +20,8 @@ pub mod parser;
 pub mod pattern;
 /// Machine state — registers and memory.
 pub mod state;
+/// Runtime loop-period detector and affine projector.
+pub mod tick_period;
 /// IR type definitions — expressions, assignments, programs.
 pub mod types;
 

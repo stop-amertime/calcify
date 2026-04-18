@@ -15,3 +15,35 @@ crossterm = "0.28"
 [[bin]]
 name = "calcite-bench"
 path = "src/bench.rs"
+
+[[bin]]
+name = "probe-splash-memo"
+path = "src/bin/probe_splash_memo.rs"
+
+[[bin]]
+name = "probe-splash-trace"
+path = "src/bin/probe_splash_trace.rs"
+
+[[bin]]
+name = "probe-splash-affine"
+path = "src/bin/probe_splash_affine.rs"
+
+[[bin]]
+name = "probe-splash-period"
+path = "src/bin/probe_splash_period.rs"
+
+[[bin]]
+name = "probe-splash-project"
+path = "src/bin/probe_splash_project.rs"
+
+[[bin]]
+name = "probe-full-vs-sub"
+path = "src/bin/probe_full_vs_sub.rs"
+
+[[bin]]
+name = "probe-cyclic-slots"
+path = "src/bin/probe_cyclic_slots.rs"
+
+[[bin]]
+name = "probe-regions"
+path = "src/bin/probe_regions.rs"

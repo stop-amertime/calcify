@@ -55,6 +55,14 @@ pub struct State {
     pub string_properties: std::collections::HashMap<String, String>,
     /// Tick counter (incremented each evaluation cycle).
     pub frame_counter: u32,
+    /// Optional per-tick read log. When the inner `Option` is `Some`, every
+    /// `read_mem`/`read_mem16` call appends `(addr, value)`. `None` = no
+    /// overhead beyond a single `is_some()` check. Interior mutability so
+    /// `read_mem(&self)` can log without changing its signature.
+    pub read_log: std::cell::RefCell<Option<Vec<(i32, i32)>>>,
+    /// Optional per-tick write log. When `Some`, every `write_mem` call
+    /// appends `(addr, value)`. Used by the memoisation-viability probe.
+    pub write_log: Option<Vec<(i32, i32)>>,
 }
 
 impl State {
@@ -68,6 +76,8 @@ impl State {
             extended: std::collections::HashMap::new(),
             string_properties: std::collections::HashMap::new(),
             frame_counter: 0,
+            read_log: std::cell::RefCell::new(None),
+            write_log: None,
         }
     }
 
@@ -102,7 +112,7 @@ impl State {
     /// - Negative: state variables (slot index = -addr - 1)
     /// - `0..`: memory bytes
     pub fn read_mem(&self, addr: i32) -> i32 {
-        if addr < 0 {
+        let v = if addr < 0 {
             let idx = (-addr - 1) as usize;
             if idx < self.state_vars.len() {
                 self.state_vars[idx]
@@ -112,14 +122,20 @@ impl State {
         } else {
             let addr_u = addr as usize;
             if addr_u >= 0xF0000 {
-                return self.extended.get(&addr).copied().unwrap_or(0);
-            }
-            if addr_u < self.memory.len() {
+                self.extended.get(&addr).copied().unwrap_or(0)
+            } else if addr_u < self.memory.len() {
                 self.memory[addr_u] as i32
             } else {
                 0
             }
+        };
+        // Optional read log for memoisation-viability probing.
+        if let Ok(mut borrow) = self.read_log.try_borrow_mut() {
+            if let Some(ref mut log) = *borrow {
+                log.push((addr, v));
+            }
         }
+        v
     }
 
     /// Read a 16-bit little-endian word from memory.
@@ -131,6 +147,9 @@ impl State {
 
     /// Write a value to the unified address space.
     pub fn write_mem(&mut self, addr: i32, value: i32) {
+        if let Some(ref mut log) = self.write_log {
+            log.push((addr, value));
+        }
         if addr < 0 {
             let idx = (-addr - 1) as usize;
             if idx < self.state_vars.len() {
