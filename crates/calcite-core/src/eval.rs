@@ -15,6 +15,7 @@ use crate::compile::{
 };
 use crate::pattern::broadcast_write::{self, BroadcastWrite};
 use crate::pattern::dispatch_table::{self, DispatchTable};
+use crate::pattern::memory_fill;
 use crate::state::State;
 use crate::types::*;
 
@@ -293,7 +294,7 @@ impl Evaluator {
 
         log::info!("[compile phase] logging: {:.2}s", _t.elapsed().as_secs_f64());
         let _t = Instant::now();
-        let compiled = compile::compile(
+        let mut compiled = compile::compile(
             &assignments,
             &broadcast_result.writes,
             &functions,
@@ -301,12 +302,40 @@ impl Evaluator {
         );
 
         log::info!("[compile phase] compile::compile: {:.2}s", _t.elapsed().as_secs_f64());
+
+        // Recognise CSS-level bulk-fill bindings and attach them to the
+        // compiled program. Runs after broadcast recognition so we can detect
+        // the range-predicate shape across every memory cell. The bindings are
+        // consumed pre-tick by `tick`.
+        let _t = Instant::now();
+        let bulk_fill = memory_fill::recognise_bulk_fills(&program.assignments);
         log::info!(
-            "Compiled: {} ops, {} slots, {} dispatch tables, {} broadcast writes",
+            "[compile phase] bulk-fill recognition: {:.2}s ({} bindings)",
+            _t.elapsed().as_secs_f64(),
+            bulk_fill.bindings.len(),
+        );
+        for b in &bulk_fill.bindings {
+            log::info!(
+                "Recognised bulk-fill binding: kind={}={} dst={} count={} val={} range={:#x}..{:#x} ({} cells)",
+                b.kind_property,
+                b.kind_value,
+                b.dst_property,
+                b.count_property,
+                b.val_property,
+                b.addr_range.start,
+                b.addr_range.end,
+                b.addr_range.end - b.addr_range.start,
+            );
+        }
+        compiled.bulk_fill_bindings = bulk_fill.bindings;
+
+        log::info!(
+            "Compiled: {} ops, {} slots, {} dispatch tables, {} broadcast writes, {} bulk-fill bindings",
             compiled.ops.len(),
             compiled.slot_count,
             compiled.dispatch_tables.len(),
             compiled.broadcast_writes.len(),
+            compiled.bulk_fill_bindings.len(),
         );
 
         // Precompute function body patterns for the interpreter fast-path.
@@ -342,12 +371,71 @@ impl Evaluator {
         self.pre_tick_hooks.push(hook);
     }
 
+    /// Execute any active CSS-level bulk-fill bindings against state memory.
+    ///
+    /// For each binding, reads the kind sentinel (`--bulkOpKind` by
+    /// convention); if it equals the kind value for the binding, performs a
+    /// native `memory.fill` over the byte range `[dst, dst + count)` using
+    /// the low byte of `--bulkValue`.
+    ///
+    /// This runs before the normal bytecode pass. The CSS cells' per-cell
+    /// branches still evaluate normally afterward — that's fine because they
+    /// either match the same range predicate (idempotent) or fall through to
+    /// their normal broadcast writes when the bulk op isn't active.
+    fn execute_bulk_fills(&self, state: &mut State) {
+        let bindings = &self.compiled.bulk_fill_bindings;
+        if bindings.is_empty() {
+            return;
+        }
+        for binding in bindings {
+            let Some(kind_addr) = property_to_address(&binding.kind_property) else {
+                continue;
+            };
+            let kind = state.read_mem(kind_addr) as i64;
+            if kind != binding.kind_value {
+                continue;
+            }
+            let Some(dst_addr) = property_to_address(&binding.dst_property) else {
+                continue;
+            };
+            let Some(count_addr) = property_to_address(&binding.count_property) else {
+                continue;
+            };
+            let Some(val_addr) = property_to_address(&binding.val_property) else {
+                continue;
+            };
+            let dst = state.read_mem(dst_addr);
+            let count = state.read_mem(count_addr);
+            let val = (state.read_mem(val_addr) & 0xFF) as u8;
+            if count <= 0 || dst < 0 {
+                continue;
+            }
+            let mem_len = state.memory.len();
+            let lo = (dst as usize).min(mem_len);
+            let hi = ((dst as i64).saturating_add(count as i64) as usize).min(mem_len);
+            // Also clip to the cells the binding absorbed — we must not
+            // write outside the range the detector validated.
+            let binding_lo = (binding.addr_range.start.max(0) as usize).min(mem_len);
+            let binding_hi = (binding.addr_range.end.max(0) as usize).min(mem_len);
+            let lo = lo.max(binding_lo);
+            let hi = hi.min(binding_hi);
+            if hi > lo {
+                state.memory[lo..hi].fill(val);
+            }
+        }
+    }
+
     /// Run a single tick: evaluate all assignments against the state.
     pub fn tick(&mut self, state: &mut State) -> TickResult {
         // Run pre-tick hooks (e.g., external function dispatch).
         for hook in &self.pre_tick_hooks {
             hook(state);
         }
+
+        // Execute any CSS-level bulk-fill bindings. This must happen before
+        // the normal bytecode pass so the natively-filled bytes are visible
+        // to any later per-cell branches that consume them.
+        self.execute_bulk_fills(state);
 
         // Snapshot state vars for change detection
         let prev_vars = state.state_vars.clone();
@@ -408,6 +496,7 @@ impl Evaluator {
         for hook in &self.pre_tick_hooks {
             hook(state);
         }
+        self.execute_bulk_fills(state);
         compile::execute(&self.compiled, state, &mut self.slots);
         if !self.string_assignments.is_empty() {
             self.properties.clear();
@@ -447,6 +536,8 @@ impl Evaluator {
         for hook in &self.pre_tick_hooks {
             hook(state);
         }
+        // Bulk fills run in the hooks-timing bucket for profiling purposes.
+        self.execute_bulk_fills(state);
         let t1 = Instant::now();
         profile.hooks += t1.duration_since(t0).as_secs_f64();
 
@@ -512,6 +603,7 @@ impl Evaluator {
         for hook in &self.pre_tick_hooks {
             hook(state);
         }
+        self.execute_bulk_fills(state);
 
         self.properties.clear();
         self.call_depth = 0;
@@ -1024,6 +1116,22 @@ fn collect_style_test_deps(
                 collect_style_test_deps(t, defined, functions, fn_cache, out);
             }
         }
+        StyleTest::Compare { left, right, .. } => {
+            collect_style_deps(left, defined, functions, fn_cache, out);
+            collect_style_deps(right, defined, functions, fn_cache, out);
+        }
+    }
+}
+
+/// Evaluate a numeric comparison (shared between evaluator and detector).
+pub(crate) fn eval_compare(l: f64, op: CompareOp, r: f64) -> bool {
+    match op {
+        CompareOp::Ge => l >= r,
+        CompareOp::Gt => l > r,
+        CompareOp::Le => l <= r,
+        CompareOp::Lt => l < r,
+        CompareOp::Eq => l == r,
+        CompareOp::Ne => l != r,
     }
 }
 
@@ -1607,6 +1715,11 @@ impl Evaluator {
             }
             StyleTest::And(tests) => tests.iter().all(|t| self.eval_style_test(t, state)),
             StyleTest::Or(tests) => tests.iter().any(|t| self.eval_style_test(t, state)),
+            StyleTest::Compare { left, op, right } => {
+                let l = self.eval_expr(left, state).as_number();
+                let r = self.eval_expr(right, state).as_number();
+                eval_compare(l, *op, r)
+            }
         }
     }
 

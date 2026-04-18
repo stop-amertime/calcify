@@ -207,6 +207,37 @@ pub enum StyleTest {
     And(Vec<StyleTest>),
     /// `condition1 or condition2` — any must match.
     Or(Vec<StyleTest>),
+    /// A numeric comparison predicate — `calc(left <op> right)` treated as a
+    /// boolean (true when the relation holds, false otherwise).
+    ///
+    /// CSS-DOS's bulk-op memory-cell clauses use this shape:
+    /// `style(--bulkOpKind: 1) and calc(<addr> >= var(--bulkDst))
+    ///     and calc(<addr> < var(--bulkDst) + var(--bulkCount))`.
+    Compare {
+        /// Left-hand side of the comparison.
+        left: Expr,
+        /// Comparison relation.
+        op: CompareOp,
+        /// Right-hand side of the comparison.
+        right: Expr,
+    },
+}
+
+/// Comparison relation used in [`StyleTest::Compare`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CompareOp {
+    /// `left >= right`.
+    Ge,
+    /// `left > right`.
+    Gt,
+    /// `left <= right`.
+    Le,
+    /// `left < right`.
+    Lt,
+    /// `left == right`.
+    Eq,
+    /// `left != right`.
+    Ne,
 }
 
 /// Arithmetic / math operations from `calc()`, `mod()`, `round()`, etc.

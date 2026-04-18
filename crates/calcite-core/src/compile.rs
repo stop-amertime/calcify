@@ -216,8 +216,38 @@ pub enum Op {
     BitNot16 { dst: Slot, a: Slot },
 
     // --- Comparisons & control flow ---
-    /// slot[dst] = (slot[a] == slot[b]) as i64  (integer comparison)
+    /// slot[dst] = (slot[a] == slot[b]) as i32  (integer comparison)
     CmpEq {
+        dst: Slot,
+        a: Slot,
+        b: Slot,
+    },
+    /// slot[dst] = (slot[a] != slot[b]) as i32
+    CmpNe {
+        dst: Slot,
+        a: Slot,
+        b: Slot,
+    },
+    /// slot[dst] = (slot[a] >= slot[b]) as i32 (signed integer comparison)
+    CmpGe {
+        dst: Slot,
+        a: Slot,
+        b: Slot,
+    },
+    /// slot[dst] = (slot[a] > slot[b]) as i32
+    CmpGt {
+        dst: Slot,
+        a: Slot,
+        b: Slot,
+    },
+    /// slot[dst] = (slot[a] <= slot[b]) as i32
+    CmpLe {
+        dst: Slot,
+        a: Slot,
+        b: Slot,
+    },
+    /// slot[dst] = (slot[a] < slot[b]) as i32
+    CmpLt {
         dst: Slot,
         a: Slot,
         b: Slot,
@@ -339,6 +369,15 @@ pub struct CompiledProgram {
     pub flat_dispatch_arrays: Vec<FlatDispatchArray>,
     /// Mapping from property name → slot index (for reading computed values after execution).
     pub property_slots: HashMap<String, Slot>,
+    /// Recognised CSS-level bulk-fill bindings.
+    ///
+    /// Each binding collapses a dense contiguous range of memory-cell
+    /// assignments whose top branch is the identical
+    /// `style(--bulkOpKind: K) and calc(addr >= var(--bulkDst))
+    /// and calc(addr < var(--bulkDst) + var(--bulkCount))` range predicate
+    /// writing `var(--bulkValue)`. The evaluator executes these pre-tick as
+    /// a single native `memory.fill`.
+    pub bulk_fill_bindings: Vec<crate::pattern::memory_fill::CssMemoryFillBinding>,
 }
 
 /// A dispatch chain table — maps an i32 key to a body PC.
@@ -869,6 +908,11 @@ fn fold_test(test: &StyleTest) -> StyleTest {
         },
         StyleTest::And(tests) => StyleTest::And(tests.iter().map(fold_test).collect()),
         StyleTest::Or(tests) => StyleTest::Or(tests.iter().map(fold_test).collect()),
+        StyleTest::Compare { left, op, right } => StyleTest::Compare {
+            left: const_fold(left),
+            op: *op,
+            right: const_fold(right),
+        },
     }
 }
 
@@ -1531,6 +1575,20 @@ impl<'a> Compiler<'a> {
                     }
                 }
                 result
+            }
+            StyleTest::Compare { left, op, right } => {
+                let l_slot = self.compile_expr(left, ops);
+                let r_slot = self.compile_expr(right, ops);
+                let dst = self.alloc();
+                ops.push(match op {
+                    CompareOp::Eq => Op::CmpEq { dst, a: l_slot, b: r_slot },
+                    CompareOp::Ne => Op::CmpNe { dst, a: l_slot, b: r_slot },
+                    CompareOp::Ge => Op::CmpGe { dst, a: l_slot, b: r_slot },
+                    CompareOp::Gt => Op::CmpGt { dst, a: l_slot, b: r_slot },
+                    CompareOp::Le => Op::CmpLe { dst, a: l_slot, b: r_slot },
+                    CompareOp::Lt => Op::CmpLt { dst, a: l_slot, b: r_slot },
+                });
+                dst
             }
             StyleTest::Or(tests) => {
                 // Any must be true
@@ -2256,6 +2314,7 @@ fn collect_literal_and_tests(test: &StyleTest) -> Option<Vec<(String, i32)>> {
             }
             StyleTest::And(tests) => tests.iter().all(|t| walk(t, out)),
             StyleTest::Or(_) => false,
+            StyleTest::Compare { .. } => false,
         }
     }
     if walk(test, &mut out) && !out.is_empty() {
@@ -2370,6 +2429,7 @@ pub fn compile(
         chain_tables: Vec::new(),
         flat_dispatch_arrays: compiler.compiled_flat_arrays,
         property_slots: compiler.property_slots,
+        bulk_fill_bindings: Vec::new(),
     };
 
     let _ct = web_time::Instant::now();
@@ -3368,7 +3428,12 @@ fn op_slots_read(op: &Op) -> Vec<Slot> {
         Op::Bit { val, idx, .. } => vec![*val, *idx],
         Op::BitAnd16 { a, b, .. } | Op::BitOr16 { a, b, .. } | Op::BitXor16 { a, b, .. } => vec![*a, *b],
         Op::BitNot16 { a, .. } => vec![*a],
-        Op::CmpEq { a, b, .. } => vec![*a, *b],
+        Op::CmpEq { a, b, .. }
+        | Op::CmpNe { a, b, .. }
+        | Op::CmpGe { a, b, .. }
+        | Op::CmpGt { a, b, .. }
+        | Op::CmpLe { a, b, .. }
+        | Op::CmpLt { a, b, .. } => vec![*a, *b],
         Op::BranchIfZero { cond, .. } => vec![*cond],
         Op::BranchIfNotEqLit { a, .. } => vec![*a],
         Op::LoadStateAndBranchIfNotEqLit { .. } => vec![],
@@ -3413,6 +3478,11 @@ fn op_dst(op: &Op) -> Option<Slot> {
         | Op::BitXor16 { dst, .. }
         | Op::BitNot16 { dst, .. }
         | Op::CmpEq { dst, .. }
+        | Op::CmpNe { dst, .. }
+        | Op::CmpGe { dst, .. }
+        | Op::CmpGt { dst, .. }
+        | Op::CmpLe { dst, .. }
+        | Op::CmpLt { dst, .. }
         | Op::Dispatch { dst, .. }
         | Op::DispatchFlatArray { dst, .. } => Some(*dst),
         Op::AddLit { dst, .. } | Op::SubLit { dst, .. } | Op::MulLit { dst, .. }
@@ -3509,7 +3579,12 @@ fn map_op_slots(op: &mut Op, slot_map: &mut HashMap<Slot, Slot>, alloc: &mut Slo
             *a = alloc.get_or_alloc(*a, slot_map);
             *dst = alloc.get_or_alloc(*dst, slot_map);
         }
-        Op::CmpEq { dst, a, b } => {
+        Op::CmpEq { dst, a, b }
+        | Op::CmpNe { dst, a, b }
+        | Op::CmpGe { dst, a, b }
+        | Op::CmpGt { dst, a, b }
+        | Op::CmpLe { dst, a, b }
+        | Op::CmpLt { dst, a, b } => {
             *a = alloc.get_or_alloc(*a, slot_map);
             *b = alloc.get_or_alloc(*b, slot_map);
             *dst = alloc.get_or_alloc(*dst, slot_map);
@@ -3587,7 +3662,12 @@ fn seed_from_parent(
         Op::Bit { val, idx, .. } => { seed(*val); seed(*idx); }
         Op::BitAnd16 { a, b, .. } | Op::BitOr16 { a, b, .. } | Op::BitXor16 { a, b, .. } => { seed(*a); seed(*b); }
         Op::BitNot16 { a, .. } => { seed(*a); }
-        Op::CmpEq { a, b, .. } => { seed(*a); seed(*b); }
+        Op::CmpEq { a, b, .. }
+        | Op::CmpNe { a, b, .. }
+        | Op::CmpGe { a, b, .. }
+        | Op::CmpGt { a, b, .. }
+        | Op::CmpLe { a, b, .. }
+        | Op::CmpLt { a, b, .. } => { seed(*a); seed(*b); }
         Op::Min { args, .. } | Op::Max { args, .. } => { for a in args { seed(*a); } }
         Op::Clamp { min, val, max, .. } => { seed(*min); seed(*val); seed(*max); }
         Op::Round { val, interval, .. } => { seed(*val); seed(*interval); }
@@ -3938,6 +4018,21 @@ fn exec_ops(
             }
             Op::CmpEq { dst, a, b } => {
                 sstore!(*dst, if sload!(*a) == sload!(*b) { 1 } else { 0 });
+            }
+            Op::CmpNe { dst, a, b } => {
+                sstore!(*dst, if sload!(*a) != sload!(*b) { 1 } else { 0 });
+            }
+            Op::CmpGe { dst, a, b } => {
+                sstore!(*dst, if sload!(*a) >= sload!(*b) { 1 } else { 0 });
+            }
+            Op::CmpGt { dst, a, b } => {
+                sstore!(*dst, if sload!(*a) > sload!(*b) { 1 } else { 0 });
+            }
+            Op::CmpLe { dst, a, b } => {
+                sstore!(*dst, if sload!(*a) <= sload!(*b) { 1 } else { 0 });
+            }
+            Op::CmpLt { dst, a, b } => {
+                sstore!(*dst, if sload!(*a) < sload!(*b) { 1 } else { 0 });
             }
             Op::BranchIfZero { cond, target } => {
                 if sload!(*cond) == 0 {
@@ -4333,6 +4428,26 @@ fn exec_ops_profiled(
                 } else {
                     0
                 };
+            }
+            Op::CmpNe { dst, a, b } => {
+                count_op!(profile, "CmpNe");
+                slots[*dst as usize] = if slots[*a as usize] != slots[*b as usize] { 1 } else { 0 };
+            }
+            Op::CmpGe { dst, a, b } => {
+                count_op!(profile, "CmpGe");
+                slots[*dst as usize] = if slots[*a as usize] >= slots[*b as usize] { 1 } else { 0 };
+            }
+            Op::CmpGt { dst, a, b } => {
+                count_op!(profile, "CmpGt");
+                slots[*dst as usize] = if slots[*a as usize] > slots[*b as usize] { 1 } else { 0 };
+            }
+            Op::CmpLe { dst, a, b } => {
+                count_op!(profile, "CmpLe");
+                slots[*dst as usize] = if slots[*a as usize] <= slots[*b as usize] { 1 } else { 0 };
+            }
+            Op::CmpLt { dst, a, b } => {
+                count_op!(profile, "CmpLt");
+                slots[*dst as usize] = if slots[*a as usize] < slots[*b as usize] { 1 } else { 0 };
             }
             Op::BranchIfZero { cond, target } => {
                 count_op!(profile, "BranchIfZero");
@@ -4756,6 +4871,66 @@ pub fn exec_ops_traced(
                 if should_trace {
                     trace.push(TraceEntry {
                         pc, op: format!("CmpEq dst={} a={}({}) b={}({}) → {}", dst, a, av, b, bv, val),
+                        dst_slot: Some(*dst), dst_value: Some(val),
+                        inputs: vec![(*a, av), (*b, bv)], branch_taken: None, depth,
+                    });
+                }
+            }
+            Op::CmpNe { dst, a, b } => {
+                let av = slots[*a as usize]; let bv = slots[*b as usize];
+                let val = if av != bv { 1 } else { 0 };
+                slots[*dst as usize] = val;
+                if should_trace {
+                    trace.push(TraceEntry {
+                        pc, op: format!("CmpNe dst={} a={}({}) b={}({}) → {}", dst, a, av, b, bv, val),
+                        dst_slot: Some(*dst), dst_value: Some(val),
+                        inputs: vec![(*a, av), (*b, bv)], branch_taken: None, depth,
+                    });
+                }
+            }
+            Op::CmpGe { dst, a, b } => {
+                let av = slots[*a as usize]; let bv = slots[*b as usize];
+                let val = if av >= bv { 1 } else { 0 };
+                slots[*dst as usize] = val;
+                if should_trace {
+                    trace.push(TraceEntry {
+                        pc, op: format!("CmpGe dst={} a={}({}) b={}({}) → {}", dst, a, av, b, bv, val),
+                        dst_slot: Some(*dst), dst_value: Some(val),
+                        inputs: vec![(*a, av), (*b, bv)], branch_taken: None, depth,
+                    });
+                }
+            }
+            Op::CmpGt { dst, a, b } => {
+                let av = slots[*a as usize]; let bv = slots[*b as usize];
+                let val = if av > bv { 1 } else { 0 };
+                slots[*dst as usize] = val;
+                if should_trace {
+                    trace.push(TraceEntry {
+                        pc, op: format!("CmpGt dst={} a={}({}) b={}({}) → {}", dst, a, av, b, bv, val),
+                        dst_slot: Some(*dst), dst_value: Some(val),
+                        inputs: vec![(*a, av), (*b, bv)], branch_taken: None, depth,
+                    });
+                }
+            }
+            Op::CmpLe { dst, a, b } => {
+                let av = slots[*a as usize]; let bv = slots[*b as usize];
+                let val = if av <= bv { 1 } else { 0 };
+                slots[*dst as usize] = val;
+                if should_trace {
+                    trace.push(TraceEntry {
+                        pc, op: format!("CmpLe dst={} a={}({}) b={}({}) → {}", dst, a, av, b, bv, val),
+                        dst_slot: Some(*dst), dst_value: Some(val),
+                        inputs: vec![(*a, av), (*b, bv)], branch_taken: None, depth,
+                    });
+                }
+            }
+            Op::CmpLt { dst, a, b } => {
+                let av = slots[*a as usize]; let bv = slots[*b as usize];
+                let val = if av < bv { 1 } else { 0 };
+                slots[*dst as usize] = val;
+                if should_trace {
+                    trace.push(TraceEntry {
+                        pc, op: format!("CmpLt dst={} a={}({}) b={}({}) → {}", dst, a, av, b, bv, val),
                         dst_slot: Some(*dst), dst_value: Some(val),
                         inputs: vec![(*a, av), (*b, bv)], branch_taken: None, depth,
                     });
