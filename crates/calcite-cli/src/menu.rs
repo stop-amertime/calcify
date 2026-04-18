@@ -1,14 +1,14 @@
 //! Interactive program picker.
 //!
 //! When `calcite` is invoked without `-i`, this shows a grid of available
-//! programs (pre-built `.css` in `output/`, plus every `.com`/`.exe` under
-//! `programs/` recursively). Arrow keys to navigate, Enter to select,
-//! Q / Esc / Ctrl+C to quit.
+//! programs (pre-built `.css` in `output/`, plus every top-level `.com`/`.exe`
+//! and every cart subdirectory under `programs/`). Arrow keys to navigate,
+//! Enter to select, Q / Esc / Ctrl+C to quit.
 //!
 //! Selecting a pre-built `.css` returns its path directly.
-//! Selecting a program invokes `node transpiler/generate-dos.mjs`,
-//! streaming its stdout/stderr below the CSS-DOS logo, then returns the
-//! generated `.css` path.
+//! Selecting a program invokes `node ../CSS-DOS/builder/build.mjs` with the
+//! cart path (either the loose .com/.exe or the subdir), streaming its output
+//! below the CSS-DOS logo, then returns the generated `.css` path.
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -23,13 +23,14 @@ use crate::cssdos_logo;
 pub enum Entry {
     /// Pre-built CSS in `output/`.
     PrebuiltCss { name: String, path: PathBuf, bytes: u64 },
-    /// A .com or .exe we need to generate CSS for.
+    /// A cart to build: either a loose .com/.exe or a subdirectory.
     Program {
         name: String,
-        exec: PathBuf,
+        /// Path handed to build.mjs — a loose file or a directory.
+        cart: PathBuf,
         bytes: u64,
-        /// Sibling files in the same directory (for `--data` flags).
-        siblings: Vec<PathBuf>,
+        /// True if `cart` points at a directory cart.
+        is_dir: bool,
     },
 }
 
@@ -39,13 +40,17 @@ impl Entry {
             Entry::PrebuiltCss { name, bytes, .. } => {
                 format!("{name}.css ({})", human_size(*bytes))
             }
-            Entry::Program { name, exec, bytes, .. } => {
-                let ext = exec
-                    .extension()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("")
-                    .to_lowercase();
-                format!("{name}.{ext} ({})", human_size(*bytes))
+            Entry::Program { name, cart, bytes, is_dir } => {
+                if *is_dir {
+                    format!("{name}/ ({})", human_size(*bytes))
+                } else {
+                    let ext = cart
+                        .extension()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("")
+                        .to_lowercase();
+                    format!("{name}.{ext} ({})", human_size(*bytes))
+                }
             }
         }
     }
@@ -108,10 +113,18 @@ fn collect_programs(root: &Path, dir: &Path, out: &mut Vec<Entry>) {
     for entry in rd.flatten() {
         let p = entry.path();
         if p.is_dir() {
-            if p.file_name().and_then(|s| s.to_str()) == Some(".cache") {
+            let dname = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if dname == ".cache" {
                 continue;
             }
-            collect_subdir_programs(root, &p, out);
+            // Only surface subdirs that actually contain a runnable.
+            if !has_runnable(&p) {
+                continue;
+            }
+            let bytes = dir_size(&p);
+            let rel = p.strip_prefix(root).unwrap_or(&p);
+            let name = rel.to_string_lossy().replace('\\', "/");
+            out.push(Entry::Program { name, cart: p, bytes, is_dir: true });
         } else {
             let ext = p
                 .extension()
@@ -119,57 +132,52 @@ fn collect_programs(root: &Path, dir: &Path, out: &mut Vec<Entry>) {
                 .map(|s| s.to_ascii_lowercase())
                 .unwrap_or_default();
             if ext == "com" || ext == "exe" {
-                // Top-level standalone program: no siblings.
                 let bytes = p.metadata().ok().map(|m| m.len()).unwrap_or(0);
                 let rel = p.strip_prefix(root).unwrap_or(&p);
                 let name = rel.with_extension("").to_string_lossy().replace('\\', "/");
-                out.push(Entry::Program { name, exec: p, bytes, siblings: Vec::new() });
+                out.push(Entry::Program { name, cart: p, bytes, is_dir: false });
             }
         }
     }
 }
 
-fn collect_subdir_programs(root: &Path, dir: &Path, out: &mut Vec<Entry>) {
-    // Gather every file in this subdir and its descendants once.
-    let mut all_files = Vec::new();
-    gather_files(dir, &mut all_files);
-
-    for p in &all_files {
+fn has_runnable(dir: &Path) -> bool {
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(_) => return false,
+    };
+    for entry in rd.flatten() {
+        let p = entry.path();
+        if !p.is_file() {
+            continue;
+        }
         let ext = p
             .extension()
             .and_then(|s| s.to_str())
             .map(|s| s.to_ascii_lowercase())
             .unwrap_or_default();
-        if ext != "com" && ext != "exe" {
-            continue;
+        if ext == "com" || ext == "exe" {
+            return true;
         }
-        let bytes = p.metadata().ok().map(|m| m.len()).unwrap_or(0);
-        let rel = p.strip_prefix(root).unwrap_or(p);
-        let name = rel.with_extension("").to_string_lossy().replace('\\', "/");
-        // Siblings: every other file in the whole subdir tree.
-        let siblings: Vec<PathBuf> = all_files.iter().filter(|f| *f != p).cloned().collect();
-        out.push(Entry::Program {
-            name,
-            exec: p.clone(),
-            bytes,
-            siblings,
-        });
     }
+    false
 }
 
-fn gather_files(dir: &Path, out: &mut Vec<PathBuf>) {
+fn dir_size(dir: &Path) -> u64 {
     let rd = match std::fs::read_dir(dir) {
         Ok(rd) => rd,
-        Err(_) => return,
+        Err(_) => return 0,
     };
+    let mut total = 0u64;
     for entry in rd.flatten() {
         let p = entry.path();
         if p.is_dir() {
-            gather_files(&p, out);
-        } else if p.is_file() {
-            out.push(p);
+            total = total.saturating_add(dir_size(&p));
+        } else if let Ok(md) = p.metadata() {
+            total = total.saturating_add(md.len());
         }
     }
+    total
 }
 
 /// Show the menu, return the selected entry or None if cancelled.
@@ -283,74 +291,44 @@ fn ellipsize(s: &str, max: usize) -> String {
     }
 }
 
-/// Resolve an entry to a `.css` path, invoking `generate-dos.mjs` if needed.
-/// Streams the generator's output to stderr. `calcite_root` is the directory
+/// Resolve an entry to a `.css` path, invoking CSS-DOS's builder if needed.
+/// Streams the builder's output to stderr. `calcite_root` is the directory
 /// containing `output/` and `programs/`.
 pub fn resolve_to_css(entry: &Entry, calcite_root: &Path) -> io::Result<PathBuf> {
     match entry {
         Entry::PrebuiltCss { path, .. } => Ok(path.clone()),
-        Entry::Program { name, exec, siblings, .. } => {
+        Entry::Program { name, cart, .. } => {
             let output_dir = calcite_root.join("output");
             let _ = std::fs::create_dir_all(&output_dir);
             // Sanitise name for the output file (replace path separators).
             let safe = name.replace(['/', '\\'], "_");
             let out_css = output_dir.join(format!("{safe}.css"));
 
-            // Calculate --mem via tools/calc-mem.mjs (existing helper).
-            let calc_mem = calcite_root.join("tools").join("calc-mem.mjs");
-            let mem = if calc_mem.exists() {
-                let out = Command::new("node")
-                    .arg(&calc_mem)
-                    .arg(exec)
-                    .output();
-                match out {
-                    Ok(o) if o.status.success() => {
-                        String::from_utf8_lossy(&o.stdout).trim().to_string()
-                    }
-                    _ => String::new(),
-                }
-            } else {
-                String::new()
-            };
-
-            // Build args for generate-dos.mjs.
-            let generator = calcite_root
+            // builder/build.mjs lives in the sibling CSS-DOS repo.
+            let builder = calcite_root
                 .parent()
-                .map(|p| p.join("CSS-DOS").join("transpiler").join("generate-dos.mjs"))
-                .unwrap_or_else(|| PathBuf::from("../CSS-DOS/transpiler/generate-dos.mjs"));
+                .map(|p| p.join("CSS-DOS").join("builder").join("build.mjs"))
+                .unwrap_or_else(|| PathBuf::from("../CSS-DOS/builder/build.mjs"));
 
             eprintln!(
-                "\n  Generating CSS for {} → {} …",
-                exec.display(),
+                "\n  Building {} → {} …",
+                cart.display(),
                 out_css.display()
             );
 
-            let mut cmd = Command::new("node");
-            cmd.arg("--max-old-space-size=8192")
-                .arg(&generator)
-                .arg(exec)
+            let status = Command::new("node")
+                .arg("--max-old-space-size=8192")
+                .arg(&builder)
+                .arg(cart)
                 .arg("-o")
-                .arg(&out_css);
-            if !mem.is_empty() {
-                cmd.arg("--mem").arg(&mem);
-            }
-            // All siblings become --data (option 1 semantics).
-            for s in siblings {
-                let fname = s
-                    .file_name()
-                    .and_then(|f| f.to_str())
-                    .unwrap_or("unknown");
-                cmd.arg("--data").arg(fname).arg(s);
-            }
-
-            let status = cmd
+                .arg(&out_css)
                 .stdout(Stdio::inherit())
                 .stderr(Stdio::inherit())
                 .status()?;
             if !status.success() {
                 return Err(io::Error::new(
                     io::ErrorKind::Other,
-                    format!("generate-dos.mjs exited with {status}"),
+                    format!("build.mjs exited with {status}"),
                 ));
             }
 
