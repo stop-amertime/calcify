@@ -299,8 +299,8 @@
           <button id="btn-start" class="btn" disabled>Run</button>
           <button id="btn-stop" class="btn" disabled>Stop</button>
           <div class="spacer"></div>
-          <label>Ticks/batch:</label>
-          <input id="batch-size" class="field" type="number" value="100" min="1" max="10000">
+          <label title="Upper cap on adaptive batch size (ticks per yield to the UI). Lower = smoother keyboard, slower run.">Max ticks/batch:</label>
+          <input id="batch-size" class="field" type="number" value="10000" min="1" max="200000">
         </div>
       </div>
 
@@ -421,6 +421,32 @@
     let totalCycles = 0;
     let startTime = 0;
     let engineReady = false;
+
+    // Adaptive batch sizing: target ~60 fps by scaling the next batch so it
+    // should take TARGET_MS of wall-clock. Smooth with an EMA so one jittery
+    // batch doesn't whip the size around. The input box is the upper cap.
+    const TARGET_MS = 14;   // a bit under 16.67 ms to leave room for render+keyboard
+    const EMA_ALPHA = 0.3;  // weight of the latest sample; higher = more reactive
+    const MIN_BATCH = 50;
+    let batchCount = 200;   // starting guess; grows/shrinks with measured dt
+    let batchSentAt = 0;    // performance.now() when the last batch was dispatched
+    let batchMsEma = TARGET_MS;
+
+    function dispatchBatch() {
+      const cap = parseInt(batchInput.value, 10) || 10000;
+      batchCount = Math.max(MIN_BATCH, Math.min(cap, Math.round(batchCount)));
+      batchSentAt = performance.now();
+      worker.postMessage({ type: 'tick', count: batchCount });
+    }
+
+    function updateBatchSize() {
+      const dt = performance.now() - batchSentAt;
+      if (dt <= 0) return;
+      batchMsEma = batchMsEma * (1 - EMA_ALPHA) + dt * EMA_ALPHA;
+      // Scale toward target; clamp per-step to avoid huge jumps on one slow batch.
+      const ratio = Math.max(0.5, Math.min(2.0, TARGET_MS / batchMsEma));
+      batchCount = batchCount * ratio;
+    }
     // Detected video regions: { text: {...}|null, gfx: {...}|null }
     let video = { text: null, gfx: null };
     // Cached ImageData for the gfx canvas, sized on first use.
@@ -437,6 +463,10 @@
           engineReady = true;
           btnStart.disabled = false;
           video = data.video || { text: null, gfx: null };
+          if (data.timing) {
+            console.log('[calcite init]', JSON.stringify(data.timing));
+            modeBadge.title = `parse+compile ${data.timing.parseCompileMs}ms / total ${data.timing.totalMs}ms (${data.timing.cssBytes} bytes)`;
+          }
 
           // Mode badge: "GFX 320x200", "TEXT 80x25", or "GFX+TEXT".
           const labels = [];
@@ -467,6 +497,7 @@
         }
 
         case 'tick-result': {
+          updateBatchSize();
           totalTicks += data.ticks;
           // Worker sends absolute cycleCount each batch — take it directly.
           totalCycles = data.cycles != null ? data.cycles : totalCycles;
@@ -522,7 +553,7 @@
           }
 
           if (running) {
-            worker.postMessage({ type: 'tick', count: parseInt(batchInput.value, 10) || 100 });
+            dispatchBatch();
           }
           break;
         }
@@ -545,7 +576,7 @@
       btnStart.disabled = true;
       btnStop.disabled = false;
       status.textContent = 'Running...';
-      worker.postMessage({ type: 'tick', count: parseInt(batchInput.value, 10) || 100 });
+      dispatchBatch();
     }
 
     btnStart.addEventListener('click', startRunning);
