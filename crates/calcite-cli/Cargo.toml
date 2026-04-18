@@ -47,3 +47,7 @@ path = "src/bin/probe_cyclic_slots.rs"
 [[bin]]
 name = "probe-regions"
 path = "src/bin/probe_regions.rs"
+
+[[bin]]
+name = "probe-bytecode-shape"
+path = "src/bin/probe_bytecode_shape.rs"
