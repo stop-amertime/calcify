@@ -17,6 +17,72 @@ use crate::state::State;
 use crate::types::*;
 
 // ---------------------------------------------------------------------------
+// Per-function compile profiler. Enable with CALCITE_PROFILE_COMPILE=1.
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    static PROF_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static PROF_TOTALS: std::cell::RefCell<Vec<(&'static str, f64, u64)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+pub fn profile_compile_init() {
+    PROF_ENABLED.with(|e| e.set(std::env::var_os("CALCITE_PROFILE_COMPILE").is_some()));
+    PROF_TOTALS.with(|t| t.borrow_mut().clear());
+}
+
+pub fn profile_compile_dump() {
+    if !PROF_ENABLED.with(|e| e.get()) { return; }
+    PROF_TOTALS.with(|t| {
+        let mut entries: Vec<_> = t.borrow().clone();
+        entries.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        eprintln!("[compile profile] ---- per-scope totals (incl. children) ----");
+        for (name, total, count) in &entries {
+            eprintln!("  {:>8.3}s  {:>12} calls  {:>9.3}us/call  {}",
+                total, count, total / *count as f64 * 1_000_000.0, name);
+        }
+    });
+}
+
+pub struct ProfScope {
+    idx: usize,
+    start: std::time::Instant,
+    enabled: bool,
+}
+
+impl ProfScope {
+    pub fn new(name: &'static str) -> Self {
+        let enabled = PROF_ENABLED.with(|e| e.get());
+        if !enabled {
+            return ProfScope { idx: 0, start: std::time::Instant::now(), enabled: false };
+        }
+        let idx = PROF_TOTALS.with(|t| {
+            let mut v = t.borrow_mut();
+            if let Some(i) = v.iter().position(|(n, _, _)| *n == name) { i }
+            else { v.push((name, 0.0, 0)); v.len() - 1 }
+        });
+        ProfScope { idx, start: std::time::Instant::now(), enabled: true }
+    }
+}
+
+impl Drop for ProfScope {
+    fn drop(&mut self) {
+        if !self.enabled { return; }
+        let elapsed = self.start.elapsed().as_secs_f64();
+        PROF_TOTALS.with(|t| {
+            let mut v = t.borrow_mut();
+            v[self.idx].1 += elapsed;
+            v[self.idx].2 += 1;
+        });
+    }
+}
+
+macro_rules! prof {
+    ($name:expr) => { let _prof_guard = $crate::compile::ProfScope::new($name); };
+}
+
+
+// ---------------------------------------------------------------------------
 // Op — flat bytecode instruction
 // ---------------------------------------------------------------------------
 
@@ -281,6 +347,16 @@ pub enum Op {
         default: i32,
     },
 
+    /// Call a compiled function: copy arg slots into the function's reserved
+    /// parameter slots, execute its body, copy the result slot into `dst`.
+    /// Compiled once per function and reused at every call site to avoid the
+    /// N² recompile cost that dominates compilation of large programs.
+    Call {
+        dst: Slot,
+        fn_id: u32,
+        arg_slots: Vec<Slot>,
+    },
+
     // --- Stores ---
     /// state.write_mem(addr, slot[src]) — compile-time-known address
     StoreState {
@@ -319,8 +395,26 @@ pub struct CompiledProgram {
     pub chain_tables: Vec<DispatchChainTable>,
     /// Flat-array dispatch tables (for DispatchFlatArray op — dense literal-only lookups).
     pub flat_dispatch_arrays: Vec<FlatDispatchArray>,
+    /// Compiled function bodies (for `Op::Call` — reused across call sites).
+    pub functions: Vec<CompiledFunction>,
     /// Mapping from property name → slot index (for reading computed values after execution).
     pub property_slots: HashMap<String, Slot>,
+}
+
+/// A function compiled once and reused at every call site via `Op::Call`.
+///
+/// Each call copies the argument slots into `param_slots` (and initializes any
+/// locals by re-running `body_ops`), then reads the result from `result_slot`.
+#[derive(Debug)]
+pub struct CompiledFunction {
+    /// Reserved slots for the parameters, in declaration order.
+    pub param_slots: Vec<Slot>,
+    /// Compiled body ops. Reads from `param_slots`, writes to `result_slot`
+    /// (and any intermediate/local slots). Self-contained — slots referenced
+    /// here are either params, locals, or temporaries scoped to this body.
+    pub body_ops: Vec<Op>,
+    /// Slot holding the result after body_ops runs.
+    pub result_slot: Slot,
 }
 
 /// A dispatch chain table — maps an i32 key to a body PC.
@@ -761,6 +855,7 @@ pub(crate) fn classify_bitwise_decomposition(func: &FunctionDef) -> Option<Bitwi
 
 /// Check if a dispatch table is an identity-read: every entry maps key K → state[K].
 pub(crate) fn is_dispatch_identity_read(table: &DispatchTable) -> bool {
+    prof!("is_dispatch_identity_read");
     if table.entries.len() < 4 {
         return false;
     }
@@ -789,6 +884,7 @@ pub(crate) fn is_dispatch_identity_read(table: &DispatchTable) -> bool {
 /// `exception_keys` listing the keys that are NOT identity reads. Returns `None` if the
 /// table doesn't qualify.
 fn classify_near_identity_read(table: &DispatchTable) -> Option<Vec<i64>> {
+    prof!("classify_near_identity_read");
     if table.entries.len() < 100 {
         return None;
     }
@@ -816,6 +912,7 @@ fn classify_near_identity_read(table: &DispatchTable) -> Option<Vec<i64>> {
 
 /// Recursively fold constant expressions and eliminate identity operations.
 fn const_fold(expr: &Expr) -> Expr {
+    prof!("const_fold");
     match expr {
         Expr::Calc(op) => fold_calc(op),
         Expr::StyleCondition {
@@ -1037,6 +1134,11 @@ struct Compiler<'a> {
     identity_read_cache: HashMap<String, bool>,
     /// Cache: dispatch table name → near-identity exception keys (or None).
     near_identity_cache: HashMap<String, Option<Vec<i64>>>,
+    /// Compiled function bodies, indexed by `fn_id`. Populated by
+    /// `compile_general_function` on first encounter and reused thereafter.
+    compiled_functions: Vec<CompiledFunction>,
+    /// Cache: function name → fn_id in `compiled_functions`.
+    function_cache: HashMap<String, u32>,
 }
 
 impl<'a> Compiler<'a> {
@@ -1055,6 +1157,8 @@ impl<'a> Compiler<'a> {
             flat_dispatch_cache: HashMap::new(),
             identity_read_cache: HashMap::new(),
             near_identity_cache: HashMap::new(),
+            compiled_functions: Vec::new(),
+            function_cache: HashMap::new(),
         }
     }
 
@@ -1067,8 +1171,12 @@ impl<'a> Compiler<'a> {
 
     /// Compile an Expr into ops, returning the slot holding the result.
     fn compile_expr(&mut self, expr: &Expr, ops: &mut Vec<Op>) -> Slot {
+        prof!("compile_expr");
         // Constant-fold before compiling
-        let folded = const_fold(expr);
+        let folded = {
+            prof!("compile_expr:const_fold");
+            const_fold(expr)
+        };
         let expr = &folded;
         match expr {
             Expr::Literal(v) => {
@@ -1100,6 +1208,7 @@ impl<'a> Compiler<'a> {
 
     /// Compile a variable reference.
     fn compile_var(&mut self, name: &str, fallback: Option<&Expr>, ops: &mut Vec<Op>) -> Slot {
+        prof!("compile_var");
         // If it's a property we've already computed in this tick, use its slot directly.
         // But NOT for buffer-prefixed names (--__0*, --__1*, --__2*) — those explicitly
         // read the previous tick's state, not the current tick's computed value.
@@ -1129,6 +1238,7 @@ impl<'a> Compiler<'a> {
 
     /// Compile a CalcOp.
     fn compile_calc(&mut self, op: &CalcOp, ops: &mut Vec<Op>) -> Slot {
+        prof!("compile_calc");
         match op {
             CalcOp::Add(a, b) => {
                 // Lit-operand fast path: if either side is a literal, emit AddLit.
@@ -1297,6 +1407,7 @@ impl<'a> Compiler<'a> {
         fallback: &Expr,
         ops: &mut Vec<Op>,
     ) -> Slot {
+        prof!("compile_style_condition");
         // Try dispatch table optimization for large single-key chains
         if let Some(table) = dispatch_table::recognise_dispatch(branches, fallback) {
             return self.compile_inline_dispatch(&table, ops);
@@ -1565,6 +1676,7 @@ impl<'a> Compiler<'a> {
     /// efficient native operations. This is fully generic — it works for
     /// any CSS function with the right shape.
     fn compile_function_call(&mut self, name: &str, args: &[Expr], ops: &mut Vec<Op>) -> Slot {
+        prof!("compile_function_call");
         // Try body-pattern analysis on the function definition.
         // Since self.functions is &'a (external borrow), this reference doesn't
         // conflict with &mut self for compile_expr calls.
@@ -1608,6 +1720,7 @@ impl<'a> Compiler<'a> {
         args: &[Expr],
         ops: &mut Vec<Op>,
     ) -> Option<Slot> {
+        prof!("try_compile_by_body_pattern");
         let params = &func.parameters;
 
         // Identity: 1 param, no locals, result = var(param)
@@ -1770,6 +1883,7 @@ impl<'a> Compiler<'a> {
 
     /// Check if a dispatch table is an identity-read pattern (cached).
     fn check_dispatch_identity_read(&mut self, name: &str) -> bool {
+        prof!("check_dispatch_identity_read");
         if let Some(&cached) = self.identity_read_cache.get(name) {
             return cached;
         }
@@ -1782,6 +1896,7 @@ impl<'a> Compiler<'a> {
 
     /// Classify a dispatch table as near-identity-read (cached).
     fn check_near_identity_read(&mut self, name: &str) -> Option<Vec<i64>> {
+        prof!("check_near_identity_read");
         if let Some(cached) = self.near_identity_cache.get(name) {
             return cached.clone();
         }
@@ -1804,6 +1919,7 @@ impl<'a> Compiler<'a> {
         exception_keys: &[i64],
         ops: &mut Vec<Op>,
     ) -> Slot {
+        prof!("compile_near_identity_dispatch");
         let table = self.dispatch_tables.remove(name).unwrap();
         let func = self.functions.get(name);
 
@@ -2002,116 +2118,123 @@ impl<'a> Compiler<'a> {
 
     /// Compile a dispatch table function call.
     ///
-    /// Large dispatch tables (≥100 entries) are compiled once and cached — subsequent
-    /// calls reuse the same `table_id`. This is safe because dispatch table entries
-    /// are keyed by the dispatch value (the parameter), not by parameter slots. The
-    /// parameter only appears as the key; entry bodies are context-independent.
+    /// Dispatch tables are compiled once per program and reused via `Op::Call`.
+    /// The first call compiles the table's entries against reserved parameter
+    /// slots into a self-contained body that ends with an `Op::Dispatch` (or
+    /// flat-array fast path). Subsequent calls emit only `Op::Call`.
     fn compile_dispatch_call(&mut self, name: &str, args: &[Expr], ops: &mut Vec<Op>) -> Slot {
+        prof!("compile_dispatch_call");
+        let func = self.functions.get(name).map(|f| f as *const FunctionDef);
+        // SAFETY: self.functions is &'a external; never mutated during compile.
+        let func = func.map(|p| unsafe { &*p });
+
+        // Cache hit: emit a single Op::Call.
+        if let Some(&fn_id) = self.function_cache.get(name) {
+            let mut arg_slots: Vec<Slot> = Vec::with_capacity(args.len());
+            for a in args {
+                arg_slots.push(self.compile_expr(a, ops));
+            }
+            let param_count = func.map_or(0, |f| f.parameters.len());
+            while arg_slots.len() < param_count {
+                let s = self.alloc();
+                ops.push(Op::LoadLit { dst: s, val: 0 });
+                arg_slots.push(s);
+            }
+            arg_slots.truncate(param_count);
+            let dst = self.alloc();
+            ops.push(Op::Call { dst, fn_id, arg_slots });
+            return dst;
+        }
+
+        // First call: compile the dispatch into a cached body.
+        self.compile_dispatch_body_then_call(name, args, ops)
+    }
+
+    /// Compile a dispatch table function's body once (reserved params + dispatch op),
+    /// cache it under a fresh `fn_id`, then emit `Op::Call` at the current call site.
+    fn compile_dispatch_body_then_call(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        ops: &mut Vec<Op>,
+    ) -> Slot {
+        prof!("compile_dispatch_body_then_call");
         let _dt = web_time::Instant::now();
         let table = self.dispatch_tables.remove(name).unwrap();
         let func = self.functions.get(name);
 
-        // Bind arguments to parameter slots, then evaluate locals
-        // (the dispatch key may reference a local, e.g. --parity dispatches on --low8)
-        // Bind arguments with LoadSlot copy to prevent stale reads from
-        // dispatch entries that didn't execute (same fix as near-identity and
-        // general function paths).
+        // Reserve parameter slots for the body. Op::Call writes these per call.
+        let param_slots: Vec<Slot> = func
+            .as_ref()
+            .map(|f| f.parameters.iter().map(|_| self.alloc()).collect())
+            .unwrap_or_default();
+
+        // Bind param/local names to reserved slots while we compile the body.
         let saved: Vec<(String, Option<Slot>)> = if let Some(ref f) = func {
             let mut saved: Vec<(String, Option<Slot>)> = f.parameters
                 .iter()
-                .enumerate()
-                .map(|(i, param)| {
+                .zip(&param_slots)
+                .map(|(param, &pslot)| {
                     let old = self.property_slots.get(&param.name).copied();
-                    let compiled_slot = args
-                        .get(i)
-                        .map(|a| self.compile_expr(a, ops))
-                        .unwrap_or_else(|| {
-                            let s = self.alloc();
-                            ops.push(Op::LoadLit { dst: s, val: 0 });
-                            s
-                        });
-                    let local_slot = self.alloc();
-                    ops.push(Op::LoadSlot { dst: local_slot, src: compiled_slot });
-                    self.property_slots.insert(param.name.clone(), local_slot);
+                    self.property_slots.insert(param.name.clone(), pslot);
                     (param.name.clone(), old)
                 })
                 .collect();
-            // Evaluate locals so the dispatch key can reference them
-            for local in &f.locals {
-                let old = self.property_slots.get(&local.name).copied();
-                let val_slot = self.compile_expr(&local.value, ops);
-                self.property_slots.insert(local.name.clone(), val_slot);
-                saved.push((local.name.clone(), old));
-            }
             saved
         } else {
             Vec::new()
         };
 
-        // Compile the key lookup
-        let key_slot = self.compile_var(&table.key_property, None, ops);
+        // Build the body ops into a fresh Vec. Locals, key lookup, entry
+        // compilation, and the final Dispatch/DispatchFlatArray op all go
+        // into body_ops — reads of the parameters resolve to the reserved
+        // param slots which Op::Call will write at runtime.
+        let mut body_ops: Vec<Op> = Vec::new();
 
-        // ---- Flat-byte-array fast path ----
-        //
-        // When every dispatch entry is an integer literal and the key range is
-        // dense, compile the whole table to a single `Vec<i32>` lookup. Avoids
-        // the O(N) per-entry bytecode emission (and matching per-entry runtime
-        // HashMap lookup) that dominates compile time and memory for very large
-        // literal dispatch tables (hundreds of thousands of entries or more).
-        let single_param = func.map_or(true, |f| f.parameters.len() <= 1);
-        if single_param && !table.entries.is_empty() {
-            if let Some((array_id, base_key, default)) =
-                self.try_build_flat_dispatch(name, &table)
-            {
-                // Restore and emit single op.
-                self.dispatch_tables.insert(name.to_string(), table);
-                for (param_name, old) in saved {
-                    match old {
-                        Some(s) => { self.property_slots.insert(param_name, s); }
-                        None => { self.property_slots.remove(&param_name); }
-                    }
-                }
-                let dst = self.alloc();
-                ops.push(Op::DispatchFlatArray {
-                    dst,
-                    key: key_slot,
-                    array_id,
-                    base_key,
-                    default,
-                });
-                return dst;
+        // Locals.
+        let mut saved = saved;
+        if let Some(f) = func {
+            for local in &f.locals {
+                let old = self.property_slots.get(&local.name).copied();
+                let val_slot = self.compile_expr(&local.value, &mut body_ops);
+                self.property_slots.insert(local.name.clone(), val_slot);
+                saved.push((local.name.clone(), old));
             }
         }
 
-        // Check cache for large tables — compile entries only once.
-        // IMPORTANT: Only use cache for parameterless functions. If the function
-        // has parameters, the compiled entries bake in the parameter values from
-        // the first call site, producing wrong results for subsequent calls with
-        // different arguments (e.g., getDest(0) vs getDest(1)).
-        let cacheable = func.map_or(true, |f| f.parameters.is_empty());
-        let table_id = if cacheable {
-            if let Some(&cached_id) = self.dispatch_cache.get(name) {
-                Some(cached_id)
-            } else {
-                None
-            }
+        // Compile the key lookup into the body.
+        let key_slot = self.compile_var(&table.key_property, None, &mut body_ops);
+
+        // ---- Flat-byte-array fast path ----
+        let single_param = func.map_or(true, |f| f.parameters.len() <= 1);
+        let flat = if single_param && !table.entries.is_empty() {
+            self.try_build_flat_dispatch(name, &table)
         } else {
             None
         };
-        let table_id = if let Some(id) = table_id { id } else {
-            // Compile each dispatch entry into its own op sequence
+        let result_slot = if let Some((array_id, base_key, default)) = flat {
+            let dst = self.alloc();
+            body_ops.push(Op::DispatchFlatArray {
+                dst,
+                key: key_slot,
+                array_id,
+                base_key,
+                default,
+            });
+            dst
+        } else {
+            // Compile each dispatch entry into its own op sequence (body uses
+            // reserved param slots, so entries' var() refs resolve correctly).
             let mut compiled_entries = HashMap::new();
             for (&key_val, entry_expr) in &table.entries {
                 let mut entry_ops = Vec::new();
                 let result = self.compile_expr(entry_expr, &mut entry_ops);
                 compiled_entries.insert(key_val, (entry_ops, result));
             }
-
-            // Compile fallback
             let mut fallback_ops = Vec::new();
             let fallback_slot = self.compile_expr(&table.fallback, &mut fallback_ops);
 
-            let id = self.compiled_dispatches.len() as Slot;
+            let table_id = self.compiled_dispatches.len() as Slot;
             self.compiled_dispatches.push(CompiledDispatchTable {
                 entries: compiled_entries,
                 fallback_ops,
@@ -2122,97 +2245,149 @@ impl<'a> Compiler<'a> {
                 log::info!("[compile detail] dispatch_call {} compiled: {} entries, {:.2}s",
                     name, table.entries.len(), _dt.elapsed().as_secs_f64());
             }
-            // Cache large parameterless tables for reuse
-            if cacheable && table.entries.len() >= 100 {
-                self.dispatch_cache.insert(name.to_string(), id);
-            }
 
-            id
+            let dst = self.alloc();
+            body_ops.push(Op::Dispatch {
+                dst,
+                key: key_slot,
+                table_id,
+                fallback_target: 0,
+            });
+            dst
         };
 
-        // Restore the dispatch table and parameter bindings
+        // Restore property bindings.
         self.dispatch_tables.insert(name.to_string(), table);
         for (param_name, old) in saved {
             match old {
-                Some(s) => {
-                    self.property_slots.insert(param_name, s);
-                }
-                None => {
-                    self.property_slots.remove(&param_name);
-                }
+                Some(s) => { self.property_slots.insert(param_name, s); }
+                None => { self.property_slots.remove(&param_name); }
             }
         }
 
-        let dst = self.alloc();
-        ops.push(Op::Dispatch {
-            dst,
-            key: key_slot,
-            table_id,
-            fallback_target: 0, // not used — dispatch is handled by the executor
+        // Register the compiled function and cache under fn_id.
+        let fn_id = self.compiled_functions.len() as u32;
+        self.compiled_functions.push(CompiledFunction {
+            param_slots,
+            body_ops,
+            result_slot,
         });
+        self.function_cache.insert(name.to_string(), fn_id);
+
+        // Emit Op::Call at this call site.
+        let param_count = func.map_or(0, |f| f.parameters.len());
+        let mut arg_slots: Vec<Slot> = Vec::with_capacity(args.len());
+        for a in args {
+            arg_slots.push(self.compile_expr(a, ops));
+        }
+        while arg_slots.len() < param_count {
+            let s = self.alloc();
+            ops.push(Op::LoadLit { dst: s, val: 0 });
+            arg_slots.push(s);
+        }
+        arg_slots.truncate(param_count);
+
+        let dst = self.alloc();
+        ops.push(Op::Call { dst, fn_id, arg_slots });
         dst
     }
 
-    /// Compile a general function call by inlining its body.
+    /// Compile a general function call.
+    ///
+    /// The function body is compiled **once** per program into an `Op::Call`
+    /// target — a self-contained `Vec<Op>` referencing reserved parameter
+    /// slots. Every call site emits a single `Op::Call { fn_id, arg_slots,
+    /// dst }` that copies args into the reserved slots and runs the cached
+    /// body. This avoids the N² recompile cost of the old inlining path.
     fn compile_general_function(&mut self, name: &str, args: &[Expr], ops: &mut Vec<Op>) -> Slot {
-        // Since self.functions is &'a (external borrow), holding a reference
-        // doesn't conflict with &mut self for compile_expr/property_slots calls.
+        prof!("compile_general_function");
         let func = match self.functions.get(name) {
-            Some(f) => f,
+            Some(f) => f as *const FunctionDef,
             None => {
                 let dst = self.alloc();
                 ops.push(Op::LoadLit { dst, val: 0 });
                 return dst;
             }
         };
+        // SAFETY: self.functions is &'a (external borrow). Never mutated during compile.
+        let func = unsafe { &*func };
 
-        // Bind arguments to parameter slots.
-        // We emit a LoadSlot copy to ensure the value is materialized in THIS ops
-        // context. Without this, if the argument is a var reference to a slot set
-        // in a different dispatch entry's ops, the value would be stale at runtime.
-        let mut saved: Vec<(String, Option<Slot>)> = Vec::with_capacity(
-            func.parameters.len() + func.locals.len(),
-        );
-        for (i, param) in func.parameters.iter().enumerate() {
+        let fn_id = if let Some(&id) = self.function_cache.get(name) {
+            id
+        } else {
+            self.compile_function_body(name, func)
+        };
+
+        // Compile arguments at the call site (they execute in the caller's ops context).
+        let mut arg_slots: Vec<Slot> = Vec::with_capacity(args.len());
+        for a in args {
+            arg_slots.push(self.compile_expr(a, ops));
+        }
+        // Pad missing arguments with zero literals so Op::Call can count on a
+        // full vector of arg slots matching `param_slots`.
+        while arg_slots.len() < func.parameters.len() {
+            let s = self.alloc();
+            ops.push(Op::LoadLit { dst: s, val: 0 });
+            arg_slots.push(s);
+        }
+        arg_slots.truncate(func.parameters.len());
+
+        let dst = self.alloc();
+        ops.push(Op::Call { dst, fn_id, arg_slots });
+        dst
+    }
+
+    /// Compile a function body once. Reserves param slots, binds them in
+    /// `property_slots`, compiles locals and the result into a standalone
+    /// body op stream, and records the result in `compiled_functions`.
+    fn compile_function_body(&mut self, name: &str, func: &FunctionDef) -> u32 {
+        prof!("compile_function_body");
+        // Reserve a slot per parameter. Op::Call writes these before the body runs.
+        let param_slots: Vec<Slot> = func.parameters.iter().map(|_| self.alloc()).collect();
+
+        // Save & bind property_slots for parameters and locals so that
+        // var() references inside the body resolve to the reserved slots.
+        let mut saved: Vec<(String, Option<Slot>)> =
+            Vec::with_capacity(func.parameters.len() + func.locals.len());
+        for (param, &pslot) in func.parameters.iter().zip(&param_slots) {
             let old = self.property_slots.get(&param.name).copied();
-            let compiled_slot = args
-                .get(i)
-                .map(|a| self.compile_expr(a, ops))
-                .unwrap_or_else(|| {
-                    let s = self.alloc();
-                    ops.push(Op::LoadLit { dst: s, val: 0 });
-                    s
-                });
-            let local_slot = self.alloc();
-            ops.push(Op::LoadSlot { dst: local_slot, src: compiled_slot });
-            self.property_slots.insert(param.name.clone(), local_slot);
+            self.property_slots.insert(param.name.clone(), pslot);
             saved.push((param.name.clone(), old));
         }
 
-        // Evaluate local variables
+        let mut body_ops: Vec<Op> = Vec::new();
+
+        // Compile locals. Their value ops go into body_ops (runs on every call).
         for local in &func.locals {
             let old = self.property_slots.get(&local.name).copied();
-            let val_slot = self.compile_expr(&local.value, ops);
+            let val_slot = self.compile_expr(&local.value, &mut body_ops);
             self.property_slots.insert(local.name.clone(), val_slot);
             saved.push((local.name.clone(), old));
         }
 
-        // Compile the result expression
-        let result_slot = self.compile_expr(&func.result, ops);
+        // Compile the result expression into the body.
+        let result_slot = self.compile_expr(&func.result, &mut body_ops);
 
-        // Restore previous bindings
-        for (param_name, old) in saved {
+        // Restore caller's property bindings.
+        for (name_s, old) in saved {
             match old {
                 Some(s) => {
-                    self.property_slots.insert(param_name, s);
+                    self.property_slots.insert(name_s, s);
                 }
                 None => {
-                    self.property_slots.remove(&param_name);
+                    self.property_slots.remove(&name_s);
                 }
             }
         }
 
-        result_slot
+        let fn_id = self.compiled_functions.len() as u32;
+        self.compiled_functions.push(CompiledFunction {
+            param_slots,
+            body_ops,
+            result_slot,
+        });
+        self.function_cache.insert(name.to_string(), fn_id);
+        fn_id
     }
 }
 
@@ -2272,6 +2447,8 @@ pub fn compile(
     functions: &HashMap<String, FunctionDef>,
     dispatch_tables: &HashMap<String, DispatchTable>,
 ) -> CompiledProgram {
+    profile_compile_init();
+    prof!("compile");
     let _ct = web_time::Instant::now();
     let mut compiler = Compiler::new(functions, dispatch_tables);
     log::info!("[compile detail] Compiler::new clone: {:.2}s", _ct.elapsed().as_secs_f64());
@@ -2351,8 +2528,19 @@ pub fn compile(
         dispatch_tables: compiler.compiled_dispatches,
         chain_tables: Vec::new(),
         flat_dispatch_arrays: compiler.compiled_flat_arrays,
+        functions: compiler.compiled_functions,
         property_slots: compiler.property_slots,
     };
+
+    // Expand all Op::Call sites inline. Op::Call was a compile-time device to
+    // avoid O(N) per-call-site recompilation; at runtime we want the flat
+    // linear op stream the evaluator is optimized for. After this pass,
+    // program.ops (and all dispatch entries, broadcast value_ops) contain no
+    // Op::Call ops — the bodies are inlined.
+    let _ct = web_time::Instant::now();
+    let inlined = inline_calls(&mut program);
+    log::info!("[compile detail] inline calls: {} sites inlined, {:.2}s",
+        inlined, _ct.elapsed().as_secs_f64());
 
     let _ct = web_time::Instant::now();
     let fused = fuse_cmp_branch(&mut program);
@@ -2370,7 +2558,249 @@ pub fn compile(
     compact_slots(&mut program);
     log::info!("[compile detail] slot compaction: {:.2}s", _ct.elapsed().as_secs_f64());
 
+    profile_compile_dump();
     program
+}
+
+// ---------------------------------------------------------------------------
+// Op::Call inlining — expand every Call site back into its body_ops.
+// ---------------------------------------------------------------------------
+//
+// The Op::Call mechanism is a compile-time device: it lets us compile each
+// function body exactly once instead of once per call site. But at runtime,
+// a Call op forces a nested exec_ops() recursion, which is ~40x slower than
+// running the body inline in the main linear op stream. So we expand every
+// Call back into its body after compilation. Bodies are inlined with their
+// original slot numbers — since execution is strictly sequential, sharing
+// the same body-internal slots across call sites is safe (same invariant
+// as the existing dispatch-entry slot overlay).
+//
+// Body ops may contain branches with absolute PC targets (Jump,
+// BranchIfNotEqLit, BranchIfZero, LoadStateAndBranchIfNotEqLit,
+// DispatchChain, etc.). When inlined at offset `base`, every target must
+// be shifted by `base`. Dispatch sub-op entries have their own PC scope
+// and don't need shifting.
+//
+// Bodies are inlined in topological order: leaves (no nested Calls) first.
+// We fully inline each CompiledFunction.body_ops once, then use those
+// flattened bodies when expanding Call sites in the main ops stream and
+// elsewhere. This ensures a single-pass expansion of call sites.
+
+fn shift_branch_targets(ops: &mut [Op], offset: u32) {
+    for op in ops {
+        match op {
+            Op::Jump { target } => *target += offset,
+            Op::BranchIfZero { target, .. } => *target += offset,
+            Op::BranchIfNotEqLit { target, .. } => *target += offset,
+            Op::LoadStateAndBranchIfNotEqLit { target, .. } => *target += offset,
+            Op::DispatchChain { miss_target, .. } => *miss_target += offset,
+            // Dispatch op's fallback_target is unused (sub-ops live in dispatch tables).
+            _ => {}
+        }
+    }
+}
+
+/// Expand a single stream of ops: every `Op::Call { fn_id, arg_slots, dst }`
+/// is replaced with the function's already-inlined body_ops plus the arg→param
+/// copy and result→dst copy. Returns the number of call sites expanded.
+///
+/// Branch targets in the *containing* stream (already-copied ops in `out`, and
+/// ops still to come in `src`) must be shifted to account for inserted ops.
+/// We build `out` by iterating `src` with an index map: old index N → new index
+/// `shift_table[N]`. After construction, any branch op's target `T` (which
+/// references an old index) is rewritten to `shift_table[T]`.
+fn expand_calls_in_stream(ops: &mut Vec<Op>, flat_bodies: &[Vec<Op>], param_slots: &[Vec<Slot>], result_slots: &[Slot]) -> usize {
+    let has_any = ops.iter().any(|o| matches!(o, Op::Call { .. }));
+    if !has_any { return 0; }
+
+    let src = std::mem::take(ops);
+    let src_len = src.len();
+    let mut out: Vec<Op> = Vec::with_capacity(src_len * 2);
+    // shift_table[i] = new index of old instruction i.
+    // An extra trailing entry (shift_table[src_len] = out.len() at end) lets
+    // targets that pointed past-the-end (to "end of stream") remap correctly.
+    let mut shift_table: Vec<u32> = Vec::with_capacity(src_len + 1);
+    let mut expanded = 0usize;
+
+    for op in src {
+        shift_table.push(out.len() as u32);
+        match op {
+            Op::Call { dst, fn_id, arg_slots } => {
+                let fid = fn_id as usize;
+                let params = &param_slots[fid];
+                let body = &flat_bodies[fid];
+                let result = result_slots[fid];
+
+                // arg → reserved param slot
+                for (arg, &param) in arg_slots.iter().zip(params.iter()) {
+                    out.push(Op::LoadSlot { dst: param, src: *arg });
+                }
+
+                // Inline body. Body targets are absolute within the body;
+                // shift them by the current `out.len()` at body start.
+                let base = out.len() as u32;
+                let start = out.len();
+                out.extend(body.iter().cloned());
+                shift_branch_targets(&mut out[start..], base);
+
+                // result → dst
+                out.push(Op::LoadSlot { dst, src: result });
+                expanded += 1;
+            }
+            other => out.push(other),
+        }
+    }
+    // Sentinel for targets that pointed at src_len (end of stream).
+    shift_table.push(out.len() as u32);
+
+    // Rewrite branch targets in out[] using shift_table. Only rewrite targets
+    // that correspond to original (non-body-inlined) ops. Body-inlined ops
+    // already had their internal targets shifted by `base` above and don't
+    // reference outer indices; they have different target ranges, and none
+    // of them points into shift_table. We distinguish by target value: body
+    // targets (shifted by `base`) are always < final out.len() and ≥ the
+    // base at which they were inlined — but that's hard to track after the
+    // fact.
+    //
+    // Simpler: rebuild out with a second pass that only rewrites targets of
+    // ops that came from `src` (non-inlined). We track each op's origin via
+    // a parallel `is_outer` vector.
+    //
+    // Rebuild approach. We redo the loop but now populate is_outer alongside.
+    // This mirrors the body-shift pass above.
+    //
+    // (We do the rebuild here rather than inline in the first loop to keep
+    // the control flow straightforward.)
+    let mut is_outer = vec![false; out.len()];
+    {
+        // Re-run the logical layout to figure out which indices correspond to
+        // original src ops. At entry, shift_table[i] = start position of op i
+        // in out. If op i was not a Call, exactly one op lives at that position.
+        // If it was a Call, several ops live starting there; none are "outer".
+        //
+        // Our rule: out[shift_table[i]] is "outer" iff src[i] was not a Call.
+        // To avoid re-iterating src (which we consumed), we infer from the
+        // sequence of shift_table deltas: size=1 means non-call, size>1 means call.
+        // A call expansion size is `arg_count + body_len + 1` (LoadSlot dst).
+        // We just check shift_table[i+1] - shift_table[i] == 1.
+        for i in 0..src_len {
+            let delta = shift_table[i + 1] - shift_table[i];
+            if delta == 1 {
+                is_outer[shift_table[i] as usize] = true;
+            }
+        }
+    }
+
+    for idx in 0..out.len() {
+        if !is_outer[idx] { continue; }
+        match &mut out[idx] {
+            Op::Jump { target }
+            | Op::BranchIfZero { target, .. }
+            | Op::BranchIfNotEqLit { target, .. }
+            | Op::LoadStateAndBranchIfNotEqLit { target, .. }
+            | Op::DispatchChain { miss_target: target, .. } => {
+                let old = *target as usize;
+                if old <= src_len {
+                    *target = shift_table[old];
+                }
+            }
+            _ => {}
+        }
+    }
+
+    *ops = out;
+    expanded
+}
+
+/// Inline every `Op::Call` in the program. Processes CompiledFunction bodies in
+/// topological order (leaves first), then expands calls in the main ops stream,
+/// dispatch entry/fallback ops, and broadcast value/spillover ops.
+fn inline_calls(program: &mut CompiledProgram) -> usize {
+    let n = program.functions.len();
+    if n == 0 { return 0; }
+
+    // Compute each function's immediate Call callees.
+    let mut callees: Vec<Vec<u32>> = Vec::with_capacity(n);
+    for func in &program.functions {
+        let mut c = Vec::new();
+        for op in &func.body_ops {
+            if let Op::Call { fn_id, .. } = op {
+                c.push(*fn_id);
+            }
+        }
+        callees.push(c);
+    }
+
+    // Topological sort — leaves (no callees) first. Cycles would mean recursion,
+    // which the compile-path doesn't produce; if we detect one, break arbitrarily.
+    let mut order: Vec<u32> = Vec::with_capacity(n);
+    let mut inlined_set = vec![false; n];
+    loop {
+        let mut progressed = false;
+        for i in 0..n {
+            if inlined_set[i] { continue; }
+            if callees[i].iter().all(|&c| inlined_set[c as usize]) {
+                order.push(i as u32);
+                inlined_set[i] = true;
+                progressed = true;
+            }
+        }
+        if !progressed { break; }
+    }
+    // Any leftover (cycle) — append in index order; we'll inline them without
+    // recursion support.
+    for i in 0..n {
+        if !inlined_set[i] { order.push(i as u32); }
+    }
+
+    // Take out bodies so we can mutate them while keeping &program.functions layout.
+    let mut bodies: Vec<Vec<Op>> = program.functions.iter_mut()
+        .map(|f| std::mem::take(&mut f.body_ops))
+        .collect();
+    let param_slots: Vec<Vec<Slot>> = program.functions.iter()
+        .map(|f| f.param_slots.clone())
+        .collect();
+    let result_slots: Vec<Slot> = program.functions.iter()
+        .map(|f| f.result_slot)
+        .collect();
+
+    // Fully inline each function's body in topo order. After inlining bodies[i],
+    // it contains no Op::Call ops, and any later function that calls i can
+    // freely inline bodies[i].
+    let mut total = 0usize;
+    for &i in &order {
+        let idx = i as usize;
+        let mut body = std::mem::take(&mut bodies[idx]);
+        total += expand_calls_in_stream(&mut body, &bodies, &param_slots, &result_slots);
+        bodies[idx] = body;
+    }
+
+    // Now inline calls in the main ops stream.
+    total += expand_calls_in_stream(&mut program.ops, &bodies, &param_slots, &result_slots);
+
+    // Dispatch tables: entry ops and fallback ops.
+    for table in &mut program.dispatch_tables {
+        for (_key, (entry_ops, _slot)) in &mut table.entries {
+            total += expand_calls_in_stream(entry_ops, &bodies, &param_slots, &result_slots);
+        }
+        total += expand_calls_in_stream(&mut table.fallback_ops, &bodies, &param_slots, &result_slots);
+    }
+
+    // Broadcast writes: value_ops and spillover entry ops.
+    for bw in &mut program.broadcast_writes {
+        total += expand_calls_in_stream(&mut bw.value_ops, &bodies, &param_slots, &result_slots);
+        if let Some(ref mut spillover) = bw.spillover {
+            for (_key, (spill_ops, _slot)) in &mut spillover.entries {
+                total += expand_calls_in_stream(spill_ops, &bodies, &param_slots, &result_slots);
+            }
+        }
+    }
+
+    // Bodies are no longer needed at runtime since all Call sites are inlined.
+    // Clear them to free memory; leave the CompiledFunction structs in place
+    // (harmless, and the executor's Op::Call arm won't be invoked).
+    program.functions.clear();
+    total
 }
 
 // ---------------------------------------------------------------------------
@@ -3360,6 +3790,10 @@ fn op_slots_read(op: &Op) -> Vec<Slot> {
         Op::DispatchFlatArray { key, .. } => vec![*key],
         Op::StoreState { src, .. } => vec![*src],
         Op::StoreMem { addr_slot, src, .. } => vec![*addr_slot, *src],
+        // Call reads the arg slots at the call site; param/local slots
+        // inside body_ops belong to the body's own scope and are listed
+        // by the compaction walk when it recurses into body_ops.
+        Op::Call { arg_slots, .. } => arg_slots.clone(),
     }
 }
 
@@ -3395,7 +3829,8 @@ fn op_dst(op: &Op) -> Option<Slot> {
         | Op::BitNot16 { dst, .. }
         | Op::CmpEq { dst, .. }
         | Op::Dispatch { dst, .. }
-        | Op::DispatchFlatArray { dst, .. } => Some(*dst),
+        | Op::DispatchFlatArray { dst, .. }
+        | Op::Call { dst, .. } => Some(*dst),
         Op::AddLit { dst, .. } | Op::SubLit { dst, .. } | Op::MulLit { dst, .. }
         | Op::AndLit { dst, .. } | Op::ShrLit { dst, .. } | Op::ShlLit { dst, .. }
         | Op::ModLit { dst, .. } => Some(*dst),
@@ -3523,6 +3958,12 @@ fn map_op_slots(op: &mut Op, slot_map: &mut HashMap<Slot, Slot>, alloc: &mut Slo
             *addr_slot = alloc.get_or_alloc(*addr_slot, slot_map);
             *src = alloc.get_or_alloc(*src, slot_map);
         }
+        Op::Call { dst, arg_slots, .. } => {
+            for s in arg_slots.iter_mut() {
+                *s = alloc.get_or_alloc(*s, slot_map);
+            }
+            *dst = alloc.get_or_alloc(*dst, slot_map);
+        }
     }
 }
 
@@ -3576,11 +4017,13 @@ fn seed_from_parent(
         Op::DispatchFlatArray { key, .. } => { seed(*key); }
         Op::StoreState { src, .. } => { seed(*src); }
         Op::StoreMem { addr_slot, src } => { seed(*addr_slot); seed(*src); }
+        Op::Call { arg_slots, .. } => { for s in arg_slots { seed(*s); } }
     }
 }
 
 /// Compile a single broadcast write.
 fn compile_broadcast_write(bw: &BroadcastWrite, compiler: &mut Compiler) -> CompiledBroadcastWrite {
+    prof!("compile_broadcast_write");
     let _t0 = web_time::Instant::now();
     // Compile dest property resolution
     let dest_slot = compiler.compile_var(&bw.dest_property, None, &mut Vec::new());
@@ -3653,7 +4096,7 @@ pub fn execute(program: &CompiledProgram, state: &mut State, slots: &mut Vec<i32
     }
 
     // Execute main ops
-    exec_ops(&program.ops, &program.dispatch_tables, &program.chain_tables, &program.flat_dispatch_arrays, state, slots);
+    exec_ops(&program.ops, &program.dispatch_tables, &program.chain_tables, &program.flat_dispatch_arrays, &program.functions, state, slots);
 
     // Writeback: apply computed values to state
     for &(slot, addr) in &program.writeback {
@@ -3669,7 +4112,7 @@ pub fn execute(program: &CompiledProgram, state: &mut State, slots: &mut Vec<i32
         let dest = slots[bw.dest_slot as usize];
         let dest_i64 = dest as i64;
         if bw.address_map.contains_key(&dest_i64) {
-            exec_ops(&bw.value_ops, &program.dispatch_tables, &program.chain_tables, &program.flat_dispatch_arrays, state, slots);
+            exec_ops(&bw.value_ops, &program.dispatch_tables, &program.chain_tables, &program.flat_dispatch_arrays, &program.functions, state, slots);
             let value = slots[bw.value_slot as usize];
             state.write_mem(dest, value);
         }
@@ -3678,7 +4121,7 @@ pub fn execute(program: &CompiledProgram, state: &mut State, slots: &mut Vec<i32
             let guard = slots[spillover.guard_slot as usize];
             if guard == 1 {
                 if let Some((ref spill_ops, spill_slot)) = spillover.entries.get(&dest_i64) {
-                    exec_ops(spill_ops, &program.dispatch_tables, &program.chain_tables, &program.flat_dispatch_arrays, state, slots);
+                    exec_ops(spill_ops, &program.dispatch_tables, &program.chain_tables, &program.flat_dispatch_arrays, &program.functions, state, slots);
                     let value = slots[*spill_slot as usize];
                     state.write_mem(dest + 1, value);
                 }
@@ -3701,6 +4144,7 @@ fn exec_ops(
     dispatch_tables: &[CompiledDispatchTable],
     chain_tables: &[DispatchChainTable],
     flat_dispatch_arrays: &[FlatDispatchArray],
+    functions: &[CompiledFunction],
     state: &mut State,
     slots: &mut [i32],
 ) {
@@ -3939,10 +4383,10 @@ fn exec_ops(
                 let key_val = sload!(*key) as i64;
                 let table = unsafe { dispatch_tables.get_unchecked(*table_id as usize) };
                 if let Some((entry_ops, result_slot)) = table.entries.get(&key_val) {
-                    exec_ops(entry_ops, dispatch_tables, chain_tables, flat_dispatch_arrays, state, slots);
+                    exec_ops(entry_ops, dispatch_tables, chain_tables, flat_dispatch_arrays, functions, state, slots);
                     sstore!(*dst, sload!(*result_slot));
                 } else {
-                    exec_ops(&table.fallback_ops, dispatch_tables, chain_tables, flat_dispatch_arrays, state, slots);
+                    exec_ops(&table.fallback_ops, dispatch_tables, chain_tables, flat_dispatch_arrays, functions, state, slots);
                     sstore!(*dst, sload!(table.fallback_slot));
                 }
             }
@@ -3956,6 +4400,16 @@ fn exec_ops(
                     unsafe { *arr.values.get_unchecked(idx as usize) }
                 };
                 sstore!(*dst, v);
+            }
+            Op::Call { dst, fn_id, arg_slots } => {
+                let func = unsafe { functions.get_unchecked(*fn_id as usize) };
+                // Copy arg values into the reserved parameter slots.
+                for (arg, &param) in arg_slots.iter().zip(func.param_slots.iter()) {
+                    sstore!(param, sload!(*arg));
+                }
+                // Run the cached body (uses its own internal slots + the param slots).
+                exec_ops(&func.body_ops, dispatch_tables, chain_tables, flat_dispatch_arrays, functions, state, slots);
+                sstore!(*dst, sload!(func.result_slot));
             }
             Op::StoreState { addr, src } => {
                 state.write_mem(*addr, sload!(*src));
@@ -3992,7 +4446,7 @@ pub fn execute_profiled(
     profile.slot_reset += t1.duration_since(t0).as_secs_f64();
 
     // Main ops (profiled — fills dispatch_time, counts, etc. directly)
-    exec_ops_profiled(&program.ops, &program.dispatch_tables, &program.chain_tables, &program.flat_dispatch_arrays, state, slots, profile);
+    exec_ops_profiled(&program.ops, &program.dispatch_tables, &program.chain_tables, &program.flat_dispatch_arrays, &program.functions, state, slots, profile);
     let t2 = Instant::now();
     profile.main_ops += t2.duration_since(t1).as_secs_f64();
     profile.linear_ops = profile.main_ops - profile.dispatch_time;
@@ -4018,7 +4472,7 @@ pub fn execute_profiled(
         let dest = slots[bw.dest_slot as usize];
         let dest_i64 = dest as i64;
         if bw.address_map.contains_key(&dest_i64) {
-            exec_ops(&bw.value_ops, &program.dispatch_tables, &program.chain_tables, &program.flat_dispatch_arrays, state, slots);
+            exec_ops(&bw.value_ops, &program.dispatch_tables, &program.chain_tables, &program.flat_dispatch_arrays, &program.functions, state, slots);
             let value = slots[bw.value_slot as usize];
             state.write_mem(dest, value);
             bw_fired += 1;
@@ -4027,7 +4481,7 @@ pub fn execute_profiled(
             let guard = slots[spillover.guard_slot as usize];
             if guard == 1 {
                 if let Some((ref spill_ops, spill_slot)) = spillover.entries.get(&dest_i64) {
-                    exec_ops(spill_ops, &program.dispatch_tables, &program.chain_tables, &program.flat_dispatch_arrays, state, slots);
+                    exec_ops(spill_ops, &program.dispatch_tables, &program.chain_tables, &program.flat_dispatch_arrays, &program.functions, state, slots);
                     let value = slots[*spill_slot as usize];
                     state.write_mem(dest + 1, value);
                 }
@@ -4046,6 +4500,7 @@ fn exec_ops_profiled(
     dispatch_tables: &[CompiledDispatchTable],
     chain_tables: &[DispatchChainTable],
     flat_dispatch_arrays: &[FlatDispatchArray],
+    functions: &[CompiledFunction],
     state: &mut State,
     slots: &mut [i32],
     profile: &mut TickProfile,
@@ -4337,11 +4792,11 @@ fn exec_ops_profiled(
                 let table = &dispatch_tables[*table_id as usize];
                 if let Some((entry_ops, result_slot)) = table.entries.get(&key_val) {
                     profile.dispatch_sub_ops_count += entry_ops.len() as u64;
-                    exec_ops(entry_ops, dispatch_tables, chain_tables, flat_dispatch_arrays, state, slots);
+                    exec_ops(entry_ops, dispatch_tables, chain_tables, flat_dispatch_arrays, functions, state, slots);
                     slots[*dst as usize] = slots[*result_slot as usize];
                 } else {
                     profile.dispatch_sub_ops_count += table.fallback_ops.len() as u64;
-                    exec_ops(&table.fallback_ops, dispatch_tables, chain_tables, flat_dispatch_arrays, state, slots);
+                    exec_ops(&table.fallback_ops, dispatch_tables, chain_tables, flat_dispatch_arrays, functions, state, slots);
                     slots[*dst as usize] = slots[table.fallback_slot as usize];
                 }
                 profile.dispatch_time += td.elapsed().as_secs_f64();
@@ -4357,6 +4812,15 @@ fn exec_ops_profiled(
                     arr.values[idx as usize]
                 };
                 slots[*dst as usize] = v;
+            }
+            Op::Call { dst, fn_id, arg_slots } => {
+                count_op!(profile, "Call");
+                let func = &functions[*fn_id as usize];
+                for (arg, &param) in arg_slots.iter().zip(func.param_slots.iter()) {
+                    slots[param as usize] = slots[*arg as usize];
+                }
+                exec_ops(&func.body_ops, dispatch_tables, chain_tables, flat_dispatch_arrays, functions, state, slots);
+                slots[*dst as usize] = slots[func.result_slot as usize];
             }
             Op::StoreState { addr, src } => {
                 count_op!(profile, "StoreState");
@@ -4403,6 +4867,7 @@ pub fn exec_ops_traced(
     dispatch_tables: &[CompiledDispatchTable],
     chain_tables: &[DispatchChainTable],
     flat_dispatch_arrays: &[FlatDispatchArray],
+    functions: &[CompiledFunction],
     state: &mut State,
     slots: &mut [i32],
     op_range: Option<(usize, usize)>,
@@ -4768,7 +5233,7 @@ pub fn exec_ops_traced(
                 let table = &dispatch_tables[*table_id as usize];
                 if let Some((entry_ops, result_slot)) = table.entries.get(&key_val) {
                     if should_trace {
-                        let mut sub = exec_ops_traced(entry_ops, dispatch_tables, chain_tables, flat_dispatch_arrays, state, slots, None, depth + 1);
+                        let mut sub = exec_ops_traced(entry_ops, dispatch_tables, chain_tables, flat_dispatch_arrays, functions, state, slots, None, depth + 1);
                         trace.push(TraceEntry {
                             pc, op: format!("Dispatch dst={} key={}({}) table={} → entry (result_slot={}={})", dst, key, key_val, table_id, result_slot, slots[*result_slot as usize]),
                             dst_slot: Some(*dst), dst_value: Some(slots[*result_slot as usize]),
@@ -4776,13 +5241,13 @@ pub fn exec_ops_traced(
                         });
                         trace.append(&mut sub);
                     } else {
-                        exec_ops(entry_ops, dispatch_tables, chain_tables, flat_dispatch_arrays, state, slots);
+                        exec_ops(entry_ops, dispatch_tables, chain_tables, flat_dispatch_arrays, functions, state, slots);
                     }
                     slots[*dst as usize] = slots[*result_slot as usize];
                 } else {
                     if should_trace {
-                        let mut sub = exec_ops_traced(&table.fallback_ops, dispatch_tables, chain_tables, flat_dispatch_arrays, state, slots, None, depth + 1);
-                        exec_ops(&table.fallback_ops, dispatch_tables, chain_tables, flat_dispatch_arrays, state, slots);
+                        let mut sub = exec_ops_traced(&table.fallback_ops, dispatch_tables, chain_tables, flat_dispatch_arrays, functions, state, slots, None, depth + 1);
+                        exec_ops(&table.fallback_ops, dispatch_tables, chain_tables, flat_dispatch_arrays, functions, state, slots);
                         trace.push(TraceEntry {
                             pc, op: format!("Dispatch dst={} key={}({}) table={} → fallback (fallback_slot={}={})", dst, key, key_val, table_id, table.fallback_slot, slots[table.fallback_slot as usize]),
                             dst_slot: Some(*dst), dst_value: Some(slots[table.fallback_slot as usize]),
@@ -4790,7 +5255,7 @@ pub fn exec_ops_traced(
                         });
                         trace.append(&mut sub);
                     } else {
-                        exec_ops(&table.fallback_ops, dispatch_tables, chain_tables, flat_dispatch_arrays, state, slots);
+                        exec_ops(&table.fallback_ops, dispatch_tables, chain_tables, flat_dispatch_arrays, functions, state, slots);
                     }
                     slots[*dst as usize] = slots[table.fallback_slot as usize];
                 }
@@ -4812,6 +5277,26 @@ pub fn exec_ops_traced(
                         inputs: vec![(*key, key_val)], branch_taken: None, depth,
                     });
                 }
+            }
+            Op::Call { dst, fn_id, arg_slots } => {
+                let func = &functions[*fn_id as usize];
+                for (arg, &param) in arg_slots.iter().zip(func.param_slots.iter()) {
+                    slots[param as usize] = slots[*arg as usize];
+                }
+                if should_trace {
+                    let mut sub = exec_ops_traced(&func.body_ops, dispatch_tables, chain_tables, flat_dispatch_arrays, functions, state, slots, None, depth + 1);
+                    let result = slots[func.result_slot as usize];
+                    trace.push(TraceEntry {
+                        pc, op: format!("Call dst={} fn_id={} args={:?} → {}", dst, fn_id, arg_slots, result),
+                        dst_slot: Some(*dst), dst_value: Some(result),
+                        inputs: arg_slots.iter().map(|&s| (s, slots[s as usize])).collect(),
+                        branch_taken: None, depth,
+                    });
+                    trace.append(&mut sub);
+                } else {
+                    exec_ops(&func.body_ops, dispatch_tables, chain_tables, flat_dispatch_arrays, functions, state, slots);
+                }
+                slots[*dst as usize] = slots[func.result_slot as usize];
             }
             Op::StoreState { addr, src } => {
                 let val = slots[*src as usize];
@@ -4857,6 +5342,7 @@ pub fn trace_property(
         &program.dispatch_tables,
         &program.chain_tables,
         &program.flat_dispatch_arrays,
+        &program.functions,
         state,
         slots,
         None, // trace all ops
@@ -4940,7 +5426,7 @@ mod tests {
 
         let mut state = State::default();
         let mut slots = vec![0i32; compiler.next_slot as usize];
-        exec_ops(&ops, &[], &[], &[], &mut state, &mut slots);
+        exec_ops(&ops, &[], &[], &[], &[], &mut state, &mut slots);
         assert_eq!(slots[slot as usize], 42);
     }
 
@@ -4958,7 +5444,7 @@ mod tests {
 
         let mut state = State::default();
         let mut slots = vec![0i32; compiler.next_slot as usize];
-        exec_ops(&ops, &[], &[], &[], &mut state, &mut slots);
+        exec_ops(&ops, &[], &[], &[], &[], &mut state, &mut slots);
         assert_eq!(slots[slot as usize], 30);
     }
 
@@ -4977,7 +5463,7 @@ mod tests {
 
         state.set_var("AX", 0x1234);
         let mut slots = vec![0i32; compiler.next_slot as usize];
-        exec_ops(&ops, &[], &[], &[], &mut state, &mut slots);
+        exec_ops(&ops, &[], &[], &[], &[], &mut state, &mut slots);
         assert_eq!(slots[slot as usize], 0x1234);
     }
 
@@ -5011,7 +5497,7 @@ mod tests {
 
         state.set_var("AX", 2);
         let mut slots = vec![0i32; compiler.next_slot as usize];
-        exec_ops(&ops, &[], &[], &[], &mut state, &mut slots);
+        exec_ops(&ops, &[], &[], &[], &[], &mut state, &mut slots);
         assert_eq!(slots[slot as usize], 200);
     }
 
@@ -5078,7 +5564,7 @@ mod tests {
 
         state.set_var("AX", 42);
         let mut slots = vec![0i32; compiler.next_slot as usize];
-        exec_ops(&ops, &compiler.compiled_dispatches, &[], &compiler.compiled_flat_arrays, &mut state, &mut slots);
+        exec_ops(&ops, &compiler.compiled_dispatches, &[], &compiler.compiled_flat_arrays, &compiler.compiled_functions, &mut state, &mut slots);
         assert_eq!(slots[slot as usize], 42);
     }
 
@@ -5129,7 +5615,7 @@ mod tests {
 
         let mut state = State::default();
         let mut slots = vec![0i32; compiler.next_slot as usize];
-        exec_ops(&ops, &[], &[], &[], &mut state, &mut slots);
+        exec_ops(&ops, &[], &[], &[], &[], &mut state, &mut slots);
         assert_eq!(slots[slot as usize], 15);
     }
 
@@ -5189,7 +5675,7 @@ mod tests {
 
         let mut state = State::default();
         let mut slots = vec![0i32; compiler.next_slot as usize];
-        exec_ops(&ops, &[], &[], &[], &mut state, &mut slots);
+        exec_ops(&ops, &[], &[], &[], &compiler.compiled_functions, &mut state, &mut slots);
         assert_eq!(slots[slot as usize], 42);
     }
 
@@ -5337,10 +5823,13 @@ mod tests {
         let mut compiler = Compiler::new(&functions, &dispatch_tables);
         let mut ops = Vec::new();
         let slot = compiler.compile_expr(&expr, &mut ops);
+        // Op::Call wraps the body, which contains the DispatchFlatArray op.
+        let has_flat = compiler.compiled_functions.iter()
+            .any(|f| f.body_ops.iter().any(|o| matches!(o, Op::DispatchFlatArray { .. })));
         assert!(
-            ops.iter().any(|o| matches!(o, Op::DispatchFlatArray { .. })),
-            "expected DispatchFlatArray op in {:?}",
-            ops
+            has_flat || ops.iter().any(|o| matches!(o, Op::DispatchFlatArray { .. })),
+            "expected DispatchFlatArray op somewhere (top-level ops {:?}, functions {})",
+            ops, compiler.compiled_functions.len()
         );
 
         // Execute and check the value.
@@ -5351,6 +5840,7 @@ mod tests {
             &compiler.compiled_dispatches,
             &[],
             &compiler.compiled_flat_arrays,
+            &compiler.compiled_functions,
             &mut state,
             &mut slots,
         );
@@ -5369,6 +5859,7 @@ mod tests {
             &compiler.compiled_dispatches,
             &[],
             &compiler.compiled_flat_arrays,
+            &compiler.compiled_functions,
             &mut state,
             &mut slots2,
         );
