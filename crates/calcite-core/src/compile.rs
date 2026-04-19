@@ -470,6 +470,10 @@ pub struct CompiledBroadcastWrite {
     pub address_map: HashMap<i64, i32>,
     /// Spillover ops (for word writes).
     pub spillover: Option<CompiledSpillover>,
+    /// Optional "outer gate" slot: if set, the broadcast only fires when
+    /// this slot reads as 1. Matches `BroadcastWrite::gate_property` from
+    /// the recogniser — see its docs for the CSS shape this absorbs.
+    pub gate_slot: Option<Slot>,
 }
 
 /// Compiled spillover for word-write broadcast.
@@ -3439,6 +3443,10 @@ fn compact_slots(program: &mut CompiledProgram) {
     for bw in &mut program.broadcast_writes {
         // dest_slot is in main scope — already mapped
         bw.dest_slot = slot_map.get(&bw.dest_slot).copied().unwrap_or(bw.dest_slot);
+        // gate_slot is also main-scope (compiled via compile_var with no dispatch)
+        if let Some(gs) = bw.gate_slot {
+            bw.gate_slot = Some(slot_map.get(&gs).copied().unwrap_or(gs));
+        }
 
         // value_ops get their own compact range starting from layer_base
         let bw_high = compact_sub_ops(&mut bw.value_ops, &mut bw.value_slot, layer_base, &slot_map, &mut scratch);
@@ -3488,6 +3496,9 @@ fn collect_main_pinned(program: &CompiledProgram) -> Vec<Slot> {
     }
     for bw in &program.broadcast_writes {
         pinned.push(bw.dest_slot);
+        if let Some(gs) = bw.gate_slot {
+            pinned.push(gs);
+        }
         if let Some(ref spillover) = bw.spillover {
             pinned.push(spillover.guard_slot);
         }
@@ -4098,12 +4109,21 @@ fn compile_broadcast_write(bw: &BroadcastWrite, compiler: &mut Compiler) -> Comp
         None
     };
 
+    // Compile the outer gate property if this broadcast write was recognised
+    // as sitting inside `style(--gate: 1): if(...)`. The executor checks
+    // this slot once per tick and skips the whole broadcast on mismatch.
+    let gate_slot = bw
+        .gate_property
+        .as_deref()
+        .map(|g| compiler.compile_var(g, None, &mut Vec::new()));
+
     CompiledBroadcastWrite {
         dest_slot,
         value_ops,
         value_slot,
         address_map,
         spillover,
+        gate_slot,
     }
 }
 
@@ -4135,6 +4155,13 @@ pub fn execute(program: &CompiledProgram, state: &mut State, slots: &mut Vec<i32
 
     // Execute broadcast writes
     for bw in &program.broadcast_writes {
+        // Gated broadcasts skip entirely when the gate is not 1. Mirrors
+        // the interpreted path in eval.rs.
+        if let Some(gate_slot) = bw.gate_slot {
+            if slots[gate_slot as usize] != 1 {
+                continue;
+            }
+        }
         let dest = slots[bw.dest_slot as usize];
         let dest_i64 = dest as i64;
         if bw.address_map.contains_key(&dest_i64) {
@@ -4525,6 +4552,12 @@ pub fn execute_profiled(
     // Broadcast writes
     let mut bw_fired: u64 = 0;
     for bw in &program.broadcast_writes {
+        // Gated broadcasts skip entirely when the gate is not 1.
+        if let Some(gate_slot) = bw.gate_slot {
+            if slots[gate_slot as usize] != 1 {
+                continue;
+            }
+        }
         let dest = slots[bw.dest_slot as usize];
         let dest_i64 = dest as i64;
         if bw.address_map.contains_key(&dest_i64) {

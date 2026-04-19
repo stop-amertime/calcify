@@ -210,10 +210,12 @@ impl Evaluator {
         // Recognise broadcast write patterns in assignments
         let broadcast_result = broadcast_write::recognise_broadcast(&program.assignments);
         for bw in &broadcast_result.writes {
+            let gate = bw.gate_property.as_deref().unwrap_or("(ungated)");
             log::info!(
-                "Recognised broadcast write: {} → {} targets",
+                "Recognised broadcast write: {} → {} targets  gate={}",
                 bw.dest_property,
                 bw.address_map.len(),
+                gate,
             );
         }
 
@@ -601,6 +603,14 @@ impl Evaluator {
         let bw_len = self.broadcast_writes.len();
         for i in 0..bw_len {
             let bw = unsafe { &*bw_ptr.add(i) };
+            // Gated broadcasts skip entirely when the gate is not 1. See
+            // the compiled path (compile::execute) for the same check.
+            if let Some(ref gate_property) = bw.gate_property {
+                let gate = self.resolve_property(gate_property, state).as_number();
+                if gate as i64 != 1 {
+                    continue;
+                }
+            }
             let dest = self.resolve_property(&bw.dest_property, state).as_number();
             let dest_i64 = dest as i64;
             if bw.address_map.contains_key(&dest_i64) {

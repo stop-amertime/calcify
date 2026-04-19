@@ -30,6 +30,16 @@ pub struct BroadcastWrite {
     pub spillover_map: HashMap<i64, (String, Expr)>,
     /// The property that gates spillover writes (e.g., `--isWordWrite`).
     pub spillover_guard: Option<String>,
+    /// Optional "outer gate": if set, the broadcast write only fires when
+    /// this property == 1. Used for broadcast assignments shaped like
+    ///   `if(style(--memAddr0:N): valN;
+    ///       style(--gate:1): if(style(--memAddr2:N): valN; ...);
+    ///       else: keep)`
+    /// where the inner broadcast lives inside a gating `style(--gate: 1)`
+    /// branch. The recogniser peels the gate off and records it here, so
+    /// the executor can skip the whole broadcast on ticks where the gate
+    /// is 0 without evaluating any of its address entries.
+    pub gate_property: Option<String>,
 }
 
 /// Result of broadcast pattern recognition.
@@ -50,8 +60,13 @@ pub struct BroadcastResult {
 /// execution logic (e.g. `--addrJump`) are left in the normal assignment loop.
 pub fn recognise_broadcast(assignments: &[Assignment]) -> BroadcastResult {
     let _p1 = web_time::Instant::now();
-    // Phase 1: Collect all broadcast port entries, grouped by dest_property.
-    let mut direct_groups: HashMap<String, Vec<(i64, String, Expr)>> = HashMap::new();
+    // Phase 1: Collect all broadcast port entries, grouped by
+    // (dest_property, gate_property). Keying by the gate as well as the dest
+    // keeps ungated and gated ports from colliding into one group — each gate
+    // forms its own broadcast-write entry so the gate can be checked once per
+    // group at tick time.
+    type DirectKey = (String, Option<String>);
+    let mut direct_groups: HashMap<DirectKey, Vec<(i64, String, Expr)>> = HashMap::new();
     let mut spillover_groups: HashMap<String, Vec<(i64, String, String, Expr)>> = HashMap::new();
     let mut pure_broadcast: HashSet<String> = HashSet::new();
 
@@ -73,10 +88,11 @@ pub fn recognise_broadcast(assignments: &[Assignment]) -> BroadcastResult {
                         dest_property,
                         address,
                         value_expr,
+                        gate_property,
                     } => {
                         *port_counts.entry(assignment.property.clone()).or_insert(0) += 1;
                         direct_groups
-                            .entry(dest_property)
+                            .entry((dest_property, gate_property))
                             .or_default()
                             .push((address, assignment.property.clone(), value_expr));
                     }
@@ -107,12 +123,14 @@ pub fn recognise_broadcast(assignments: &[Assignment]) -> BroadcastResult {
     // Count of large groups that skip per-entry absorption tracking
     let mut bulk_absorbed_groups: usize = 0;
 
-    // Phase 2: For each dest_property, find the majority value expression and
-    // only absorb entries that use it. Entries with different expressions (e.g.
-    // split register byte-merges) are left in the normal assignment loop.
+    // Phase 2: For each (dest_property, gate_property), find the majority
+    // value expression and only absorb entries that use it.
+    //
+    // Spillovers attach only to the ungated group for a given dest_property —
+    // gated broadcast writes and spillovers are never combined today.
     let writes: Vec<BroadcastWrite> = direct_groups
         .into_iter()
-        .filter_map(|(dest_property, entries)| {
+        .filter_map(|((dest_property, gate_property), entries)| {
             // Group entries by value expression using HashMap (O(n) via hashing)
             // instead of linear scan with deep equality (O(n * tree_depth)).
             let mut expr_map: HashMap<Expr, Vec<(i64, String)>> = HashMap::new();
@@ -155,15 +173,22 @@ pub fn recognise_broadcast(assignments: &[Assignment]) -> BroadcastResult {
                 bulk_absorbed_groups += 1;
             }
 
-            // Build spillover map for this dest_property
-            let spillovers = spillover_groups.remove(&dest_property);
-            let (spillover_map, spillover_guard) = if let Some(spills) = spillovers {
-                let guard = spills.first().map(|(_, _, g, _)| g.clone());
-                let map = spills
-                    .into_iter()
-                    .map(|(src_addr, var_name, _, val_expr)| (src_addr, (var_name, val_expr)))
-                    .collect();
-                (map, guard)
+            // Build spillover map for this dest_property. Only the ungated
+            // group (gate_property == None) picks up spillovers — gated
+            // broadcasts don't have spillover siblings in the recognised
+            // CSS shape today.
+            let (spillover_map, spillover_guard) = if gate_property.is_none() {
+                let spillovers = spillover_groups.remove(&dest_property);
+                if let Some(spills) = spillovers {
+                    let guard = spills.first().map(|(_, _, g, _)| g.clone());
+                    let map = spills
+                        .into_iter()
+                        .map(|(src_addr, var_name, _, val_expr)| (src_addr, (var_name, val_expr)))
+                        .collect();
+                    (map, guard)
+                } else {
+                    (HashMap::new(), None)
+                }
             } else {
                 (HashMap::new(), None)
             };
@@ -174,6 +199,7 @@ pub fn recognise_broadcast(assignments: &[Assignment]) -> BroadcastResult {
                 address_map,
                 spillover_map,
                 spillover_guard,
+                gate_property,
             })
         })
         .collect();
@@ -210,10 +236,16 @@ pub fn recognise_broadcast(assignments: &[Assignment]) -> BroadcastResult {
 #[derive(Debug)]
 enum BroadcastPort {
     /// Direct write: `style(--addrDestX: ADDR) → value`
+    ///
+    /// `gate_property` is set when the port came from an inner branch of
+    /// `style(--gate: 1): if(...)`. Gated and ungated ports for the same
+    /// dest_property form separate BroadcastWrite entries so the gate can be
+    /// checked once per group at tick time.
     Direct {
         dest_property: String,
         address: i64,
         value_expr: Expr,
+        gate_property: Option<String>,
     },
     /// Spillover write: `style(--addrDestX: ADDR) and style(--isWordWrite: 1) → value`
     /// The address is the *source* address (N-1); the target cell is at N.
@@ -249,58 +281,8 @@ fn extract_broadcast_ports(assignment: &Assignment) -> Option<Vec<BroadcastPort>
             }
 
             let mut ports = Vec::with_capacity(branches.len());
-            for branch in branches {
-                match &branch.condition {
-                    StyleTest::Single {
-                        property,
-                        value: Expr::Literal(v),
-                    } => {
-                        ports.push(BroadcastPort::Direct {
-                            dest_property: property.clone(),
-                            address: *v as i64,
-                            value_expr: branch.then.clone(),
-                        });
-                    }
-                    StyleTest::Single { .. } => return None,
-                    StyleTest::And(tests) if tests.len() == 2 => {
-                        // Match: style(--addrX: N) and style(--guard: 1)
-                        // Identify the address test (the one whose property also appears
-                        // in single-condition branches) vs the guard test (value == 1).
-                        let (mut addr_test, mut guard_test) = (None, None);
-                        for t in tests {
-                            if let StyleTest::Single {
-                                property,
-                                value: Expr::Literal(v),
-                            } = t
-                            {
-                                if *v as i64 == 1 && guard_test.is_none() {
-                                    // Candidate guard (value == 1)
-                                    guard_test = Some(property.clone());
-                                } else if addr_test.is_none() {
-                                    // Candidate address
-                                    addr_test = Some((property.clone(), *v as i64));
-                                }
-                            }
-                        }
-                        // If both tests matched as guard candidates (both value == 1),
-                        // the first was taken as guard and second as address, which is wrong.
-                        // Re-check: the address property should match a Direct port's property.
-                        // For now, accept any valid pair — Phase 2 grouping will discard
-                        // nonsense combinations via the min-count threshold.
-                        match (addr_test, guard_test) {
-                            (Some((dest_property, source_address)), Some(guard_property)) => {
-                                ports.push(BroadcastPort::Spillover {
-                                    dest_property,
-                                    source_address,
-                                    guard_property,
-                                    value_expr: branch.then.clone(),
-                                });
-                            }
-                            _ => return None,
-                        }
-                    }
-                    _ => return None,
-                }
+            if !extract_branches_into(&assignment.property, branches, None, &mut ports) {
+                return None;
             }
             if ports.is_empty() {
                 None
@@ -310,6 +292,106 @@ fn extract_broadcast_ports(assignment: &Assignment) -> Option<Vec<BroadcastPort>
         }
         _ => None,
     }
+}
+
+/// Try to interpret each branch as a broadcast port and append to `ports`.
+/// Returns false if any branch isn't a valid port shape (bail whole assignment).
+///
+/// `outer_gate` is the gate carried down from an enclosing `style(--gate: 1): if(...)`
+/// branch, or None at the top level. It's stamped onto every Direct port emitted
+/// from this call, so inner broadcasts stay grouped separately by gate in phase 1.
+fn extract_branches_into(
+    property: &str,
+    branches: &[StyleBranch],
+    outer_gate: Option<&str>,
+    ports: &mut Vec<BroadcastPort>,
+) -> bool {
+    for branch in branches {
+        match &branch.condition {
+            StyleTest::Single {
+                property: cond_prop,
+                value: Expr::Literal(v),
+            } => {
+                let val = *v as i64;
+                // Gated-inner-broadcast pattern:
+                //   style(--gate: 1): if(<inner StyleCondition with simple keep>)
+                // Recurse into the inner branches, stamping the gate onto each
+                // emitted Direct port. This lets the CSS nest broadcast writes
+                // behind a rarely-true gate without defeating recognition.
+                //
+                // Only one level of gating is supported per port — an inner
+                // branch carrying its own `style(--gate2: 1)` would form a
+                // second gate, and we don't currently combine two gates into
+                // one port. (Deeply-nested gates still recurse; the innermost
+                // gate wins for grouping purposes. In practice the CSS only
+                // uses two levels and we don't need a more general solution.)
+                if val == 1 {
+                    if let Expr::StyleCondition {
+                        branches: inner_branches,
+                        fallback: inner_fallback,
+                    } = &branch.then
+                    {
+                        if is_simple_keep(inner_fallback, property) {
+                            // Recurse; the gate property for inner ports is the
+                            // current condition's property. If we already have
+                            // an outer_gate, keep the innermost (same rationale
+                            // as the comment above).
+                            let gate = cond_prop.as_str();
+                            if !extract_branches_into(property, inner_branches, Some(gate), ports) {
+                                return false;
+                            }
+                            continue;
+                        }
+                    }
+                }
+                // Regular direct port (possibly under an outer gate).
+                ports.push(BroadcastPort::Direct {
+                    dest_property: cond_prop.clone(),
+                    address: val,
+                    value_expr: branch.then.clone(),
+                    gate_property: outer_gate.map(|s| s.to_string()),
+                });
+            }
+            StyleTest::Single { .. } => return false,
+            StyleTest::And(tests) if tests.len() == 2 => {
+                // Match: style(--addrX: N) and style(--guard: 1)
+                // Identify the address test (the one whose property also appears
+                // in single-condition branches) vs the guard test (value == 1).
+                let (mut addr_test, mut guard_test) = (None, None);
+                for t in tests {
+                    if let StyleTest::Single {
+                        property: p,
+                        value: Expr::Literal(v),
+                    } = t
+                    {
+                        if *v as i64 == 1 && guard_test.is_none() {
+                            guard_test = Some(p.clone());
+                        } else if addr_test.is_none() {
+                            addr_test = Some((p.clone(), *v as i64));
+                        }
+                    }
+                }
+                match (addr_test, guard_test) {
+                    (Some((dest_property, source_address)), Some(guard_property)) => {
+                        // Spillover ports under an outer gate aren't supported;
+                        // bail rather than silently drop the gate.
+                        if outer_gate.is_some() {
+                            return false;
+                        }
+                        ports.push(BroadcastPort::Spillover {
+                            dest_property,
+                            source_address,
+                            guard_property,
+                            value_expr: branch.then.clone(),
+                        });
+                    }
+                    _ => return false,
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// Check if a fallback expression is a simple "keep previous value" pattern.
