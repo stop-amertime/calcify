@@ -12,6 +12,7 @@ env_logger = "0.11"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.28"
 mimalloc = { version = "0.1", default-features = false }
+cssparser = { workspace = true }
 
 [[bin]]
 name = "calcite-bench"
@@ -52,3 +53,11 @@ path = "src/bin/probe_regions.rs"
 [[bin]]
 name = "probe-bytecode-shape"
 path = "src/bin/probe_bytecode_shape.rs"
+
+[[bin]]
+name = "probe-parse-cost"
+path = "src/bin/probe_parse_cost.rs"
+
+[[bin]]
+name = "probe-cell-template"
+path = "src/bin/probe_cell_template.rs"
