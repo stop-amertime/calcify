@@ -46,7 +46,7 @@ pub fn profile_compile_dump() {
 
 pub struct ProfScope {
     idx: usize,
-    start: web_time::Instant,
+    start: std::time::Instant,
     enabled: bool,
 }
 
@@ -54,14 +54,14 @@ impl ProfScope {
     pub fn new(name: &'static str) -> Self {
         let enabled = PROF_ENABLED.with(|e| e.get());
         if !enabled {
-            return ProfScope { idx: 0, start: web_time::Instant::now(), enabled: false };
+            return ProfScope { idx: 0, start: std::time::Instant::now(), enabled: false };
         }
         let idx = PROF_TOTALS.with(|t| {
             let mut v = t.borrow_mut();
             if let Some(i) = v.iter().position(|(n, _, _)| *n == name) { i }
             else { v.push((name, 0.0, 0)); v.len() - 1 }
         });
-        ProfScope { idx, start: web_time::Instant::now(), enabled: true }
+        ProfScope { idx, start: std::time::Instant::now(), enabled: true }
     }
 }
 
@@ -1545,15 +1545,12 @@ impl<'a> Compiler<'a> {
             let ops_before = ops.len();
             let then_slot = self.compile_expr(&branch.then, ops);
             let ops_after = ops.len();
-            // Diagnostic: dump medium-sized branch chains. Was temporarily set to
-            // warn! for a specific investigation (memAddr for opcode 214 uOp 1);
-            // left enabled it floods the browser console during compile and
-            // stalls the worker. Kept as trace! so it's opt-in via RUST_LOG.
+            // Log ops for the branch that produces memAddr for opcode 214 uOp 1
             if ops_after - ops_before > 10 && ops_after - ops_before < 5000 {
-                log::trace!("[linear branch] {} ops (idx {}-{}) result_slot={} then_slot={}",
+                log::warn!("[linear branch] {} ops (idx {}-{}) result_slot={} then_slot={}",
                     ops_after - ops_before, ops_before, ops_after, result_slot, then_slot);
                 for j in ops_before..std::cmp::min(ops_after, ops_before + 30) {
-                    log::trace!("  [{:4}] {:?}", j, ops[j]);
+                    log::warn!("  [{:4}] {:?}", j, ops[j]);
                 }
             }
             ops.push(Op::LoadSlot {
