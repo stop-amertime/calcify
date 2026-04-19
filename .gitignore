@@ -34,3 +34,6 @@ MEMORY.md
 # Screenshots and images (not source)
 *.png
 output/
+
+# run-web.bat temp cart wrappers
+.cache/

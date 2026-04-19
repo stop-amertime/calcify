@@ -65,6 +65,14 @@ impl CalciteEngine {
         let evaluator = calcite_core::Evaluator::from_parsed(&parsed);
         log::info!("Evaluator created");
 
+        // Copy literal BIOS-byte entries out of the --readMem dispatch table
+        // into state memory so read_mem() / debugger tooling can see ROM. Without
+        // this, BIOS bytes exist only as CSS literal branches and read_mem()
+        // returns 0 for every F0000+ address.
+        if let Some(table) = evaluator.dispatch_tables.get("--readMem") {
+            state.populate_memory_from_readmem(table);
+        }
+
         Ok(CalciteEngine { state, evaluator })
     }
 
@@ -200,6 +208,24 @@ impl CalciteEngine {
     /// Common values: 0x03 = 80x25 text, 0x13 = VGA Mode 13h (320x200x256).
     pub fn get_video_mode(&self) -> u8 {
         self.state.read_mem(0x0449) as u8
+    }
+
+    /// Read the last video mode the program REQUESTED, before any silent
+    /// remap. Written by the corduroy BIOS to linear 0x04F2 on every
+    /// INT 10h AH=00h call. If this differs from `get_video_mode()` the
+    /// program asked for a mode CSS-DOS doesn't implement (EGA/VGA planar,
+    /// CGA, Hercules, etc.) and was silently remapped to text mode 0x03.
+    pub fn get_requested_video_mode(&self) -> u8 {
+        self.state.read_mem(0x04F2) as u8
+    }
+
+    /// Read the sticky "unknown opcode" latch. 0 means none seen yet.
+    /// A non-zero value is the opcode byte of the first instruction the
+    /// CPU hit that has no dispatch entry — typically a 286/386/486
+    /// instruction the 8086 core doesn't implement. Execution is
+    /// effectively halted because IP can't advance through it.
+    pub fn get_halt_code(&self) -> u8 {
+        self.state.get_var("haltCode").unwrap_or(0) as u8
     }
 
     /// Return string properties as a JSON object string, e.g. `{"textBuffer":"Hello"}`.

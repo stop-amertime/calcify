@@ -30,4 +30,16 @@ if %errorlevel% neq 0 (
 
 echo.
 echo Rebuild complete. The next MCP tool call should launch the new binary.
+echo.
+echo [REMINDER] This script only rebuilds calcite-debugger. If you changed
+echo            code shared with the WASM target (e.g. calcite-core/state.rs,
+echo            eval.rs, ops.rs) and the browser player needs to pick up
+echo            the changes too, you ALSO need:
+echo.
+echo              wasm-pack build crates/calcite-wasm --target web ^
+echo                         --out-dir ../../web/pkg --release
+echo.
+echo            That rebuilds ../calcite/web/pkg/calcite_wasm_bg.wasm, which
+echo            is what CSS-DOS's web/scripts/dev.mjs serves to the browser
+echo            (aliased as /calcite/pkg/).
 endlocal

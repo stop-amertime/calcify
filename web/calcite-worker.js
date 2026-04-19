@@ -40,15 +40,30 @@ self.onmessage = async function (event) {
   try {
     switch (type) {
       case 'init': {
+        const t0 = performance.now();
         if (!wasmModule) {
           wasmModule = await loadWasm();
         }
+        const tWasmLoaded = performance.now();
+
+        const cssBytes = data.css.length;
         engine = new wasmModule.CalciteEngine(data.css);
+        const tEngineBuilt = performance.now();
 
         // Detect video regions. The new JSON shape is {text, gfx}; either
         // can be null. If neither is present, fall back to assuming
         // standard DOS text mode at 0xB8000 so simple programs still work.
         const videoJson = engine.detect_video();
+        const tVideoDetected = performance.now();
+
+        const timing = {
+          cssBytes,
+          wasmLoadMs: +(tWasmLoaded - t0).toFixed(1),
+          parseCompileMs: +(tEngineBuilt - tWasmLoaded).toFixed(1),
+          detectVideoMs: +(tVideoDetected - tEngineBuilt).toFixed(1),
+          totalMs: +(tVideoDetected - t0).toFixed(1),
+        };
+        console.log('[calcite init]', JSON.stringify(timing));
         const parsed = JSON.parse(videoJson) || {};
         videoRegions = {
           text: parsed.text || null,
@@ -58,7 +73,7 @@ self.onmessage = async function (event) {
           videoRegions.text = { addr: 0xB8000, size: 4000, width: 80, height: 25 };
         }
 
-        self.postMessage({ type: 'ready', video: videoRegions });
+        self.postMessage({ type: 'ready', video: videoRegions, timing });
         break;
       }
 
@@ -75,6 +90,12 @@ self.onmessage = async function (event) {
         // it to decide which output to show (text vs. canvas).
         const videoMode = engine.get_video_mode();
         const isGfxMode = videoMode === 0x13; // Mode 13h: 320x200x256
+
+        // Diagnostics: what video mode the program asked for (pre-remap),
+        // and whether the CPU has hit an unknown opcode. Both stickily
+        // latched in the engine; the host surfaces them as warnings.
+        const requestedVideoMode = engine.get_requested_video_mode();
+        const haltCode = engine.get_halt_code();
 
         // Text-mode screen: only rendered when not in a graphics mode.
         // HTML variant includes CGA color spans; the UI sets innerHTML.
@@ -105,6 +126,8 @@ self.onmessage = async function (event) {
             screen,
             gfxBytes,
             videoMode,
+            requestedVideoMode,
+            haltCode,
             ticks: data.count || 1,
             cycles,
           },

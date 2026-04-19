@@ -401,6 +401,86 @@ fn default_summary_action() -> String {
     "get".into()
 }
 
+#[derive(Deserialize, schemars::JsonSchema)]
+struct SummariseParams {
+    /// Number of ticks to record. Hard-capped at 100000 — the point of this
+    /// endpoint is tactical recording over a small window, not bulk tracing.
+    /// For longer runs use `run_until` (no recording) to navigate, then
+    /// `summarise` over the small interesting window.
+    max_ticks: u32,
+    /// IP-window threshold for block breaks (default 256 bytes). Smaller =
+    /// more, finer blocks; larger = fewer, coarser blocks.
+    #[serde(default)]
+    ip_window: Option<i32>,
+    /// Session name. Required.
+    session: String,
+}
+
+const SUMMARISE_HARD_CAP: u32 = 100_000;
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct EntryStateCheckParams {
+    /// Session name. Required.
+    session: String,
+    /// CS value to wait for. If omitted, runs until CS is outside the BIOS
+    /// (0xF000) and outside the very low IVT/BDA region (CS < 0x0100). For a
+    /// .COM loaded via SHELL=, that lands in the program's PSP+0x10 segment.
+    #[serde(default)]
+    target_cs: Option<i32>,
+    /// Maximum ticks to run before giving up. Defaults to 30,000,000 — enough
+    /// to clear BIOS splash + DOS boot + CONFIG.SYS processing for a small .COM.
+    #[serde(default)]
+    max_ticks: Option<u32>,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+struct IvtEntry {
+    /// Interrupt number (e.g. 0x10 for video).
+    int_num: i32,
+    /// Handler segment from IVT slot int_num*4+2.
+    seg: i32,
+    /// Handler offset from IVT slot int_num*4+0.
+    off: i32,
+    /// Linear address = seg*16+off.
+    linear: i32,
+    /// First 8 bytes of code at linear (hex). All-zeros = handler not installed.
+    code_hex: String,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+struct EntryStateCheckResult {
+    /// True if the wait condition was hit; false on timeout.
+    found: bool,
+    /// Tick we landed on (or last tick reached on timeout).
+    tick: u32,
+    /// Reason for stopping: "matched", "timeout", "halted".
+    reason: String,
+    /// All registers + flags at the landing tick.
+    registers: BTreeMap<String, i32>,
+    /// IVT entries for the interrupts most programs actually use.
+    /// Empty `code_hex` (all zeros) is the smoking gun for "BIOS didn't install
+    /// this handler" — the program will execute through a null vector and crash.
+    ivt: Vec<IvtEntry>,
+    /// BDA fields the program might read. Each entry is (label, value).
+    bda: BTreeMap<String, i32>,
+    /// Stack contents around SS:SP. 32 bytes starting at SS:SP. Useful for
+    /// confirming the return address looks like a real CS:IP, that the
+    /// program-environment + cmdline-offset words DOS pushes are sane, etc.
+    stack_hex: String,
+    /// First 32 bytes at CS:IP — confirms the program code is actually loaded
+    /// at the address we think it is, and matches what NASM produced.
+    code_at_pc_hex: String,
+    /// First 32 bytes at CS:0x100 — for .COM files this is the entry point.
+    /// If CS:IP != CS:0x100 it tells us we landed somewhere unexpected.
+    code_at_com_entry_hex: String,
+    /// PSP fields if this looks like a .COM (CS-segment:0). cmdline length+text.
+    /// `null` if the byte at CS:0x80 doesn't look like a plausible cmdline length.
+    psp_cmdline: Option<String>,
+    /// Plain-English notes about anything that looks wrong.
+    /// e.g. "INT 10h handler is null", "DS != CS for a .COM (DOS sets DS=PSP)".
+    warnings: Vec<String>,
+}
+
 // --- Result types -----------------------------------------------------------
 
 #[derive(Serialize, schemars::JsonSchema)]
@@ -802,6 +882,12 @@ impl DebugSession {
     /// step-by-step inspection anyway).
     fn step_one_no_log(&mut self) {
         self.evaluator.tick(&mut self.state);
+        // Feed the summary recorder if one is attached. Cheap when None.
+        // Used by `summarise` to capture a tactical window of execution
+        // without paying the per-tick delta cost.
+        if let Some(ref mut log) = self.summary {
+            log.record_tick(&self.state);
+        }
         if self.base_interval > 0 {
             let t = self.current_tick();
             if t > 0 && t % self.base_interval == 0
@@ -2300,6 +2386,244 @@ impl DebuggerHandler {
             ))),
         }
     }
+
+    #[tool(
+        description = "Run forward up to `max_ticks` (hard-capped at 100000) with full event recording, then return the segmented blocks. One-shot tactical view — no start/stop/get state to manage. Use it after navigating cheaply to a known landmark with `run_until`, to see what's actually happening across the next small window. Each block summarises a coherent execution phase (CS / IP range / interrupts / memory writes) so you can ask 'what happened between point A and point B' without wading through millions of ticks."
+    )]
+    fn summarise(
+        &self,
+        Parameters(p): Parameters<SummariseParams>,
+    ) -> Result<Json<SummaryResult>, ErrorData> {
+        use calcite_core::summary::{EventLogger, SegmentConfig, SummaryConfig, render_block, segment};
+        if p.max_ticks > SUMMARISE_HARD_CAP {
+            return Err(invalid_params(format!(
+                "max_ticks={} exceeds the {SUMMARISE_HARD_CAP} hard cap. \
+                 summarise is for tactical recording over small windows. \
+                 For longer runs, use run_until (no recording) to navigate, \
+                 then summarise over a smaller interesting window.",
+                p.max_ticks
+            )));
+        }
+        let sess = self.get_session(&p.session)?;
+        let mut guard = sess.lock().unwrap();
+        let s = &mut *guard;
+
+        // Stash any prior summary recorder so this call doesn't disturb it.
+        let stash = s.summary.take();
+        s.summary = Some(EventLogger::new(SummaryConfig {
+            // Cap events at one-per-tick worst case; REP-collapse usually
+            // gives much fewer. Leave headroom so truncation is rare.
+            max_events: (p.max_ticks as usize).max(1) * 2,
+            record_writes: true,
+        }));
+
+        let start_tick = s.current_tick();
+        for _ in 0..p.max_ticks {
+            s.step_one_no_log();
+            if s.state.get_var("halt").unwrap_or(0) != 0 {
+                break;
+            }
+        }
+        let end_tick = s.current_tick();
+
+        let log = s.summary.take().expect("recorder we just installed");
+        // Restore any prior recorder so a separate `execution_summary`
+        // session in progress isn't clobbered by this tactical call.
+        s.summary = stash;
+
+        let seg_config = SegmentConfig {
+            ip_window: p.ip_window.unwrap_or(256),
+        };
+        let blocks = segment(&log.events, &seg_config);
+        let prose_lines: Vec<String> = blocks.iter().map(render_block).collect();
+        let prose = prose_lines.join("\n");
+        let header = format!(
+            "[summarise] ticks {}..{} ({} executed, {} events, {} blocks{})",
+            start_tick,
+            end_tick,
+            end_tick - start_tick,
+            log.events.len(),
+            blocks.len(),
+            if log.truncated { ", TRUNCATED" } else { "" },
+        );
+        let prose = format!("{header}\n{prose}");
+        let out_blocks: Vec<SummaryBlock> = blocks
+            .iter()
+            .map(|b| SummaryBlock {
+                start_tick: b.start_tick,
+                end_tick: b.end_tick,
+                cs: b.cs,
+                ip_min: b.ip_min,
+                ip_max: b.ip_max,
+                total_ticks: b.total_ticks,
+                event_count: b.event_count,
+                dominant_pc: b.dominant_pc.map(|(cs, ip, hits)| vec![cs, ip, hits as i32]),
+                interrupts: b.interrupts.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+                write_regions: b.write_regions.iter().map(|(lo, hi, n)| vec![*lo, *hi, *n as i32]).collect(),
+                line: render_block(b),
+            })
+            .collect();
+        Ok(Json(SummaryResult {
+            action: "summarise".into(),
+            active: false,
+            truncated: log.truncated,
+            event_count: log.events.len() as u32,
+            blocks: out_blocks,
+            prose,
+        }))
+    }
+
+    #[tool(
+        description = "Run forward until execution lands at a 'program entry' moment (CS leaves the BIOS / IVT region, or matches `target_cs`), then dump everything the program's first instruction will see: regs, IVT entries it might call, BDA fields, stack, code bytes at PC, and PSP. Catches 'BIOS handed the program a broken environment' bugs that lockstep-against-program can't see (because both sides inherit the same broken setup). Also flags obviously-wrong things in `warnings`."
+    )]
+    fn entry_state_check(
+        &self,
+        Parameters(p): Parameters<EntryStateCheckParams>,
+    ) -> Result<Json<EntryStateCheckResult>, ErrorData> {
+        let sess = self.get_session(&p.session)?;
+        let mut guard = sess.lock().unwrap();
+        let s = &mut *guard;
+
+        let max_ticks = p.max_ticks.unwrap_or(30_000_000);
+
+        // ---- Run until landing condition ----
+        let mut reason = "timeout".to_string();
+        let mut found = false;
+        for _ in 0..max_ticks {
+            let cs = s.state.get_var("CS").unwrap_or(0);
+            let matched = match p.target_cs {
+                Some(tc) => cs == tc,
+                None => cs != 0xF000 && cs >= 0x0100,
+            };
+            if matched {
+                reason = "matched".into();
+                found = true;
+                break;
+            }
+            if s.state.get_var("halt").unwrap_or(0) != 0 {
+                reason = "halted".into();
+                break;
+            }
+            s.step_one_no_log();
+        }
+
+        // ---- Snapshot everything ----
+        let registers = s.registers_map();
+        let cs = registers.get("CS").copied().unwrap_or(0);
+        let ip = registers.get("IP").copied().unwrap_or(0);
+        let ds = registers.get("DS").copied().unwrap_or(0);
+        let ss = registers.get("SS").copied().unwrap_or(0);
+        let sp = registers.get("SP").copied().unwrap_or(0);
+
+        let cs_lin = (cs as i64 * 16) as i32;
+        let ss_lin = (ss as i64 * 16) as i32;
+
+        // ---- IVT scan for the interrupts programs actually use ----
+        let mut warnings: Vec<String> = Vec::new();
+        let mut ivt: Vec<IvtEntry> = Vec::new();
+        for &n in &[0x08, 0x09, 0x10, 0x13, 0x16, 0x1A, 0x21] {
+            let off = s.state.read_mem16(n * 4);
+            let seg = s.state.read_mem16(n * 4 + 2);
+            let linear = (seg as i64 * 16 + off as i64) as i32;
+            let mut bytes = Vec::with_capacity(8);
+            for i in 0..8 {
+                bytes.push(s.state.read_mem(linear + i) as u8);
+            }
+            let code_hex: String = bytes.iter().map(|b| format!("{:02X}", b)).collect();
+            if seg == 0 && off == 0 {
+                warnings.push(format!("IVT[0x{:02X}] is NULL (seg=0 off=0)", n));
+            } else if bytes.iter().all(|b| *b == 0) {
+                warnings.push(format!(
+                    "IVT[0x{:02X}] -> {:04X}:{:04X} but those bytes are all zero (no handler installed there)",
+                    n, seg, off
+                ));
+            }
+            ivt.push(IvtEntry {
+                int_num: n,
+                seg,
+                off,
+                linear,
+                code_hex,
+            });
+        }
+
+        // ---- BDA fields ----
+        let mut bda = BTreeMap::new();
+        bda.insert("equipment_word(0x410)".into(), s.state.read_mem16(0x410));
+        bda.insert("memory_size_kb(0x413)".into(), s.state.read_mem16(0x413));
+        bda.insert("kbd_buf_head(0x41A)".into(), s.state.read_mem16(0x41A));
+        bda.insert("kbd_buf_tail(0x41C)".into(), s.state.read_mem16(0x41C));
+        bda.insert("video_mode(0x449)".into(), s.state.read_mem(0x449));
+        bda.insert("video_cols(0x44A)".into(), s.state.read_mem16(0x44A));
+        bda.insert("active_page(0x462)".into(), s.state.read_mem(0x462));
+        bda.insert("ticks_lo(0x46C)".into(), s.state.read_mem16(0x46C));
+        bda.insert("ticks_hi(0x46E)".into(), s.state.read_mem16(0x46E));
+
+        // ---- Stack: 32 bytes at SS:SP ----
+        let stack_hex: String = (0..32)
+            .map(|i| format!("{:02X}", s.state.read_mem(ss_lin + sp + i) as u8))
+            .collect();
+
+        // ---- Code at CS:IP and CS:0x100 ----
+        let code_at_pc_hex: String = (0..32)
+            .map(|i| format!("{:02X}", s.state.read_mem(cs_lin + ip + i) as u8))
+            .collect();
+        let code_at_com_entry_hex: String = (0..32)
+            .map(|i| format!("{:02X}", s.state.read_mem(cs_lin + 0x100 + i) as u8))
+            .collect();
+
+        // ---- PSP cmdline (CS:0x80 = length, CS:0x81.. = text) ----
+        let cmd_len = s.state.read_mem(cs_lin + 0x80) as u8;
+        let psp_cmdline = if cmd_len > 0 && cmd_len < 127 {
+            let mut s_str = String::new();
+            for i in 0..cmd_len as i32 {
+                let c = s.state.read_mem(cs_lin + 0x81 + i) as u8;
+                if (32..127).contains(&c) {
+                    s_str.push(c as char);
+                } else {
+                    s_str.push('.');
+                }
+            }
+            Some(s_str)
+        } else {
+            None
+        };
+
+        // ---- Sanity warnings ----
+        // For a .COM, DOS sets DS=ES=PSP=CS at entry. If we caught this BEFORE
+        // fire's `push cs; push cs; pop ds; pop es` runs, DS should equal CS.
+        if found && ip == 0x100 && ds != cs {
+            warnings.push(format!(
+                ".COM convention violated: DS={:04X} but CS={:04X} (DOS should set DS=PSP=CS for a .COM at entry)",
+                ds, cs
+            ));
+        }
+        // Stack should not be in the IVT.
+        if ss < 0x0050 {
+            warnings.push(format!("SS={:04X} is suspiciously low (in IVT/BDA)", ss));
+        }
+        // SP looks reasonable for a .COM (typically 0xFFFE — top of segment).
+        if ip == 0x100 && sp < 0x100 {
+            warnings.push(format!(
+                "SP={:04X} is suspiciously low for a .COM at entry (DOS typically sets SP=0xFFFE)",
+                sp
+            ));
+        }
+
+        Ok(Json(EntryStateCheckResult {
+            found,
+            tick: s.current_tick(),
+            reason,
+            registers,
+            ivt,
+            bda,
+            stack_hex,
+            code_at_pc_hex,
+            code_at_com_entry_hex,
+            psp_cmdline,
+            warnings,
+        }))
+    }
 }
 
 #[tool_handler]
@@ -2317,7 +2641,17 @@ impl ServerHandler for DebuggerHandler {
              state, `open` again with the same name to rehydrate."
                 .into(),
         );
-        info.capabilities = ServerCapabilities::builder().enable_tools().build();
+        // Declare tool_list_changed so the client (Claude Desktop, etc.)
+        // knows we may push tool-catalog updates and re-fetches when we
+        // emit `notifications/tools/list_changed` on every accept(). That
+        // notification path is how a client running across debugger
+        // rebuilds picks up newly-added tools without restarting itself
+        // — the daemon binary changed, but the client keeps the connection
+        // and the cached tool list otherwise.
+        info.capabilities = ServerCapabilities::builder()
+            .enable_tools()
+            .enable_tool_list_changed()
+            .build();
         info
     }
 }
@@ -2516,10 +2850,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             log_event("conn", &format!("{peer} connected"));
             tokio::spawn(async move {
                 match handler_clone.serve(stream).await {
-                    Ok(service) => match service.waiting().await {
-                        Ok(reason) => log_event("conn", &format!("{peer} closed: {reason:?}")),
-                        Err(e) => log_event("conn", &format!("{peer} error: {e}")),
-                    },
+                    Ok(service) => {
+                        // Force the client to re-fetch the tool catalog. Without
+                        // this, a client that already has a cached catalog from
+                        // an earlier connection (typical when the daemon was
+                        // rebuilt + restarted but the MCP host kept its
+                        // subprocess shim alive) won't see newly-added tools.
+                        // notify_tool_list_changed only does anything if the
+                        // server declared tool_list_changed in capabilities
+                        // (which we did in get_info above).
+                        let p = service.peer().clone();
+                        let peer_addr = peer.to_string();
+                        tokio::spawn(async move {
+                            match p.notify_tool_list_changed().await {
+                                Ok(_) => log_event("conn", &format!("{peer_addr} notified tool_list_changed")),
+                                Err(e) => log_event("conn", &format!("{peer_addr} notify_tool_list_changed failed: {e}")),
+                            }
+                        });
+                        match service.waiting().await {
+                            Ok(reason) => log_event("conn", &format!("{peer} closed: {reason:?}")),
+                            Err(e) => log_event("conn", &format!("{peer} error: {e}")),
+                        }
+                    }
                     Err(e) => log_event("conn", &format!("{peer} serve failed: {e}")),
                 }
             });

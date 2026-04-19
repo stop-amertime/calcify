@@ -24,6 +24,8 @@ pub mod state;
 pub mod tick_period;
 /// Signature-based cycle detector (experimental, WIP — projection bug).
 pub mod cycle_tracker;
+/// Execution summary — event log, block segmenter, prose renderer.
+pub mod summary;
 /// IR type definitions — expressions, assignments, programs.
 pub mod types;
 

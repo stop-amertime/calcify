@@ -12,6 +12,14 @@ pub const DEFAULT_MEM_SIZE: usize = 0x600;
 
 /// 16-color CGA palette used by [`State::render_framebuffer`].
 ///
+/// CSS-DOS shadows the VGA DAC palette (768 bytes: 256 entries × RGB) at
+/// this out-of-1MB linear address. OUT 0x3C9 writes populate it via the
+/// kiln port-decode machinery (kiln/patterns/misc.mjs). Values are 6-bit
+/// (0..63), matching real VGA hardware; `read_framebuffer_rgba` expands
+/// them to 8-bit when producing canvas pixels. Keep in sync with
+/// `DAC_LINEAR` in CSS-DOS's kiln/memory.mjs.
+pub const VGA_DAC_LINEAR: i32 = 0x100000;
+
 /// Standard IRGB CGA colors: the low 8 entries are the dark variants,
 /// the high 8 are the bright variants. These also form the first 16
 /// entries of the full VGA palette, so a future 256-entry upgrade is
@@ -440,6 +448,27 @@ impl State {
         width: usize,
         height: usize,
     ) -> Vec<u8> {
+        // Snapshot the VGA DAC palette once per frame. CSS-DOS shadows OUT
+        // 0x3C9 writes to 768 bytes starting at linear 0x100000, stored as
+        // 6-bit values (0..63) just like real VGA hardware. If the cabinet
+        // doesn't declare a DAC zone (old builds, hack carts without gfx
+        // pruning), every byte comes back 0 (all-black palette); we fall
+        // back to the hardcoded CGA palette in that case so existing
+        // cabinets don't regress.
+        let mut dac = [0u8; 768];
+        let mut dac_populated = false;
+        for i in 0..768 {
+            let v = self
+                .extended
+                .get(&(VGA_DAC_LINEAR + i as i32))
+                .copied()
+                .unwrap_or(0);
+            if v != 0 {
+                dac_populated = true;
+            }
+            dac[i] = (v & 0x3F) as u8; // truncate to 6 bits, hardware does this
+        }
+
         let mut out = vec![0u8; width * height * 4];
         for i in 0..(width * height) {
             let addr = base_addr + i;
@@ -448,7 +477,22 @@ impl State {
             } else {
                 0
             };
-            let (r, g, b) = CGA_PALETTE[(byte as usize) & 0x0F];
+            let (r, g, b) = if dac_populated {
+                // Expand 6-bit DAC value (0..63) to 8-bit (0..255) the way
+                // real VGA hardware did: replicate the top 2 bits into the
+                // bottom 2. Keeps 0→0 and 63→255 without a divide.
+                let idx = byte as usize * 3;
+                let r6 = dac[idx];
+                let g6 = dac[idx + 1];
+                let b6 = dac[idx + 2];
+                (
+                    (r6 << 2) | (r6 >> 4),
+                    (g6 << 2) | (g6 >> 4),
+                    (b6 << 2) | (b6 >> 4),
+                )
+            } else {
+                CGA_PALETTE[(byte as usize) & 0x0F]
+            };
             let o = i * 4;
             out[o] = r;
             out[o + 1] = g;
@@ -566,6 +610,38 @@ impl State {
                 self.extended.insert(*addr as i32, *value as i32);
             } else if *addr < self.memory.len() {
                 self.memory[*addr] = *value;
+            }
+        }
+    }
+
+    /// Populate memory from a `--readMem`-shaped dispatch table's literal entries.
+    ///
+    /// CSS-DOS emits BIOS ROM bytes as literal branches inside the
+    /// `--readMem` function (`style(--at: 0xF0055): 1;` etc.) rather than as
+    /// `--mN` @property declarations. Those literals live in the evaluator's
+    /// dispatch table, not in `load_properties`'s memory_defs, so without this
+    /// pass `read_mem()` returns 0 for every BIOS address — the CPU reads the
+    /// right bytes via the CSS function, but the debugger / tooling that calls
+    /// `read_mem` sees an empty ROM.
+    ///
+    /// Only `Literal` entries are copied. Identity entries (`Var("--mN")`) are
+    /// already covered by `load_properties`, and non-literal/non-identity
+    /// entries (like `--readDiskByte(...)` for the rom-disk window) are
+    /// ignored — reading those requires the evaluator.
+    pub fn populate_memory_from_readmem(&mut self, table: &crate::pattern::dispatch_table::DispatchTable) {
+        use crate::types::Expr;
+        for (&key, expr) in &table.entries {
+            let Expr::Literal(val) = expr else { continue };
+            let addr = key as i32;
+            if addr < 0 {
+                continue;
+            }
+            let addr_u = addr as usize;
+            let val_i32 = *val as i32;
+            if addr_u >= 0xF0000 {
+                self.extended.insert(addr, val_i32);
+            } else if addr_u < self.memory.len() {
+                self.memory[addr_u] = (val_i32 & 0xFF) as u8;
             }
         }
     }
