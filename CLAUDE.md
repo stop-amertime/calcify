@@ -152,6 +152,51 @@ What this means in practice:
   assignments all check the same property and converting them to a HashMap
   lookup is exactly what a JIT does. Same results, faster. That's the job.
 
+### Wasm safety — everything calcite-core touches must build and run on wasm32
+
+`calcite-wasm` wraps `calcite-core` and runs in the browser via the web
+player. `calcite-core` therefore has to stay wasm32-clean: anything the web
+build exercises must not panic or fail to link on `wasm32-unknown-unknown`.
+
+**Rules:**
+
+- **Never use `std::time::Instant` or `std::time::SystemTime`** anywhere
+  `calcite-core` or `calcite-wasm` can reach. Raw `std::time` panics on
+  `wasm32-unknown-unknown` with "time not implemented on this platform".
+  Use `web_time::Instant` instead — it transparently maps to `performance.now()`
+  on wasm and `std::time::Instant` on native. (The `web_time` crate is already
+  a workspace dependency.)
+- **Same applies to anything with a hidden `SystemTime`/`Instant` dependency:**
+  `std::thread::sleep`, random seeding from `SystemTime`, `std::sync::Mutex`
+  timeouts, etc. Audit before adding.
+- **No `std::thread::spawn`** or OS-thread APIs. Wasm is single-threaded in
+  our setup. If you need concurrency for native-only code paths, gate it
+  with `#[cfg(not(target_arch = "wasm32"))]`.
+- **No `std::fs`, `std::net`, `std::process::Command`, or `std::env` writes**
+  in core paths. Reads (`std::env::var`) are tolerated by the wasm stub but
+  avoid them in hot paths.
+- **Dev-only timing and logging (`CALCITE_PROFILE_COMPILE`, env-driven debug
+  dumps) must still use `web_time`** — they run on every `compile()` call,
+  including the one invoked from wasm, even when the feature is "disabled"
+  (the scope constructor still touches `Instant`).
+
+**If you must use something native-only**, cfg-gate it:
+
+```rust
+#[cfg(not(target_arch = "wasm32"))]
+{
+    // native-only code here
+}
+```
+
+**How to verify:** `wasm-pack build crates/calcite-wasm --target web --out-dir ../../web/pkg`
+must succeed with no errors, and the resulting cabinet must load in the web
+player without a `WASM panic:` line in the browser console.
+
+When in doubt: the crates a wasm build pulls in are `calcite-core` and
+`calcite-wasm`. Anything else (`calcite-cli`, `calcite-debugger`, the
+benchmark and probe bins) is native-only and can use `std::time` freely.
+
 ### Relationship to CSS-DOS
 
 [CSS-DOS](../CSS-DOS) is a sibling repo that generates 8086 CSS. It uses a

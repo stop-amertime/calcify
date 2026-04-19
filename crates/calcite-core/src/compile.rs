@@ -46,7 +46,7 @@ pub fn profile_compile_dump() {
 
 pub struct ProfScope {
     idx: usize,
-    start: std::time::Instant,
+    start: web_time::Instant,
     enabled: bool,
 }
 
@@ -54,14 +54,15 @@ impl ProfScope {
     pub fn new(name: &'static str) -> Self {
         let enabled = PROF_ENABLED.with(|e| e.get());
         if !enabled {
-            return ProfScope { idx: 0, start: std::time::Instant::now(), enabled: false };
+            // web_time::Instant is wasm-safe (raw std::time::Instant panics on wasm).
+            return ProfScope { idx: 0, start: web_time::Instant::now(), enabled: false };
         }
         let idx = PROF_TOTALS.with(|t| {
             let mut v = t.borrow_mut();
             if let Some(i) = v.iter().position(|(n, _, _)| *n == name) { i }
             else { v.push((name, 0.0, 0)); v.len() - 1 }
         });
-        ProfScope { idx, start: std::time::Instant::now(), enabled: true }
+        ProfScope { idx, start: web_time::Instant::now(), enabled: true }
     }
 }
 
