@@ -180,7 +180,13 @@ fn default_watch_max() -> u32 {
 
 /// Discriminated union — pass exactly one variant.
 /// Matches the original HTTP `RunUntilCondition` shape.
-#[derive(Deserialize, schemars::JsonSchema)]
+///
+/// Deserialization accepts either the structured object form
+/// (`{"property_equals": {"name": "--haltCode", "value": 192}}`) OR a
+/// JSON-encoded string containing the same shape. Some MCP clients
+/// stringify nested objects in tool parameters; the string form keeps
+/// those clients working without forcing them to flatten the schema.
+#[derive(schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 enum RunUntilCondition {
     /// Stop when CS:IP matches.
@@ -199,6 +205,64 @@ enum RunUntilCondition {
     PropertyChanges(String),
     /// Stop when memory byte equals a value.
     MemByteEquals { addr: i32, value: i32 },
+}
+
+// Manual Deserialize: accept either the native object shape OR a JSON string
+// that re-deserializes to the same shape. Both rmcp's strict schema clients
+// and clients that stringify nested objects end up working.
+impl<'de> Deserialize<'de> for RunUntilCondition {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // The real (strict) externally-tagged form, under a different name
+        // so we can delegate to its auto-derived impl.
+        #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum Inner {
+            CsIp { cs: i32, ip: i32 },
+            Cs(i32),
+            IpRange { cs: i32, min: i32, max: i32 },
+            Int(bool),
+            IntNum(i32),
+            PropertyEquals { name: String, value: i64 },
+            PropertyChanges(String),
+            MemByteEquals { addr: i32, value: i32 },
+        }
+        impl From<Inner> for RunUntilCondition {
+            fn from(i: Inner) -> Self {
+                match i {
+                    Inner::CsIp { cs, ip } => RunUntilCondition::CsIp { cs, ip },
+                    Inner::Cs(v) => RunUntilCondition::Cs(v),
+                    Inner::IpRange { cs, min, max } => {
+                        RunUntilCondition::IpRange { cs, min, max }
+                    }
+                    Inner::Int(v) => RunUntilCondition::Int(v),
+                    Inner::IntNum(v) => RunUntilCondition::IntNum(v),
+                    Inner::PropertyEquals { name, value } => {
+                        RunUntilCondition::PropertyEquals { name, value }
+                    }
+                    Inner::PropertyChanges(v) => RunUntilCondition::PropertyChanges(v),
+                    Inner::MemByteEquals { addr, value } => {
+                        RunUntilCondition::MemByteEquals { addr, value }
+                    }
+                }
+            }
+        }
+
+        // Buffer into a serde_json::Value first so we can inspect whether
+        // the client sent a string or an object.
+        let v = serde_json::Value::deserialize(deserializer)?;
+        let inner: Inner = match v {
+            serde_json::Value::String(s) => serde_json::from_str(&s)
+                .map_err(|e| serde::de::Error::custom(format!(
+                    "condition was a string but did not parse as a RunUntilCondition: {e}"
+                )))?,
+            other => serde_json::from_value(other)
+                .map_err(|e| serde::de::Error::custom(e.to_string()))?,
+        };
+        Ok(inner.into())
+    }
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]

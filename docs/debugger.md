@@ -11,6 +11,28 @@ cargo run --release -p calcite-debugger -- -i path/to/program.css
 
 Server starts on port 3333 (change with `-p PORT`).
 
+## Rebuilding after source edits
+
+The release binary is often held open by a running debugger (the MCP
+client keeps one resident across tool calls, and orphan runs from
+interrupted sessions can linger). When that happens `cargo build
+--release` fails at link time with:
+
+```
+ld.exe: cannot open output file ...\deps\calcite_debugger-HASH.exe: Permission denied
+```
+
+Use the convenience script:
+
+```sh
+./kill-and-rebuild.bat
+```
+
+It kills every `calcite-debugger.exe` process (including the one your
+MCP client is attached to — it will respawn on the next tool call) and
+then runs `cargo build --release -p calcite-debugger`. Exit code
+propagates from cargo, so you can chain it.
+
 ## Usage
 
 ```sh
