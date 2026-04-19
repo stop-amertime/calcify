@@ -12,6 +12,9 @@ use clap::Parser;
 use std::path::PathBuf;
 use std::time::Instant;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Parser, Debug)]
 #[command(name = "calcite-bench", version, about = "Headless benchmark runner for calc(ite)")]
 struct Args {
