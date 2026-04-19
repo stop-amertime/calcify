@@ -32,4 +32,4 @@ pub use eval::{
     detect_video_memory, detect_video_regions, property_to_address, Evaluator, TickProfile,
     VideoRegions,
 };
-pub use state::State;
+pub use state::{State, StateDelta};

@@ -14,6 +14,7 @@ use crate::compile::{
     is_pow2_dispatch, is_right_shift, is_var_ref, CompiledProgram,
 };
 use crate::pattern::broadcast_write::{self, BroadcastWrite};
+use crate::pattern::memory_fill::{self, CssMemoryFillBinding};
 use crate::pattern::dispatch_table::{self, DispatchTable};
 use crate::state::State;
 use crate::types::*;
@@ -81,6 +82,9 @@ pub struct Evaluator {
     pub dispatch_tables: HashMap<String, DispatchTable>,
     /// Recognised broadcast write patterns.
     pub broadcast_writes: Vec<BroadcastWrite>,
+    /// Recognised CSS-level bulk-fill bindings (INT 2F/AH=FE).
+    /// Drives the native pre-tick fill when `--bulkOpKind == 1`.
+    pub bulk_fill_bindings: Vec<CssMemoryFillBinding>,
     /// Precomputed function body patterns for the interpreter fast-path.
     function_patterns: HashMap<String, FunctionPattern>,
     /// Property values computed during the current tick. Reused across ticks.
@@ -95,7 +99,7 @@ pub struct Evaluator {
     /// The evaluator has no knowledge of what hooks do — they are registered
     /// by the caller (CLI, WASM, etc.).
     #[allow(clippy::type_complexity)]
-    pre_tick_hooks: Vec<Box<dyn Fn(&mut State)>>,
+    pre_tick_hooks: Vec<Box<dyn Fn(&mut State) + Send + Sync>>,
     /// Compiled bytecode program (flat ops over indexed slots).
     pub(crate) compiled: CompiledProgram,
     /// Slot array reused across ticks (avoids per-tick allocation).
@@ -219,6 +223,27 @@ impl Evaluator {
 
         log::info!("[compile phase] broadcast recognition: {:.2}s", _t.elapsed().as_secs_f64());
         let _t = Instant::now();
+
+        // Recognise bulk-fill range-predicate pattern emitted by CSS-DOS's kiln
+        // transpiler for INT 2F/AH=FE. Cells matching the pattern have their
+        // bulk branch stripped (so compilation processes cheap expressions
+        // instead of the full per-cell calc tree); the binding drives a
+        // pre-tick hook that performs the native fill.
+        let bulk_fill_result = memory_fill::recognise_bulk_fills(&program.assignments);
+        for b in &bulk_fill_result.bindings {
+            log::info!(
+                "Recognised bulk-fill binding: {} cells at [{:#x}..{:#x}) on ({}, {}, {}, {})",
+                b.addr_range.end - b.addr_range.start,
+                b.addr_range.start,
+                b.addr_range.end,
+                b.kind_property,
+                b.dst_property,
+                b.count_property,
+                b.val_property,
+            );
+        }
+        log::info!("[compile phase] bulk-fill recognition: {:.2}s", _t.elapsed().as_secs_f64());
+        let _t = Instant::now();
         // Identify string properties from @property syntax
         let mut string_property_names: HashSet<String> = HashSet::new();
         for prop in &program.properties {
@@ -236,6 +261,10 @@ impl Evaluator {
         // Filter out:
         // 1. Assignments absorbed into broadcast writes (would overwrite with stale values)
         // 2. Triple-buffer copies (--__0*, --__1*, --__2*) which are no-ops in mutable state
+        //
+        // Also: swap any assignment present in bulk_fill_result.rewritten with its
+        // bulk-branch-stripped form. The pre-tick hook handles the actual fill;
+        // the normal per-cell dispatch handles non-bulk writes.
         let all_assignments: Vec<Assignment> = program
             .assignments
             .iter()
@@ -243,7 +272,13 @@ impl Evaluator {
                 !broadcast_result.absorbed_properties.contains(&a.property)
                     && !is_buffer_copy(&a.property)
             })
-            .cloned()
+            .map(|a| {
+                bulk_fill_result
+                    .rewritten
+                    .get(&a.property)
+                    .cloned()
+                    .unwrap_or_else(|| a.clone())
+            })
             .collect();
 
         // Partition: string properties go to interpreter, rest to compiler
@@ -317,11 +352,12 @@ impl Evaluator {
 
         let slot_count = compiled.slot_count as usize;
         let properties_capacity = assignments.len();
-        Evaluator {
+        let mut ev = Evaluator {
             functions,
             assignments,
             dispatch_tables,
             broadcast_writes: broadcast_result.writes,
+            bulk_fill_bindings: bulk_fill_result.bindings,
             function_patterns,
             pre_tick_hooks: Vec::new(),
             properties: HashMap::with_capacity(properties_capacity),
@@ -330,6 +366,69 @@ impl Evaluator {
             string_property_names,
             compiled,
             slots: Vec::with_capacity(slot_count),
+        };
+
+        // Install the bulk-fill pre-tick hook if any bindings were recognised.
+        // The hook reads the scratch region (linear 0x510..0x516) from state
+        // memory and, when kind == 1, fills the dst range natively.
+        if !ev.bulk_fill_bindings.is_empty() {
+            let bindings = ev.bulk_fill_bindings.clone();
+            ev.add_pre_tick_hook(Box::new(move |state| {
+                Evaluator::bulk_fill_tick(state, &bindings);
+            }));
+        }
+
+        ev
+    }
+
+    /// Execute any recognised bulk-fill bindings against current state.
+    ///
+    /// Reads the scratch region (linear 0x510..0x516 by convention — that's
+    /// where the BIOS INT 2F handler writes kind/dst/count/value), and if
+    /// kind == 1, fills the dst range natively via `[u8]::fill`. Skips the
+    /// scratch kind byte itself — the CSS self-clear clause handles it on
+    /// the same tick the fill fires (resetting kind to 0 so the next tick's
+    /// hook call is a no-op).
+    ///
+    /// Constant layout matches kiln's `BULK_OP_SCRATCH_BASE`:
+    ///   0x510: kind (byte)
+    ///   0x511..0x514: dst (24-bit little-endian)
+    ///   0x514..0x516: count (16-bit little-endian)
+    ///   0x516: value (byte)
+    ///
+    /// No-op when state.memory is too small or kind != 1.
+    fn bulk_fill_tick(state: &mut crate::State, bindings: &[CssMemoryFillBinding]) {
+        if bindings.is_empty() {
+            return;
+        }
+        const BASE: usize = 0x510;
+        if state.memory.len() < BASE + 7 {
+            return;
+        }
+        let kind = state.memory[BASE];
+        if kind != 1 {
+            return;
+        }
+        let dst = state.memory[BASE + 1] as usize
+            | (state.memory[BASE + 2] as usize) << 8
+            | (state.memory[BASE + 3] as usize) << 16;
+        let count = state.memory[BASE + 4] as usize
+            | (state.memory[BASE + 5] as usize) << 8;
+        let val = state.memory[BASE + 6];
+        if count == 0 {
+            return;
+        }
+        // Only fill cells covered by a recognised binding. This prevents the
+        // hook from writing outside CSS-emitted memory (e.g. beyond the end
+        // of state.memory, or into addresses the CSS would never touch).
+        for b in bindings {
+            let lo = dst.max(b.addr_range.start as usize);
+            let hi = (dst + count)
+                .min(b.addr_range.end as usize)
+                .min(state.memory.len());
+            if hi > lo {
+                state.memory[lo..hi].fill(val);
+            }
         }
     }
 
@@ -338,7 +437,7 @@ impl Evaluator {
     /// Hooks inspect and modify state to implement external side effects
     /// (e.g., text output, keyboard input). The evaluator itself has no
     /// knowledge of what the hook does.
-    pub fn add_pre_tick_hook(&mut self, hook: Box<dyn Fn(&mut State)>) {
+    pub fn add_pre_tick_hook(&mut self, hook: Box<dyn Fn(&mut State) + Send + Sync>) {
         self.pre_tick_hooks.push(hook);
     }
 
@@ -398,6 +497,79 @@ impl Evaluator {
             changes,
             ticks_executed: 1,
         }
+    }
+
+    /// Run one tick AND produce a [`StateDelta`] capturing every mutated
+    /// channel, with both pre- and post-tick values so the delta can be
+    /// applied or reverted.
+    ///
+    /// More expensive than `tick()` because it pre-clones every channel that
+    /// might change (state_vars, memory bytes, extended map, string_properties).
+    /// For hot loops where you just need the state_var change summary, keep
+    /// using `tick()`.
+    pub fn tick_with_delta(&mut self, state: &mut State) -> (TickResult, crate::state::StateDelta) {
+        use crate::state::StateDelta;
+
+        let frame_before = state.frame_counter;
+        // Full pre-images for diff. These are "expensive" only in the sense
+        // of being O(state size) once per tick — still far cheaper than the
+        // State::clone() the HTTP debugger used to do every 1000 ticks.
+        let prev_state_vars = state.state_vars.clone();
+        let prev_memory = state.memory.clone();
+        let prev_extended = state.extended.clone();
+        let prev_strings = state.string_properties.clone();
+
+        let result = self.tick(state);
+
+        let mut delta = StateDelta {
+            frame_counter_before: frame_before,
+            frame_counter_after: state.frame_counter,
+            ..Default::default()
+        };
+
+        for (i, (old, new)) in prev_state_vars.iter().zip(state.state_vars.iter()).enumerate() {
+            if old != new {
+                delta.state_vars.push((i as u32, *old, *new));
+            }
+        }
+        // Memory may have grown (it's a Vec<u8>); treat missing old as 0.
+        let common_len = prev_memory.len().min(state.memory.len());
+        for i in 0..common_len {
+            let old = prev_memory[i];
+            let new = state.memory[i];
+            if old != new {
+                delta.memory.push((i as u32, old, new));
+            }
+        }
+        for i in common_len..state.memory.len() {
+            let new = state.memory[i];
+            if new != 0 {
+                delta.memory.push((i as u32, 0, new));
+            }
+        }
+        // Extended map: check all keys in either side.
+        let mut ext_keys: std::collections::HashSet<i32> = prev_extended.keys().copied().collect();
+        ext_keys.extend(state.extended.keys().copied());
+        for addr in ext_keys {
+            let old = prev_extended.get(&addr).copied();
+            let new = state.extended.get(&addr).copied();
+            if old != new {
+                delta.extended.push((addr, old, new));
+            }
+        }
+        // String properties: check all keys in either side.
+        let mut str_keys: std::collections::HashSet<String> =
+            prev_strings.keys().cloned().collect();
+        str_keys.extend(state.string_properties.keys().cloned());
+        for name in str_keys {
+            let old = prev_strings.get(&name).cloned();
+            let new = state.string_properties.get(&name).cloned();
+            if old != new {
+                delta.string_properties.push((name, old, new));
+            }
+        }
+
+        (result, delta)
     }
 
     /// Execute one tick without change detection — for use from run_batch where
@@ -1860,6 +2032,7 @@ mod tests {
             assignments: vec![],
             dispatch_tables,
             broadcast_writes: vec![],
+            bulk_fill_bindings: vec![],
             function_patterns,
             pre_tick_hooks: Vec::new(),
             properties: HashMap::with_capacity(16),

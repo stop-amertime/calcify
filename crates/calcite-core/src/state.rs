@@ -81,6 +81,71 @@ impl State {
         }
     }
 
+    /// Apply a delta forward — overwrites channels with `new_*` values.
+    /// Panics in debug if slot/addr is out of range (caller must apply
+    /// deltas against the same State shape that produced them).
+    pub fn apply_delta(&mut self, d: &StateDelta) {
+        for (slot, _, new) in &d.state_vars {
+            self.state_vars[*slot as usize] = *new;
+        }
+        for (addr, _, new) in &d.memory {
+            self.memory[*addr as usize] = *new;
+        }
+        for (addr, _, new) in &d.extended {
+            match new {
+                Some(v) => {
+                    self.extended.insert(*addr, *v);
+                }
+                None => {
+                    self.extended.remove(addr);
+                }
+            }
+        }
+        for (name, _, new) in &d.string_properties {
+            match new {
+                Some(v) => {
+                    self.string_properties.insert(name.clone(), v.clone());
+                }
+                None => {
+                    self.string_properties.remove(name);
+                }
+            }
+        }
+        self.frame_counter = d.frame_counter_after;
+    }
+
+    /// Apply a delta in reverse — overwrites channels with `old_*` values.
+    /// This is what makes reverse seek possible without re-execution.
+    pub fn revert_delta(&mut self, d: &StateDelta) {
+        for (slot, old, _) in &d.state_vars {
+            self.state_vars[*slot as usize] = *old;
+        }
+        for (addr, old, _) in &d.memory {
+            self.memory[*addr as usize] = *old;
+        }
+        for (addr, old, _) in &d.extended {
+            match old {
+                Some(v) => {
+                    self.extended.insert(*addr, *v);
+                }
+                None => {
+                    self.extended.remove(addr);
+                }
+            }
+        }
+        for (name, old, _) in &d.string_properties {
+            match old {
+                Some(v) => {
+                    self.string_properties.insert(name.clone(), v.clone());
+                }
+                None => {
+                    self.string_properties.remove(name);
+                }
+            }
+        }
+        self.frame_counter = d.frame_counter_before;
+    }
+
     /// Look up a state variable by name. Returns None if not found.
     pub fn get_var(&self, name: &str) -> Option<i32> {
         self.state_var_index.get(name).map(|&i| self.state_vars[i])
@@ -545,6 +610,40 @@ fn cp437_to_unicode(b: u8) -> char {
         0x20..=0x7E => b as char,
         0x7F => '\u{2302}',
         _ => HIGH[(b - 0x80) as usize],
+    }
+}
+
+/// A per-tick change record over [`State`]. Stores both the pre- and post-tick
+/// value for every mutated channel so deltas can be replayed forward OR
+/// backward without re-executing the tick.
+///
+/// Channels:
+/// - `state_vars`: (slot_index, old, new) — state_var_names/state_var_index
+///   are program-static and not recorded.
+/// - `memory`: (byte_addr, old, new) — only for byte memory. Extended/string
+///   channels handled separately.
+/// - `extended`: (addr, old, new) where `None` means "entry absent".
+/// - `string_properties`: (name, old, new) where `None` means "entry absent".
+///
+/// Empty-delta ticks are still produced (frame_counter always changes).
+#[derive(Debug, Clone, Default)]
+pub struct StateDelta {
+    /// Tick at the START of this tick (what frame_counter equalled before tick).
+    pub frame_counter_before: u32,
+    /// Tick at the END of this tick (frame_counter_before + 1 in practice).
+    pub frame_counter_after: u32,
+    pub state_vars: Vec<(u32, i32, i32)>,
+    pub memory: Vec<(u32, u8, u8)>,
+    pub extended: Vec<(i32, Option<i32>, Option<i32>)>,
+    pub string_properties: Vec<(String, Option<String>, Option<String>)>,
+}
+
+impl StateDelta {
+    pub fn total_changes(&self) -> usize {
+        self.state_vars.len()
+            + self.memory.len()
+            + self.extended.len()
+            + self.string_properties.len()
     }
 }
 
