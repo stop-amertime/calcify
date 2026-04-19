@@ -30,7 +30,10 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -41,13 +44,30 @@ use std::sync::{Arc, Mutex};
 struct Cli {
     /// Path to the CSS file to debug. Optional — if omitted, the server starts
     /// with no program loaded and you call the `open` tool to choose one.
+    /// When given, `--session <name>` is also required so the pre-loaded
+    /// program has a session name.
     #[arg(short, long)]
     input: Option<PathBuf>,
+
+    /// Session name to install the pre-loaded program under. Required when
+    /// `-i/--input` is given. Ignored otherwise.
+    #[arg(short = 's', long)]
+    session: Option<String>,
 
     /// Ticks between full-state base checkpoints. Deltas are recorded every
     /// tick regardless. Default 50,000 matches the PR 2 brief.
     #[arg(long, default_value = "50000")]
     base_interval: u32,
+
+    /// Listen on a TCP address (e.g. `127.0.0.1:3334`) instead of stdio.
+    /// Daemon mode — the server keeps all in-memory session state alive
+    /// across client reconnects. Each accepted connection gets its own
+    /// handler task; the underlying session map is shared, so clients
+    /// using the same session name collaborate, and distinct names stay
+    /// isolated. Without this flag, the server speaks MCP over stdio
+    /// (standard per-client-process mode). See docs/daemon-mode.md.
+    #[arg(long, value_name = "HOST:PORT")]
+    listen: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -60,11 +80,20 @@ struct Cli {
 #[derive(Deserialize, Serialize, schemars::JsonSchema, Default)]
 struct EmptyParams {}
 
+/// For tools that need no params besides the session name.
+#[derive(Deserialize, schemars::JsonSchema)]
+struct SessionOnlyParams {
+    /// Session name. Required — pass the same name to every tool call that should share state (open, tick, seek, etc.). If the server restarts (rebuild, crash), call `open` again with the same name to rehydrate.
+    session: String,
+}
+
 #[derive(Deserialize, schemars::JsonSchema)]
 struct TickParams {
     /// Number of ticks to advance. Defaults to 1.
     #[serde(default = "default_one")]
     count: u32,
+    /// Session name. Required — pass the same name to every tool call that should share state (open, tick, seek, etc.). If the server restarts (rebuild, crash), call `open` again with the same name to rehydrate.
+    session: String,
 }
 fn default_one() -> u32 {
     1
@@ -74,6 +103,8 @@ fn default_one() -> u32 {
 struct SeekParams {
     /// Target tick number. Forward or backward — uses nearest snapshot then replays.
     tick: u32,
+    /// Session name. Required — pass the same name to every tool call that should share state (open, tick, seek, etc.). If the server restarts (rebuild, crash), call `open` again with the same name to rehydrate.
+    session: String,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -83,6 +114,8 @@ struct MemoryParams {
     /// Number of bytes to read. Defaults to 256.
     #[serde(default = "default_mem_len")]
     len: usize,
+    /// Session name. Required — pass the same name to every tool call that should share state (open, tick, seek, etc.). If the server restarts (rebuild, crash), call `open` again with the same name to rehydrate.
+    session: String,
 }
 fn default_mem_len() -> usize {
     256
@@ -99,6 +132,8 @@ struct ScreenParams {
     /// Rows. Defaults to 25.
     #[serde(default)]
     height: Option<usize>,
+    /// Session name. Required — pass the same name to every tool call that should share state (open, tick, seek, etc.). If the server restarts (rebuild, crash), call `open` again with the same name to rehydrate.
+    session: String,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -108,6 +143,8 @@ struct CompareReferenceParams {
     /// Stop at the first divergence. Defaults to true.
     #[serde(default = "default_true")]
     stop_at_first: bool,
+    /// Session name. Required — pass the same name to every tool call that should share state (open, tick, seek, etc.). If the server restarts (rebuild, crash), call `open` again with the same name to rehydrate.
+    session: String,
 }
 fn default_true() -> bool {
     true
@@ -129,6 +166,8 @@ struct CompareStateParams {
     /// Memory ranges to diff: list of {addr, len, bytes} entries.
     #[serde(default)]
     memory: Option<Vec<CompareMemEntry>>,
+    /// Session name. Required — pass the same name to every tool call that should share state (open, tick, seek, etc.). If the server restarts (rebuild, crash), call `open` again with the same name to rehydrate.
+    session: String,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -149,6 +188,8 @@ struct SendKeyParams {
     /// path that converts edges into IRQ 1).
     #[serde(default = "default_key_target")]
     target: String,
+    /// Session name. Required — pass the same name to every tool call that should share state (open, tick, seek, etc.). If the server restarts (rebuild, crash), call `open` again with the same name to rehydrate.
+    session: String,
 }
 fn default_key_target() -> String {
     "bda".into()
@@ -158,6 +199,8 @@ fn default_key_target() -> String {
 struct TracePropertyParams {
     /// CSS property name to trace (e.g. "--memAddr").
     property: String,
+    /// Session name. Required — pass the same name to every tool call that should share state (open, tick, seek, etc.). If the server restarts (rebuild, crash), call `open` again with the same name to rehydrate.
+    session: String,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -173,6 +216,8 @@ struct WatchpointParams {
     /// Stop when the byte equals this value (instead of "any change").
     #[serde(default)]
     expected: Option<i32>,
+    /// Session name. Required — pass the same name to every tool call that should share state (open, tick, seek, etc.). If the server restarts (rebuild, crash), call `open` again with the same name to rehydrate.
+    session: String,
 }
 fn default_watch_max() -> u32 {
     100_000
@@ -186,7 +231,7 @@ fn default_watch_max() -> u32 {
 /// JSON-encoded string containing the same shape. Some MCP clients
 /// stringify nested objects in tool parameters; the string form keeps
 /// those clients working without forcing them to flatten the schema.
-#[derive(schemars::JsonSchema)]
+#[derive(Clone, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 enum RunUntilCondition {
     /// Stop when CS:IP matches.
@@ -205,6 +250,10 @@ enum RunUntilCondition {
     PropertyChanges(String),
     /// Stop when memory byte equals a value.
     MemByteEquals { addr: i32, value: i32 },
+    /// Stop when any byte in `[start, end)` is nonzero. Useful for detecting
+    /// "this region got populated" — e.g. fire's framebuffer at 0xA0000 or
+    /// the VGA DAC palette shadow at 0x100000.
+    MemRangeNonzero { start: i32, end: i32 },
 }
 
 // Manual Deserialize: accept either the native object shape OR a JSON string
@@ -228,6 +277,7 @@ impl<'de> Deserialize<'de> for RunUntilCondition {
             PropertyEquals { name: String, value: i64 },
             PropertyChanges(String),
             MemByteEquals { addr: i32, value: i32 },
+            MemRangeNonzero { start: i32, end: i32 },
         }
         impl From<Inner> for RunUntilCondition {
             fn from(i: Inner) -> Self {
@@ -245,6 +295,9 @@ impl<'de> Deserialize<'de> for RunUntilCondition {
                     Inner::PropertyChanges(v) => RunUntilCondition::PropertyChanges(v),
                     Inner::MemByteEquals { addr, value } => {
                         RunUntilCondition::MemByteEquals { addr, value }
+                    }
+                    Inner::MemRangeNonzero { start, end } => {
+                        RunUntilCondition::MemRangeNonzero { start, end }
                     }
                 }
             }
@@ -274,9 +327,24 @@ struct RunUntilParams {
     /// If set, seek to this tick first.
     #[serde(default)]
     from_tick: Option<u32>,
+    /// Session name. Required — pass the same name to every tool call that should share state (open, tick, seek, etc.). If the server restarts (rebuild, crash), call `open` again with the same name to rehydrate.
+    session: String,
 }
 fn default_run_until_max() -> u32 {
     1_000_000
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct JobIdParams {
+    job_id: u64,
+    /// Session name. Required — pass the same name to every tool call that should share state (open, tick, seek, etc.). If the server restarts (rebuild, crash), call `open` again with the same name to rehydrate.
+    session: String,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+struct RunUntilCancelResult {
+    job_id: u64,
+    cancelled: bool,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -291,6 +359,8 @@ struct DumpOpsParams {
     /// Mutually exclusive with start/end.
     #[serde(default)]
     property: Option<String>,
+    /// Session name. Required — pass the same name to every tool call that should share state (open, tick, seek, etc.). If the server restarts (rebuild, crash), call `open` again with the same name to rehydrate.
+    session: String,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -299,33 +369,80 @@ struct SnapshotParams {
     /// Defaults to `list`.
     #[serde(default = "default_snapshot_action")]
     action: String,
+    /// Session name. Required — pass the same name to every tool call that should share state (open, tick, seek, etc.). If the server restarts (rebuild, crash), call `open` again with the same name to rehydrate.
+    session: String,
 }
 fn default_snapshot_action() -> String {
     "list".into()
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct SummaryParams {
+    /// `start` to reset and begin recording; `stop` to pause; `get` to
+    /// return the current set of blocks; `clear` to discard the log.
+    /// `start` is the usual entry point.
+    #[serde(default = "default_summary_action")]
+    action: String,
+    /// Max events to keep before recording halts (default 500k).
+    /// A REP loop is one event, so 500k is plenty for a 1M-tick run.
+    #[serde(default)]
+    max_events: Option<usize>,
+    /// Also record memory writes? Off by default — turning it on roughly
+    /// doubles per-tick overhead because we scan 8 state slots each tick.
+    #[serde(default)]
+    record_writes: Option<bool>,
+    /// IP-window threshold for block breaks (default 256 bytes).
+    #[serde(default)]
+    ip_window: Option<i32>,
+    /// Session name. Required — pass the same name to every tool call that should share state (open, tick, seek, etc.). If the server restarts (rebuild, crash), call `open` again with the same name to rehydrate.
+    session: String,
+}
+fn default_summary_action() -> String {
+    "get".into()
 }
 
 // --- Result types -----------------------------------------------------------
 
 #[derive(Serialize, schemars::JsonSchema)]
 struct InfoResult {
-    /// False when no CSS file has been loaded yet. In that case the other
-    /// fields are empty/zero and the caller should invoke `open` to load one.
+    /// True if any session is loaded. Check `sessions` for the full list.
     loaded: bool,
+    /// Back-compat: the "default" session's CSS path (if any). Prefer `sessions`.
     css_file: Option<String>,
+    /// Back-compat: the "default" session's current tick. Prefer `sessions`.
     current_tick: u32,
+    /// Back-compat fields — all refer to the "default" session.
     properties_count: usize,
     functions_count: usize,
     assignments_count: usize,
     snapshots: Vec<u32>,
     /// The current base_interval setting (shared across all loaded programs).
     base_interval: u32,
+    /// All loaded sessions, keyed by name. Each entry is a snapshot of that
+    /// session's metadata. Independent sessions let multiple agents debug
+    /// different cabinets (or the same cabinet at different ticks) without
+    /// stepping on each other's state.
+    sessions: BTreeMap<String, SessionInfo>,
+}
+
+#[derive(Serialize, Clone, schemars::JsonSchema)]
+struct SessionInfo {
+    css_file: String,
+    current_tick: u32,
+    properties_count: usize,
+    functions_count: usize,
+    assignments_count: usize,
+    snapshots: Vec<u32>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct OpenParams {
-    /// Path to the CSS file to load. Replaces any currently-loaded program;
-    /// previous state / snapshots / deltas are discarded.
+    /// Path to the CSS file to load. Replaces any currently-loaded program
+    /// in this session; previous state / snapshots / deltas for this
+    /// session are discarded. Other sessions are unaffected.
     path: String,
+    /// Session name. Required — pass the same name to every tool call that should share state (open, tick, seek, etc.). If the server restarts (rebuild, crash), call `open` again with the same name to rehydrate.
+    session: String,
 }
 
 #[derive(Serialize, schemars::JsonSchema)]
@@ -456,9 +573,17 @@ struct WatchpointResult {
     registers: BTreeMap<String, i32>,
 }
 
-#[derive(Serialize, schemars::JsonSchema)]
+#[derive(Serialize, Clone, schemars::JsonSchema)]
 struct RunUntilResult {
+    /// The condition matched within the run.
     hit: bool,
+    /// The run finished — either because it hit, exhausted max_ticks, was
+    /// cancelled, or errored. When `done` is false, poll with run_until_poll
+    /// using the `job_id`. When `done` is true with `hit=false`, the run
+    /// exhausted max_ticks (or was cancelled).
+    done: bool,
+    /// Present when `done` is false — pass to run_until_poll / run_until_cancel.
+    job_id: Option<u64>,
     tick: u32,
     ticks_run: u32,
     cs: Option<i32>,
@@ -503,6 +628,43 @@ struct SnapshotResult {
     created: Option<u32>,
 }
 
+#[derive(Serialize, schemars::JsonSchema)]
+struct SummaryBlock {
+    start_tick: u32,
+    end_tick: u32,
+    cs: i32,
+    ip_min: i32,
+    ip_max: i32,
+    total_ticks: u32,
+    event_count: u32,
+    /// If ≥60% of the block sat at one PC: `[cs, ip, hits]`. Else omitted.
+    dominant_pc: Option<Vec<i32>>,
+    /// Interrupts observed: map of opcode/vector (as string) → count.
+    /// `"-1"` = block started already mid-IRQ. `"205"` = software INT (0xCD).
+    interrupts: BTreeMap<String, u32>,
+    /// Coarse memory write regions: each entry is `[lo, hi, count]`.
+    /// `lo`/`hi` are 256-byte bucket starts; `hi+0xFF` is the inclusive end.
+    write_regions: Vec<Vec<i32>>,
+    /// Pre-rendered one-liner.
+    line: String,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+struct SummaryResult {
+    action: String,
+    /// True once a recorder is attached and `action` was a control verb
+    /// (start/stop/clear). Always true for `get`.
+    active: bool,
+    /// True if the recorder hit its `max_events` cap.
+    truncated: bool,
+    /// Number of raw events in the log (post REP-collapse).
+    event_count: u32,
+    /// Blocks produced by the segmenter (only populated for `get`).
+    blocks: Vec<SummaryBlock>,
+    /// Full prose rendering, one block per line.
+    prose: String,
+}
+
 // ---------------------------------------------------------------------------
 // DebugSession — the actual debugger state, behind a Mutex inside the handler.
 // Identical mechanics to the HTTP version; only the transport changed.
@@ -543,6 +705,9 @@ struct DebugSession {
     css_file: String,
     video_config: Option<(usize, usize)>,
     property_names: Vec<String>,
+    /// Optional per-tick event recorder. When `Some`, `step_one` feeds it
+    /// after each tick. Blocks/prose come from `calcite_core::summary`.
+    summary: Option<calcite_core::summary::EventLogger>,
 }
 
 impl DebugSession {
@@ -589,6 +754,12 @@ impl DebugSession {
             self.deltas[tick_before as usize] = delta;
         } else {
             self.deltas.push(delta);
+        }
+        // Feed the summary recorder if enabled. Done here so every tick path
+        // (tick_n, watchpoint, run_until) is covered — everything funnels
+        // through step_one.
+        if let Some(ref mut log) = self.summary {
+            log.record_tick(&self.state);
         }
         // Base checkpoint on crossing boundaries. Tick 0 is always in `bases`.
         if self.base_interval > 0 {
@@ -807,18 +978,23 @@ impl DebugSession {
         }
     }
 
-    fn run_until(&mut self, cond: RunUntilCondition, max_ticks: u32) -> RunUntilResult {
-        let start = self.current_tick();
-        let t0 = std::time::Instant::now();
-
-        let initial_prop_value: Option<i64> = match &cond {
-            RunUntilCondition::PropertyChanges(name) => {
-                self.evaluator.get_slot_value(name).map(|v| v as i64)
-            }
-            _ => None,
-        };
-
-        for _ in 0..max_ticks {
+    /// Run up to `chunk_ticks` iterations, checking `cond` after each one.
+    /// Returns `Some(result)` if a match (or something terminal) was found,
+    /// `None` if the chunk completed without matching. Used by the background
+    /// run_until driver, which repeatedly calls this with a small chunk size
+    /// and releases the session lock between chunks so other MCP tools (poll,
+    /// cancel, get_state) can interleave.
+    ///
+    /// `initial_prop_value` and `start_tick` are carried across chunks by the
+    /// caller so "ticks_run" and PropertyChanges' baseline are stable.
+    fn run_until_chunk(
+        &mut self,
+        cond: &RunUntilCondition,
+        initial_prop_value: Option<i64>,
+        chunk_ticks: u32,
+        start_tick: u32,
+    ) -> Option<RunUntilResult> {
+        for _ in 0..chunk_ticks {
             self.step_one();
 
             let cs = self.state.get_var("CS").unwrap_or(0) & 0xFFFF;
@@ -827,7 +1003,7 @@ impl DebugSession {
             let op_byte = self.state.read_mem(fetch_addr) & 0xFF;
             let next_byte = self.state.read_mem(fetch_addr + 1) & 0xFF;
 
-            let matched: Option<serde_json::Value> = match &cond {
+            let matched: Option<serde_json::Value> = match cond {
                 RunUntilCondition::CsIp { cs: c, ip: i } => {
                     (cs == *c && ip == *i).then(|| serde_json::json!("cs_ip"))
                 }
@@ -860,25 +1036,27 @@ impl DebugSession {
                     ((self.state.read_mem(*addr) & 0xFF) == (*value & 0xFF))
                         .then(|| serde_json::json!({"addr": addr, "value": value}))
                 }
+                RunUntilCondition::MemRangeNonzero { start, end } => {
+                    let mut hit = None;
+                    for a in *start..*end {
+                        let v = self.state.read_mem(a) & 0xFF;
+                        if v != 0 {
+                            hit = Some(serde_json::json!({"addr": a, "value": v}));
+                            break;
+                        }
+                    }
+                    hit
+                }
             };
 
             if let Some(desc) = matched {
                 let ax = self.state.get_var("AX").unwrap_or(0) & 0xFFFF;
                 let ah = (ax >> 8) & 0xFF;
-                let ticks_run = self.current_tick() - start;
-                eprintln!(
-                    "[run-until] hit at tick {} (+{}) CS:IP={:04x}:{:04x} op={:02x} next={:02x} AH={:02x} ({:.3}s)",
-                    self.current_tick(),
-                    ticks_run,
-                    cs,
-                    ip,
-                    op_byte,
-                    next_byte,
-                    ah,
-                    t0.elapsed().as_secs_f64()
-                );
-                return RunUntilResult {
+                let ticks_run = self.current_tick() - start_tick;
+                return Some(RunUntilResult {
                     hit: true,
+                    done: true,
+                    job_id: None,
                     tick: self.current_tick(),
                     ticks_run,
                     cs: Some(cs),
@@ -888,26 +1066,18 @@ impl DebugSession {
                     ah: Some(ah),
                     matched: Some(desc),
                     registers: self.registers_map(),
-                };
+                });
             }
         }
+        None
+    }
 
-        eprintln!(
-            "[run-until] no match after {} ticks ({:.3}s)",
-            max_ticks,
-            t0.elapsed().as_secs_f64()
-        );
-        RunUntilResult {
-            hit: false,
-            tick: self.current_tick(),
-            ticks_run: self.current_tick() - start,
-            cs: None,
-            ip: None,
-            opcode: None,
-            next_byte: None,
-            ah: None,
-            matched: None,
-            registers: BTreeMap::new(),
+    fn initial_prop_value(&self, cond: &RunUntilCondition) -> Option<i64> {
+        match cond {
+            RunUntilCondition::PropertyChanges(name) => {
+                self.evaluator.get_slot_value(name).map(|v| v as i64)
+            }
+            _ => None,
         }
     }
 
@@ -1013,14 +1183,35 @@ impl DebugSession {
 
 #[derive(Clone)]
 struct DebuggerHandler {
-    /// None when no CSS file is loaded yet (the server was started with no
-    /// `-i` flag). Every tool except `info` and `open` errors with
-    /// NO_PROGRAM_LOADED until `open` is called.
-    session: Arc<Mutex<Option<DebugSession>>>,
+    /// Named sessions. The "default" slot is what a tool call without a
+    /// `session` param talks to. Clients that want to debug two cabinets at
+    /// once (or two agents sharing one MCP server) can `open` into distinct
+    /// names and pass `session: "foo"` on every call. Each entry is wrapped
+    /// in its own Mutex so two sessions can run independently without
+    /// contending for a single lock.
+    sessions: Arc<Mutex<HashMap<String, Arc<Mutex<DebugSession>>>>>,
     /// CLI-provided base_interval, used when a new program is loaded via `open`.
     base_interval: u32,
+    /// Background run_until jobs, keyed by session name. One job per session.
+    run_jobs: Arc<Mutex<HashMap<String, RunJob>>>,
     tool_router: ToolRouter<DebuggerHandler>,
 }
+
+/// Shared state between the run_until spawned thread and the MCP handler.
+/// The thread owns forward progress; the handler reads it from poll/cancel.
+struct RunJob {
+    id: u64,
+    cancel: Arc<AtomicBool>,
+    /// Condition matched / max_ticks exhausted / cancel ⇒ thread writes the
+    /// final RunUntilResult here and flips `done`.
+    result: Arc<Mutex<Option<RunUntilResult>>>,
+    done: Arc<AtomicBool>,
+    /// Thread handle. Kept so a drop of the outer job waits for the thread
+    /// (which should have noticed `cancel` and exited promptly).
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+static JOB_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 fn invalid_params(msg: impl Into<String>) -> ErrorData {
     ErrorData::invalid_params(msg.into(), None)
@@ -1033,6 +1224,13 @@ fn no_program() -> ErrorData {
         ),
         None,
     )
+}
+
+/// Read the current tick from a shared session without holding the lock
+/// across the whole caller. Used for diagnostics in run_until cancel /
+/// session-unload paths.
+fn current_tick_locked(session: &Arc<Mutex<DebugSession>>) -> u32 {
+    session.lock().unwrap().current_tick()
 }
 
 /// Parse + compile a CSS file into a fresh DebugSession. Extracted so `main`
@@ -1060,6 +1258,14 @@ fn load_css(path: &std::path::Path, base_interval: u32) -> Result<DebugSession, 
     let evaluator = Evaluator::from_parsed(&parsed);
     eprintln!("Compiled in {:.2}s", t1.elapsed().as_secs_f64());
 
+    // BIOS ROM bytes are emitted as literal branches inside --readMem, not as
+    // --mN @property declarations. Copy them into state memory so read_memory
+    // / get_state tooling can see ROM contents. Without this, the debugger
+    // reports F0000+ as all zeros even though the CPU reads correct bytes.
+    if let Some(table) = evaluator.dispatch_tables.get("--readMem") {
+        state.populate_memory_from_readmem(table);
+    }
+
     let video_config = calcite_core::detect_video_memory();
     if let Some((addr, size)) = video_config {
         eprintln!("Video memory detected at 0x{:X} ({} bytes)", addr, size);
@@ -1083,51 +1289,91 @@ fn load_css(path: &std::path::Path, base_interval: u32) -> Result<DebugSession, 
         css_file: path.display().to_string(),
         video_config,
         property_names,
+        summary: None,
     })
 }
 
 #[tool_router]
 impl DebuggerHandler {
-    fn new(session: Option<DebugSession>, base_interval: u32) -> Self {
+    fn new(
+        session_name: Option<&str>,
+        session: Option<DebugSession>,
+        base_interval: u32,
+    ) -> Self {
+        let mut sessions = HashMap::new();
+        if let (Some(name), Some(s)) = (session_name, session) {
+            sessions.insert(name.to_string(), Arc::new(Mutex::new(s)));
+        }
         Self {
-            session: Arc::new(Mutex::new(session)),
+            sessions: Arc::new(Mutex::new(sessions)),
             base_interval,
+            run_jobs: Arc::new(Mutex::new(HashMap::new())),
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// Resolve a session name to its mutex, or return NO_PROGRAM_LOADED if
+    /// the slot is empty.
+    fn get_session(&self, name: &str) -> Result<Arc<Mutex<DebugSession>>, ErrorData> {
+        let sessions = self.sessions.lock().unwrap();
+        sessions.get(name).cloned().ok_or_else(|| {
+            ErrorData::invalid_params(
+                format!("no program loaded in session '{name}' — call the `open` tool with a CSS file path first"),
+                None,
+            )
+        })
+    }
+
+    fn install_session(&self, name: &str, s: DebugSession) {
+        let mut sessions = self.sessions.lock().unwrap();
+        sessions.insert(name.to_string(), Arc::new(Mutex::new(s)));
     }
 
     #[tool(
         description = "Session metadata. Also works when no program is loaded — returns {loaded: false} so the client knows to call `open` first."
     )]
     fn info(&self, _params: Parameters<EmptyParams>) -> Result<Json<InfoResult>, ErrorData> {
-        let guard = self.session.lock().unwrap();
         let base_interval = self.base_interval;
-        match guard.as_ref() {
-            Some(s) => Ok(Json(InfoResult {
-                loaded: true,
-                css_file: Some(s.css_file.clone()),
-                current_tick: s.current_tick(),
-                properties_count: s.properties_count,
-                functions_count: s.functions_count,
-                assignments_count: s.assignments_count,
-                snapshots: s.bases.iter().map(|(t, _)| *t).collect(),
-                base_interval,
-            })),
-            None => Ok(Json(InfoResult {
-                loaded: false,
-                css_file: None,
-                current_tick: 0,
-                properties_count: 0,
-                functions_count: 0,
-                assignments_count: 0,
-                snapshots: vec![],
-                base_interval,
-            })),
+
+        // Clone the Arc list first so we don't hold the outer lock while
+        // locking each session (which could deadlock if another op has the
+        // sessions map + a session lock in the opposite order).
+        let entries: Vec<(String, Arc<Mutex<DebugSession>>)> = {
+            let sessions = self.sessions.lock().unwrap();
+            sessions.iter().map(|(k, v)| (k.clone(), Arc::clone(v))).collect()
+        };
+
+        let mut session_infos = BTreeMap::new();
+        for (name, arc) in &entries {
+            let g = arc.lock().unwrap();
+            session_infos.insert(name.clone(), SessionInfo {
+                css_file: g.css_file.clone(),
+                current_tick: g.current_tick(),
+                properties_count: g.properties_count,
+                functions_count: g.functions_count,
+                assignments_count: g.assignments_count,
+                snapshots: g.bases.iter().map(|(t, _)| *t).collect(),
+            });
         }
+
+        // Sessions are all listed in `sessions`; the top-level back-compat
+        // fields are left empty now that there is no implicit "default"
+        // session to mirror.
+        Ok(Json(InfoResult {
+            loaded: !session_infos.is_empty(),
+            css_file: None,
+            current_tick: 0,
+            properties_count: 0,
+            functions_count: 0,
+            assignments_count: 0,
+            snapshots: vec![],
+            base_interval,
+            sessions: session_infos,
+        }))
     }
 
     #[tool(
-        description = "Load a CSS file into the debugger. Replaces any currently-loaded program. Required before any other tool (except `info`) can run if the server was started without -i."
+        description = "Load a CSS file into the debugger. Requires a `session` name — reuse the same name across `open`, `tick`, `seek`, etc. Replaces any currently-loaded program. Required before any other tool (except `info`) can run if the server was started without -i."
     )]
     fn open(
         &self,
@@ -1141,17 +1387,32 @@ impl DebuggerHandler {
             functions_count: new_session.functions_count,
             assignments_count: new_session.assignments_count,
         };
-        // Swap in the new session, dropping the old one (and all its snapshots/deltas).
-        *self.session.lock().unwrap() = Some(new_session);
+        // If there's a still-running run_until job on this session, cancel it
+        // before replacing the session out from under it. The worker thread
+        // will notice, write a cancellation result, and exit.
+        let session_key = p.session.clone();
+        {
+            let jobs = self.run_jobs.lock().unwrap();
+            if let Some(existing) = jobs.get(&session_key) {
+                if !existing.done.load(Ordering::Acquire) {
+                    existing.cancel.store(true, Ordering::Release);
+                }
+            }
+        }
+        self.install_session(&session_key, new_session);
         Ok(Json(result))
     }
 
     #[tool(
-        description = "Current registers (state vars) and computed property values at the current tick."
+        description = "Current registers (state vars) and computed property values at the current tick. Requires a `session` name — reuse the same name across `open`, `tick`, `seek`, etc."
     )]
-    fn get_state(&self, _params: Parameters<EmptyParams>) -> Result<Json<StateResult>, ErrorData> {
-        let guard = self.session.lock().unwrap();
-        let s = guard.as_ref().ok_or_else(no_program)?;
+    fn get_state(
+        &self,
+        Parameters(p): Parameters<SessionOnlyParams>,
+    ) -> Result<Json<StateResult>, ErrorData> {
+        let sess = self.get_session(&p.session)?;
+        let guard = sess.lock().unwrap();
+        let s = &*guard;
         Ok(Json(StateResult {
             tick: s.current_tick(),
             registers: s.registers_map(),
@@ -1160,11 +1421,34 @@ impl DebuggerHandler {
     }
 
     #[tool(
-        description = "Advance the simulation by N ticks. Returns the new tick, count executed, and accumulated state-var changes."
+        description = "Advance the simulation by N ticks, returning the per-tick state-var change log. Requires a `session` name — reuse the same name across `open`, `tick`, `seek`, etc. Intended for step-by-step debugging (count=1) or small bursts (up to a few hundred). For bulk advancement to a specific tick, use `seek` — it replays from the nearest snapshot and returns only the final state. For \"run until something happens\", use `run_until`."
     )]
     fn tick(&self, Parameters(p): Parameters<TickParams>) -> Result<Json<TickResult>, ErrorData> {
-        let mut guard = self.session.lock().unwrap();
-        let s = guard.as_mut().ok_or_else(no_program)?;
+        // Guard rail: `tick` returns every state-var change across every tick
+        // executed. At ~5 changes per tick that's thousands of tuples for even
+        // a modest count, which blows past the MCP client's result-size cap
+        // and is rarely what the caller actually wants. If they really do
+        // want N-thousand ticks of change log, splitting the request makes
+        // that explicit. Pointed error so callers can route themselves:
+        // - bulk advance → `seek`
+        // - run until some condition → `run_until`
+        const TICK_CHANGELOG_LIMIT: u32 = 500;
+        if p.count > TICK_CHANGELOG_LIMIT {
+            return Err(invalid_params(format!(
+                "tick(count={}): {} ticks is too many for the per-tick change log — the response would likely exceed the MCP result-size limit. \
+                 Use `seek(tick: {})` to jump to a specific tick without the change log, or `run_until(...)` to run until a condition matches. \
+                 If you genuinely need the change log for a big range, issue multiple `tick` calls each with count <= {}.",
+                p.count,
+                p.count,
+                self.get_session(&p.session)
+                    .and_then(|sess| Ok(sess.lock().unwrap().current_tick() + p.count))
+                    .unwrap_or(p.count),
+                TICK_CHANGELOG_LIMIT,
+            )));
+        }
+        let sess = self.get_session(&p.session)?;
+        let mut guard = sess.lock().unwrap();
+        let s = &mut *guard;
         let t0 = std::time::Instant::now();
         let resp = s.tick_n(p.count);
         let elapsed = t0.elapsed();
@@ -1179,11 +1463,12 @@ impl DebuggerHandler {
     }
 
     #[tool(
-        description = "Seek to a specific tick. Restores the nearest snapshot at or before the target, then replays forward. Going backward also works (seeks via snapshot then replays)."
+        description = "Seek to a specific tick. Requires a `session` name — reuse the same name across `open`, `tick`, `seek`, etc. Restores the nearest snapshot at or before the target, then replays forward. Going backward also works (seeks via snapshot then replays)."
     )]
     fn seek(&self, Parameters(p): Parameters<SeekParams>) -> Result<Json<StateResult>, ErrorData> {
-        let mut guard = self.session.lock().unwrap();
-        let s = guard.as_mut().ok_or_else(no_program)?;
+        let sess = self.get_session(&p.session)?;
+        let mut guard = sess.lock().unwrap();
+        let s = &mut *guard;
         let from = s.current_tick();
         let t0 = std::time::Instant::now();
         s.seek(p.tick);
@@ -1201,25 +1486,27 @@ impl DebuggerHandler {
         }))
     }
 
-    #[tool(description = "Read a range of bytes from 8086 memory. Returns hex, raw bytes, and LE-u16 view.")]
+    #[tool(description = "Read a range of bytes from 8086 memory. Requires a `session` name — reuse the same name across `open`, `tick`, `seek`, etc. Returns hex, raw bytes, and LE-u16 view.")]
     fn read_memory(
         &self,
         Parameters(p): Parameters<MemoryParams>,
     ) -> Result<Json<MemoryResult>, ErrorData> {
-        let guard = self.session.lock().unwrap();
-        let s = guard.as_ref().ok_or_else(no_program)?;
+        let sess = self.get_session(&p.session)?;
+        let guard = sess.lock().unwrap();
+        let s = &*guard;
         Ok(Json(s.read_memory(p.addr, p.len)))
     }
 
     #[tool(
-        description = "Render a region of video memory as text (each cell is one character byte; attribute bytes ignored). Defaults to detected video region or 0xB8000 80x25."
+        description = "Render a region of video memory as text (each cell is one character byte; attribute bytes ignored). Requires a `session` name — reuse the same name across `open`, `tick`, `seek`, etc. Defaults to detected video region or 0xB8000 80x25."
     )]
     fn render_screen(
         &self,
         Parameters(p): Parameters<ScreenParams>,
     ) -> Result<Json<ScreenResult>, ErrorData> {
-        let guard = self.session.lock().unwrap();
-        let s = guard.as_ref().ok_or_else(no_program)?;
+        let sess = self.get_session(&p.session)?;
+        let guard = sess.lock().unwrap();
+        let s = &*guard;
         let (addr, w, h) = (
             p.addr.unwrap_or_else(|| {
                 s.video_config.map(|(a, _)| a as i32).unwrap_or(0xB8000)
@@ -1231,14 +1518,15 @@ impl DebuggerHandler {
     }
 
     #[tool(
-        description = "Compare execution against a reference trace. Each ref entry is {tick, registers: {NAME: value, ...}}. Stops at first divergence by default."
+        description = "Compare execution against a reference trace. Requires a `session` name — reuse the same name across `open`, `tick`, `seek`, etc. Each ref entry is {tick, registers: {NAME: value, ...}}. Stops at first divergence by default."
     )]
     fn compare_reference(
         &self,
         Parameters(p): Parameters<CompareReferenceParams>,
     ) -> Result<Json<CompareReferenceResult>, ErrorData> {
-        let mut guard = self.session.lock().unwrap();
-        let s = guard.as_mut().ok_or_else(no_program)?;
+        let sess = self.get_session(&p.session)?;
+        let mut guard = sess.lock().unwrap();
+        let s = &mut *guard;
         s.seek(0);
         let mut divergences = Vec::new();
         let ticks_to_compare = p.reference.len() as u32;
@@ -1271,24 +1559,26 @@ impl DebuggerHandler {
     }
 
     #[tool(
-        description = "Run one tick via both the compiled and interpreted paths and diff the results. Does not advance the session. Use to find compiler bugs."
+        description = "Run one tick via both the compiled and interpreted paths and diff the results. Requires a `session` name — reuse the same name across `open`, `tick`, `seek`, etc. Does not advance the session. Use to find compiler bugs."
     )]
     fn compare_paths(
         &self,
-        _params: Parameters<EmptyParams>,
+        Parameters(p): Parameters<SessionOnlyParams>,
     ) -> Result<Json<ComparePathsResult>, ErrorData> {
-        let mut guard = self.session.lock().unwrap();
-        let s = guard.as_mut().ok_or_else(no_program)?;
+        let sess = self.get_session(&p.session)?;
+        let mut guard = sess.lock().unwrap();
+        let s = &mut *guard;
         Ok(Json(s.compare_paths()))
     }
 
-    #[tool(description = "Diff the current state against a supplied register/memory snapshot.")]
+    #[tool(description = "Diff the current state against a supplied register/memory snapshot. Requires a `session` name — reuse the same name across `open`, `tick`, `seek`, etc.")]
     fn compare_state(
         &self,
         Parameters(p): Parameters<CompareStateParams>,
     ) -> Result<Json<CompareStateResult>, ErrorData> {
-        let guard = self.session.lock().unwrap();
-        let s = guard.as_ref().ok_or_else(no_program)?;
+        let sess = self.get_session(&p.session)?;
+        let guard = sess.lock().unwrap();
+        let s = &*guard;
         let mut register_diffs = Vec::new();
         let mut memory_diffs = Vec::new();
 
@@ -1331,14 +1621,15 @@ impl DebuggerHandler {
     }
 
     #[tool(
-        description = "Send a key into the machine. target=bda (default) pushes into the BIOS Data Area ring buffer; target=keyboard sets the --keyboard CSS state variable."
+        description = "Send a key into the machine. Requires a `session` name — reuse the same name across `open`, `tick`, `seek`, etc. target=bda (default) pushes into the BIOS Data Area ring buffer; target=keyboard sets the --keyboard CSS state variable."
     )]
     fn send_key(
         &self,
         Parameters(p): Parameters<SendKeyParams>,
     ) -> Result<Json<SendKeyResult>, ErrorData> {
-        let mut guard = self.session.lock().unwrap();
-        let s = guard.as_mut().ok_or_else(no_program)?;
+        let sess = self.get_session(&p.session)?;
+        let mut guard = sess.lock().unwrap();
+        let s = &mut *guard;
         let target = p.target.to_lowercase();
         let ok = match target.as_str() {
             "bda" => {
@@ -1361,26 +1652,28 @@ impl DebuggerHandler {
     }
 
     #[tool(
-        description = "Trace every compiled op that contributes to a property at the current tick. Returns the compiled value, interpreted value (for cross-check), and op-by-op trace."
+        description = "Trace every compiled op that contributes to a property at the current tick. Requires a `session` name — reuse the same name across `open`, `tick`, `seek`, etc. Returns the compiled value, interpreted value (for cross-check), and op-by-op trace."
     )]
     fn trace_property(
         &self,
         Parameters(p): Parameters<TracePropertyParams>,
     ) -> Result<Json<TracePropertyResult>, ErrorData> {
-        let mut guard = self.session.lock().unwrap();
-        let s = guard.as_mut().ok_or_else(no_program)?;
+        let sess = self.get_session(&p.session)?;
+        let mut guard = sess.lock().unwrap();
+        let s = &mut *guard;
         Ok(Json(s.trace_property(&p.property)))
     }
 
     #[tool(
-        description = "Run forward until a memory byte changes (or matches an expected value). Optionally seek to from_tick first. Stops at max_ticks."
+        description = "Run forward until a memory byte changes (or matches an expected value). Requires a `session` name — reuse the same name across `open`, `tick`, `seek`, etc. Optionally seek to from_tick first. Stops at max_ticks."
     )]
     fn watchpoint(
         &self,
         Parameters(p): Parameters<WatchpointParams>,
     ) -> Result<Json<WatchpointResult>, ErrorData> {
-        let mut guard = self.session.lock().unwrap();
-        let s = guard.as_mut().ok_or_else(no_program)?;
+        let sess = self.get_session(&p.session)?;
+        let mut guard = sess.lock().unwrap();
+        let s = &mut *guard;
         if let Some(t) = p.from_tick {
             s.seek(t);
         }
@@ -1388,29 +1681,212 @@ impl DebuggerHandler {
     }
 
     #[tool(
-        description = "Run forward until a condition matches. Conditions: cs_ip, cs, ip_range, int (any INT), int_num (specific INT), property_equals, property_changes, mem_byte_equals."
+        description = "Run forward until a condition matches. Requires a `session` name — reuse the same name across `open`, `tick`, `seek`, etc. Conditions: cs_ip, cs, ip_range, int (any INT), int_num (specific INT), property_equals, property_changes, mem_byte_equals. \n\nStructural long-run handling: the run executes on a background thread, checking cancel between chunks. If the condition hits (or max_ticks exhausts) within ~8 seconds wall-clock, the result is returned inline with `done: true`. Otherwise this call returns `done: false, job_id: N` and the run keeps going — poll with `run_until_poll` or stop it with `run_until_cancel`."
     )]
     fn run_until(
         &self,
         Parameters(p): Parameters<RunUntilParams>,
     ) -> Result<Json<RunUntilResult>, ErrorData> {
-        let mut guard = self.session.lock().unwrap();
-        let s = guard.as_mut().ok_or_else(no_program)?;
-        if let Some(t) = p.from_tick {
-            s.seek(t);
+        let session_key = p.session.clone();
+
+        // Refuse if another job is already in flight for this session. This
+        // keeps session-lock interleaving simple: at most one worker thread
+        // mutates a given session at a time. Different sessions are
+        // independent — two agents with distinct session names can run
+        // simultaneously.
+        {
+            let mut jobs = self.run_jobs.lock().unwrap();
+            if let Some(existing) = jobs.get(&session_key) {
+                if !existing.done.load(Ordering::Acquire) {
+                    return Err(invalid_params(format!(
+                        "another run_until job is still in progress for session '{session_key}' (job_id={}). Poll or cancel it first.",
+                        existing.id
+                    )));
+                }
+                // Previous job finished. Drop it so we can start a new one.
+                // Join its thread if present (should be immediate — it's done).
+                if let Some(mut old) = jobs.remove(&session_key) {
+                    if let Some(h) = old.handle.take() { let _ = h.join(); }
+                }
+            }
         }
-        Ok(Json(s.run_until(p.condition, p.max_ticks)))
+
+        let session_arc = self.get_session(&p.session)?;
+
+        // Apply from_tick up front, while we still have exclusive access.
+        if let Some(t) = p.from_tick {
+            session_arc.lock().unwrap().seek(t);
+        }
+
+        let cond = p.condition;
+        let max_ticks = p.max_ticks;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let result_slot: Arc<Mutex<Option<RunUntilResult>>> = Arc::new(Mutex::new(None));
+        let id = JOB_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+
+        // Snapshot start_tick and initial_prop_value now under the lock so the
+        // worker can do its initial setup without racing with a caller that
+        // seeks between our setup and the worker's first chunk.
+        let (start_tick, initial_prop) = {
+            let guard = session_arc.lock().unwrap();
+            (guard.current_tick(), guard.initial_prop_value(&cond))
+        };
+
+        let worker_cancel = Arc::clone(&cancel);
+        let worker_done = Arc::clone(&done);
+        let worker_result = Arc::clone(&result_slot);
+        let worker_session = Arc::clone(&session_arc);
+        let worker_cond = cond.clone();
+        let worker_key = session_key.clone();
+        let t0 = Instant::now();
+
+        let handle = thread::spawn(move || {
+            // Chunk size is a trade-off: larger = less lock churn, smaller =
+            // faster cancel response and more room for other tools. 2000 ticks
+            // is ~5-20ms of work at typical speeds.
+            const CHUNK: u32 = 2000;
+            let mut total_run: u32 = 0;
+
+            loop {
+                if worker_cancel.load(Ordering::Acquire) {
+                    let mut slot = worker_result.lock().unwrap();
+                    *slot = Some(RunUntilResult {
+                        hit: false, done: true, job_id: None,
+                        tick: current_tick_locked(&worker_session),
+                        ticks_run: total_run,
+                        cs: None, ip: None, opcode: None, next_byte: None, ah: None,
+                        matched: Some(serde_json::json!("cancelled")),
+                        registers: BTreeMap::new(),
+                    });
+                    worker_done.store(true, Ordering::Release);
+                    eprintln!("[run-until] job {id} (session '{worker_key}') cancelled after {total_run} ticks ({:.3}s)", t0.elapsed().as_secs_f64());
+                    return;
+                }
+
+                let remaining = max_ticks.saturating_sub(total_run);
+                if remaining == 0 {
+                    let tick = current_tick_locked(&worker_session);
+                    let mut slot = worker_result.lock().unwrap();
+                    *slot = Some(RunUntilResult {
+                        hit: false, done: true, job_id: None,
+                        tick, ticks_run: total_run,
+                        cs: None, ip: None, opcode: None, next_byte: None, ah: None,
+                        matched: None, registers: BTreeMap::new(),
+                    });
+                    worker_done.store(true, Ordering::Release);
+                    eprintln!("[run-until] job {id} (session '{worker_key}') no match after {max_ticks} ticks ({:.3}s)", t0.elapsed().as_secs_f64());
+                    return;
+                }
+                let chunk = remaining.min(CHUNK);
+
+                // Hold the session lock only for the chunk itself, then drop
+                // it between iterations so poll/cancel/other tools can land.
+                let hit = {
+                    let mut guard = worker_session.lock().unwrap();
+                    guard.run_until_chunk(&worker_cond, initial_prop, chunk, start_tick)
+                };
+
+                if let Some(res) = hit {
+                    eprintln!("[run-until] job {id} (session '{worker_key}') hit at tick {} (+{}) ({:.3}s)",
+                        res.tick, res.ticks_run, t0.elapsed().as_secs_f64());
+                    let mut slot = worker_result.lock().unwrap();
+                    *slot = Some(res);
+                    worker_done.store(true, Ordering::Release);
+                    return;
+                }
+
+                total_run += chunk;
+                thread::yield_now();
+            }
+        });
+
+        {
+            let mut jobs = self.run_jobs.lock().unwrap();
+            jobs.insert(session_key.clone(), RunJob {
+                id,
+                cancel: Arc::clone(&cancel),
+                result: Arc::clone(&result_slot),
+                done: Arc::clone(&done),
+                handle: Some(handle),
+            });
+        }
+
+        // Wait up to INLINE_BUDGET for the job to finish. If it does, return
+        // the result inline. If not, hand the caller a job_id to poll with.
+        const INLINE_BUDGET_MS: u64 = 8000;
+        const POLL_INTERVAL_MS: u64 = 20;
+        let deadline = Instant::now() + Duration::from_millis(INLINE_BUDGET_MS);
+        while Instant::now() < deadline {
+            if done.load(Ordering::Acquire) {
+                let slot = result_slot.lock().unwrap();
+                return Ok(Json(slot.clone().expect("done but no result")));
+            }
+            thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
+        }
+
+        Ok(Json(RunUntilResult {
+            hit: false, done: false, job_id: Some(id),
+            tick: 0, ticks_run: 0,
+            cs: None, ip: None, opcode: None, next_byte: None, ah: None,
+            matched: None, registers: BTreeMap::new(),
+        }))
     }
 
     #[tool(
-        description = "Dump compiled ops. Either by index range (start, end) or by property name. Mutually exclusive."
+        description = "Poll a long-running run_until job. Requires a `session` name — reuse the same name across `open`, `tick`, `seek`, etc. Returns {done: false} if still running, or the final result with {done: true} if it finished (hit the condition, exhausted max_ticks, or was cancelled)."
+    )]
+    fn run_until_poll(
+        &self,
+        Parameters(p): Parameters<JobIdParams>,
+    ) -> Result<Json<RunUntilResult>, ErrorData> {
+        let session_key = p.session.as_str();
+        let guard = self.run_jobs.lock().unwrap();
+        let job = guard.get(session_key)
+            .filter(|j| j.id == p.job_id)
+            .ok_or_else(|| invalid_params(format!(
+                "no run_until job with id {} on session '{session_key}'", p.job_id
+            )))?;
+        if job.done.load(Ordering::Acquire) {
+            let slot = job.result.lock().unwrap();
+            return Ok(Json(slot.clone().expect("done but no result")));
+        }
+        Ok(Json(RunUntilResult {
+            hit: false, done: false, job_id: Some(job.id),
+            tick: 0, ticks_run: 0,
+            cs: None, ip: None, opcode: None, next_byte: None, ah: None,
+            matched: None, registers: BTreeMap::new(),
+        }))
+    }
+
+    #[tool(
+        description = "Cancel a long-running run_until job. Requires a `session` name — reuse the same name across `open`, `tick`, `seek`, etc. Sets a flag that the worker thread checks between tick chunks (≤ ~5ms). After cancellation the run is 'done' with hit=false and matched='cancelled'."
+    )]
+    fn run_until_cancel(
+        &self,
+        Parameters(p): Parameters<JobIdParams>,
+    ) -> Result<Json<RunUntilCancelResult>, ErrorData> {
+        let session_key = p.session.as_str();
+        let guard = self.run_jobs.lock().unwrap();
+        let job = guard.get(session_key)
+            .filter(|j| j.id == p.job_id)
+            .ok_or_else(|| invalid_params(format!(
+                "no run_until job with id {} on session '{session_key}'", p.job_id
+            )))?;
+        job.cancel.store(true, Ordering::Release);
+        Ok(Json(RunUntilCancelResult { job_id: job.id, cancelled: true }))
+    }
+
+    #[tool(
+        description = "Dump compiled ops. Requires a `session` name — reuse the same name across `open`, `tick`, `seek`, etc. Either by index range (start, end) or by property name. Mutually exclusive."
     )]
     fn dump_ops(
         &self,
         Parameters(p): Parameters<DumpOpsParams>,
     ) -> Result<Json<DumpOpsResult>, ErrorData> {
-        let guard = self.session.lock().unwrap();
-        let s = guard.as_ref().ok_or_else(no_program)?;
+        let sess = self.get_session(&p.session)?;
+        let guard = sess.lock().unwrap();
+        let s = &*guard;
         match (p.property.as_deref(), p.start, p.end) {
             (Some(prop), None, None) => match s.evaluator.get_ops_for_property(prop) {
                 Some(lines) => Ok(Json(DumpOpsResult {
@@ -1434,13 +1910,14 @@ impl DebuggerHandler {
         }
     }
 
-    #[tool(description = "List every compiled slot with its name and current value.")]
+    #[tool(description = "List every compiled slot with its name and current value. Requires a `session` name — reuse the same name across `open`, `tick`, `seek`, etc.")]
     fn slot_map(
         &self,
-        _params: Parameters<EmptyParams>,
+        Parameters(p): Parameters<SessionOnlyParams>,
     ) -> Result<Json<SlotMapResult>, ErrorData> {
-        let guard = self.session.lock().unwrap();
-        let s = guard.as_ref().ok_or_else(no_program)?;
+        let sess = self.get_session(&p.session)?;
+        let guard = sess.lock().unwrap();
+        let s = &*guard;
         let entries: Vec<SlotEntry> = s
             .evaluator
             .get_slot_map()
@@ -1455,14 +1932,15 @@ impl DebuggerHandler {
     }
 
     #[tool(
-        description = "Snapshot (base) management. action='create' forces a full-state checkpoint at the current tick (in addition to the automatic ones at base_interval boundaries); action='list' enumerates existing bases. Deltas are tracked automatically every tick."
+        description = "Snapshot (base) management. Requires a `session` name — reuse the same name across `open`, `tick`, `seek`, etc. action='create' forces a full-state checkpoint at the current tick (in addition to the automatic ones at base_interval boundaries); action='list' enumerates existing bases. Deltas are tracked automatically every tick."
     )]
     fn snapshots(
         &self,
         Parameters(p): Parameters<SnapshotParams>,
     ) -> Result<Json<SnapshotResult>, ErrorData> {
-        let mut guard = self.session.lock().unwrap();
-        let s = guard.as_mut().ok_or_else(no_program)?;
+        let sess = self.get_session(&p.session)?;
+        let mut guard = sess.lock().unwrap();
+        let s = &mut *guard;
         let action = p.action.to_lowercase();
         let created = match action.as_str() {
             "create" => {
@@ -1486,6 +1964,114 @@ impl DebuggerHandler {
             created,
         }))
     }
+
+    #[tool(
+        description = "Execution summary: per-tick CS/IP/opcode log (REP-collapsed) broken into coherent blocks. Requires a `session` name — reuse the same name across `open`, `tick`, `seek`, etc. Usage: action='start' to begin recording (call before stepping), then step with tick/seek/run_until, then action='get' to read blocks. Each block describes one coherent phase (tick range, CS, IP range, interrupts, memory write regions, dominant-PC stall detection). Much more useful than tick-by-tick inspection when you're trying to understand what happened across thousands of ticks."
+    )]
+    fn execution_summary(
+        &self,
+        Parameters(p): Parameters<SummaryParams>,
+    ) -> Result<Json<SummaryResult>, ErrorData> {
+        use calcite_core::summary::{EventLogger, SegmentConfig, SummaryConfig, render_block, segment};
+        let sess = self.get_session(&p.session)?;
+        let mut guard = sess.lock().unwrap();
+        let s = &mut *guard;
+        let action = p.action.to_lowercase();
+        match action.as_str() {
+            "start" => {
+                let config = SummaryConfig {
+                    max_events: p.max_events.unwrap_or(500_000),
+                    record_writes: p.record_writes.unwrap_or(true),
+                };
+                s.summary = Some(EventLogger::new(config));
+                Ok(Json(SummaryResult {
+                    action,
+                    active: true,
+                    truncated: false,
+                    event_count: 0,
+                    blocks: Vec::new(),
+                    prose: String::new(),
+                }))
+            }
+            "stop" => {
+                let active = s.summary.is_some();
+                let (event_count, truncated) = s.summary.as_ref()
+                    .map(|l| (l.events.len() as u32, l.truncated))
+                    .unwrap_or((0, false));
+                // Keep the log — caller still needs `get`. Just mark inactive
+                // conceptually by dropping it after they fetch results.
+                // For simplicity we leave it attached; `clear` discards.
+                Ok(Json(SummaryResult {
+                    action,
+                    active,
+                    truncated,
+                    event_count,
+                    blocks: Vec::new(),
+                    prose: String::new(),
+                }))
+            }
+            "clear" => {
+                s.summary = None;
+                Ok(Json(SummaryResult {
+                    action,
+                    active: false,
+                    truncated: false,
+                    event_count: 0,
+                    blocks: Vec::new(),
+                    prose: String::new(),
+                }))
+            }
+            "get" => {
+                let Some(ref log) = s.summary else {
+                    return Err(invalid_params(
+                        "no summary recording is active — call action='start' first",
+                    ));
+                };
+                let seg_config = SegmentConfig {
+                    ip_window: p.ip_window.unwrap_or(256),
+                };
+                let blocks = segment(&log.events, &seg_config);
+                let prose = blocks
+                    .iter()
+                    .map(render_block)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let out_blocks: Vec<SummaryBlock> = blocks
+                    .iter()
+                    .map(|b| SummaryBlock {
+                        start_tick: b.start_tick,
+                        end_tick: b.end_tick,
+                        cs: b.cs,
+                        ip_min: b.ip_min,
+                        ip_max: b.ip_max,
+                        total_ticks: b.total_ticks,
+                        event_count: b.event_count,
+                        dominant_pc: b.dominant_pc.map(|(cs, ip, hits)| {
+                            vec![cs, ip, hits as i32]
+                        }),
+                        interrupts: b.interrupts.iter()
+                            .map(|(k, v)| (k.to_string(), *v))
+                            .collect(),
+                        write_regions: b.write_regions.iter()
+                            .map(|(lo, hi, n)| vec![*lo, *hi, *n as i32])
+                            .collect(),
+                        line: render_block(b),
+                    })
+                    .collect();
+                Ok(Json(SummaryResult {
+                    action,
+                    active: true,
+                    truncated: log.truncated,
+                    event_count: log.events.len() as u32,
+                    blocks: out_blocks,
+                    prose,
+                }))
+            }
+            other => Err(invalid_params(format!(
+                "unknown action '{other}'; expected 'start', 'stop', 'get', or 'clear'"
+            ))),
+        }
+    }
 }
 
 #[tool_handler]
@@ -1497,7 +2083,10 @@ impl ServerHandler for DebuggerHandler {
             "calcite-debugger MCP server. Drives one CSS program through tick-by-tick \
              execution. Use `info` for session state, `tick`/`seek` to navigate, \
              `get_state`/`read_memory`/`render_screen` to inspect, and `compare_paths` / \
-             `trace_property` to find compiler/interpreter divergences."
+             `trace_property` to find compiler/interpreter divergences. \
+             You MUST pass `session` on every tool call. The name you choose in `open` \
+             is the name all subsequent calls must use. If the server restarts and loses \
+             state, `open` again with the same name to rehydrate."
                 .into(),
         );
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
@@ -1518,6 +2107,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cli = Cli::parse();
 
+    // `-i` requires `--session` so the pre-loaded program lives under a
+    // caller-chosen name — session names are required on every MCP tool call.
+    if cli.input.is_some() && cli.session.is_none() {
+        return Err(
+            "`-i/--input` requires `--session <name>` so the pre-loaded program has a session name"
+                .into(),
+        );
+    }
+
     // If -i was given, load that file now. If not, start with no program —
     // the client will call the `open` tool to pick one.
     let initial_session = match &cli.input {
@@ -1528,11 +2126,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    eprintln!("MCP server ready on stdio. Awaiting initialize...");
+    let handler = DebuggerHandler::new(
+        cli.session.as_deref(),
+        initial_session,
+        cli.base_interval,
+    );
 
-    let handler = DebuggerHandler::new(initial_session, cli.base_interval);
-    let service = handler.serve(stdio()).await?;
-    let quit_reason = service.waiting().await?;
-    eprintln!("MCP server stopped: {:?}", quit_reason);
+    // Two transport modes:
+    //   - stdio (default): one client, one process. State dies with the
+    //     process — which happens whenever the MCP host tears the
+    //     subprocess down (timeout, client restart, rebuild).
+    //   - TCP listen (daemon): accept connections in a loop, each served
+    //     on its own task sharing the same handler (all handler state
+    //     is Arc-wrapped so concurrent tasks coordinate via the session
+    //     map and the run-jobs map, not a single top-level lock). The
+    //     daemon process outlives individual clients, so sessions
+    //     survive reconnects.
+    if let Some(addr) = cli.listen.as_deref() {
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind(addr).await.map_err(|e| {
+            format!("failed to bind listener on {addr}: {e}")
+        })?;
+        eprintln!("MCP daemon ready on {addr}. Awaiting connections...");
+
+        loop {
+            let (stream, peer) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    eprintln!("accept error: {e} (continuing)");
+                    continue;
+                }
+            };
+            let handler_clone = handler.clone();
+            eprintln!("[conn] {peer} connected");
+            tokio::spawn(async move {
+                match handler_clone.serve(stream).await {
+                    Ok(service) => match service.waiting().await {
+                        Ok(reason) => eprintln!("[conn] {peer} closed: {reason:?}"),
+                        Err(e) => eprintln!("[conn] {peer} error: {e}"),
+                    },
+                    Err(e) => eprintln!("[conn] {peer} serve failed: {e}"),
+                }
+            });
+        }
+    } else {
+        eprintln!("MCP server ready on stdio. Awaiting initialize...");
+        let service = handler.serve(stdio()).await?;
+        let quit_reason = service.waiting().await?;
+        eprintln!("MCP server stopped: {:?}", quit_reason);
+    }
     Ok(())
 }
