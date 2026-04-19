@@ -88,16 +88,20 @@ paper over it.
 
 ## Known tricky bits
 
-- **CSS-DOS build**: check `bios/NOTES.md` before running any build.
-  OpenWatcom has CRLF sensitivities (see recent commit `1679553`).
+- **CSS-DOS big rename (session 11b) happened after the plan was written.**
+  See the "2026-04-19 addendum" at the top of `2026-04-18-bulk-ops.md` for
+  the path-translation table. In short: `transpiler/` → `kiln/`,
+  `bios/css-emu-bios.asm` → `bios/corduroy/handlers.asm`, `generate-dos.mjs`
+  → `builder/build.mjs`, memory cells are `--m<addr>` (not `--memByte_<addr>`),
+  and the BIOS-reserved bulk-op scratch region must move from `0x500..0x505`
+  to `0x510..0x515` (the old range collides with corduroy's rom-disk LBA
+  and halt flag).
+- **CSS-DOS build**: check `bios/corduroy/README.md` before running any
+  build. OpenWatcom has CRLF sensitivities (see recent commit `1679553`).
 - **Range-predicate CSS syntax**: `calc(X >= var(--bulkDst))` in a
   CSS `if()` condition — verify early (Task 1.3) whether Chrome needs
   `= 1` appended explicitly. If your first Chrome test shows the
   wrong bytes, this is the likely culprit.
-- **BIOS-reserved memory**: the plan uses addresses 0x500–0x505 for
-  bulk-op state. Verify this range is unused by DOS/kernel before
-  committing to it. If conflict, pick a different range in the BIOS
-  scratch area (below 0x600 TPA start, above the IVT and BDA).
 - **Op::MemoryFill already exists** in calcite (commit `d813801`).
   You're not adding it; you're building the CSS-level detector that
   emits it. The op's evaluator unit tests are in
