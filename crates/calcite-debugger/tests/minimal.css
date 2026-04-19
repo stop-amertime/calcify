@@ -1,0 +1,3 @@
+/* Minimal CSS for smoke-testing the debugger. No actual computation. */
+@property --tick { syntax: "<integer>"; inherits: false; initial-value: 0; }
+.cpu { --tick: calc(var(--tick) + 1); }
