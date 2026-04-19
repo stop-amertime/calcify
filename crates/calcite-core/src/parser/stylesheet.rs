@@ -326,11 +326,51 @@ pub fn parse_stylesheet(css: &str) -> Result<ParsedProgram> {
     let progress_start = web_time::Instant::now();
     let mut last_render = web_time::Instant::now();
 
-    let mut input = cssparser::ParserInput::new(css);
+    // ------------------------------------------------------------------
+    // Fast-path pre-scan.
+    //
+    // On large programs (≥ 1 MB) we scan the raw bytes for dense,
+    // byte-templated regions (repeated `--mN:` assignments and
+    // `@property --mN` blocks). Anything we can absorb is emitted as
+    // pre-built `PropertyDef`/`BroadcastWrite` entries, and the source
+    // bytes are blanked with spaces/newlines so cssparser still sees an
+    // input of the same length (preserving error-message line numbers)
+    // but skips over the dense region as pure whitespace.
+    //
+    // Falls back cleanly: if nothing matches, we pass the original `css`
+    // through to cssparser unchanged.
+    // ------------------------------------------------------------------
+    let t_fast = web_time::Instant::now();
+    let fast = if total_bytes >= 1_000_000 {
+        super::fast_path::recognise(css)
+    } else {
+        // Empty result — skip the scan overhead on small inputs.
+        super::fast_path::FastPathResult::empty_pub()
+    };
+    let fast_elapsed = t_fast.elapsed().as_secs_f64();
+    let cssparser_input: std::borrow::Cow<str> = if fast.blank_ranges.is_empty() {
+        std::borrow::Cow::Borrowed(css)
+    } else {
+        std::borrow::Cow::Owned(super::fast_path::apply_blank_ranges(css, &fast.blank_ranges))
+    };
+    if !fast.blank_ranges.is_empty() {
+        let blanked: usize = fast.blank_ranges.iter().map(|&(s, e)| e - s).sum();
+        log::info!(
+            "[parse fast-path] recognised {} properties + {} broadcast writes, blanked {:.1} MB ({:.1}% of input) in {:.2}s",
+            fast.properties.len(),
+            fast.broadcast_writes.len(),
+            blanked as f64 / 1_048_576.0,
+            100.0 * blanked as f64 / total_bytes as f64,
+            fast_elapsed,
+        );
+    }
+
+    let css_for_parser: &str = &cssparser_input;
+    let mut input = cssparser::ParserInput::new(css_for_parser);
     let mut parser = Parser::new(&mut input);
     let mut rule_parser = CalciteRuleParser;
 
-    let mut properties = Vec::new();
+    let mut properties = fast.properties;
     let mut functions = Vec::new();
     let mut assignments = Vec::new();
 
@@ -375,5 +415,7 @@ pub fn parse_stylesheet(css: &str) -> Result<ParsedProgram> {
         properties,
         functions,
         assignments,
+        prebuilt_broadcast_writes: fast.broadcast_writes,
+        fast_path_absorbed: fast.absorbed_properties,
     })
 }

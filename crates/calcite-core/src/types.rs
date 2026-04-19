@@ -254,7 +254,7 @@ pub enum RoundStrategy {
 }
 
 /// A complete parsed CSS program ready for pattern compilation.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Default)]
 pub struct ParsedProgram {
     /// `@property` declarations (used to initialise state).
     pub properties: Vec<PropertyDef>,
@@ -262,6 +262,18 @@ pub struct ParsedProgram {
     pub functions: Vec<FunctionDef>,
     /// Property assignments on `.cpu`, in declaration order.
     pub assignments: Vec<Assignment>,
+    /// Broadcast writes that were pre-recognised by the parser fast-path
+    /// (see `parser::fast_path`). These are emitted **without** building
+    /// `Expr` trees for the underlying assignments, so the assignments
+    /// themselves do NOT appear in `assignments` — they're absorbed
+    /// straight into the fast-path output. Consumers should merge these
+    /// with whatever `pattern::broadcast_write::recognise_broadcast` finds
+    /// in `assignments`.
+    pub prebuilt_broadcast_writes: Vec<crate::pattern::broadcast_write::BroadcastWrite>,
+    /// Property names already absorbed by the fast-path. The evaluator
+    /// filters these out of `assignments` and broadcast-write phase 2 by
+    /// union with `BroadcastResult::absorbed_properties`.
+    pub fast_path_absorbed: std::collections::HashSet<String>,
 }
 
 /// A single property assignment: `--name: <expr>`.

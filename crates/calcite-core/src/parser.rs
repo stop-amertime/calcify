@@ -9,6 +9,7 @@
 //! - Property assignments on `.cpu`
 
 pub mod css_functions;
+pub mod fast_path;
 pub mod property;
 pub mod stylesheet;
 

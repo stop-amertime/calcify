@@ -207,8 +207,18 @@ impl Evaluator {
 
         log::info!("[compile phase] dispatch tables: {:.2}s", _t.elapsed().as_secs_f64());
         let _t = Instant::now();
-        // Recognise broadcast write patterns in assignments
-        let broadcast_result = broadcast_write::recognise_broadcast(&program.assignments);
+        // Recognise broadcast write patterns in assignments. Then merge in
+        // any broadcast writes the parser fast-path already produced: those
+        // never reached `program.assignments` (their Expr trees were never
+        // built), so the recogniser can't see them.
+        let mut broadcast_result =
+            broadcast_write::recognise_broadcast(&program.assignments);
+        for pre in &program.prebuilt_broadcast_writes {
+            broadcast_result.writes.push(pre.clone());
+        }
+        for name in &program.fast_path_absorbed {
+            broadcast_result.absorbed_properties.insert(name.clone());
+        }
         for bw in &broadcast_result.writes {
             let gate = bw.gate_property.as_deref().unwrap_or("(ungated)");
             log::info!(
@@ -2151,6 +2161,7 @@ mod tests {
                     value: Expr::Literal(255.0),
                 },
             ],
+            ..Default::default()
         };
 
         let mut state = State::default();
