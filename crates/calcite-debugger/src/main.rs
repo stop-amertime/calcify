@@ -453,6 +453,21 @@ struct OpenResult {
     assignments_count: usize,
 }
 
+#[derive(Deserialize, schemars::JsonSchema)]
+struct CloseSessionParams {
+    /// Session name to close. Drops all state for this session: snapshots,
+    /// deltas, the loaded program. Cancels any in-flight run_until job.
+    /// Other sessions are unaffected. Calling close on an unknown name is
+    /// not an error — returns `existed: false`.
+    session: String,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+struct CloseSessionResult {
+    session: String,
+    existed: bool,
+}
+
 #[derive(Serialize, schemars::JsonSchema)]
 struct StateResult {
     tick: u32,
@@ -773,6 +788,30 @@ impl DebugSession {
         result
     }
 
+    /// Bulk-advance variant: same as `step_one` but skips the per-tick delta
+    /// computation. Used by `run_until_chunk`, where the per-tick change log
+    /// is never read — only the final landing tick matters. Skipping the
+    /// delta avoids cloning state.memory + state.extended every tick, which
+    /// dominated runtime on large cabinets (370 MB+ CSS, 50 MB+ memory image
+    /// → ~50 MB clone per tick → 250x slowdown vs. calcite-cli).
+    ///
+    /// Trade-off: after a `run_until`, the deltas vec has a gap from the
+    /// pre-run tick to the landing tick. `seek` backward into that gap will
+    /// fall through to base-snapshot replay rather than delta-revert. The
+    /// summary recorder is also skipped (it is only meaningful for
+    /// step-by-step inspection anyway).
+    fn step_one_no_log(&mut self) {
+        self.evaluator.tick(&mut self.state);
+        if self.base_interval > 0 {
+            let t = self.current_tick();
+            if t > 0 && t % self.base_interval == 0
+                && !self.bases.iter().any(|(bt, _)| *bt == t)
+            {
+                self.bases.push((t, self.state.clone()));
+            }
+        }
+    }
+
     fn tick_n(&mut self, count: u32) -> TickResult {
         let start = self.current_tick();
         let mut all_changes = Vec::new();
@@ -995,7 +1034,7 @@ impl DebugSession {
         start_tick: u32,
     ) -> Option<RunUntilResult> {
         for _ in 0..chunk_ticks {
-            self.step_one();
+            self.step_one_no_log();
 
             let cs = self.state.get_var("CS").unwrap_or(0) & 0xFFFF;
             let ip = self.state.get_var("IP").unwrap_or(0) & 0xFFFF;
@@ -1194,7 +1233,47 @@ struct DebuggerHandler {
     base_interval: u32,
     /// Background run_until jobs, keyed by session name. One job per session.
     run_jobs: Arc<Mutex<HashMap<String, RunJob>>>,
+    /// Last-activity timestamp per session (unix millis). Bumped by `get_session`
+    /// on every tool-call lookup, and seeded when `install_session` adds a new
+    /// entry. Read by the operator REPL's `list` command. Never blocks anyone:
+    /// AtomicU64 update is wait-free and the parallel map is touched only
+    /// during session insert / lookup / kill.
+    last_activity: Arc<Mutex<HashMap<String, Arc<AtomicU64>>>>,
     tool_router: ToolRouter<DebuggerHandler>,
+}
+
+/// Unix-millis as u64. Saturates on overflow (won't happen for ~584 million years).
+fn now_millis() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Format a unix-millis timestamp as `HH:MM:SS` for the event log.
+fn format_hms(ms: u64) -> String {
+    let secs = ms / 1000;
+    let h = (secs / 3600) % 24;
+    let m = (secs / 60) % 60;
+    let s = secs % 60;
+    format!("{h:02}:{m:02}:{s:02}")
+}
+
+/// In `--listen` (daemon) mode, stdout is the operator console — events go
+/// there. In stdio MCP mode, stdout is reserved for MCP frames, so events
+/// must go to stderr instead. `main` flips this once at startup.
+static EVENTS_TO_STDOUT: AtomicBool = AtomicBool::new(false);
+
+/// Print one event-log line. The format is intentionally plain so an operator
+/// can grep / scroll the supervisor window without TUI fuss.
+fn log_event(kind: &str, msg: &str) {
+    let line = format!("{}  [{kind}] {msg}", format_hms(now_millis()));
+    if EVENTS_TO_STDOUT.load(Ordering::Relaxed) {
+        println!("{line}");
+    } else {
+        eprintln!("{line}");
+    }
 }
 
 /// Shared state between the run_until spawned thread and the MCP handler.
@@ -1293,7 +1372,6 @@ fn load_css(path: &std::path::Path, base_interval: u32) -> Result<DebugSession, 
     })
 }
 
-#[tool_router]
 impl DebuggerHandler {
     fn new(
         session_name: Option<&str>,
@@ -1308,27 +1386,151 @@ impl DebuggerHandler {
             sessions: Arc::new(Mutex::new(sessions)),
             base_interval,
             run_jobs: Arc::new(Mutex::new(HashMap::new())),
+            last_activity: Arc::new(Mutex::new(HashMap::new())),
             tool_router: Self::tool_router(),
         }
     }
 
     /// Resolve a session name to its mutex, or return NO_PROGRAM_LOADED if
-    /// the slot is empty.
+    /// the slot is empty. Bumps last-activity for the operator REPL's `list`.
     fn get_session(&self, name: &str) -> Result<Arc<Mutex<DebugSession>>, ErrorData> {
-        let sessions = self.sessions.lock().unwrap();
-        sessions.get(name).cloned().ok_or_else(|| {
-            ErrorData::invalid_params(
+        let arc = {
+            let sessions = self.sessions.lock().unwrap();
+            sessions.get(name).cloned()
+        };
+        match arc {
+            Some(s) => {
+                if let Some(stamp) = self.last_activity.lock().unwrap().get(name) {
+                    stamp.store(now_millis(), Ordering::Relaxed);
+                }
+                Ok(s)
+            }
+            None => Err(ErrorData::invalid_params(
                 format!("no program loaded in session '{name}' — call the `open` tool with a CSS file path first"),
                 None,
-            )
-        })
+            )),
+        }
     }
 
     fn install_session(&self, name: &str, s: DebugSession) {
         let mut sessions = self.sessions.lock().unwrap();
         sessions.insert(name.to_string(), Arc::new(Mutex::new(s)));
+        let mut activity = self.last_activity.lock().unwrap();
+        activity.insert(name.to_string(), Arc::new(AtomicU64::new(now_millis())));
     }
 
+    /// Drop a session and any associated run_until job. Returns `true` if the
+    /// session existed and was removed, `false` otherwise. Used by the
+    /// `close_session` MCP tool and the operator REPL's `kill` command.
+    fn drop_session(&self, name: &str) -> bool {
+        // Cancel any outstanding run job first so its worker thread notices
+        // and exits cleanly (it holds an Arc to the session, so the session
+        // mutex won't actually drop until the thread releases it).
+        {
+            let mut jobs = self.run_jobs.lock().unwrap();
+            if let Some(job) = jobs.remove(name) {
+                if !job.done.load(Ordering::Acquire) {
+                    job.cancel.store(true, Ordering::Release);
+                }
+            }
+        }
+        let removed = self.sessions.lock().unwrap().remove(name).is_some();
+        self.last_activity.lock().unwrap().remove(name);
+        removed
+    }
+
+    /// One-line summary of every loaded session, as `(name, summary)` pairs.
+    /// Cheap — does not lock individual session mutexes for long.
+    fn list_sessions(&self) -> Vec<(String, String)> {
+        let entries: Vec<(String, Arc<Mutex<DebugSession>>, Option<u64>)> = {
+            let sessions = self.sessions.lock().unwrap();
+            let activity = self.last_activity.lock().unwrap();
+            sessions
+                .iter()
+                .map(|(k, v)| {
+                    let stamp = activity.get(k).map(|a| a.load(Ordering::Relaxed));
+                    (k.clone(), Arc::clone(v), stamp)
+                })
+                .collect()
+        };
+        let now = now_millis();
+        let mut out = Vec::with_capacity(entries.len());
+        for (name, arc, stamp) in entries {
+            // Try to lock briefly. If contended (a long-running tool holds
+            // it), skip the per-session detail rather than block the REPL.
+            let detail = match arc.try_lock() {
+                Ok(g) => format!(
+                    "tick={:<8} bases={:<3} css={}",
+                    g.current_tick(),
+                    g.bases.len(),
+                    short_path(&g.css_file),
+                ),
+                Err(_) => "(busy: holding session lock — long-running call in progress)".to_string(),
+            };
+            let idle = stamp
+                .map(|t| {
+                    let secs = now.saturating_sub(t) / 1000;
+                    if secs < 60 {
+                        format!("{secs}s")
+                    } else if secs < 3600 {
+                        format!("{}m{}s", secs / 60, secs % 60)
+                    } else {
+                        format!("{}h{}m", secs / 3600, (secs / 60) % 60)
+                    }
+                })
+                .unwrap_or_else(|| "-".to_string());
+            out.push((name, format!("idle={:<8} {}", idle, detail)));
+        }
+        out
+    }
+
+    /// Detailed multi-line view of one session for the operator REPL's `info`.
+    fn session_info_lines(&self, name: &str) -> Option<Vec<String>> {
+        let arc = self.sessions.lock().unwrap().get(name).cloned()?;
+        let stamp = self
+            .last_activity
+            .lock()
+            .unwrap()
+            .get(name)
+            .map(|a| a.load(Ordering::Relaxed));
+        let now = now_millis();
+        let mut lines = vec![format!("session: {name}")];
+        match arc.try_lock() {
+            Ok(g) => {
+                lines.push(format!("  css:           {}", g.css_file));
+                lines.push(format!("  current_tick:  {}", g.current_tick()));
+                lines.push(format!("  snapshots:     {} ({})", g.bases.len(),
+                    g.bases.iter().map(|(t, _)| t.to_string()).collect::<Vec<_>>().join(", ")));
+                lines.push(format!("  properties:    {}", g.properties_count));
+                lines.push(format!("  functions:     {}", g.functions_count));
+                lines.push(format!("  assignments:   {}", g.assignments_count));
+            }
+            Err(_) => {
+                lines.push("  (busy: long-running tool call holding session lock)".into());
+            }
+        }
+        if let Some(t) = stamp {
+            let secs = now.saturating_sub(t) / 1000;
+            lines.push(format!("  last_activity: {secs}s ago"));
+        }
+        Some(lines)
+    }
+}
+
+/// Trim leading directory components for compact `list` output, keeping the
+/// last two path segments so different cabinets in the same folder remain
+/// distinguishable. Best-effort — falls back to the full string.
+fn short_path(p: &str) -> String {
+    let parts: Vec<&str> = p.rsplit(['/', '\\']).take(2).collect();
+    if parts.is_empty() {
+        p.to_string()
+    } else {
+        parts.into_iter().rev().collect::<Vec<_>>().join("/")
+    }
+}
+
+#[tool_router]
+impl DebuggerHandler {
     #[tool(
         description = "Session metadata. Also works when no program is loaded — returns {loaded: false} so the client knows to call `open` first."
     )]
@@ -1400,7 +1602,33 @@ impl DebuggerHandler {
             }
         }
         self.install_session(&session_key, new_session);
+        log_event(
+            "open",
+            &format!(
+                "session={session_key}  css={}  ({} props, {} assignments)",
+                short_path(&result.css_file),
+                result.properties_count,
+                result.assignments_count,
+            ),
+        );
         Ok(Json(result))
+    }
+
+    #[tool(
+        description = "Drop a session and free its memory. Cancels any in-flight run_until job, removes snapshots and deltas. Other sessions are unaffected. Calling on an unknown session is not an error — returns existed=false."
+    )]
+    fn close_session(
+        &self,
+        Parameters(p): Parameters<CloseSessionParams>,
+    ) -> Result<Json<CloseSessionResult>, ErrorData> {
+        let existed = self.drop_session(&p.session);
+        if existed {
+            log_event("close", &format!("session={}", p.session));
+        }
+        Ok(Json(CloseSessionResult {
+            session: p.session,
+            existed,
+        }))
     }
 
     #[tool(
@@ -2095,6 +2323,121 @@ impl ServerHandler for DebuggerHandler {
 }
 
 // ---------------------------------------------------------------------------
+// Operator REPL (--listen mode)
+// ---------------------------------------------------------------------------
+//
+// Runs in a dedicated OS thread so blocking reads on stdin don't tangle with
+// the Tokio runtime serving MCP clients. Commands operate directly on the
+// shared DebuggerHandler — no separate state, no IPC.
+//
+// Design choices for v1:
+//   - No persistent prompt. Events stream to stdout; commands are typed
+//     "into the stream" and the response prints below. Avoids needing a
+//     TUI library.
+//   - Output goes through `println!` so it interleaves cleanly with
+//     `log_event` (also stdout). Both use Rust's line-buffered Stdout
+//     mutex, so lines won't tear.
+//   - Errors from typos are tolerant: unknown command prints `help`-like
+//     hint; bad session name prints "no such session".
+
+fn run_operator_repl(handler: DebuggerHandler) {
+    use std::io::{BufRead, Write};
+    let stdin = std::io::stdin();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        // Flush stdout so the prompt-feel is consistent: any pending event
+        // log lines hit the screen before we wait on stdin.
+        let _ = std::io::stdout().flush();
+        match stdin.lock().read_line(&mut line) {
+            Ok(0) => {
+                // EOF on stdin — operator detached (e.g. Ctrl-Z then close).
+                // Don't tear the daemon down; just stop reading.
+                println!("[repl] stdin closed; operator commands disabled. Daemon keeps serving MCP clients.");
+                return;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                println!("[repl] stdin read error: {e}");
+                return;
+            }
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let mut parts = trimmed.split_whitespace();
+        let cmd = parts.next().unwrap_or("").to_lowercase();
+        let arg = parts.next().map(str::to_string);
+        match cmd.as_str() {
+            "help" | "h" | "?" => {
+                println!("Operator commands:");
+                println!("  list, ls            — show all sessions");
+                println!("  info <name>         — detailed view of one session");
+                println!("  kill <name>         — drop a session and free memory");
+                println!("  kill all            — drop every session");
+                println!("  quit, exit          — kill all sessions and stop the daemon");
+                println!("  help                — this message");
+            }
+            "list" | "ls" => {
+                let entries = handler.list_sessions();
+                if entries.is_empty() {
+                    println!("(no sessions loaded)");
+                } else {
+                    for (name, summary) in entries {
+                        println!("  {name:<16}  {summary}");
+                    }
+                }
+            }
+            "info" => {
+                let Some(name) = arg else {
+                    println!("usage: info <session>");
+                    continue;
+                };
+                match handler.session_info_lines(&name) {
+                    Some(lines) => for l in lines { println!("{l}"); },
+                    None => println!("no such session: {name}"),
+                }
+            }
+            "kill" => {
+                let Some(target) = arg else {
+                    println!("usage: kill <session> | kill all");
+                    continue;
+                };
+                if target == "all" {
+                    let names: Vec<String> = handler.list_sessions().into_iter().map(|(n, _)| n).collect();
+                    if names.is_empty() {
+                        println!("(no sessions to kill)");
+                    } else {
+                        for n in &names {
+                            handler.drop_session(n);
+                            log_event("kill", &format!("session={n}  by operator"));
+                        }
+                        println!("killed {} session(s)", names.len());
+                    }
+                } else if handler.drop_session(&target) {
+                    log_event("kill", &format!("session={target}  by operator"));
+                    println!("killed: {target}");
+                } else {
+                    println!("no such session: {target}");
+                }
+            }
+            "quit" | "exit" => {
+                let names: Vec<String> = handler.list_sessions().into_iter().map(|(n, _)| n).collect();
+                for n in &names {
+                    handler.drop_session(n);
+                }
+                println!("daemon shutting down ({} session(s) killed)", names.len());
+                std::process::exit(0);
+            }
+            other => {
+                println!("unknown command: {other}  (try `help`)");
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -2144,28 +2487,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //     survive reconnects.
     if let Some(addr) = cli.listen.as_deref() {
         use tokio::net::TcpListener;
+        // Daemon mode: stdout becomes the operator console. Switch event-log
+        // routing before any session activity so [open] etc. don't go to
+        // stderr first, then stdout, in mixed order.
+        EVENTS_TO_STDOUT.store(true, Ordering::Relaxed);
         let listener = TcpListener::bind(addr).await.map_err(|e| {
             format!("failed to bind listener on {addr}: {e}")
         })?;
-        eprintln!("MCP daemon ready on {addr}. Awaiting connections...");
+        println!("calcite-debugger daemon listening on {addr}");
+        println!("Type `help` for operator commands. Events appear below.");
+        println!();
+
+        // Operator REPL on stdin. Runs in a blocking thread so stdin reads
+        // don't fight with Tokio. Commands are dispatched against the same
+        // `handler` that serves MCP clients — they share session state.
+        let repl_handler = handler.clone();
+        std::thread::spawn(move || run_operator_repl(repl_handler));
 
         loop {
             let (stream, peer) = match listener.accept().await {
                 Ok(pair) => pair,
                 Err(e) => {
-                    eprintln!("accept error: {e} (continuing)");
+                    log_event("error", &format!("accept: {e} (continuing)"));
                     continue;
                 }
             };
             let handler_clone = handler.clone();
-            eprintln!("[conn] {peer} connected");
+            log_event("conn", &format!("{peer} connected"));
             tokio::spawn(async move {
                 match handler_clone.serve(stream).await {
                     Ok(service) => match service.waiting().await {
-                        Ok(reason) => eprintln!("[conn] {peer} closed: {reason:?}"),
-                        Err(e) => eprintln!("[conn] {peer} error: {e}"),
+                        Ok(reason) => log_event("conn", &format!("{peer} closed: {reason:?}")),
+                        Err(e) => log_event("conn", &format!("{peer} error: {e}")),
                     },
-                    Err(e) => eprintln!("[conn] {peer} serve failed: {e}"),
+                    Err(e) => log_event("conn", &format!("{peer} serve failed: {e}")),
                 }
             });
         }

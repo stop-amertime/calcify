@@ -14,9 +14,21 @@
 // running across client reconnects. State lives in the daemon; the shim
 // is disposable.
 //
-// If the daemon isn't running, the shim autostarts it, waits for the
-// port to open, then proceeds. One daemon serves all clients — only the
-// first shim pays the startup cost.
+// If the daemon isn't running, the shim FAILS LOUDLY rather than autostart.
+// Autostart was attractive but caused a "ghost daemon" failure mode: when
+// the daemon crashed or was never started, an MCP client triggered the
+// shim, which spawned a fresh detached daemon and immediately tried to
+// connect — sometimes succeeding before the daemon had actually bound
+// the port, sometimes losing the race and producing an orphan. The
+// orphan held no sessions but couldn't be told apart from a real daemon
+// by the operator (`tasklist` shows both as `calcite-debugger.exe`).
+// State silently disappeared between agent calls.
+//
+// Now the operator is in charge: start the daemon explicitly, see its
+// output in a window you control, kill it deliberately. The shim's job
+// is purely to bridge bytes.
+//
+// Set CALCITE_DEBUGGER_AUTOSTART=1 to opt in to the old behavior.
 //
 // Usage (for .mcp.json):
 //   "command": "node",
@@ -115,10 +127,22 @@ async function connectOrStart() {
     log(`connected to existing daemon at ${ADDR}`);
     return sock;
   }
-  autostartDaemon();
-  sock = await waitForDaemon();
-  log(`connected to fresh daemon at ${ADDR}`);
-  return sock;
+  if (process.env.CALCITE_DEBUGGER_AUTOSTART === '1') {
+    autostartDaemon();
+    sock = await waitForDaemon();
+    log(`connected to fresh daemon at ${ADDR} (autostarted)`);
+    return sock;
+  }
+  // Fail loudly rather than autostart. See the file header for why.
+  throw new Error(
+    `no calcite-debugger daemon listening at ${ADDR}. ` +
+      `Start one explicitly so you can see its output and kill it deliberately:\n` +
+      `    cd ${REPO_ROOT}\n` +
+      `    .\\start-debugger-daemon.bat        (Windows)\n` +
+      `    target/release/calcite-debugger --listen ${ADDR}   (any platform)\n` +
+      `Or set CALCITE_DEBUGGER_AUTOSTART=1 to autostart anyway (not recommended; ` +
+      `produces ghost daemons on crash).`,
+  );
 }
 
 async function main() {
