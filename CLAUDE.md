@@ -136,10 +136,14 @@ What this means in practice:
   properties. It can recognise patterns and optimise (broadcast writes,
   dispatch tables), but it cannot skip, remove, or alter what the CSS
   expresses — just like V8 can't skip your JavaScript, only run it faster.
-- **Never suggest CSS changes to help calcite.** The CSS is written to work
-  in Chrome. Telling CSS-DOS to "not emit properties" or restructure
-  things for calcite's benefit is backwards — like telling a JS developer
-  to write worse code so V8 can optimise it.
+- **CSS restructuring to help calcite is allowed IF Chrome still evaluates
+  it correctly and the work is real.** Expressing the same computation in
+  a different, more pattern-recognisable shape is fine — that's how
+  compilers and runtimes co-evolve with the code they run. What is NOT
+  fine: adding dummy properties, metadata signals, or side-channels whose
+  only purpose is to leak information to calcite. The CSS has to do
+  honest work in Chrome; calcite just gets to recognise patterns in that
+  honest work faster.
 - **No features that don't exist in CSS.** If Chrome can't evaluate it,
   calcite can't rely on it. Calcite can be smarter about evaluating CSS
   patterns, but it can't invent new semantics.

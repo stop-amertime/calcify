@@ -97,7 +97,7 @@ pub struct Evaluator {
     #[allow(clippy::type_complexity)]
     pre_tick_hooks: Vec<Box<dyn Fn(&mut State)>>,
     /// Compiled bytecode program (flat ops over indexed slots).
-    compiled: CompiledProgram,
+    pub(crate) compiled: CompiledProgram,
     /// Slot array reused across ticks (avoids per-tick allocation).
     slots: Vec<i32>,
 }
@@ -160,6 +160,12 @@ pub struct TickResult {
 }
 
 impl Evaluator {
+    /// Access the compiled program (for diagnostic/debug probes).
+    #[doc(hidden)]
+    pub fn compiled(&self) -> &CompiledProgram {
+        &self.compiled
+    }
+
     /// Build an evaluator from a `ParsedProgram`.
     pub fn from_parsed(program: &ParsedProgram) -> Self {
         let _t = Instant::now();

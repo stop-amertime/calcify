@@ -546,3 +546,238 @@ MHz, different widths). Replaced the live status line with:
 - Feature-flagging rule of thumb for this project: if something "should"
   be fast per the bench but isn't in a real run, look first at whether
   the CLI wrapper is forcing a slow path.
+
+
+## 2026-04-17 — Memoisation viability: Probes 1-4 + runtime period projector prototype
+
+Spec: `docs/superpowers/specs/2026-04-17-memoisation-viability.md`.
+
+### Probes summary
+
+Four probes built as `probe-splash-{memo,trace,affine,period}` binaries
+against bootle-ctest.css. First three (per-tick value-keyed memoisation;
+LuaJIT-style trace specialisation; consecutive-tick affine store detection)
+are **dead ends** — the data rules them out.
+
+Probe 4 (loop-period autocorrelation over the fingerprint stream) **found
+the real signal**: splash-fill is a 26-tick microcode iteration, 99.6% of
+the splash phase, one affine memory write per iteration (`base +
+iter * 1`, constant value = pixel colour). See spec for numbers.
+
+### Runtime projector prototype
+
+New module `crates/calcite-core/src/tick_period.rs` + bench binary
+`probe-splash-project`. Pipeline:
+
+1. **Cold phase**: collect 4096 samples (`(pre_tick_vars, first_mem_write)`).
+2. **Calibration**: identify "cyclic" slots (≤ min(32, len/64) unique values);
+   vote per cyclic slot for its best absolute-value period under
+   autocorrelation. Quorum = ≥ half the voting slots agreeing.
+3. **Affinity verification**: across `CONFIRM_ITERS+1` candidate iterations,
+   verify each state var evolves as `base + k * per_iter_delta` and each
+   offset's memory write evolves as `(base_addr + k * addr_stride,
+   constant_value)`. Non-affine vars are only tolerated if their delta is 0.
+4. **Projection**: at an iteration boundary, advance state vars scalarly
+   and fill memory with a `memset` over `N` iterations of writes.
+5. **Validation**: after projection, run one real iteration and check that
+   post-iteration state matches `anchor + (iters_since_lock+1) * delta`
+   absolutely. Miss → cooldown 64 ticks, re-enter Cold.
+6. **Rollback**: driver snapshots `state.memory`, `state.state_vars`,
+   `state.extended`, `state.string_properties`, `frame_counter` before
+   every projection; on validation miss, restores all five.
+
+### Current status — honest assessment
+
+**Correctness: bit-identical to baseline.** Halt tick, memory hash, and
+state_vars hash all match baseline (`1828538 / 94e2a9a5d967e282 /
+a7d99bf7857452b2`) on bootle-ctest end-to-end.
+
+Early attempts had silent state drift: memory hashed correctly (rollback
+caught every miss) but halt tick drifted by 104 and state_vars hash
+mismatched. Fixed by changing `validate_iteration` to compare **absolute**
+state against `anchor + iters * delta`, not just the incremental `post ==
+pre + delta`. Under an affine workload, one real iteration advances by
+`delta` from ANY starting state — incremental check is trivially true
+even when the projected `pre` is wrong. The absolute check catches it.
+
+But the projector still doesn't pay off:
+- **156 of 157 locks miss validation.** The detector locks after
+  CONFIRM_ITERS=3 iterations of affine behaviour, but 4 iterations is not
+  enough evidence that the next N will ALSO be affine. The spec's data
+  backs this up: longest P=26 contiguous run is only 8292 ticks (318
+  iterations), so locks happen mostly on shorter runs where projection
+  quickly outruns the regime.
+- **Net speedup: 1.02×, inside noise.**
+
+This is a prototype, not a ship-ready optimisation. Remaining work to get
+a real win:
+
+1. **Stronger lock gate.** Require CONFIRM_ITERS ≥ 10 and a high match
+   ratio in the full calibration window (not just the anchor region). In
+   theory this moves the false-positive rate below the disruption rate,
+   so locks stick.
+2. **Reduce calibration cost.** O(n_vars × max_period × window) per
+   attempt is ~5ms per 4096 ticks at current settings — on par with the
+   tick cost itself. Only recompute when `state_vars` hash rings a bell
+   (i.e., skip calibration while the workload looks unchanged).
+3. **Smarter projection budget.** Current code doubles on success, resets
+   to 4 on miss. In a workload where ~1 in 300 iterations is a disruption,
+   the expected-value-optimal starting budget is much higher — but we need
+   the lock gate to be reliable first.
+4. **Consider whether the detector overhead can be made pay-per-use**: if
+   Cold-mode observation costs > compiled-tick cost, we're net-negative.
+   The probe's observation adds a state_vars.clone() + first-mem-write
+   scan per tick — that's already a significant fraction of tick cost.
+
+### Artifacts
+
+- `crates/calcite-core/src/tick_period.rs` — detector + projector.
+- `crates/calcite-cli/src/bin/probe_splash_{memo,trace,affine,period,project}.rs`
+  — the four research probes + the end-to-end projector driver.
+- `crates/calcite-cli/src/bin/probe_{full_vs_sub,cyclic_slots}.rs` —
+  diagnostic probes for fingerprint-strategy selection (kept for future
+  reference; they were how I discovered that delta-fingerprint gives 45%
+  match rate while a subset-of-cyclic-slots absolute fingerprint gives
+  100%).
+- `probe.*.log` — raw probe outputs (not committed).
+
+### What the prototype establishes
+
+- The detection pipeline (fingerprint → voting → affine verify) does find
+  P=26 on bootle-ctest in a 4096-sample window. With a wider window it
+  would also find the harmonics (52, 78, 104, …).
+- The rollback pathway keeps memory bit-identical across projection
+  attempts even when the projection is wrong.
+- The spec's 20–30× upper bound is **not** demonstrated by this code —
+  the validation gap collapses every projection back to a rollback.
+
+The easy validation fix landed (absolute-anchor comparison). The hard
+remaining work is detector discipline: locks are firing far too
+optimistically, so almost every projection gets rolled back. A longer
+confirm window or a more stringent agreement threshold should move the
+false-positive rate below the workload's natural disruption rate — at
+which point the 20–30× upper bound from the spec becomes reachable in
+principle. Until that lands, the detector is instrumentation, not
+optimisation.
+
+
+## 2026-04-18 — Splash fill: REP STOSB rewrite + runtime projector stabilised + signature-based detector WIP
+
+Two parallel workstreams this session. One shipped (on CSS-DOS side); one
+partially landed (runtime projector fixes); one is research-quality code
+that needs a final correctness pass before it's useful.
+
+### CSS-DOS: REP STOSB splash rewrite — shipped
+
+Commit `2acc748` on `../CSS-DOS/master`. `bios/splash.c`'s per-pixel C
+loop for the dark-gray fill replaced with an OpenWatcom `#pragma aux
+vga_fill` wrapper emitting `rep stosb`. **Splash ticks: 1,828,538 →
+194,918. 9.4× fewer CSS ticks** for the 64,000-byte fill. Output CSS
+rebuilt via `generate-dos-c.mjs`.
+
+### Runtime projector (`PeriodTracker`) — correctness fix + opts
+
+Prior session left the projector in a broken state: correct detection but
+`project()` didn't cap N by counter-zero-crossing, so it over-filled past
+REP STOSB end by ~1,500 bytes and corrupted post-fill memory. Fixed:
+
+1. **Zero-crossing cap in `project()`.** For any state slot with non-zero
+   delta, bound N so the slot doesn't cross zero during projection. Pure
+   observation of slot values, no x86 knowledge — cardinal-rule-safe.
+   **Result: memory hash matches baseline bit-identically.**
+
+2. **Opt: no per-tick heap allocations in `observe()`.** `Sample.vars`
+   boxes pre-allocated at construction; hot path just `copy_from_slice`s
+   into the next ring slot. Probe's `pre_vars` clone replaced with a
+   reusable `Vec<i32>` scratch.
+
+3. **Opt: `CALIB_LEN` 4096 → 256** with scaled `MIN_MATCHES` (512 → 32)
+   and a cyclic-threshold clamp of `(len/8).clamp(8, 32)`. Gives 16× more
+   calibration attempts per workload; still passes the in-module tests.
+
+4. **Opt: `INITIAL_BUDGET` 4 → 64.** Zero-crossing cap is now the safety
+   net against overfill, so we can start projecting more aggressively.
+
+**Combined result: stable ~1.25–1.30× median splash speedup (best
+~1.42×), memory hash bit-identical to baseline, no missed validations on
+the hot path.**
+
+### Why only 1.30× — honest bottleneck analysis
+
+Expected 5–10×, got 1.30×. Measured decomposition:
+
+- **67% of splash** is burnt in Cold-mode calibration before lock. The
+  voting-based autocorrelation needs many samples to disambiguate a real
+  period from dispatchy-slot coincidences. With MIN_PERIOD=1 (necessary
+  for the REP STOSB workload after the rewrite), only one in ~32
+  calibration buffers lands with an affine-verifiable window — all the
+  others fail `non-affine var with nonzero delta`.
+- **Remaining 33%** is projected. Bulk memset saves ~30% of that 33% =
+  ~10% of total. Plus some validation overhead saved from the small
+  opts.
+- **Tracker observation overhead** is only ~5% per tick after opt 1, not
+  the ~18% I'd initially guessed from a noisy run.
+
+The wall: lock timing isn't deterministic — it depends on buffer
+end-alignment landing inside a phase of the microcode cycle where 5
+consecutive tick-to-tick deltas happen to be self-consistent. That only
+happens ~1/32 of the time. Shrinking the buffer gives more attempts but
+doesn't change per-attempt success rate.
+
+### Structural critique → signature-based cycle detector (WIP)
+
+The real fix is to stop inducing cycles statistically from state_vars
+autocorrelation and instead use structural execution signatures: two
+ticks that wrote to the same set of state slots with the same
+relative-address mem-write pattern did mechanically the same work.
+Cycle period falls out in O(ticks), not O(ticks²).
+
+New module `crates/calcite-core/src/cycle_tracker.rs`. Per-tick
+signature = hash of (slot-change-set, relative-mem-write-offsets).
+Last-seen-at map gives a period candidate in O(1); `CONFIRM_CYCLES=3`
+cycles of matching confirms. Handles harmonics via a third-cycle
+affine-consistency check at lock time.
+
+**Detection works**: on the real workload (bootle-ctest), the tracker
+locks on the period-4 REP STOSB cycle at tick **3,263** instead of tick
+131,072. 40× reduction in time-to-lock, correctly identifies
+addr_stride=+2/cycle and writes/cycle=2. Unit tests pass.
+
+**Projection is broken**: after the harmonic-rejection gate, the detector
+falls through to locking on a DIFFERENT pattern later in the trace (tick
+130,948) and my hand-rolled `project()` writes wrong bytes. Memory hash
+diverges from baseline. Phase alignment between captured anchor and
+current state_vars is the source of the bug — I tried several fixes but
+didn't converge in-session.
+
+### Next step (unfinished)
+
+The right shape of the fix: keep `CycleTracker`'s detection primitive
+(it solves the real "observe for 131K ticks" problem); throw away my
+hand-rolled `project()`; wire CycleTracker's output (period,
+addr_stride, write_offsets, per_cycle_delta, anchor_vars) directly into
+`PeriodTracker::Mode::Locked` to use the proven projection code. That
+gives fast lock + correct project. Expected: the 5–10× that didn't land
+this session.
+
+### Honest scope comparison with the original brief
+
+Original brief (from prior session handover) was to pattern-match the
+REP STOSB shape at **compile time** and lower it to a new
+`Op::MemoryFill` bytecode. I did not do that. I iterated on the
+**runtime** detector instead — a different architectural choice with a
+different risk profile (less invasive to `compile.rs`, but lower ceiling
+than symbolic compile-time analysis). The 9.4× from Task 1 (CSS-DOS
+side) is real; the 10×-ceiling of Task 2 is not here.
+
+### Artifacts (this session)
+
+- `crates/calcite-core/src/tick_period.rs` — zero-crossing cap +
+  opts 1/2/4. Stable, correct, bench-worthy.
+- `crates/calcite-core/src/cycle_tracker.rs` — signature-based detector.
+  Detection works, projection broken. Marked as experimental.
+- `crates/calcite-cli/src/bin/probe_write_sig.rs`,
+  `probe_cycle_detect.rs`, `probe_cycle_project.rs` — diagnostic
+  + bench probes for the new detector.
+- `../CSS-DOS/bios/splash.c` (commit `2acc748`) — REP STOSB rewrite,
+  shipped.
