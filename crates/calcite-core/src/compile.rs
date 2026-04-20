@@ -4215,7 +4215,7 @@ pub fn execute(program: &CompiledProgram, state: &mut State, slots: &mut Vec<i32
     // Runtime REP fast-forward: after the CSS has applied one iteration of a
     // REP string op, collapse the remaining iterations into one bulk memory
     // operation. See rep_fast_forward() for the detection rules.
-    rep_fast_forward(state);
+    rep_fast_forward(program, state, slots);
 }
 
 /// Post-tick recognizer for REP string ops. Runs after the CSS has applied
@@ -4224,6 +4224,11 @@ pub fn execute(program: &CompiledProgram, state: &mut State, slots: &mut Vec<i32
 /// is no segment override, and CX is still > 0, apply the remaining iterations
 /// in bulk and zero CX. This is functionally equivalent to running the CSS for
 /// CX more ticks.
+///
+/// Reads from `slots` because most of the CSS signals we inspect
+/// (--opcode, --hasREP, --repType, --hasSegOverride) are derived intermediate
+/// properties, not `@property` state vars. Only CX/DI/SI/IP/ES/DS/AL/AX/flags
+/// are @property-backed state vars; we read those from State.
 ///
 /// Guards (any of these failing → fall through, let the CSS handle it):
 /// - Opcode not in {0xAA, 0xAB, 0xA4, 0xA5}.
@@ -4237,34 +4242,43 @@ pub fn execute(program: &CompiledProgram, state: &mut State, slots: &mut Vec<i32
 /// When fast-forwarding we update: memory, DI (and SI for MOVS), CX, IP, and
 /// cycleCount. Other state vars (AL/AX/flags/ES/DS) don't change during these
 /// opcodes so they stay as-is.
-fn rep_fast_forward(state: &mut State) {
-    // Pull decoded fields. Bail if any is missing (program doesn't look like
-    // CSS-DOS output).
-    let opcode = match state.get_var("opcode") { Some(v) => v, None => return };
+fn rep_fast_forward(program: &CompiledProgram, state: &mut State, slots: &[i32]) {
+    // Resolve a CSS property to its current value. Tries the compiled
+    // program's property_slots first, falls back to state vars by bare name.
+    // Implemented as a function rather than a closure so the `state` borrow
+    // is released after each call.
+    fn read_prop(program: &CompiledProgram, state: &State, slots: &[i32], name: &str) -> Option<i32> {
+        if let Some(&s) = program.property_slots.get(name) {
+            return Some(slots[s as usize]);
+        }
+        let bare = name.strip_prefix("--").unwrap_or(name);
+        state.get_var(bare)
+    }
+
+    // Snapshot every field the hook needs up-front so we can release the
+    // state borrow before any mutations.
+    let opcode = match read_prop(program, state, slots, "--opcode") { Some(v) => v, None => return };
     if opcode != 0xAA && opcode != 0xAB && opcode != 0xA4 && opcode != 0xA5 {
         return;
     }
-    let has_rep = state.get_var("hasREP").unwrap_or(0);
-    if has_rep != 1 { return; }
-    let rep_type = state.get_var("repType").unwrap_or(0);
-    if rep_type != 1 { return; }
-    let cx = state.get_var("__1CX").unwrap_or(0);
+    if read_prop(program, state, slots, "--hasREP").unwrap_or(0) != 1 { return; }
+    if read_prop(program, state, slots, "--repType").unwrap_or(0) != 1 { return; }
+    let cx = match read_prop(program, state, slots, "--CX") {
+        Some(v) => v,
+        None => return,
+    };
     if cx <= 0 { return; }
-    let flags = state.get_var("__1flags").unwrap_or(0);
-    let df = (flags >> 10) & 1;
-    if df != 0 { return; }
-    let seg_override = state.get_var("hasSegOverride").unwrap_or(0);
-    if seg_override != 0 { return; }
+    let flags = read_prop(program, state, slots, "--flags").unwrap_or(0);
+    if (flags >> 10) & 1 != 0 { return; }
+    if read_prop(program, state, slots, "--hasSegOverride").unwrap_or(0) != 0 { return; }
 
     let step: i32 = if opcode == 0xAB || opcode == 0xA5 { 2 } else { 1 };
     let n = cx;
-    // Wrap-safe DI/SI check: i16-space values must not overflow the 16-bit
-    // register. `checked_add` on i64 of (current + n*step) compared to 65536.
-    let di = state.get_var("__1DI").unwrap_or(0);
+    let di = read_prop(program, state, slots, "--DI").unwrap_or(0);
     let di_end = di as i64 + (n as i64) * (step as i64);
     if di_end > 0xFFFF { return; }
     let si_end_opt = if opcode == 0xA4 || opcode == 0xA5 {
-        let si = state.get_var("__1SI").unwrap_or(0);
+        let si = read_prop(program, state, slots, "--SI").unwrap_or(0);
         let e = si as i64 + (n as i64) * (step as i64);
         if e > 0xFFFF { return; }
         Some((si, e))
@@ -4272,21 +4286,33 @@ fn rep_fast_forward(state: &mut State) {
         None
     };
 
-    let es = state.get_var("__1ES").unwrap_or(0);
+    let es = read_prop(program, state, slots, "--ES").unwrap_or(0);
     let es_base = (es as i64) * 16;
     let dst_linear = es_base + di as i64;
 
+    let al_or_ax = match opcode {
+        0xAA => read_prop(program, state, slots, "--AL").unwrap_or(0),
+        0xAB => read_prop(program, state, slots, "--AX").unwrap_or(0),
+        _ => 0,
+    };
+    let ds = if opcode == 0xA4 || opcode == 0xA5 {
+        read_prop(program, state, slots, "--DS").unwrap_or(0)
+    } else {
+        0
+    };
+    let ip = state.get_var("IP").unwrap_or(0);
+    let prefix_len = read_prop(program, state, slots, "--prefixLen").unwrap_or(1);
+    let cs = read_prop(program, state, slots, "--CS").unwrap_or(0);
+
+    // Now mutate memory and state vars. State reads are done.
     match opcode {
         0xAA => {
-            // REP STOSB: fill [dst_linear .. dst_linear + n] with AL.
-            let al = (state.get_var("AL").unwrap_or(0) & 0xFF) as u8;
+            let al = (al_or_ax & 0xFF) as u8;
             bulk_fill(state, dst_linear, n as usize, al);
         }
         0xAB => {
-            // REP STOSW: fill words (little-endian AX).
-            let ax = state.get_var("__1AX").unwrap_or(0);
-            let lo = (ax & 0xFF) as u8;
-            let hi = ((ax >> 8) & 0xFF) as u8;
+            let lo = (al_or_ax & 0xFF) as u8;
+            let hi = ((al_or_ax >> 8) & 0xFF) as u8;
             let mut off = 0i64;
             for _ in 0..n {
                 bulk_store_byte(state, dst_linear + off, lo);
@@ -4295,38 +4321,67 @@ fn rep_fast_forward(state: &mut State) {
             }
         }
         0xA4 | 0xA5 => {
-            // REP MOVSB/MOVSW: copy from DS:SI (or override) to ES:DI.
-            // No segment override (guarded above), so source segment is DS.
-            let ds = state.get_var("__1DS").unwrap_or(0);
             let src_linear = (ds as i64) * 16 + si_end_opt.unwrap().0 as i64;
             bulk_copy(state, src_linear, dst_linear, (n as usize) * step as usize);
         }
         _ => unreachable!(),
     }
 
-    // Advance DI (and SI for MOVS). The CSS masks to 16 bits via --lowerBytes;
-    // we guarded against overflow above so a plain add is safe.
-    state.set_var("__1DI", di + n * step);
+    state.set_var("DI", di + n * step);
     if let Some((si, _)) = si_end_opt {
-        state.set_var("__1SI", si + n * step);
+        state.set_var("SI", si + n * step);
     }
-    // CX → 0.
-    state.set_var("__1CX", 0);
-    // IP advances past the string op (+1). The REP prefix byte was accounted
-    // for on the tick that entered the loop; here IP was held at the prefix
-    // because _repContinue=1. Moving to +2 from the prefix skips both prefix
-    // and the opcode. But post-tick the CSS has already left IP at the prefix
-    // byte itself (unchanged this tick). So we need +2 to pass both.
-    // Actually: IP held by CSS is the IP of the REP prefix byte. Advancing to
-    // IP + 2 moves past prefix + string op. This matches what the CSS would
-    // produce on the final iteration (repIP() with _repContinue=0 gives IP+1
-    // inside the dispatch, and the wrapper adds prefixLen=1 → IP+2 total).
-    let ip = state.get_var("__1IP").unwrap_or(0);
-    state.set_var("__1IP", (ip + 2) & 0xFFFF);
+    state.set_var("CX", 0);
+    // IP bookkeeping. What post-tick IP the CSS produces for a continuing
+    // iteration depends on how the CSS emits the REP-continuing IP expression:
+    //
+    //   Variant A (conceptually correct):
+    //     post_tick_IP = IP_of_prefix   (unchanged during continuation).
+    //     After final iteration: post_tick_IP = IP_of_prefix + 1 + prefixLen
+    //     → delta to post-final: +1 + prefixLen.
+    //
+    //   Variant B (current CSS-DOS kiln — the `IP - prefixLen` expression is
+    //   *not* counter-balanced by the outer `+ prefixLen` wrapper):
+    //     post_tick_IP = IP_of_prefix - prefixLen
+    //     After final iteration: post_tick_IP = IP_of_prefix + 1 + prefixLen
+    //     → delta to post-final: +1 + 2*prefixLen.
+    //
+    // We detect which variant we're in by reading `--prefixLen`:
+    //   - In variant A the CSS would leave post_tick_IP *at the prefix byte*
+    //     while the decoded `--prefixLen` still reflects the 1-byte prefix.
+    //     So post-tick IP_at_prefix_byte and prefixLen > 0.
+    //   - In variant B, post-tick IP sits BEFORE the prefix byte (by
+    //     prefixLen); next tick's `--prefixLen` decode is then computed off
+    //     the already-moved IP. But we're looking at THIS tick's prefixLen,
+    //     which was 1.
+    //
+    // Since we only fast-forward when we *just* saw a REP iteration, the
+    // current tick's prefixLen is the right quantity regardless. Add
+    // `1 + 2 * prefixLen` if post_tick_IP points before the prefix byte
+    // (variant B, prefixLen > 0 and we know IP decremented), otherwise
+    // `1 + prefixLen`. We distinguish by comparing the raw byte at IP:
+    // if it's the REP prefix (0xF3/0xF2), variant A; else variant B.
+    let ip_linear = (cs as i64) * 16 + ip as i64;
+    let byte_at_ip = if ip_linear >= 0 && (ip_linear as usize) < state.memory.len() {
+        state.memory[ip_linear as usize]
+    } else {
+        0
+    };
+    let is_rep_byte = byte_at_ip == 0xF3 || byte_at_ip == 0xF2;
+    let delta: i32 = if is_rep_byte {
+        // Variant A: IP is at the REP prefix byte. Past prefix + 1-byte opcode.
+        1 + prefix_len
+    } else {
+        // Variant B: IP is one prefixLen *before* the prefix byte (current
+        // CSS-DOS bug). Skip back through the virtual step, past prefix, past
+        // 1-byte string op.
+        1 + 2 * prefix_len
+    };
+    state.set_var("IP", (ip + delta) & 0xFFFF);
     // Charge cycles. CSS adds 10 per STOS and 17 per MOVS iteration.
     let per_iter = if opcode == 0xAA || opcode == 0xAB { 10 } else { 17 };
-    if let Some(cc) = state.get_var("__1cycleCount") {
-        state.set_var("__1cycleCount", cc.wrapping_add(n.wrapping_mul(per_iter)));
+    if let Some(cc) = state.get_var("cycleCount") {
+        state.set_var("cycleCount", cc.wrapping_add(n.wrapping_mul(per_iter)));
     }
 }
 

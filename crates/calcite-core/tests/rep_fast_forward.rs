@@ -38,8 +38,8 @@ fn rigged_state() -> State {
     // Names the recognizer reads/writes. Order doesn't matter for lookup.
     let names = [
         "opcode", "hasREP", "repType", "hasSegOverride",
-        "__1CX", "__1DI", "__1SI", "__1IP",
-        "__1AX", "__1ES", "__1DS", "__1flags", "__1cycleCount",
+        "CX", "DI", "SI", "IP",
+        "AX", "ES", "DS", "flags", "cycleCount",
         "AL",
     ];
     let props: Vec<PropertyDef> = names
@@ -65,15 +65,19 @@ fn rep_stosb_fast_forwards_remaining_iterations() {
     // 0xA000:0000, with AL=0x42. The CSS wrote byte 0 already and incremented
     // DI to 1 while decrementing CX to 255.
     state.memory[0xA0000] = 0x42; // already-written byte from the tick
+    // Rig the REP prefix byte at IP so variant-A (conceptually-correct)
+    // detection fires and the recognizer picks +2 for the IP delta.
+    state.memory[0x100] = 0xF3;
+    state.memory[0x101] = 0xAA;
     state.set_var("opcode", 0xAA);
     state.set_var("hasREP", 1);
     state.set_var("repType", 1);
     state.set_var("hasSegOverride", 0);
-    state.set_var("__1CX", 255);
-    state.set_var("__1DI", 1);
-    state.set_var("__1ES", 0xA000);
-    state.set_var("__1IP", 0x100); // IP held at REP prefix
-    state.set_var("__1flags", 0);
+    state.set_var("CX", 255);
+    state.set_var("DI", 1);
+    state.set_var("ES", 0xA000);
+    state.set_var("IP", 0x100); // IP held at REP prefix
+    state.set_var("flags", 0);
     state.set_var("AL", 0x42);
 
     execute(&prog, &mut state, &mut slots);
@@ -85,11 +89,11 @@ fn rep_stosb_fast_forwards_remaining_iterations() {
     // Byte after untouched.
     assert_eq!(state.memory[0xA0000 + 256], 0);
     // DI advanced, CX zeroed, IP past prefix+opcode.
-    assert_eq!(state.get_var("__1DI"), Some(256));
-    assert_eq!(state.get_var("__1CX"), Some(0));
-    assert_eq!(state.get_var("__1IP"), Some(0x102));
+    assert_eq!(state.get_var("DI"), Some(256));
+    assert_eq!(state.get_var("CX"), Some(0));
+    assert_eq!(state.get_var("IP"), Some(0x102));
     // cycleCount got 255 * 10.
-    assert_eq!(state.get_var("__1cycleCount"), Some(255 * 10));
+    assert_eq!(state.get_var("cycleCount"), Some(255 * 10));
 }
 
 #[test]
@@ -101,14 +105,17 @@ fn rep_stosw_fast_forwards_word_fill() {
     // REP STOSW (0xAB), AX=0xBEEF, filled 1 word already. 3 iterations left.
     state.memory[0xA0000] = 0xEF;
     state.memory[0xA0001] = 0xBE;
+    // Rig prefix + opcode at IP for variant-A detection.
+    state.memory[0x100] = 0xF3;
+    state.memory[0x101] = 0xAB;
     state.set_var("opcode", 0xAB);
     state.set_var("hasREP", 1);
     state.set_var("repType", 1);
-    state.set_var("__1CX", 3);
-    state.set_var("__1DI", 2);
-    state.set_var("__1ES", 0xA000);
-    state.set_var("__1IP", 0x100);
-    state.set_var("__1AX", 0xBEEF);
+    state.set_var("CX", 3);
+    state.set_var("DI", 2);
+    state.set_var("ES", 0xA000);
+    state.set_var("IP", 0x100);
+    state.set_var("AX", 0xBEEF);
 
     execute(&prog, &mut state, &mut slots);
 
@@ -118,9 +125,9 @@ fn rep_stosw_fast_forwards_word_fill() {
         assert_eq!(state.memory[0xA0000 + i], *want, "word-fill byte {}", i);
     }
     assert_eq!(state.memory[0xA0000 + 8], 0); // untouched after
-    assert_eq!(state.get_var("__1DI"), Some(8));
-    assert_eq!(state.get_var("__1CX"), Some(0));
-    assert_eq!(state.get_var("__1IP"), Some(0x102));
+    assert_eq!(state.get_var("DI"), Some(8));
+    assert_eq!(state.get_var("CX"), Some(0));
+    assert_eq!(state.get_var("IP"), Some(0x102));
 }
 
 #[test]
@@ -137,15 +144,18 @@ fn rep_movsb_fast_forwards_copy() {
     }
     // Simulate 1 byte already copied and SI/DI bumped to 1, CX=15.
     state.memory[dst_base] = state.memory[src_base];
+    // Rig prefix + opcode at IP for variant-A detection.
+    state.memory[0x100] = 0xF3;
+    state.memory[0x101] = 0xA4;
     state.set_var("opcode", 0xA4);
     state.set_var("hasREP", 1);
     state.set_var("repType", 1);
-    state.set_var("__1CX", 15);
-    state.set_var("__1SI", 1);
-    state.set_var("__1DI", 1);
-    state.set_var("__1DS", 0x2000);
-    state.set_var("__1ES", 0x3000);
-    state.set_var("__1IP", 0x100);
+    state.set_var("CX", 15);
+    state.set_var("SI", 1);
+    state.set_var("DI", 1);
+    state.set_var("DS", 0x2000);
+    state.set_var("ES", 0x3000);
+    state.set_var("IP", 0x100);
 
     execute(&prog, &mut state, &mut slots);
 
@@ -157,10 +167,10 @@ fn rep_movsb_fast_forwards_copy() {
             i
         );
     }
-    assert_eq!(state.get_var("__1SI"), Some(16));
-    assert_eq!(state.get_var("__1DI"), Some(16));
-    assert_eq!(state.get_var("__1CX"), Some(0));
-    assert_eq!(state.get_var("__1cycleCount"), Some(15 * 17));
+    assert_eq!(state.get_var("SI"), Some(16));
+    assert_eq!(state.get_var("DI"), Some(16));
+    assert_eq!(state.get_var("CX"), Some(0));
+    assert_eq!(state.get_var("cycleCount"), Some(15 * 17));
 }
 
 #[test]
@@ -175,19 +185,19 @@ fn no_fast_forward_when_df_set() {
     state.set_var("opcode", 0xAA);
     state.set_var("hasREP", 1);
     state.set_var("repType", 1);
-    state.set_var("__1CX", 100);
-    state.set_var("__1DI", 0);
-    state.set_var("__1ES", 0);
-    state.set_var("__1flags", 1 << 10); // DF set
+    state.set_var("CX", 100);
+    state.set_var("DI", 0);
+    state.set_var("ES", 0);
+    state.set_var("flags", 1 << 10); // DF set
     state.set_var("AL", 0x55);
-    state.set_var("__1IP", 0x200);
+    state.set_var("IP", 0x200);
 
     execute(&prog, &mut state, &mut slots);
 
     // Memory untouched, CX unchanged.
     assert_eq!(state.memory[0x100], 0xFF);
-    assert_eq!(state.get_var("__1CX"), Some(100));
-    assert_eq!(state.get_var("__1IP"), Some(0x200));
+    assert_eq!(state.get_var("CX"), Some(100));
+    assert_eq!(state.get_var("IP"), Some(0x200));
 }
 
 #[test]
@@ -200,17 +210,17 @@ fn no_fast_forward_when_has_seg_override() {
     state.set_var("hasREP", 1);
     state.set_var("repType", 1);
     state.set_var("hasSegOverride", 1); // override active
-    state.set_var("__1CX", 50);
-    state.set_var("__1DI", 0);
-    state.set_var("__1SI", 0);
-    state.set_var("__1IP", 0x300);
+    state.set_var("CX", 50);
+    state.set_var("DI", 0);
+    state.set_var("SI", 0);
+    state.set_var("IP", 0x300);
 
     execute(&prog, &mut state, &mut slots);
 
     // CX unchanged — fast-forward bailed.
-    assert_eq!(state.get_var("__1CX"), Some(50));
-    assert_eq!(state.get_var("__1DI"), Some(0));
-    assert_eq!(state.get_var("__1IP"), Some(0x300));
+    assert_eq!(state.get_var("CX"), Some(50));
+    assert_eq!(state.get_var("DI"), Some(0));
+    assert_eq!(state.get_var("IP"), Some(0x300));
 }
 
 #[test]
@@ -223,17 +233,17 @@ fn no_fast_forward_when_no_rep_prefix() {
 
     state.set_var("opcode", 0xAA);
     state.set_var("hasREP", 0); // no prefix
-    state.set_var("__1CX", 1000);
-    state.set_var("__1DI", 0);
-    state.set_var("__1ES", 0xB800);
+    state.set_var("CX", 1000);
+    state.set_var("DI", 0);
+    state.set_var("ES", 0xB800);
     state.set_var("AL", 0x20);
-    state.set_var("__1IP", 0x500);
+    state.set_var("IP", 0x500);
 
     execute(&prog, &mut state, &mut slots);
 
     assert_eq!(state.memory[0xB8000], 0, "must not fill without REP");
-    assert_eq!(state.get_var("__1CX"), Some(1000));
-    assert_eq!(state.get_var("__1IP"), Some(0x500));
+    assert_eq!(state.get_var("CX"), Some(1000));
+    assert_eq!(state.get_var("IP"), Some(0x500));
 }
 
 #[test]
@@ -246,16 +256,16 @@ fn no_fast_forward_when_cx_zero() {
     state.set_var("opcode", 0xAA);
     state.set_var("hasREP", 1);
     state.set_var("repType", 1);
-    state.set_var("__1CX", 0);
-    state.set_var("__1DI", 1000);
-    state.set_var("__1IP", 0x400);
+    state.set_var("CX", 0);
+    state.set_var("DI", 1000);
+    state.set_var("IP", 0x400);
 
     execute(&prog, &mut state, &mut slots);
 
     // DI and IP untouched.
-    assert_eq!(state.get_var("__1CX"), Some(0));
-    assert_eq!(state.get_var("__1DI"), Some(1000));
-    assert_eq!(state.get_var("__1IP"), Some(0x400));
+    assert_eq!(state.get_var("CX"), Some(0));
+    assert_eq!(state.get_var("DI"), Some(1000));
+    assert_eq!(state.get_var("IP"), Some(0x400));
 }
 
 #[test]
@@ -268,13 +278,13 @@ fn no_fast_forward_on_unrelated_opcode() {
     state.set_var("opcode", 0x90);
     state.set_var("hasREP", 1);
     state.set_var("repType", 1);
-    state.set_var("__1CX", 500);
-    state.set_var("__1IP", 0x600);
+    state.set_var("CX", 500);
+    state.set_var("IP", 0x600);
 
     execute(&prog, &mut state, &mut slots);
 
-    assert_eq!(state.get_var("__1CX"), Some(500));
-    assert_eq!(state.get_var("__1IP"), Some(0x600));
+    assert_eq!(state.get_var("CX"), Some(500));
+    assert_eq!(state.get_var("IP"), Some(0x600));
 }
 
 #[test]
@@ -287,15 +297,15 @@ fn no_fast_forward_when_di_would_overflow_16_bits() {
     state.set_var("opcode", 0xAA);
     state.set_var("hasREP", 1);
     state.set_var("repType", 1);
-    state.set_var("__1CX", 100);
-    state.set_var("__1DI", 0xFFF0); // only 16 bytes left before wrap
-    state.set_var("__1ES", 0);
+    state.set_var("CX", 100);
+    state.set_var("DI", 0xFFF0); // only 16 bytes left before wrap
+    state.set_var("ES", 0);
     state.set_var("AL", 0x77);
-    state.set_var("__1IP", 0x700);
+    state.set_var("IP", 0x700);
 
     execute(&prog, &mut state, &mut slots);
 
-    assert_eq!(state.get_var("__1CX"), Some(100));
-    assert_eq!(state.get_var("__1IP"), Some(0x700));
+    assert_eq!(state.get_var("CX"), Some(100));
+    assert_eq!(state.get_var("IP"), Some(0x700));
     assert_eq!(state.memory[0xFFF0], 0);
 }
