@@ -4302,7 +4302,6 @@ fn rep_fast_forward(program: &CompiledProgram, state: &mut State, slots: &[i32])
     };
     let ip = state.get_var("IP").unwrap_or(0);
     let prefix_len = read_prop(program, state, slots, "--prefixLen").unwrap_or(1);
-    let cs = read_prop(program, state, slots, "--CS").unwrap_or(0);
 
     // Now mutate memory and state vars. State reads are done.
     match opcode {
@@ -4332,52 +4331,14 @@ fn rep_fast_forward(program: &CompiledProgram, state: &mut State, slots: &[i32])
         state.set_var("SI", si + n * step);
     }
     state.set_var("CX", 0);
-    // IP bookkeeping. What post-tick IP the CSS produces for a continuing
-    // iteration depends on how the CSS emits the REP-continuing IP expression:
-    //
-    //   Variant A (conceptually correct):
-    //     post_tick_IP = IP_of_prefix   (unchanged during continuation).
-    //     After final iteration: post_tick_IP = IP_of_prefix + 1 + prefixLen
-    //     → delta to post-final: +1 + prefixLen.
-    //
-    //   Variant B (current CSS-DOS kiln — the `IP - prefixLen` expression is
-    //   *not* counter-balanced by the outer `+ prefixLen` wrapper):
-    //     post_tick_IP = IP_of_prefix - prefixLen
-    //     After final iteration: post_tick_IP = IP_of_prefix + 1 + prefixLen
-    //     → delta to post-final: +1 + 2*prefixLen.
-    //
-    // We detect which variant we're in by reading `--prefixLen`:
-    //   - In variant A the CSS would leave post_tick_IP *at the prefix byte*
-    //     while the decoded `--prefixLen` still reflects the 1-byte prefix.
-    //     So post-tick IP_at_prefix_byte and prefixLen > 0.
-    //   - In variant B, post-tick IP sits BEFORE the prefix byte (by
-    //     prefixLen); next tick's `--prefixLen` decode is then computed off
-    //     the already-moved IP. But we're looking at THIS tick's prefixLen,
-    //     which was 1.
-    //
-    // Since we only fast-forward when we *just* saw a REP iteration, the
-    // current tick's prefixLen is the right quantity regardless. Add
-    // `1 + 2 * prefixLen` if post_tick_IP points before the prefix byte
-    // (variant B, prefixLen > 0 and we know IP decremented), otherwise
-    // `1 + prefixLen`. We distinguish by comparing the raw byte at IP:
-    // if it's the REP prefix (0xF3/0xF2), variant A; else variant B.
-    let ip_linear = (cs as i64) * 16 + ip as i64;
-    let byte_at_ip = if ip_linear >= 0 && (ip_linear as usize) < state.memory.len() {
-        state.memory[ip_linear as usize]
-    } else {
-        0
-    };
-    let is_rep_byte = byte_at_ip == 0xF3 || byte_at_ip == 0xF2;
-    let delta: i32 = if is_rep_byte {
-        // Variant A: IP is at the REP prefix byte. Past prefix + 1-byte opcode.
-        1 + prefix_len
-    } else {
-        // Variant B: IP is one prefixLen *before* the prefix byte (current
-        // CSS-DOS bug). Skip back through the virtual step, past prefix, past
-        // 1-byte string op.
-        1 + 2 * prefix_len
-    };
-    state.set_var("IP", (ip + delta) & 0xFFFF);
+    // IP bookkeeping. The kiln emits repIP() as
+    //     calc(if(_repContinue=1: IP - prefixLen; else: IP + instrLen) + prefixLen)
+    // so on a continuing iteration the post-tick IP stays at the REP prefix
+    // byte. Our fast-forward replaces the remaining iterations with the
+    // final one, which would have taken the `else` branch: post-tick IP =
+    // IP_at_prefix + instrLen + prefixLen. instrLen is 1 for all four
+    // opcodes we handle.
+    state.set_var("IP", (ip + 1 + prefix_len) & 0xFFFF);
     // Charge cycles. CSS adds 10 per STOS and 17 per MOVS iteration.
     let per_iter = if opcode == 0xAA || opcode == 0xAB { 10 } else { 17 };
     if let Some(cc) = state.get_var("cycleCount") {

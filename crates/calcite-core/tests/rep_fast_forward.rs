@@ -65,10 +65,6 @@ fn rep_stosb_fast_forwards_remaining_iterations() {
     // 0xA000:0000, with AL=0x42. The CSS wrote byte 0 already and incremented
     // DI to 1 while decrementing CX to 255.
     state.memory[0xA0000] = 0x42; // already-written byte from the tick
-    // Rig the REP prefix byte at IP so variant-A (conceptually-correct)
-    // detection fires and the recognizer picks +2 for the IP delta.
-    state.memory[0x100] = 0xF3;
-    state.memory[0x101] = 0xAA;
     state.set_var("opcode", 0xAA);
     state.set_var("hasREP", 1);
     state.set_var("repType", 1);
@@ -105,9 +101,6 @@ fn rep_stosw_fast_forwards_word_fill() {
     // REP STOSW (0xAB), AX=0xBEEF, filled 1 word already. 3 iterations left.
     state.memory[0xA0000] = 0xEF;
     state.memory[0xA0001] = 0xBE;
-    // Rig prefix + opcode at IP for variant-A detection.
-    state.memory[0x100] = 0xF3;
-    state.memory[0x101] = 0xAB;
     state.set_var("opcode", 0xAB);
     state.set_var("hasREP", 1);
     state.set_var("repType", 1);
@@ -144,9 +137,6 @@ fn rep_movsb_fast_forwards_copy() {
     }
     // Simulate 1 byte already copied and SI/DI bumped to 1, CX=15.
     state.memory[dst_base] = state.memory[src_base];
-    // Rig prefix + opcode at IP for variant-A detection.
-    state.memory[0x100] = 0xF3;
-    state.memory[0x101] = 0xA4;
     state.set_var("opcode", 0xA4);
     state.set_var("hasREP", 1);
     state.set_var("repType", 1);
