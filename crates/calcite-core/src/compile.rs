@@ -4215,8 +4215,27 @@ pub fn execute(program: &CompiledProgram, state: &mut State, slots: &mut Vec<i32
     // Runtime REP fast-forward: after the CSS has applied one iteration of a
     // REP string op, collapse the remaining iterations into one bulk memory
     // operation. See rep_fast_forward() for the detection rules.
-    rep_fast_forward(program, state, slots);
+    // Gated by CALCITE_REP_FASTFWD=0 env var for A/B debugging of
+    // regressions; on by default.
+    if rep_fastfwd_enabled() {
+        rep_fast_forward(program, state, slots);
+    }
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+fn rep_fastfwd_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        match std::env::var("CALCITE_REP_FASTFWD").as_deref() {
+            Ok("0") | Ok("false") | Ok("off") => false,
+            _ => true,
+        }
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+fn rep_fastfwd_enabled() -> bool { true }
 
 /// Post-tick recognizer for REP string ops. Runs after the CSS has applied
 /// exactly one iteration. If the opcode is a simple REP string op (0xAA STOSB,
@@ -4289,6 +4308,18 @@ fn rep_fast_forward(program: &CompiledProgram, state: &mut State, slots: &[i32])
     let es = read_prop(program, state, slots, "--ES").unwrap_or(0);
     let es_base = (es as i64) * 16;
     let dst_linear = es_base + di as i64;
+    let n_bytes = (n as i64) * (step as i64);
+
+    // Bail out if the destination range touches a region that isn't plain
+    // state.memory. Writes to those regions in the CSS go through dispatch
+    // functions (not `--mN` state vars), so a bulk `state.memory` write
+    // wouldn't match what the CSS would compute.
+    //
+    //   [0xD0000, 0xD0200)  — ROM-disk window (read-only via --readDiskByte)
+    //   [0xF0000, 0x100000) — BIOS ROM (extended map, not state.memory)
+    if ranges_overlap_virtual(dst_linear, n_bytes) {
+        return;
+    }
 
     let al_or_ax = match opcode {
         0xAA => read_prop(program, state, slots, "--AL").unwrap_or(0),
@@ -4300,6 +4331,19 @@ fn rep_fast_forward(program: &CompiledProgram, state: &mut State, slots: &[i32])
     } else {
         0
     };
+
+    // For MOVS, the source is the much bigger concern: the ROM-disk window
+    // at DS:SI → linear 0xD0000..0xD01FF is dispatched *per byte read* to
+    // `--readDiskByte(lba*512 + offset)`, so the bytes in `state.memory`
+    // at that window are never populated — a `copy_within` here pulls
+    // zeros. CSS-DOS's INT 13h handler does exactly this (rep movsw from
+    // DS=0xD000). Must bail.
+    if opcode == 0xA4 || opcode == 0xA5 {
+        let src_linear = (ds as i64) * 16 + si_end_opt.unwrap().0 as i64;
+        if ranges_overlap_virtual(src_linear, n_bytes) {
+            return;
+        }
+    }
     let ip = state.get_var("IP").unwrap_or(0);
     let prefix_len = read_prop(program, state, slots, "--prefixLen").unwrap_or(1);
 
@@ -4346,7 +4390,25 @@ fn rep_fast_forward(program: &CompiledProgram, state: &mut State, slots: &[i32])
     }
 }
 
+/// Returns true if [start, start+len) overlaps a memory region that isn't
+/// backed by plain `state.memory` byte storage. CSS-DOS exposes three such
+/// regions via dispatch in `--readMem`:
+///   - [0x0500, 0x0502)   — BDA keyboard head bridge to `--keyboard` state var.
+///   - [0xD0000, 0xD0200) — ROM-disk window synthesised by `--readDiskByte`.
+///   - [0xF0000, 0x100000) — BIOS ROM, routed to state.extended.
+/// Plus writes to the BIOS region also route to state.extended. The
+/// fast-forward collapses iterations into a single `state.memory`
+/// operation, which would be wrong for any of these ranges.
 #[inline]
+fn ranges_overlap_virtual(start: i64, len: i64) -> bool {
+    if len <= 0 { return false; }
+    let end = start + len;
+    let overlaps = |a: i64, b: i64, c: i64, d: i64| a < d && c < b;
+    overlaps(start, end, 0x0500, 0x0502)
+        || overlaps(start, end, 0xD_0000, 0xD_0200)
+        || overlaps(start, end, 0xF_0000, 0x10_0000)
+}
+
 fn bulk_store_byte(state: &mut State, addr: i64, val: u8) {
     // Inline implementation that skips write_log; mirrors MemoryFill/MemoryCopy
     // discipline (bulk path is diagnostic-silent).
