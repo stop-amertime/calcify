@@ -4211,6 +4211,165 @@ pub fn execute(program: &CompiledProgram, state: &mut State, slots: &mut Vec<i32
             }
         }
     }
+
+    // Runtime REP fast-forward: after the CSS has applied one iteration of a
+    // REP string op, collapse the remaining iterations into one bulk memory
+    // operation. See rep_fast_forward() for the detection rules.
+    rep_fast_forward(state);
+}
+
+/// Post-tick recognizer for REP string ops. Runs after the CSS has applied
+/// exactly one iteration. If the opcode is a simple REP string op (0xAA STOSB,
+/// 0xAB STOSW, 0xA4 MOVSB, 0xA5 MOVSW), the direction flag is forward, there
+/// is no segment override, and CX is still > 0, apply the remaining iterations
+/// in bulk and zero CX. This is functionally equivalent to running the CSS for
+/// CX more ticks.
+///
+/// Guards (any of these failing → fall through, let the CSS handle it):
+/// - Opcode not in {0xAA, 0xAB, 0xA4, 0xA5}.
+/// - `--hasREP` != 1 (no REP prefix → just a single iteration).
+/// - `--repType` != 1 (REPNE on STOS/MOVS is a misuse; be conservative).
+/// - CX already 0 (nothing to fast-forward).
+/// - DF=1 (flags bit 10 set → reverse direction; skip for simplicity).
+/// - `--hasSegOverride` == 1 (rare; skip).
+/// - DI or SI would wrap past 65535 over the range (rare; skip).
+///
+/// When fast-forwarding we update: memory, DI (and SI for MOVS), CX, IP, and
+/// cycleCount. Other state vars (AL/AX/flags/ES/DS) don't change during these
+/// opcodes so they stay as-is.
+fn rep_fast_forward(state: &mut State) {
+    // Pull decoded fields. Bail if any is missing (program doesn't look like
+    // CSS-DOS output).
+    let opcode = match state.get_var("opcode") { Some(v) => v, None => return };
+    if opcode != 0xAA && opcode != 0xAB && opcode != 0xA4 && opcode != 0xA5 {
+        return;
+    }
+    let has_rep = state.get_var("hasREP").unwrap_or(0);
+    if has_rep != 1 { return; }
+    let rep_type = state.get_var("repType").unwrap_or(0);
+    if rep_type != 1 { return; }
+    let cx = state.get_var("__1CX").unwrap_or(0);
+    if cx <= 0 { return; }
+    let flags = state.get_var("__1flags").unwrap_or(0);
+    let df = (flags >> 10) & 1;
+    if df != 0 { return; }
+    let seg_override = state.get_var("hasSegOverride").unwrap_or(0);
+    if seg_override != 0 { return; }
+
+    let step: i32 = if opcode == 0xAB || opcode == 0xA5 { 2 } else { 1 };
+    let n = cx;
+    // Wrap-safe DI/SI check: i16-space values must not overflow the 16-bit
+    // register. `checked_add` on i64 of (current + n*step) compared to 65536.
+    let di = state.get_var("__1DI").unwrap_or(0);
+    let di_end = di as i64 + (n as i64) * (step as i64);
+    if di_end > 0xFFFF { return; }
+    let si_end_opt = if opcode == 0xA4 || opcode == 0xA5 {
+        let si = state.get_var("__1SI").unwrap_or(0);
+        let e = si as i64 + (n as i64) * (step as i64);
+        if e > 0xFFFF { return; }
+        Some((si, e))
+    } else {
+        None
+    };
+
+    let es = state.get_var("__1ES").unwrap_or(0);
+    let es_base = (es as i64) * 16;
+    let dst_linear = es_base + di as i64;
+
+    match opcode {
+        0xAA => {
+            // REP STOSB: fill [dst_linear .. dst_linear + n] with AL.
+            let al = (state.get_var("AL").unwrap_or(0) & 0xFF) as u8;
+            bulk_fill(state, dst_linear, n as usize, al);
+        }
+        0xAB => {
+            // REP STOSW: fill words (little-endian AX).
+            let ax = state.get_var("__1AX").unwrap_or(0);
+            let lo = (ax & 0xFF) as u8;
+            let hi = ((ax >> 8) & 0xFF) as u8;
+            let mut off = 0i64;
+            for _ in 0..n {
+                bulk_store_byte(state, dst_linear + off, lo);
+                bulk_store_byte(state, dst_linear + off + 1, hi);
+                off += 2;
+            }
+        }
+        0xA4 | 0xA5 => {
+            // REP MOVSB/MOVSW: copy from DS:SI (or override) to ES:DI.
+            // No segment override (guarded above), so source segment is DS.
+            let ds = state.get_var("__1DS").unwrap_or(0);
+            let src_linear = (ds as i64) * 16 + si_end_opt.unwrap().0 as i64;
+            bulk_copy(state, src_linear, dst_linear, (n as usize) * step as usize);
+        }
+        _ => unreachable!(),
+    }
+
+    // Advance DI (and SI for MOVS). The CSS masks to 16 bits via --lowerBytes;
+    // we guarded against overflow above so a plain add is safe.
+    state.set_var("__1DI", di + n * step);
+    if let Some((si, _)) = si_end_opt {
+        state.set_var("__1SI", si + n * step);
+    }
+    // CX → 0.
+    state.set_var("__1CX", 0);
+    // IP advances past the string op (+1). The REP prefix byte was accounted
+    // for on the tick that entered the loop; here IP was held at the prefix
+    // because _repContinue=1. Moving to +2 from the prefix skips both prefix
+    // and the opcode. But post-tick the CSS has already left IP at the prefix
+    // byte itself (unchanged this tick). So we need +2 to pass both.
+    // Actually: IP held by CSS is the IP of the REP prefix byte. Advancing to
+    // IP + 2 moves past prefix + string op. This matches what the CSS would
+    // produce on the final iteration (repIP() with _repContinue=0 gives IP+1
+    // inside the dispatch, and the wrapper adds prefixLen=1 → IP+2 total).
+    let ip = state.get_var("__1IP").unwrap_or(0);
+    state.set_var("__1IP", (ip + 2) & 0xFFFF);
+    // Charge cycles. CSS adds 10 per STOS and 17 per MOVS iteration.
+    let per_iter = if opcode == 0xAA || opcode == 0xAB { 10 } else { 17 };
+    if let Some(cc) = state.get_var("__1cycleCount") {
+        state.set_var("__1cycleCount", cc.wrapping_add(n.wrapping_mul(per_iter)));
+    }
+}
+
+#[inline]
+fn bulk_store_byte(state: &mut State, addr: i64, val: u8) {
+    // Inline implementation that skips write_log; mirrors MemoryFill/MemoryCopy
+    // discipline (bulk path is diagnostic-silent).
+    if addr < 0 { return; }
+    if addr >= 0xF0000 {
+        state.extended.insert(addr as i32, val as i32);
+        return;
+    }
+    let idx = addr as usize;
+    if idx < state.memory.len() {
+        state.memory[idx] = val;
+    }
+}
+
+#[inline]
+fn bulk_fill(state: &mut State, dst: i64, count: usize, val: u8) {
+    if count == 0 || dst < 0 { return; }
+    let mem_len = state.memory.len();
+    if (dst as usize) >= mem_len { return; }
+    let lo = dst as usize;
+    let hi = (dst as i64 + count as i64).min(mem_len as i64) as usize;
+    if hi > lo {
+        state.memory[lo..hi].fill(val);
+    }
+}
+
+#[inline]
+fn bulk_copy(state: &mut State, src: i64, dst: i64, count: usize) {
+    if count == 0 || src < 0 || dst < 0 { return; }
+    let mem_len = state.memory.len();
+    if (src as usize) >= mem_len || (dst as usize) >= mem_len { return; }
+    let max_by_src = (mem_len as i64) - src;
+    let max_by_dst = (mem_len as i64) - dst;
+    let n = (count as i64).min(max_by_src).min(max_by_dst) as usize;
+    if n > 0 {
+        let s = src as usize;
+        let d = dst as usize;
+        state.memory.copy_within(s..s + n, d);
+    }
 }
 
 /// Execute a sequence of ops against the slot array.

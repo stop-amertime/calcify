@@ -165,6 +165,7 @@ fn op_name(op: &Op) -> &'static str {
         Op::StoreState { .. } => "StoreState",
         Op::StoreMem { .. } => "StoreMem",
         Op::MemoryFill { .. } => "MemoryFill",
+        Op::MemoryCopy { .. } => "MemoryCopy",
         Op::Call { .. } => "Call",
     }
 }
