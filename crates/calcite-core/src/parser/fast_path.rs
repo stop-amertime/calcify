@@ -826,6 +826,54 @@ fn extract_branches(
                     gate_property: outer_gate.map(|s| s.to_string()),
                 });
             }
+            StyleTest::And(tests) if tests.len() == 2 => {
+                // Flat gated-direct shape:
+                //   `style(--_slotNLive: 1) and style(--memAddrN: <addr>)`
+                // One test is the :1 gate, the other is the :<addr> address.
+                // Emit as a gated direct port — same downstream handling as
+                // the nested `style(--_slotNLive: 1): if(style(--memAddrN: <addr>) ...)`
+                // shape, just learned from a single template branch.
+                //
+                // Spillover (`style(--memAddrN: <src>) and style(--isWordWrite: 1)`)
+                // can't land here via fast-path in practice: the fast-path
+                // template holes must be either Addr or Const, and spillover
+                // uses src = own_addr - 1, which fast-path classifies as Addr
+                // too — so a spillover-only run would still end up with a
+                // constant-literal guard, not reach this point. We still
+                // guard against misidentification by only treating the
+                // equal-to-own-address shape as gated-direct.
+                let mut addr_test = None;
+                let mut guard_prop = None;
+                for t in tests {
+                    if let StyleTest::Single {
+                        property: p,
+                        value: Expr::Literal(v),
+                    } = t
+                    {
+                        if *v as i64 == 1 && guard_prop.is_none() {
+                            guard_prop = Some(p.clone());
+                        } else if addr_test.is_none() {
+                            addr_test = Some(p.clone());
+                        }
+                    } else {
+                        return false;
+                    }
+                }
+                match (addr_test, guard_prop) {
+                    (Some(dest_property), Some(gate)) => {
+                        if outer_gate.is_some() {
+                            // Two-level gating isn't combined today.
+                            return false;
+                        }
+                        ports.push(FastPort {
+                            dest_property,
+                            value_expr: branch.then.clone(),
+                            gate_property: Some(gate),
+                        });
+                    }
+                    _ => return false,
+                }
+            }
             _ => return false,
         }
     }

@@ -354,9 +354,18 @@ fn extract_branches_into(
             }
             StyleTest::Single { .. } => return false,
             StyleTest::And(tests) if tests.len() == 2 => {
-                // Match: style(--addrX: N) and style(--guard: 1)
-                // Identify the address test (the one whose property also appears
-                // in single-condition branches) vs the guard test (value == 1).
+                // Two shapes land here:
+                //   a) Spillover: `style(--addrX: N-1) and style(--isWordWrite: 1)`
+                //      — address is N-1 (one before this cell), writes the high byte
+                //      of a word-write whose low byte went to N-1.
+                //   b) Gated direct: `style(--_slotNLive: 1) and style(--memAddrN: N)`
+                //      — address equals this cell's own address; `_slotNLive` is a
+                //      per-tick gate that's 0 when no opcode uses slot N.
+                //
+                // Disambiguate by comparing the tested address against this
+                // assignment's own address (parsed from `--mN`). Equal → gated
+                // direct; anything else → treat as spillover (historical shape
+                // uses N-1; the recogniser doesn't lock that down further).
                 let (mut addr_test, mut guard_test) = (None, None);
                 for t in tests {
                     if let StyleTest::Single {
@@ -372,18 +381,34 @@ fn extract_branches_into(
                     }
                 }
                 match (addr_test, guard_test) {
-                    (Some((dest_property, source_address)), Some(guard_property)) => {
-                        // Spillover ports under an outer gate aren't supported;
-                        // bail rather than silently drop the gate.
-                        if outer_gate.is_some() {
-                            return false;
+                    (Some((dest_property, tested_address)), Some(guard_property)) => {
+                        let own_address = parse_mem_cell_address(property);
+                        if own_address == Some(tested_address) {
+                            // Gated direct: the flat per-branch gate shape.
+                            // Only one level of gating combines with outer_gate —
+                            // bail if an outer gate is already in play.
+                            if outer_gate.is_some() {
+                                return false;
+                            }
+                            ports.push(BroadcastPort::Direct {
+                                dest_property,
+                                address: tested_address,
+                                value_expr: branch.then.clone(),
+                                gate_property: Some(guard_property),
+                            });
+                        } else {
+                            // Spillover ports under an outer gate aren't supported;
+                            // bail rather than silently drop the gate.
+                            if outer_gate.is_some() {
+                                return false;
+                            }
+                            ports.push(BroadcastPort::Spillover {
+                                dest_property,
+                                source_address: tested_address,
+                                guard_property,
+                                value_expr: branch.then.clone(),
+                            });
                         }
-                        ports.push(BroadcastPort::Spillover {
-                            dest_property,
-                            source_address,
-                            guard_property,
-                            value_expr: branch.then.clone(),
-                        });
                     }
                     _ => return false,
                 }
@@ -392,6 +417,14 @@ fn extract_branches_into(
         }
     }
     true
+}
+
+/// Parse the integer address out of a memory-cell property name like `--m1234`.
+/// Returns None for names that don't match the `--m<digits>` shape — used by
+/// the gated-direct vs spillover disambiguator in `extract_branches_into`.
+fn parse_mem_cell_address(property: &str) -> Option<i64> {
+    let rest = property.strip_prefix("--m")?;
+    rest.parse::<i64>().ok()
 }
 
 /// Check if a fallback expression is a simple "keep previous value" pattern.
@@ -645,6 +678,107 @@ mod tests {
             assert_eq!(write.address_map.len(), 20);
         }
         assert_eq!(result.absorbed_properties.len(), 20);
+    }
+
+    /// Build a flat-shape gated memory cell:
+    /// `--mN: if(and(style(--_slot0Live:1), style(--memAddr0:N)): val0;
+    ///           and(style(--_slot1Live:1), style(--memAddr1:N)): val1;
+    ///           ...; else: keep)`
+    fn make_flat_gated_assignment(name: &str, addr: i64, num_slots: usize) -> Assignment {
+        let branches = (0..num_slots)
+            .map(|i| StyleBranch {
+                condition: StyleTest::And(vec![
+                    StyleTest::Single {
+                        property: format!("--_slot{i}Live"),
+                        value: Expr::Literal(1.0),
+                    },
+                    StyleTest::Single {
+                        property: format!("--memAddr{i}"),
+                        value: Expr::Literal(addr as f64),
+                    },
+                ]),
+                then: Expr::Var {
+                    name: format!("--memVal{i}"),
+                    fallback: None,
+                },
+            })
+            .collect();
+        Assignment {
+            property: format!("--{name}"),
+            value: Expr::StyleCondition {
+                branches,
+                fallback: Box::new(Expr::Var {
+                    name: format!("--__1{name}"),
+                    fallback: None,
+                }),
+            },
+        }
+    }
+
+    #[test]
+    fn detects_flat_gated_broadcast() {
+        // 20 memory cells, each with 6 gated write ports in flat form.
+        let assignments: Vec<Assignment> = (0..20)
+            .map(|i| make_flat_gated_assignment(&format!("m{i}"), i, 6))
+            .collect();
+        let result = recognise_broadcast(&assignments);
+        // One BroadcastWrite per (dest_property, gate_property) pair — 6 total.
+        assert_eq!(result.writes.len(), 6, "Should have 6 gated write ports");
+        for i in 0..6 {
+            let dest = format!("--memAddr{i}");
+            let gate = format!("--_slot{i}Live");
+            let write = result
+                .writes
+                .iter()
+                .find(|w| w.dest_property == dest)
+                .unwrap_or_else(|| panic!("Should have {dest}"));
+            assert_eq!(
+                write.gate_property.as_deref(),
+                Some(gate.as_str()),
+                "{dest} should be gated by {gate}"
+            );
+            assert_eq!(write.address_map.len(), 20);
+        }
+        assert_eq!(result.absorbed_properties.len(), 20);
+    }
+
+    #[test]
+    fn spillover_still_recognised_alongside_flat_gated() {
+        // Sanity-check: adding a spillover port to a flat-gated cell still works.
+        // (Address N-1 → distinguishable from own address N by the disambiguator.)
+        let mut base = make_flat_gated_assignment("m5", 5, 2);
+        // Inject a spillover branch: style(--memAddr0: 4) and style(--isWordWrite: 1) → high byte
+        if let Expr::StyleCondition { branches, .. } = &mut base.value {
+            branches.push(StyleBranch {
+                condition: StyleTest::And(vec![
+                    StyleTest::Single {
+                        property: "--memAddr0".to_string(),
+                        value: Expr::Literal(4.0),
+                    },
+                    StyleTest::Single {
+                        property: "--isWordWrite".to_string(),
+                        value: Expr::Literal(1.0),
+                    },
+                ]),
+                then: Expr::Var {
+                    name: "--spillVal".to_string(),
+                    fallback: None,
+                },
+            });
+        }
+        let ports = extract_broadcast_ports(&base).expect("should extract");
+        // 2 gated-direct + 1 spillover
+        assert_eq!(ports.len(), 3);
+        let spillover_count = ports
+            .iter()
+            .filter(|p| matches!(p, BroadcastPort::Spillover { .. }))
+            .count();
+        let gated_direct_count = ports
+            .iter()
+            .filter(|p| matches!(p, BroadcastPort::Direct { gate_property: Some(_), .. }))
+            .count();
+        assert_eq!(spillover_count, 1);
+        assert_eq!(gated_direct_count, 2);
     }
 
     #[test]
