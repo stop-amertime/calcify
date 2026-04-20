@@ -387,6 +387,29 @@ pub enum Op {
         count_slot: Slot,
         exit_target: u32,
     },
+
+    /// Bulk byte-copy:
+    ///   state.memory.copy_within(
+    ///       slots[src_slot] .. slots[src_slot] + slots[count_slot],
+    ///       slots[dst_slot],
+    ///   )
+    /// After executing:
+    ///   slots[src_slot] += slots[count_slot];
+    ///   slots[dst_slot] += slots[count_slot];
+    ///   slots[count_slot] = 0;
+    ///   pc = exit_target;
+    ///
+    /// Uses `slice::copy_within` under the hood, which is correct for overlapping
+    /// ranges. Out-of-bounds source or destination ranges are clipped silently
+    /// (matches `Op::MemoryFill` and `Op::StoreMem` discipline). Negative src or
+    /// dst is a no-op for memory but still advances slots logically — matches
+    /// what iterating the loop would do.
+    MemoryCopy {
+        src_slot: Slot,
+        dst_slot: Slot,
+        count_slot: Slot,
+        exit_target: u32,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -3825,6 +3848,7 @@ fn op_slots_read(op: &Op) -> Vec<Slot> {
         // by the compaction walk when it recurses into body_ops.
         Op::Call { arg_slots, .. } => arg_slots.clone(),
         Op::MemoryFill { dst_slot, val_slot, count_slot, .. } => vec![*dst_slot, *val_slot, *count_slot],
+        Op::MemoryCopy { src_slot, dst_slot, count_slot, .. } => vec![*src_slot, *dst_slot, *count_slot],
     }
 }
 
@@ -3866,7 +3890,7 @@ fn op_dst(op: &Op) -> Option<Slot> {
         | Op::AndLit { dst, .. } | Op::ShrLit { dst, .. } | Op::ShlLit { dst, .. }
         | Op::ModLit { dst, .. } => Some(*dst),
         Op::LoadStateAndBranchIfNotEqLit { dst, .. } => Some(*dst),
-        Op::BranchIfZero { .. } | Op::BranchIfNotEqLit { .. } | Op::Jump { .. } | Op::DispatchChain { .. } | Op::StoreState { .. } | Op::StoreMem { .. } | Op::MemoryFill { .. } => {
+        Op::BranchIfZero { .. } | Op::BranchIfNotEqLit { .. } | Op::Jump { .. } | Op::DispatchChain { .. } | Op::StoreState { .. } | Op::StoreMem { .. } | Op::MemoryFill { .. } | Op::MemoryCopy { .. } => {
             None
         }
     }
@@ -4000,6 +4024,11 @@ fn map_op_slots(op: &mut Op, slot_map: &mut HashMap<Slot, Slot>, alloc: &mut Slo
             *val_slot = alloc.get_or_alloc(*val_slot, slot_map);
             *count_slot = alloc.get_or_alloc(*count_slot, slot_map);
         }
+        Op::MemoryCopy { src_slot, dst_slot, count_slot, .. } => {
+            *src_slot = alloc.get_or_alloc(*src_slot, slot_map);
+            *dst_slot = alloc.get_or_alloc(*dst_slot, slot_map);
+            *count_slot = alloc.get_or_alloc(*count_slot, slot_map);
+        }
     }
 }
 
@@ -4055,6 +4084,7 @@ fn seed_from_parent(
         Op::StoreMem { addr_slot, src } => { seed(*addr_slot); seed(*src); }
         Op::Call { arg_slots, .. } => { for s in arg_slots { seed(*s); } }
         Op::MemoryFill { dst_slot, val_slot, count_slot, .. } => { seed(*dst_slot); seed(*val_slot); seed(*count_slot); }
+        Op::MemoryCopy { src_slot, dst_slot, count_slot, .. } => { seed(*src_slot); seed(*dst_slot); seed(*count_slot); }
     }
 }
 
@@ -4500,6 +4530,30 @@ fn exec_ops(
                 pc = *exit_target as usize;
                 continue;
             }
+            Op::MemoryCopy { src_slot, dst_slot, count_slot, exit_target } => {
+                let src = sload!(*src_slot);
+                let dst = sload!(*dst_slot);
+                let count = sload!(*count_slot);
+                let mem_len = state.memory.len();
+                if count > 0 && src >= 0 && dst >= 0
+                    && (src as usize) < mem_len && (dst as usize) < mem_len
+                {
+                    // Clip count to fit within memory on both ends.
+                    let max_by_src = (mem_len as i64) - src as i64;
+                    let max_by_dst = (mem_len as i64) - dst as i64;
+                    let n = (count as i64).min(max_by_src).min(max_by_dst) as usize;
+                    if n > 0 {
+                        let s = src as usize;
+                        let d = dst as usize;
+                        state.memory.copy_within(s..s + n, d);
+                    }
+                }
+                sstore!(*src_slot, src.wrapping_add(count));
+                sstore!(*dst_slot, dst.wrapping_add(count));
+                sstore!(*count_slot, 0i32);
+                pc = *exit_target as usize;
+                continue;
+            }
         }
         pc += 1;
     }
@@ -4932,6 +4986,30 @@ fn exec_ops_profiled(
                         state.memory[lo..hi].fill(val_byte);
                     }
                 }
+                slots[*dst_slot as usize] = dst.wrapping_add(count);
+                slots[*count_slot as usize] = 0;
+                pc = *exit_target as usize;
+                continue;
+            }
+            Op::MemoryCopy { src_slot, dst_slot, count_slot, exit_target } => {
+                count_op!(profile, "MemoryCopy");
+                let src = slots[*src_slot as usize];
+                let dst = slots[*dst_slot as usize];
+                let count = slots[*count_slot as usize];
+                let mem_len = state.memory.len();
+                if count > 0 && src >= 0 && dst >= 0
+                    && (src as usize) < mem_len && (dst as usize) < mem_len
+                {
+                    let max_by_src = (mem_len as i64) - src as i64;
+                    let max_by_dst = (mem_len as i64) - dst as i64;
+                    let n = (count as i64).min(max_by_src).min(max_by_dst) as usize;
+                    if n > 0 {
+                        let s = src as usize;
+                        let d = dst as usize;
+                        state.memory.copy_within(s..s + n, d);
+                    }
+                }
+                slots[*src_slot as usize] = src.wrapping_add(count);
                 slots[*dst_slot as usize] = dst.wrapping_add(count);
                 slots[*count_slot as usize] = 0;
                 pc = *exit_target as usize;
@@ -5439,6 +5517,43 @@ pub fn exec_ops_traced(
                         dst_slot: Some(*dst_slot),
                         dst_value: Some(new_dst),
                         inputs: vec![(*dst_slot, dst), (*val_slot, val), (*count_slot, count)],
+                        branch_taken: None,
+                        depth,
+                    });
+                }
+                pc = *exit_target as usize;
+                continue;
+            }
+            Op::MemoryCopy { src_slot, dst_slot, count_slot, exit_target } => {
+                let src = slots[*src_slot as usize];
+                let dst = slots[*dst_slot as usize];
+                let count = slots[*count_slot as usize];
+                let mem_len = state.memory.len();
+                if count > 0 && src >= 0 && dst >= 0
+                    && (src as usize) < mem_len && (dst as usize) < mem_len
+                {
+                    let max_by_src = (mem_len as i64) - src as i64;
+                    let max_by_dst = (mem_len as i64) - dst as i64;
+                    let n = (count as i64).min(max_by_src).min(max_by_dst) as usize;
+                    if n > 0 {
+                        let s = src as usize;
+                        let d = dst as usize;
+                        state.memory.copy_within(s..s + n, d);
+                    }
+                }
+                let new_src = src.wrapping_add(count);
+                let new_dst = dst.wrapping_add(count);
+                slots[*src_slot as usize] = new_src;
+                slots[*dst_slot as usize] = new_dst;
+                slots[*count_slot as usize] = 0;
+                if should_trace {
+                    trace.push(TraceEntry {
+                        pc,
+                        op: format!("MemoryCopy src={}({}) dst={}({}) count={}({}) → exit={}",
+                            src_slot, src, dst_slot, dst, count_slot, count, exit_target),
+                        dst_slot: Some(*dst_slot),
+                        dst_value: Some(new_dst),
+                        inputs: vec![(*src_slot, src), (*dst_slot, dst), (*count_slot, count)],
                         branch_taken: None,
                         depth,
                     });
