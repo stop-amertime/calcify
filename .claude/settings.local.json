@@ -2,7 +2,12 @@
   "permissions": {
     "allow": [
       "Bash(gh issue:*)",
-      "Bash(node -e ' *)"
+      "Bash(node -e ' *)",
+      "Bash(curl -s -f --max-time 2 http://localhost:8766/__calcite)",
+      "Bash(CALCITE_PROFILE_COMPILE=1 ./target/release/calcite-cli.exe --input output/rogue.css --parse-only)",
+      "Bash(CALCITE_PROFILE_COMPILE=1 ./target/release/calcite-cli.exe --input output/rogue.css -n 1)",
+      "Bash(cargo check *)",
+      "Bash(cargo test *)"
     ]
   },
   "outputStyle": "default"

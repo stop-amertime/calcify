@@ -1,0 +1,522 @@
+{
+    "auxiliary": {
+        "availablePages": "19640 MB",
+        "availableRam": "11877 MB",
+        "availableVirtualMemory": "134213318 MB",
+        "cores": 24,
+        "cpuAgentCount": 0,
+        "cpuFamily": 26,
+        "cpuModel": 36,
+        "cpuModelName": "AMD Ryzen AI 9 HX 370 w/ Radeon 890M",
+        "cpuTopology": [
+            [
+                0,
+                0,
+                0,
+                0,
+                0,
+                0
+            ],
+            [
+                0,
+                1,
+                0,
+                0,
+                0,
+                0
+            ],
+            [
+                0,
+                2,
+                0,
+                0,
+                0,
+                0
+            ],
+            [
+                0,
+                3,
+                0,
+                0,
+                0,
+                0
+            ],
+            [
+                0,
+                4,
+                0,
+                0,
+                0,
+                0
+            ],
+            [
+                0,
+                5,
+                0,
+                0,
+                0,
+                0
+            ],
+            [
+                0,
+                6,
+                0,
+                0,
+                0,
+                0
+            ],
+            [
+                0,
+                7,
+                0,
+                0,
+                0,
+                0
+            ],
+            [
+                1,
+                8,
+                0,
+                0,
+                0,
+                0
+            ],
+            [
+                1,
+                9,
+                0,
+                0,
+                0,
+                0
+            ],
+            [
+                1,
+                10,
+                0,
+                0,
+                0,
+                0
+            ],
+            [
+                1,
+                11,
+                0,
+                0,
+                0,
+                0
+            ],
+            [
+                1,
+                12,
+                0,
+                0,
+                0,
+                0
+            ],
+            [
+                1,
+                13,
+                0,
+                0,
+                0,
+                0
+            ],
+            [
+                1,
+                14,
+                0,
+                0,
+                0,
+                0
+            ],
+            [
+                1,
+                15,
+                0,
+                0,
+                0,
+                0
+            ],
+            [
+                1,
+                16,
+                0,
+                0,
+                0,
+                0
+            ],
+            [
+                1,
+                17,
+                0,
+                0,
+                0,
+                0
+            ],
+            [
+                1,
+                18,
+                0,
+                0,
+                0,
+                0
+            ],
+            [
+                1,
+                19,
+                0,
+                0,
+                0,
+                0
+            ],
+            [
+                1,
+                20,
+                0,
+                0,
+                0,
+                0
+            ],
+            [
+                1,
+                21,
+                0,
+                0,
+                0,
+                0
+            ],
+            [
+                1,
+                22,
+                0,
+                0,
+                0,
+                0
+            ],
+            [
+                1,
+                23,
+                0,
+                0,
+                0,
+                0
+            ]
+        ],
+        "eventColumnIds": [
+            {
+                "category": 1,
+                "categoryName": "CPU PROFILE",
+                "events": [
+                    {
+                        "callstack": true,
+                        "category": 1,
+                        "cmask": 0,
+                        "description": "CPU Time is the time in which the CPU core is executing the code.",
+                        "encodedId": 562949953478656,
+                        "eventCategory": 2,
+                        "expression": "",
+                        "fetchL3MissOnly": false,
+                        "frequency": 0,
+                        "hwEventId": 57344,
+                        "interval": 1,
+                        "invCmask": false,
+                        "isFrequencyMode": false,
+                        "isRawEvent": true,
+                        "isTimeSeriesData": true,
+                        "name": "CPU_TIME",
+                        "opDispatchedCount": false,
+                        "opL3MissOnly": false,
+                        "osMode": false,
+                        "samples": 0,
+                        "smcSource": 0,
+                        "threshold": 0,
+                        "traceMode": 0,
+                        "unit": "",
+                        "unitMask": 0,
+                        "usrMode": false
+                    }
+                ]
+            }
+        ],
+        "guest": false,
+        "guestKallsyms": "",
+        "guestKmodules": "",
+        "guestPid": 0,
+        "guestSymPaths": "",
+        "host": false,
+        "hypervisorEnabled": true,
+        "hypervisorVendor": "Microsoft Hyper-V",
+        "ibsIdentifiers": 0,
+        "ibsOpSampling": false,
+        "isCacheline": false,
+        "isFreqMode": false,
+        "issmtEnabled": true,
+        "onlineCores": 24,
+        "osName": "Win1125H2-64",
+        "p0Freq": 0,
+        "profScope": "Single Application",
+        "profiledPids": "28568;",
+        "totalPages": "113785 MB",
+        "totalRam": "64633 MB",
+        "totalVirtualMemory": "134217727 MB"
+    },
+    "categoriesCollected": [
+        "cpu"
+    ],
+    "collectCommand": "AMDuProfCLI.exe profile --config tbp -o C:/Users/AdmT9N0CX01V65438A/Documents/src/calcite/uprof-out/minimal C:/Users/AdmT9N0CX01V65438A/Documents/src/calcite/target/release/calcite-bench.exe -i C:/Users/AdmT9N0CX01V65438A/Documents/src/calcite/output/rogue.css -n 30000 --warmup 3000",
+    "collection": {
+        "branch-filter": 511,
+        "callstack": {
+            "callstackSize": 0,
+            "fpo": false,
+            "interval": 1,
+            "scope": 1,
+            "unwindDepth": 128
+        },
+        "customProfileEventMap": {
+            "keys": null,
+            "values": null
+        },
+        "dataBufferCount": 0,
+        "events": {
+            "configName": "Time-based Sampling",
+            "configType": 4,
+            "cpuTraceSourceMask": 0,
+            "ibsEvents": {
+                "cacheAnalysis": false,
+                "fetch": false,
+                "fetchCallstack": true,
+                "fetchInterval": 0,
+                "fetchL3Miss": false,
+                "loadStoreOnly": false,
+                "op": false,
+                "opCallstack": true,
+                "opCycleCount": false,
+                "opInterval": 0,
+                "opL3Miss": false,
+                "opLoadLatency": 0,
+                "randomize": true
+            },
+            "pmcEvents": null,
+            "predefinedProfileType": 3,
+            "samplingModeMask": 1,
+            "timerCallstack": true,
+            "timerInterval": 1.0,
+            "timerSamplingMode": 1
+        },
+        "flags": {
+            "collectSysModules": false,
+            "cssDefaultValues": false,
+            "defaultBranchAnalysis": false,
+            "hasCallstack": false,
+            "isThreadConcurrency": false,
+            "maxDataFileSize": 0,
+            "perEventCSSDefault": false,
+            "profileMpi": false,
+            "profileSamplinModeBpf": false,
+            "pythonTraceOptions": false,
+            "traceMpi": false,
+            "traceMpiMode": 0,
+            "traceOpenmp": false,
+            "traceOpenmpMode": 0,
+            "traceOpenmpType": 0
+        },
+        "globalFrequency": 0,
+        "globalSamplingInterval": 0,
+        "hostP0Freqs": [
+            {
+                "host": "LTN0CX01V65438A",
+                "p0Freq": 2000.0
+            }
+        ],
+        "hotspotsProfilingSignal": -1,
+        "lbr": false,
+        "livePower": null,
+        "metadataSource": 0,
+        "mmapBuffer": 0,
+        "profileChildren": true,
+        "profileConfigFiles": [
+            "tbp"
+        ],
+        "schedule": {
+            "categoryDurations": [
+                {
+                    "category": 1,
+                    "categoryName": "CPU PROFILE",
+                    "end": 96929935853300,
+                    "start": 96906359850500,
+                    "type": 0
+                }
+            ],
+            "elapsed": 23576,
+            "end": 96929935853300,
+            "endTs": "Sat Apr 18 21:11:42 2026",
+            "hostDurations": [
+                {
+                    "end": 96929935853300,
+                    "host": "LTN0CX01V65438A",
+                    "start": 96906359850500
+                }
+            ],
+            "profileCollectionDataLimitType": 0,
+            "profileDuration": 0,
+            "start": 96906359850500,
+            "startDelay": 0,
+            "startTs": "Sat Apr 18 21:11:18 2026",
+            "type": 2
+        },
+        "sessionVersion": 9,
+        "target": {
+            "appArgs": "-i C:/Users/AdmT9N0CX01V65438A/Documents/src/calcite/output/rogue.css -n 30000 --warmup 3000 ",
+            "coreAffinity": "FFFFFF",
+            "coreMask": "FFFFFF",
+            "gpuCollectAgentVersion": 0,
+            "gpuFamily": "",
+            "gpuRocprofVersion": 0,
+            "launchApp": "C:/Users/AdmT9N0CX01V65438A/Documents/src/calcite/target/release/calcite-bench.exe",
+            "profileCores": false,
+            "systemWide": false,
+            "terminateApp": false,
+            "workingDir": "C:\\Users\\AdmT9N0CX01V65438A\\Documents\\src\\CSS-DOS"
+        }
+    },
+    "deviceInfo": {
+        "keys": [
+            0
+        ],
+        "values": [
+            {
+                "keys": [
+                    0,
+                    1,
+                    2,
+                    3,
+                    4,
+                    5,
+                    6,
+                    7,
+                    8,
+                    9,
+                    10,
+                    11,
+                    12,
+                    13,
+                    14,
+                    15,
+                    16,
+                    17,
+                    18,
+                    19,
+                    20,
+                    21,
+                    22,
+                    23
+                ],
+                "values": [
+                    [
+                        0,
+                        2000000000
+                    ],
+                    [
+                        0,
+                        2000000000
+                    ],
+                    [
+                        0,
+                        2000000000
+                    ],
+                    [
+                        0,
+                        2000000000
+                    ],
+                    [
+                        0,
+                        2000000000
+                    ],
+                    [
+                        0,
+                        2000000000
+                    ],
+                    [
+                        0,
+                        2000000000
+                    ],
+                    [
+                        0,
+                        2000000000
+                    ],
+                    [
+                        0,
+                        2000000000
+                    ],
+                    [
+                        0,
+                        2000000000
+                    ],
+                    [
+                        0,
+                        2000000000
+                    ],
+                    [
+                        0,
+                        2000000000
+                    ],
+                    [
+                        0,
+                        2000000000
+                    ],
+                    [
+                        0,
+                        2000000000
+                    ],
+                    [
+                        0,
+                        2000000000
+                    ],
+                    [
+                        0,
+                        2000000000
+                    ],
+                    [
+                        0,
+                        2000000000
+                    ],
+                    [
+                        0,
+                        2000000000
+                    ],
+                    [
+                        0,
+                        2000000000
+                    ],
+                    [
+                        0,
+                        2000000000
+                    ],
+                    [
+                        0,
+                        2000000000
+                    ],
+                    [
+                        0,
+                        2000000000
+                    ],
+                    [
+                        0,
+                        2000000000
+                    ],
+                    [
+                        0,
+                        2000000000
+                    ]
+                ]
+            }
+        ]
+    },
+    "hpc": {
+        "hostName": "LTN0CX01V65438A"
+    },
+    "profileType": 1,
+    "reportCommand": "",
+    "translateCommand": ""
+}

@@ -1,0 +1,872 @@
+{
+    "auxiliary": {
+        "availablePages": "29494 MB",
+        "availableRam": "20841 MB",
+        "availableVirtualMemory": "134213333 MB",
+        "cores": 24,
+        "cpuAgentCount": 0,
+        "cpuFamily": 26,
+        "cpuModel": 36,
+        "cpuModelName": "AMD Ryzen AI 9 HX 370 w/ Radeon 890M",
+        "cpuTopology": [
+            [
+                0,
+                0,
+                0,
+                0,
+                0,
+                0
+            ],
+            [
+                0,
+                1,
+                0,
+                0,
+                0,
+                0
+            ],
+            [
+                0,
+                2,
+                0,
+                0,
+                0,
+                0
+            ],
+            [
+                0,
+                3,
+                0,
+                0,
+                0,
+                0
+            ],
+            [
+                0,
+                4,
+                0,
+                0,
+                0,
+                0
+            ],
+            [
+                0,
+                5,
+                0,
+                0,
+                0,
+                0
+            ],
+            [
+                0,
+                6,
+                0,
+                0,
+                0,
+                0
+            ],
+            [
+                0,
+                7,
+                0,
+                0,
+                0,
+                0
+            ],
+            [
+                1,
+                8,
+                0,
+                0,
+                0,
+                0
+            ],
+            [
+                1,
+                9,
+                0,
+                0,
+                0,
+                0
+            ],
+            [
+                1,
+                10,
+                0,
+                0,
+                0,
+                0
+            ],
+            [
+                1,
+                11,
+                0,
+                0,
+                0,
+                0
+            ],
+            [
+                1,
+                12,
+                0,
+                0,
+                0,
+                0
+            ],
+            [
+                1,
+                13,
+                0,
+                0,
+                0,
+                0
+            ],
+            [
+                1,
+                14,
+                0,
+                0,
+                0,
+                0
+            ],
+            [
+                1,
+                15,
+                0,
+                0,
+                0,
+                0
+            ],
+            [
+                1,
+                16,
+                0,
+                0,
+                0,
+                0
+            ],
+            [
+                1,
+                17,
+                0,
+                0,
+                0,
+                0
+            ],
+            [
+                1,
+                18,
+                0,
+                0,
+                0,
+                0
+            ],
+            [
+                1,
+                19,
+                0,
+                0,
+                0,
+                0
+            ],
+            [
+                1,
+                20,
+                0,
+                0,
+                0,
+                0
+            ],
+            [
+                1,
+                21,
+                0,
+                0,
+                0,
+                0
+            ],
+            [
+                1,
+                22,
+                0,
+                0,
+                0,
+                0
+            ],
+            [
+                1,
+                23,
+                0,
+                0,
+                0,
+                0
+            ]
+        ],
+        "eventColumnIds": [
+            {
+                "category": 1,
+                "categoryName": "CPU PROFILE",
+                "events": [
+                    {
+                        "callstack": false,
+                        "category": 1,
+                        "cmask": 0,
+                        "description": "The number of cpu cycles when the thread is not in halt state.",
+                        "encodedId": 50331766,
+                        "eventCategory": 0,
+                        "expression": "",
+                        "fetchL3MissOnly": false,
+                        "frequency": 0,
+                        "hwEventId": 118,
+                        "interval": 250000,
+                        "invCmask": false,
+                        "isFrequencyMode": false,
+                        "isRawEvent": true,
+                        "isTimeSeriesData": true,
+                        "name": "CYCLES_NOT_IN_HALT",
+                        "opDispatchedCount": false,
+                        "opL3MissOnly": false,
+                        "osMode": true,
+                        "samples": 0,
+                        "smcSource": 0,
+                        "threshold": 0,
+                        "traceMode": 0,
+                        "unit": "",
+                        "unitMask": 0,
+                        "usrMode": true
+                    },
+                    {
+                        "callstack": false,
+                        "category": 1,
+                        "cmask": 0,
+                        "description": "The number of instructions retired from execution. This count includes exceptions and interrupts. Each exception or interrupt is counted as one instruction.",
+                        "encodedId": 50331840,
+                        "eventCategory": 0,
+                        "expression": "",
+                        "fetchL3MissOnly": false,
+                        "frequency": 0,
+                        "hwEventId": 192,
+                        "interval": 250000,
+                        "invCmask": false,
+                        "isFrequencyMode": false,
+                        "isRawEvent": true,
+                        "isTimeSeriesData": true,
+                        "name": "RETIRED_INST",
+                        "opDispatchedCount": false,
+                        "opL3MissOnly": false,
+                        "osMode": true,
+                        "samples": 0,
+                        "smcSource": 0,
+                        "threshold": 0,
+                        "traceMode": 0,
+                        "unit": "",
+                        "unitMask": 0,
+                        "usrMode": true
+                    },
+                    {
+                        "callstack": false,
+                        "category": 1,
+                        "cmask": 0,
+                        "description": "The number of branch instructions retired. This includes all types of architectural control flow changes, including exceptions and interrupts.\n            ",
+                        "encodedId": 50331842,
+                        "eventCategory": 0,
+                        "expression": "",
+                        "fetchL3MissOnly": false,
+                        "frequency": 0,
+                        "hwEventId": 194,
+                        "interval": 25000,
+                        "invCmask": false,
+                        "isFrequencyMode": false,
+                        "isRawEvent": true,
+                        "isTimeSeriesData": true,
+                        "name": "RETIRED_BR_INST",
+                        "opDispatchedCount": false,
+                        "opL3MissOnly": false,
+                        "osMode": true,
+                        "samples": 0,
+                        "smcSource": 0,
+                        "threshold": 0,
+                        "traceMode": 0,
+                        "unit": "",
+                        "unitMask": 0,
+                        "usrMode": true
+                    },
+                    {
+                        "callstack": false,
+                        "category": 1,
+                        "cmask": 0,
+                        "description": "The number of retired branch instructions, that were mispredicted.Note that only EX direct mispredicts and indirect target mispredicts are counted.\n            ",
+                        "encodedId": 50331843,
+                        "eventCategory": 0,
+                        "expression": "",
+                        "fetchL3MissOnly": false,
+                        "frequency": 0,
+                        "hwEventId": 195,
+                        "interval": 25000,
+                        "invCmask": false,
+                        "isFrequencyMode": false,
+                        "isRawEvent": true,
+                        "isTimeSeriesData": true,
+                        "name": "RETIRED_BR_INST_MISP",
+                        "opDispatchedCount": false,
+                        "opL3MissOnly": false,
+                        "osMode": true,
+                        "samples": 0,
+                        "smcSource": 0,
+                        "threshold": 0,
+                        "traceMode": 0,
+                        "unit": "",
+                        "unitMask": 0,
+                        "usrMode": true
+                    },
+                    {
+                        "callstack": false,
+                        "category": 1,
+                        "cmask": 0,
+                        "description": "The number of misaligned loads. This event counts the 64B (cacheline crossing) and 4K (page crossing) misaligned loads.",
+                        "encodedId": 50528327,
+                        "eventCategory": 0,
+                        "expression": "",
+                        "fetchL3MissOnly": false,
+                        "frequency": 0,
+                        "hwEventId": 71,
+                        "interval": 25000,
+                        "invCmask": false,
+                        "isFrequencyMode": false,
+                        "isRawEvent": true,
+                        "isTimeSeriesData": true,
+                        "name": "MISALIGNED_LOADS",
+                        "opDispatchedCount": false,
+                        "opL3MissOnly": false,
+                        "osMode": true,
+                        "samples": 0,
+                        "smcSource": 0,
+                        "threshold": 0,
+                        "traceMode": 0,
+                        "unit": "",
+                        "unitMask": 3,
+                        "usrMode": true
+                    },
+                    {
+                        "callstack": false,
+                        "category": 1,
+                        "cmask": 0,
+                        "description": "The number of load and store ops dispatched to LS unit. This counts the dispatch of single op that performs a memory load, dispatch of single op that performs a memory store, dispatch of a single op that performs a load from and store to the same memory address.",
+                        "encodedId": 50790441,
+                        "eventCategory": 0,
+                        "expression": "",
+                        "fetchL3MissOnly": false,
+                        "frequency": 0,
+                        "hwEventId": 41,
+                        "interval": 250000,
+                        "invCmask": false,
+                        "isFrequencyMode": false,
+                        "isRawEvent": true,
+                        "isTimeSeriesData": true,
+                        "name": "L1_DC_ACCESSES_ALL",
+                        "opDispatchedCount": false,
+                        "opL3MissOnly": false,
+                        "osMode": true,
+                        "samples": 0,
+                        "smcSource": 0,
+                        "threshold": 0,
+                        "traceMode": 0,
+                        "unit": "",
+                        "unitMask": 7,
+                        "usrMode": true
+                    },
+                    {
+                        "callstack": false,
+                        "category": 1,
+                        "cmask": 0,
+                        "description": "The demand Data Cache fills from L2, L3, CCX and DRAM.",
+                        "encodedId": 51314755,
+                        "eventCategory": 0,
+                        "expression": "",
+                        "fetchL3MissOnly": false,
+                        "frequency": 0,
+                        "hwEventId": 67,
+                        "interval": 25000,
+                        "invCmask": false,
+                        "isFrequencyMode": false,
+                        "isRawEvent": true,
+                        "isTimeSeriesData": true,
+                        "name": "L1_DEMAND_DC_REFILLS_LOCAL",
+                        "opDispatchedCount": false,
+                        "opL3MissOnly": false,
+                        "osMode": true,
+                        "samples": 0,
+                        "smcSource": 0,
+                        "threshold": 0,
+                        "traceMode": 0,
+                        "unit": "",
+                        "unitMask": 15,
+                        "usrMode": true
+                    },
+                    {
+                        "callstack": false,
+                        "category": 1,
+                        "cmask": 0,
+                        "description": "The L2 cache access requests due to L1 data cache misses. This also counts hardware and software prefetches",
+                        "encodedId": 65011808,
+                        "eventCategory": 0,
+                        "expression": "",
+                        "fetchL3MissOnly": false,
+                        "frequency": 0,
+                        "hwEventId": 96,
+                        "interval": 25000,
+                        "invCmask": false,
+                        "isFrequencyMode": false,
+                        "isRawEvent": true,
+                        "isTimeSeriesData": true,
+                        "name": "L2_CACHE_ACCESS_FROM_L1_DC_MISS",
+                        "opDispatchedCount": false,
+                        "opL3MissOnly": false,
+                        "osMode": true,
+                        "samples": 0,
+                        "smcSource": 0,
+                        "threshold": 0,
+                        "traceMode": 0,
+                        "unit": "",
+                        "unitMask": 224,
+                        "usrMode": true
+                    }
+                ]
+            }
+        ],
+        "guest": false,
+        "guestKallsyms": "",
+        "guestKmodules": "",
+        "guestPid": 0,
+        "guestSymPaths": "",
+        "host": false,
+        "hypervisorEnabled": true,
+        "hypervisorVendor": "Microsoft Hyper-V",
+        "ibsIdentifiers": 0,
+        "ibsOpSampling": false,
+        "isCacheline": false,
+        "isFreqMode": false,
+        "issmtEnabled": true,
+        "onlineCores": 24,
+        "osName": "Win1125H2-64",
+        "p0Freq": 0,
+        "profScope": "Single Application",
+        "profiledPids": "64824;",
+        "totalPages": "113785 MB",
+        "totalRam": "64633 MB",
+        "totalVirtualMemory": "134217727 MB"
+    },
+    "categoriesCollected": [
+        "cpu"
+    ],
+    "collectCommand": "AMDuProfCLI.exe collect --config assess -o C:/Users/AdmT9N0CX01V65438A/Documents/src/calcite/uprof-out/rogue-assess C:/Users/AdmT9N0CX01V65438A/Documents/src/calcite/target/release/calcite-bench.exe -i C:/Users/AdmT9N0CX01V65438A/Documents/src/calcite/output/rogue.css -n 30000 --warmup 3000",
+    "collection": {
+        "branch-filter": 511,
+        "callstack": {
+            "callstackSize": 0,
+            "fpo": false,
+            "interval": 0,
+            "scope": 0,
+            "unwindDepth": 0
+        },
+        "customProfileEventMap": {
+            "keys": null,
+            "values": null
+        },
+        "dataBufferCount": 0,
+        "events": {
+            "configName": "Assess Performance",
+            "configType": 1,
+            "cpuTraceSourceMask": 0,
+            "ibsEvents": {
+                "cacheAnalysis": false,
+                "fetch": false,
+                "fetchCallstack": true,
+                "fetchInterval": 0,
+                "fetchL3Miss": false,
+                "loadStoreOnly": false,
+                "op": false,
+                "opCallstack": true,
+                "opCycleCount": false,
+                "opInterval": 0,
+                "opL3Miss": false,
+                "opLoadLatency": 0,
+                "randomize": true
+            },
+            "pmcEvents": {
+                "pmcEventList": [
+                    {
+                        "cntMask": 0,
+                        "collectCallstack": false,
+                        "encodedEventId": 50331766,
+                        "guest": false,
+                        "host": false,
+                        "hwId": 118,
+                        "interval": 250000,
+                        "intx": false,
+                        "intxcp": false,
+                        "invertCntMask": false,
+                        "isEdgeDetect": false,
+                        "isFrequencyMode": false,
+                        "isSampling": true,
+                        "mask": 0,
+                        "os": true,
+                        "user": true
+                    },
+                    {
+                        "cntMask": 0,
+                        "collectCallstack": false,
+                        "encodedEventId": 50331840,
+                        "guest": false,
+                        "host": false,
+                        "hwId": 192,
+                        "interval": 250000,
+                        "intx": false,
+                        "intxcp": false,
+                        "invertCntMask": false,
+                        "isEdgeDetect": false,
+                        "isFrequencyMode": false,
+                        "isSampling": true,
+                        "mask": 0,
+                        "os": true,
+                        "user": true
+                    },
+                    {
+                        "cntMask": 0,
+                        "collectCallstack": false,
+                        "encodedEventId": 50331842,
+                        "guest": false,
+                        "host": false,
+                        "hwId": 194,
+                        "interval": 25000,
+                        "intx": false,
+                        "intxcp": false,
+                        "invertCntMask": false,
+                        "isEdgeDetect": false,
+                        "isFrequencyMode": false,
+                        "isSampling": true,
+                        "mask": 0,
+                        "os": true,
+                        "user": true
+                    },
+                    {
+                        "cntMask": 0,
+                        "collectCallstack": false,
+                        "encodedEventId": 50331843,
+                        "guest": false,
+                        "host": false,
+                        "hwId": 195,
+                        "interval": 25000,
+                        "intx": false,
+                        "intxcp": false,
+                        "invertCntMask": false,
+                        "isEdgeDetect": false,
+                        "isFrequencyMode": false,
+                        "isSampling": true,
+                        "mask": 0,
+                        "os": true,
+                        "user": true
+                    },
+                    {
+                        "cntMask": 0,
+                        "collectCallstack": false,
+                        "encodedEventId": 50790441,
+                        "guest": false,
+                        "host": false,
+                        "hwId": 41,
+                        "interval": 250000,
+                        "intx": false,
+                        "intxcp": false,
+                        "invertCntMask": false,
+                        "isEdgeDetect": false,
+                        "isFrequencyMode": false,
+                        "isSampling": true,
+                        "mask": 7,
+                        "os": true,
+                        "user": true
+                    },
+                    {
+                        "cntMask": 0,
+                        "collectCallstack": false,
+                        "encodedEventId": 65011808,
+                        "guest": false,
+                        "host": false,
+                        "hwId": 96,
+                        "interval": 25000,
+                        "intx": false,
+                        "intxcp": false,
+                        "invertCntMask": false,
+                        "isEdgeDetect": false,
+                        "isFrequencyMode": false,
+                        "isSampling": true,
+                        "mask": 224,
+                        "os": true,
+                        "user": true
+                    },
+                    {
+                        "cntMask": 0,
+                        "collectCallstack": false,
+                        "encodedEventId": 51314755,
+                        "guest": false,
+                        "host": false,
+                        "hwId": 67,
+                        "interval": 25000,
+                        "intx": false,
+                        "intxcp": false,
+                        "invertCntMask": false,
+                        "isEdgeDetect": false,
+                        "isFrequencyMode": false,
+                        "isSampling": true,
+                        "mask": 15,
+                        "os": true,
+                        "user": true
+                    },
+                    {
+                        "cntMask": 0,
+                        "collectCallstack": false,
+                        "encodedEventId": 50528327,
+                        "guest": false,
+                        "host": false,
+                        "hwId": 71,
+                        "interval": 25000,
+                        "intx": false,
+                        "intxcp": false,
+                        "invertCntMask": false,
+                        "isEdgeDetect": false,
+                        "isFrequencyMode": false,
+                        "isSampling": true,
+                        "mask": 3,
+                        "os": true,
+                        "user": true
+                    }
+                ]
+            },
+            "predefinedProfileType": 4,
+            "samplingModeMask": 1
+        },
+        "flags": {
+            "collectSysModules": false,
+            "cssDefaultValues": false,
+            "defaultBranchAnalysis": false,
+            "hasCallstack": false,
+            "isThreadConcurrency": false,
+            "maxDataFileSize": 0,
+            "perEventCSSDefault": false,
+            "profileMpi": false,
+            "profileSamplinModeBpf": false,
+            "pythonTraceOptions": false,
+            "traceMpi": false,
+            "traceMpiMode": 0,
+            "traceOpenmp": false,
+            "traceOpenmpMode": 0,
+            "traceOpenmpType": 0
+        },
+        "globalFrequency": 0,
+        "globalSamplingInterval": 0,
+        "hostP0Freqs": [
+            {
+                "host": "LTN0CX01V65438A",
+                "p0Freq": 2000.0
+            }
+        ],
+        "hotspotsProfilingSignal": -1,
+        "lbr": false,
+        "livePower": null,
+        "metadataSource": 0,
+        "mmapBuffer": 0,
+        "profileChildren": true,
+        "profileConfigFiles": [
+            "assess"
+        ],
+        "schedule": {
+            "categoryDurations": [
+                {
+                    "category": 1,
+                    "categoryName": "CPU PROFILE",
+                    "end": 96517798039100,
+                    "start": 96496969514000,
+                    "type": 0
+                }
+            ],
+            "elapsed": 20829,
+            "end": 96517798039100,
+            "endTs": "Sat Apr 18 21:04:49 2026",
+            "hostDurations": [
+                {
+                    "end": 96517798039100,
+                    "host": "LTN0CX01V65438A",
+                    "start": 96496969514000
+                }
+            ],
+            "profileCollectionDataLimitType": 0,
+            "profileDuration": 0,
+            "start": 96496969514000,
+            "startDelay": 0,
+            "startTs": "Sat Apr 18 21:04:29 2026",
+            "type": 2
+        },
+        "sessionVersion": 9,
+        "target": {
+            "appArgs": "-i C:/Users/AdmT9N0CX01V65438A/Documents/src/calcite/output/rogue.css -n 30000 --warmup 3000 ",
+            "coreAffinity": "FFFFFF",
+            "coreMask": "FFFFFF",
+            "gpuCollectAgentVersion": 0,
+            "gpuFamily": "",
+            "gpuRocprofVersion": 0,
+            "launchApp": "C:/Users/AdmT9N0CX01V65438A/Documents/src/calcite/target/release/calcite-bench.exe",
+            "profileCores": false,
+            "systemWide": false,
+            "terminateApp": false,
+            "workingDir": "C:\\Program Files\\AMD\\AMDuProf\\bin"
+        }
+    },
+    "deviceInfo": {
+        "keys": [
+            0
+        ],
+        "values": [
+            {
+                "keys": [
+                    0,
+                    1,
+                    2,
+                    3,
+                    4,
+                    5,
+                    6,
+                    7,
+                    8,
+                    9,
+                    10,
+                    11,
+                    12,
+                    13,
+                    14,
+                    15,
+                    16,
+                    17,
+                    18,
+                    19,
+                    20,
+                    21,
+                    22,
+                    23
+                ],
+                "values": [
+                    [
+                        0,
+                        2000000000
+                    ],
+                    [
+                        0,
+                        2000000000
+                    ],
+                    [
+                        0,
+                        2000000000
+                    ],
+                    [
+                        0,
+                        2000000000
+                    ],
+                    [
+                        0,
+                        2000000000
+                    ],
+                    [
+                        0,
+                        2000000000
+                    ],
+                    [
+                        0,
+                        2000000000
+                    ],
+                    [
+                        0,
+                        2000000000
+                    ],
+                    [
+                        0,
+                        2000000000
+                    ],
+                    [
+                        0,
+                        2000000000
+                    ],
+                    [
+                        0,
+                        2000000000
+                    ],
+                    [
+                        0,
+                        2000000000
+                    ],
+                    [
+                        0,
+                        2000000000
+                    ],
+                    [
+                        0,
+                        2000000000
+                    ],
+                    [
+                        0,
+                        2000000000
+                    ],
+                    [
+                        0,
+                        2000000000
+                    ],
+                    [
+                        0,
+                        2000000000
+                    ],
+                    [
+                        0,
+                        2000000000
+                    ],
+                    [
+                        0,
+                        2000000000
+                    ],
+                    [
+                        0,
+                        2000000000
+                    ],
+                    [
+                        0,
+                        2000000000
+                    ],
+                    [
+                        0,
+                        2000000000
+                    ],
+                    [
+                        0,
+                        2000000000
+                    ],
+                    [
+                        0,
+                        2000000000
+                    ]
+                ]
+            }
+        ]
+    },
+    "generatedReports": [
+        {
+            "category": 0,
+            "name": "C:\\Users\\AdmT9N0CX01V65438A\\Documents\\src\\calcite\\uprof-out\\rogue-assess\\AMDuProf-calcite-bench-EBP_Apr-18-2026_21-04-28\\report.csv"
+        },
+        {
+            "category": 0,
+            "name": "C:\\Users\\AdmT9N0CX01V65438A\\Documents\\src\\calcite\\uprof-out\\rogue-assess\\AMDuProf-calcite-bench-EBP_Apr-18-2026_21-04-28\\report.csv"
+        }
+    ],
+    "hpc": {
+        "hostName": "LTN0CX01V65438A"
+    },
+    "profileType": 1,
+    "reportCommand": "AMDuProfCLI.exe report -i C:/Users/AdmT9N0CX01V65438A/Documents/src/calcite/uprof-out/rogue-assess/AMDuProf-calcite-bench-EBP_Apr-18-2026_21-04-28 --format csv --view overall",
+    "translateCommand": ""
+}

@@ -1,0 +1,39 @@
+
+"AMD uProf (Version:5.2.431.0)"
+PERFORMANCE ANALYSIS REPORT
+
+EXECUTION
+Target Path:,"C:/Users/AdmT9N0CX01V65438A/Documents/src/calcite/target/release/calcite-bench.exe"
+Command Line Arguments:,"-i C:/Users/AdmT9N0CX01V65438A/Documents/src/calcite/output/rogue.css -n 30000 --warmup 3000 "
+Working Directory:,"C:\Program Files\AMD\AMDuProf\bin"
+Environment Variables:
+CPU Details:,"Family(0x1a), Model(0x24), Number of Cores(24)"
+Operating System:,"Win1125H2-64"
+Profile Command:,"AMDuProfCLI.exe profile --config assess -o C:/Users/AdmT9N0CX01V65438A/Documents/src/calcite/uprof-out/profile-run C:/Users/AdmT9N0CX01V65438A/Documents/src/calcite/target/release/calcite-bench.exe -i C:/Users/AdmT9N0CX01V65438A/Documents/src/calcite/output/rogue.css -n 30000 --warmup 3000"
+Report Command:,"AMDuProfCLI.exe report -i C:/Users/AdmT9N0CX01V65438A/Documents/src/calcite/uprof-out/profile-run/AMDuProf-calcite-bench-EBP_Apr-18-2026_21-08-00 --view summary --format csv"
+
+PROFILE DETAILS
+Profile Session Type:,"Assess Performance"
+Profile Scope:,"Single Application"
+CPU Mask:,"0-23"
+CPU Affinity Mask:,"0-23"
+Profile Start Time:,"Sat Apr 18 21:08:01 2026"
+Profile End Time:,"Sat Apr 18 21:08:23 2026"
+Profile Duration:,"22.559 seconds"
+Data Folder:,"C:\Users\AdmT9N0CX01V65438A\Documents\src\calcite\uprof-out\profile-run\AMDuProf-calcite-bench-EBP_Apr-18-2026_21-08-00"
+Virtual Machine:,"Yes"
+Hypervisor Vendor:,"Microsoft Hyper-V"
+Call Stack Sampling:,"False"
+
+MONITORED EVENTS
+PMC Events:,Name,Interval,Unitmask,Countmask,Invert Countmask,User,OS,Description
+,"CYCLES_NOT_IN_HALT (PMCx076)",250000,0x00,0x00,False,True,True,"The number of cpu cycles when the thread is not in halt state."
+,"RETIRED_INST (PMCx0C0)",250000,0x00,0x00,False,True,True,"The number of instructions retired from execution. This count includes exceptions and interrupts. Each exception or interrupt is counted as one instruction."
+,"RETIRED_BR_INST (PMCx0C2)",25000,0x00,0x00,False,True,True,"The number of branch instructions retired. This includes all types of architectural control flow changes, including exceptions and interrupts.
+            "
+,"RETIRED_BR_INST_MISP (PMCx0C3)",25000,0x00,0x00,False,True,True,"The number of retired branch instructions, that were mispredicted.Note that only EX direct mispredicts and indirect target mispredicts are counted.
+            "
+,"MISALIGNED_LOADS (PMCx047)",25000,0x03,0x00,False,True,True,"The number of misaligned loads. This event counts the 64B (cacheline crossing) and 4K (page crossing) misaligned loads."
+,"L1_DC_ACCESSES_ALL (PMCx029)",250000,0x07,0x00,False,True,True,"The number of load and store ops dispatched to LS unit. This counts the dispatch of single op that performs a memory load, dispatch of single op that performs a memory store, dispatch of a single op that performs a load from and store to the same memory address."
+,"L1_DEMAND_DC_REFILLS_LOCAL (PMCx043)",25000,0x0F,0x00,False,True,True,"The demand Data Cache fills from L2, L3, CCX and DRAM."
+,"L2_CACHE_ACCESS_FROM_L1_DC_MISS (PMCx060)",25000,0xE0,0x00,False,True,True,"The L2 cache access requests due to L1 data cache misses. This also counts hardware and software prefetches"

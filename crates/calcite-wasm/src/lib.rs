@@ -29,6 +29,11 @@ pub fn init() {
 pub struct CalciteEngine {
     state: calcite_core::State,
     evaluator: calcite_core::Evaluator,
+    // Initial property defs, cached at construction. reset() rebuilds
+    // `state` from this without rebuilding `evaluator` (which would
+    // require reparsing + recompiling the CSS — expensive for large
+    // cabinets).
+    initial_properties: Vec<calcite_core::types::PropertyDef>,
 }
 
 #[wasm_bindgen]
@@ -73,7 +78,21 @@ impl CalciteEngine {
             state.populate_memory_from_readmem(table);
         }
 
-        Ok(CalciteEngine { state, evaluator })
+        let initial_properties = parsed.properties;
+        Ok(CalciteEngine { state, evaluator, initial_properties })
+    }
+
+    /// Reset the engine's runtime state without recompiling the CSS.
+    /// Equivalent to `new CalciteEngine(css)` but skips the parse +
+    /// compile steps, which are the expensive ones for large cabinets.
+    /// Used by the bridge worker to restart the machine on each
+    /// viewer-connect without paying multi-second compile cost.
+    pub fn reset(&mut self) {
+        self.state = calcite_core::State::default();
+        self.state.load_properties(&self.initial_properties);
+        if let Some(table) = self.evaluator.dispatch_tables.get("--readMem") {
+            self.state.populate_memory_from_readmem(table);
+        }
     }
 
     /// Run a batch of ticks and return the property changes as a JSON string.
@@ -121,6 +140,24 @@ impl CalciteEngine {
         self.state.read_video_memory(base_addr, width, height)
     }
 
+    /// Read a contiguous byte range from memory. Returns `len` bytes starting
+    /// at `base_addr`. Out-of-range reads return 0.
+    ///
+    /// Used by the browser renderer when it needs the raw VGA/CGA framebuffer
+    /// bytes (char+attr pairs for text mode, 2-bpp packed scanlines for CGA
+    /// mode 0x04). Calcite stays x86-ignorant: it just hands over the bytes,
+    /// the caller decodes.
+    pub fn read_memory_range(&self, base_addr: usize, len: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; len];
+        for i in 0..len {
+            let addr = base_addr + i;
+            if addr < self.state.memory.len() {
+                buf[i] = self.state.memory[addr];
+            }
+        }
+        buf
+    }
+
     /// Render text-mode video memory as a string (for debugging).
     pub fn render_screen(&self, base_addr: usize, width: usize, height: usize) -> String {
         self.state.render_screen(base_addr, width, height)
@@ -152,53 +189,6 @@ impl CalciteEngine {
         height: usize,
     ) -> Vec<u8> {
         self.state.read_framebuffer_rgba(base_addr, width, height)
-    }
-
-    /// Detect VGA memory regions (text and/or graphics) from the CSS.
-    ///
-    /// Returns a JSON object:
-    /// ```json
-    /// {
-    ///   "text": {"addr": 753664, "size": 4000, "width": 80, "height": 25},
-    ///   "gfx":  {"addr": 655360, "size": 64000, "width": 320, "height": 200}
-    /// }
-    /// ```
-    /// Either field can be `null` if that mode isn't present. Both can
-    /// be present simultaneously for programs that use both text and gfx
-    /// memory regions.
-    pub fn detect_video(&self) -> String {
-        let regions = calcite_core::detect_video_regions();
-        let text_json = match regions.text {
-            Some((addr, size)) => {
-                // Text mode: size/2 cells (char+attr pairs)
-                let cells = size / 2;
-                let (w, h) = if cells == 2000 {
-                    (80, 25)
-                } else if cells == 4000 {
-                    (80, 50)
-                } else if cells == 1000 {
-                    (40, 25)
-                } else {
-                    (80, cells / 80)
-                };
-                format!("{{\"addr\":{addr},\"size\":{size},\"width\":{w},\"height\":{h}}}")
-            }
-            None => "null".to_string(),
-        };
-        let gfx_json = match regions.gfx {
-            Some((addr, size)) => {
-                // Graphics mode: 1 byte per pixel
-                let (w, h) = if size == 64000 {
-                    (320, 200)
-                } else {
-                    // Unknown size — assume 320 wide and derive height
-                    (320, size / 320)
-                };
-                format!("{{\"addr\":{addr},\"size\":{size},\"width\":{w},\"height\":{h}}}")
-            }
-            None => "null".to_string(),
-        };
-        format!("{{\"text\":{text_json},\"gfx\":{gfx_json}}}")
     }
 
     /// Read the current video mode from the BDA (0x0449).

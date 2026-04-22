@@ -798,7 +798,6 @@ struct DebugSession {
     functions_count: usize,
     assignments_count: usize,
     css_file: String,
-    video_config: Option<(usize, usize)>,
     property_names: Vec<String>,
     /// Optional per-tick event recorder. When `Some`, `step_one` feeds it
     /// after each tick. Blocks/prose come from `calcite_core::summary`.
@@ -1431,11 +1430,6 @@ fn load_css(path: &std::path::Path, base_interval: u32) -> Result<DebugSession, 
         state.populate_memory_from_readmem(table);
     }
 
-    let video_config = calcite_core::detect_video_memory();
-    if let Some((addr, size)) = video_config {
-        eprintln!("Video memory detected at 0x{:X} ({} bytes)", addr, size);
-    }
-
     let property_names: Vec<String> = evaluator
         .assignments
         .iter()
@@ -1452,7 +1446,6 @@ fn load_css(path: &std::path::Path, base_interval: u32) -> Result<DebugSession, 
         functions_count: parsed.functions.len(),
         assignments_count: parsed.assignments.len(),
         css_file: path.display().to_string(),
-        video_config,
         property_names,
         summary: None,
     })
@@ -1822,9 +1815,7 @@ impl DebuggerHandler {
         let guard = sess.lock().unwrap();
         let s = &*guard;
         let (addr, w, h) = (
-            p.addr.unwrap_or_else(|| {
-                s.video_config.map(|(a, _)| a as i32).unwrap_or(0xB8000)
-            }),
+            p.addr.unwrap_or(0xB8000),
             p.width.unwrap_or(80),
             p.height.unwrap_or(25),
         );

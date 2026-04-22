@@ -30,8 +30,5 @@ pub mod summary;
 pub mod types;
 
 pub use error::{CalciteError, Result};
-pub use eval::{
-    detect_video_memory, detect_video_regions, property_to_address, Evaluator, TickProfile,
-    VideoRegions,
-};
+pub use eval::{property_to_address, Evaluator, TickProfile};
 pub use state::{State, StateDelta};
