@@ -3953,6 +3953,18 @@ fn compact_slots(program: &mut CompiledProgram) {
         }
     }
 
+    // Remap packed-broadcast write ports. gate/addr/val are main-scope
+    // property slots — they were either pre-pinned via property_slots or via
+    // collect_main_pinned, and slot_map covers them. unwrap_or(orig) is a
+    // safety belt: if for some reason the slot wasn't seen, leave it (the
+    // out-of-range read at runtime will panic loudly rather than silently
+    // splice from the wrong slot).
+    for port in &mut program.packed_broadcast_writes {
+        port.gate_slot = slot_map.get(&port.gate_slot).copied().unwrap_or(port.gate_slot);
+        port.addr_slot = slot_map.get(&port.addr_slot).copied().unwrap_or(port.addr_slot);
+        port.val_slot = slot_map.get(&port.val_slot).copied().unwrap_or(port.val_slot);
+    }
+
     program.slot_count = alloc.high_water;
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -3990,6 +4002,17 @@ fn collect_main_pinned(program: &CompiledProgram) -> Vec<Slot> {
         if let Some(ref spillover) = bw.spillover {
             pinned.push(spillover.guard_slot);
         }
+    }
+    // Packed broadcast write ports: gate/addr/val slots are read at writeback
+    // time after the main op stream completes, so they must survive compaction
+    // even though no main op references them by index. They should already be
+    // pinned via property_slots above (the recogniser only fires on properties
+    // the assignment loop registered), but listing them explicitly is cheap
+    // insurance.
+    for port in &program.packed_broadcast_writes {
+        pinned.push(port.gate_slot);
+        pinned.push(port.addr_slot);
+        pinned.push(port.val_slot);
     }
     pinned.sort_unstable();
     pinned.dedup();
