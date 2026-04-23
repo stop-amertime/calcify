@@ -125,6 +125,7 @@ fn op_name(op: &Op) -> &'static str {
         Op::LoadState { .. } => "LoadState",
         Op::LoadMem { .. } => "LoadMem",
         Op::LoadMem16 { .. } => "LoadMem16",
+        Op::LoadPackedByte { .. } => "LoadPackedByte",
         Op::Add { .. } => "Add",
         Op::AddLit { .. } => "AddLit",
         Op::Sub { .. } => "Sub",

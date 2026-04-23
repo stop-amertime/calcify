@@ -134,6 +134,22 @@ pub enum Op {
         dst: Slot,
         addr_slot: Slot,
     },
+    /// Packed-cell byte read.
+    ///
+    /// Used by the PACK_SIZE=2 memory layout where N bytes share one state-var
+    /// cell `mc{N}` (cell value = b0 | b1<<8 | ...). At runtime:
+    ///   key = slot[key_slot]
+    ///   N = key / pack
+    ///   off = key % pack
+    ///   cell_addr = packed_cell_tables[table_id][N]   // 0 if N out of bounds
+    ///   cell = state.read_mem(cell_addr)
+    ///   slot[dst] = (cell >> (off * 8)) & 0xFF
+    LoadPackedByte {
+        dst: Slot,
+        key_slot: Slot,
+        table_id: u32,
+        pack: u8,
+    },
 
     // --- Arithmetic ---
     Add {
@@ -441,6 +457,45 @@ pub struct CompiledProgram {
     pub functions: Vec<CompiledFunction>,
     /// Mapping from property name → slot index (for reading computed values after execution).
     pub property_slots: HashMap<String, Slot>,
+    /// Packed-cell address tables: `tables[id][n]` is the state-var address of cell
+    /// `mcN` (always negative; 0 means "cell not present" → read returns 0).
+    /// Used by `Op::LoadPackedByte` for the PACK_SIZE>1 memory layout.
+    pub packed_cell_tables: Vec<Vec<i32>>,
+    /// Per-`packed_cell_tables[id]` literal-exception arrays. Looked up FIRST in
+    /// LoadPackedByte runtime; if returns Some(byte), used instead of the packed
+    /// extract. Dense base-keyed Vec avoids HashMap overhead in the hot path.
+    pub packed_exception_tables: Vec<PackedExceptionTable>,
+    /// Packed-broadcast write ports (one per CSS-DOS write slot). Each port
+    /// covers all packed `--mc{N}` cells through one slot — at writeback time
+    /// the executor checks the gate, looks up the cell from the byte address,
+    /// and splices in the new byte. Replaces ~190K ops/tick of nested
+    /// `--applySlot` calls with ~6 port checks.
+    pub packed_broadcast_writes: Vec<CompiledPackedBroadcastWrite>,
+}
+
+/// Dense base-keyed lookup table for packed-byte literal exceptions.
+/// Keys outside `[base, base + values.len())` have no exception.
+/// Inside that range, `values[key - base] == i32::MIN` also means "no exception".
+#[derive(Debug, Clone)]
+pub struct PackedExceptionTable {
+    pub base: i32,
+    pub values: Vec<i32>,
+}
+
+impl PackedExceptionTable {
+    pub fn empty() -> Self {
+        PackedExceptionTable { base: 0, values: Vec::new() }
+    }
+    #[inline(always)]
+    pub fn get(&self, key: i32) -> Option<i32> {
+        let idx = key.wrapping_sub(self.base);
+        if (idx as u32) < self.values.len() as u32 {
+            let v = unsafe { *self.values.get_unchecked(idx as usize) };
+            if v != i32::MIN { Some(v) } else { None }
+        } else {
+            None
+        }
+    }
 }
 
 /// A function compiled once and reused at every call site via `Op::Call`.
@@ -506,6 +561,32 @@ pub struct CompiledSpillover {
     pub guard_slot: Slot,
     /// Map from dest address → (ops to compute high byte, result slot).
     pub entries: HashMap<i64, (Vec<Op>, Slot)>,
+}
+
+/// A compiled packed-broadcast write port — one per memory write slot.
+///
+/// At runtime, when `gate_slot` reads 1, the executor reads the byte address
+/// from `addr_slot`, looks up the cell's state address in `addr_to_cell_addr`
+/// (dense base-keyed Vec), reads the previous cell value, splices in the byte
+/// from `val_slot` based on `addr & 1`, and writes the result back.
+///
+/// One CompiledPackedBroadcastWrite covers all packed cells through one slot.
+/// Slot 0 is applied last so it wins same-cell collisions (matching the CSS
+/// `--applySlot` chain's outermost-wins semantics).
+#[derive(Debug)]
+pub struct CompiledPackedBroadcastWrite {
+    /// Slot holding the per-tick gate (`--_slotKLive`). Skip the port when 0.
+    pub gate_slot: Slot,
+    /// Slot holding the byte address (`--memAddrK`).
+    pub addr_slot: Slot,
+    /// Slot holding the byte value (`--memValK`).
+    pub val_slot: Slot,
+    /// Pack size — bytes per cell (currently always 2).
+    pub pack: u8,
+    /// Dense cell-index → cell-state-address lookup. Index by `byte_addr / pack`.
+    /// 0 means "no cell at this index — drop the write" (state-var addresses
+    /// are always negative, so 0 is a safe sentinel).
+    pub cell_table: Vec<i32>,
 }
 
 /// A flat-array dispatch table — dense `Vec<i32>` keyed by (key - base_key).
@@ -922,6 +1003,109 @@ pub(crate) fn is_dispatch_identity_read(table: &DispatchTable) -> bool {
     true
 }
 
+/// Strip CSS prop name prefixes (`--`, optional `__0`/`__1`/`__2`).
+/// Returns `"mc42"` for `"--__1mc42"`.
+fn strip_prop_prefixes(name: &str) -> &str {
+    let after_dashes = name.strip_prefix("--").unwrap_or(name);
+    after_dashes
+        .strip_prefix("__0")
+        .or_else(|| after_dashes.strip_prefix("__1"))
+        .or_else(|| after_dashes.strip_prefix("__2"))
+        .unwrap_or(after_dashes)
+}
+
+/// Parse `"mc42"` → `Some(42)`.  Returns None for any other shape.
+fn parse_packed_cell_name(bare: &str) -> Option<u64> {
+    let rest = bare.strip_prefix("mc")?;
+    if rest.is_empty() || !rest.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    rest.parse().ok()
+}
+
+/// If `expr` is `mod(var(--mcN), 256)`, return Some(N). Otherwise None.
+fn match_low_byte_extract(expr: &Expr) -> Option<u64> {
+    let Expr::Calc(CalcOp::Mod(lhs, rhs)) = expr else { return None };
+    let Expr::Var { name, .. } = lhs.as_ref() else { return None };
+    let n = parse_packed_cell_name(strip_prop_prefixes(name))?;
+    if !matches!(rhs.as_ref(), Expr::Literal(v) if (*v - 256.0).abs() < f64::EPSILON) {
+        return None;
+    }
+    Some(n)
+}
+
+/// If `expr` is `round(down, var(--mcN) / 256)`, return Some(N). Otherwise None.
+/// (Interval defaults to literal 1 in the parser when not specified.)
+fn match_high_byte_extract(expr: &Expr) -> Option<u64> {
+    let Expr::Calc(CalcOp::Round(RoundStrategy::Down, val, interval)) = expr else { return None };
+    if !matches!(interval.as_ref(), Expr::Literal(v) if (*v - 1.0).abs() < f64::EPSILON) {
+        return None;
+    }
+    let Expr::Calc(CalcOp::Div(num, den)) = val.as_ref() else { return None };
+    let Expr::Var { name, .. } = num.as_ref() else { return None };
+    let n = parse_packed_cell_name(strip_prop_prefixes(name))?;
+    if !matches!(den.as_ref(), Expr::Literal(v) if (*v - 256.0).abs() < f64::EPSILON) {
+        return None;
+    }
+    Some(n)
+}
+
+/// Check if a dispatch table is a packed-byte read with PACK_SIZE=2.
+///
+/// Each entry K must be:
+/// - K even (=2N): `mod(var(--mcN), 256)` (low byte)
+/// - K odd  (=2N+1): `round(down, var(--mcN) / 256)` (high byte)
+///
+/// Returns `Some(2)` if the whole table matches; otherwise `None`.
+/// Future PACK_SIZE values can extend this to return `Some(pack)`.
+/// Classify a dispatch table as "near-packed-byte-read": most entries follow the
+/// packed-byte-extract shape (key K → byte K%pack of cell `mc{K/pack}`), with a
+/// minority of exception entries (literals for ROM, function calls for MMIO, etc.).
+///
+/// Returns `Some((pack, exception_keys))` if ≥80% of entries match the packed
+/// shape AND every packed entry is consistent with a single `pack` value.
+/// Returns `None` otherwise.
+pub(crate) fn classify_near_packed_byte(table: &DispatchTable) -> Option<(u8, Vec<i64>)> {
+    prof!("classify_near_packed_byte");
+    if table.entries.len() < 100 {
+        return None;
+    }
+    // Currently we only recognise pack=2 (low/high byte via mod/round-down-div).
+    // Higher packs would require additional shape detection.
+    let pack: u8 = 2;
+    let mut exceptions = Vec::new();
+    let mut packed_count: usize = 0;
+    for (&key, expr) in &table.entries {
+        if key < 0 {
+            exceptions.push(key);
+            continue;
+        }
+        let expected_n = (key as u64) / pack as u64;
+        let off = (key as u64) % pack as u64;
+        let cell_n = if off == 0 {
+            match_low_byte_extract(expr)
+        } else {
+            match_high_byte_extract(expr)
+        };
+        if cell_n == Some(expected_n) {
+            packed_count += 1;
+        } else {
+            exceptions.push(key);
+        }
+    }
+    // Require ≥80% packed shape — looser than near-identity (90%) because the
+    // exceptions for readMem include ROM (~600 bytes) and MMIO function calls.
+    if packed_count * 10 < table.entries.len() * 8 {
+        return None;
+    }
+    log::info!(
+        "near-packed-byte ({}): {} packed entries, {} exceptions (lit handled in O(1) table)",
+        if pack == 2 { "PACK_SIZE=2" } else { "?" },
+        packed_count, exceptions.len()
+    );
+    Some((pack, exceptions))
+}
+
 /// Classify a dispatch table as "near-identity-read": most entries map key K → state[K],
 /// but a small number have non-identity expressions (e.g., computed values for special
 /// addresses like self-modifying code patches).
@@ -1180,6 +1364,16 @@ struct Compiler<'a> {
     identity_read_cache: HashMap<String, bool>,
     /// Cache: dispatch table name → near-identity exception keys (or None).
     near_identity_cache: HashMap<String, Option<Vec<i64>>>,
+    /// Cache: dispatch table name → near-packed-byte (pack, exception keys) or None.
+    near_packed_cache: HashMap<String, Option<(u8, Vec<i64>)>>,
+    /// Cache: dispatch table name → table_id into `packed_cell_tables`.
+    packed_cell_table_cache: HashMap<String, u32>,
+    /// Packed-cell address tables (one per near-packed-byte dispatch).
+    /// `packed_cell_tables[id][N]` = state-var address (negative) for cell `mcN`,
+    /// or `0` if N has no entry (read returns 0).
+    packed_cell_tables: Vec<Vec<i32>>,
+    /// Per-table literal exception array, parallel to packed_cell_tables.
+    packed_exception_tables: Vec<PackedExceptionTable>,
     /// Compiled function bodies, indexed by `fn_id`. Populated by
     /// `compile_general_function` on first encounter and reused thereafter.
     compiled_functions: Vec<CompiledFunction>,
@@ -1203,6 +1397,10 @@ impl<'a> Compiler<'a> {
             flat_dispatch_cache: HashMap::new(),
             identity_read_cache: HashMap::new(),
             near_identity_cache: HashMap::new(),
+            near_packed_cache: HashMap::new(),
+            packed_cell_table_cache: HashMap::new(),
+            packed_cell_tables: Vec::new(),
+            packed_exception_tables: Vec::new(),
             compiled_functions: Vec::new(),
             function_cache: HashMap::new(),
         }
@@ -1748,6 +1946,13 @@ impl<'a> Compiler<'a> {
                 if let Some(exception_keys) = self.check_near_identity_read(name) {
                     return self.compile_near_identity_dispatch(name, args, &exception_keys, ops);
                 }
+                // Near-packed-byte-read: CSS-DOS PACK_SIZE=2 memory layout.
+                // Compile as LoadPackedByte + small exception dispatch.
+                if let Some((pack, exception_keys)) = self.check_near_packed_byte(name) {
+                    return self.compile_near_packed_byte_dispatch(
+                        name, args, pack, &exception_keys, ops,
+                    );
+                }
             }
             return self.compile_dispatch_call(name, args, ops);
         }
@@ -2075,6 +2280,208 @@ impl<'a> Compiler<'a> {
         }
 
         // No exceptions — just LoadMem
+        self.dispatch_tables.insert(name.to_string(), table);
+        for (param_name, old) in saved {
+            match old {
+                Some(s) => { self.property_slots.insert(param_name, s); }
+                None => { self.property_slots.remove(&param_name); }
+            }
+        }
+        dst
+    }
+
+    /// Classify a dispatch table as near-packed-byte (cached).
+    fn check_near_packed_byte(&mut self, name: &str) -> Option<(u8, Vec<i64>)> {
+        prof!("check_near_packed_byte");
+        if let Some(cached) = self.near_packed_cache.get(name) {
+            return cached.clone();
+        }
+        let result = self.dispatch_tables.get(name).and_then(classify_near_packed_byte);
+        self.near_packed_cache.insert(name.to_string(), result.clone());
+        result
+    }
+
+    /// Build (or reuse) a packed_cell_table for `name`, returning the table_id.
+    /// The table maps cell index N → state-var address (negative). N out of bounds
+    /// or with no entry has the value 0 (read returns 0).
+    ///
+    /// Also populates the parallel `packed_exception_tables[id]` with any entries
+    /// whose expression is a compile-time literal (e.g., ROM bytes). These are
+    /// handled inside Op::LoadPackedByte at runtime via an O(1) HashMap lookup
+    /// BEFORE the packed-byte extract, avoiding per-call-site inline branches.
+    fn get_or_build_packed_cell_table(&mut self, name: &str, pack: u8) -> u32 {
+        if let Some(&id) = self.packed_cell_table_cache.get(name) {
+            return id;
+        }
+        let table = self.dispatch_tables.get(name).expect("dispatch table exists");
+        // Find max N referenced by packed entries + collect literal exceptions.
+        let mut max_n: i64 = -1;
+        let mut literal_exceptions: Vec<(i64, i32)> = Vec::new();
+        for (&key, expr) in &table.entries {
+            if key < 0 { continue; }
+            let expected_n = (key as u64) / pack as u64;
+            let off = (key as u64) % pack as u64;
+            let cell_n = if off == 0 {
+                match_low_byte_extract(expr)
+            } else {
+                match_high_byte_extract(expr)
+            };
+            if cell_n == Some(expected_n) {
+                max_n = max_n.max(expected_n as i64);
+            } else if let Expr::Literal(v) = expr {
+                literal_exceptions.push((key, *v as i32));
+            }
+            // Non-literal exceptions (e.g. function calls) fall through to the
+            // inline-branch path in compile_near_packed_byte_dispatch.
+        }
+        let len = (max_n + 1) as usize;
+        let mut addrs = vec![0i32; len];
+        for n in 0..len {
+            let cell_name = format!("mc{}", n);
+            if let Some(addr) = crate::eval::property_to_address(&cell_name) {
+                addrs[n] = addr;
+            }
+        }
+        // Build the dense exception table.
+        let exc_table = if literal_exceptions.is_empty() {
+            PackedExceptionTable::empty()
+        } else {
+            let min_k = literal_exceptions.iter().map(|(k, _)| *k).min().unwrap();
+            let max_k = literal_exceptions.iter().map(|(k, _)| *k).max().unwrap();
+            let span = (max_k - min_k + 1) as usize;
+            // Cap span to avoid pathological tables (e.g. one exception at key 0
+            // and another at key 999999). Above this cap, fall back to inline
+            // dispatch by emitting an empty table.
+            const MAX_SPAN: usize = 1_000_000;
+            if span > MAX_SPAN {
+                PackedExceptionTable::empty()
+            } else {
+                let mut values = vec![i32::MIN; span];
+                for (k, v) in &literal_exceptions {
+                    values[(*k - min_k) as usize] = *v;
+                }
+                PackedExceptionTable { base: min_k as i32, values }
+            }
+        };
+        let id = self.packed_cell_tables.len() as u32;
+        self.packed_cell_tables.push(addrs);
+        self.packed_exception_tables.push(exc_table);
+        self.packed_cell_table_cache.insert(name.to_string(), id);
+        id
+    }
+
+    /// Compile a near-packed-byte-read dispatch table.
+    ///
+    /// Default path: `Op::LoadPackedByte` (key → cell N → byte). Exception entries
+    /// (literals, function calls, anything not the packed-byte shape) go through
+    /// a small CmpEq/BranchIfZero chain — same approach as compile_near_identity_dispatch.
+    fn compile_near_packed_byte_dispatch(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        pack: u8,
+        exception_keys: &[i64],
+        ops: &mut Vec<Op>,
+    ) -> Slot {
+        prof!("compile_near_packed_byte_dispatch");
+        let table_id = self.get_or_build_packed_cell_table(name, pack);
+        let table = self.dispatch_tables.remove(name).unwrap();
+        let func = self.functions.get(name);
+
+        // Bind arguments to parameter slots (mirror compile_near_identity_dispatch).
+        let saved: Vec<(String, Option<Slot>)> = if let Some(ref f) = func {
+            f.parameters
+                .iter()
+                .enumerate()
+                .map(|(i, param)| {
+                    let old = self.property_slots.get(&param.name).copied();
+                    let compiled_slot = args
+                        .get(i)
+                        .map(|a| self.compile_expr(a, ops))
+                        .unwrap_or_else(|| {
+                            let s = self.alloc();
+                            ops.push(Op::LoadLit { dst: s, val: 0 });
+                            s
+                        });
+                    let local_slot = self.alloc();
+                    ops.push(Op::LoadSlot { dst: local_slot, src: compiled_slot });
+                    self.property_slots.insert(param.name.clone(), local_slot);
+                    (param.name.clone(), old)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        // Compile the key (address) lookup.
+        let key_slot = self.compile_var(&table.key_property, None, ops);
+
+        // Default path: LoadPackedByte.
+        let dst = self.alloc();
+        ops.push(Op::LoadPackedByte {
+            dst,
+            key_slot,
+            table_id,
+            pack,
+        });
+
+        // Exception entries → CmpEq/BranchIfZero chain. Literal exceptions are
+        // already handled by the LoadPackedByte runtime via the per-table
+        // packed_exception_tables HashMap (O(1) lookup, shared across call sites).
+        // Only inline non-literal exceptions (function calls, MMIO, etc.).
+        let inline_exceptions: Vec<i64> = exception_keys
+            .iter()
+            .copied()
+            .filter(|k| !matches!(table.entries.get(k), Some(Expr::Literal(_))))
+            .collect();
+        if !inline_exceptions.is_empty() {
+            let mut compiled_entries: Vec<(i64, Vec<Op>, Slot)> = Vec::new();
+            for &key_val in &inline_exceptions {
+                if let Some(entry_expr) = table.entries.get(&key_val) {
+                    let mut entry_ops = Vec::new();
+                    let result = self.compile_expr(entry_expr, &mut entry_ops);
+                    compiled_entries.push((key_val, entry_ops, result));
+                }
+            }
+            let result_slot = self.alloc();
+            ops.push(Op::LoadSlot { dst: result_slot, src: dst });
+
+            let mut jumps_to_end: Vec<usize> = Vec::new();
+            for (key_val, entry_ops, entry_result) in &compiled_entries {
+                let lit = self.alloc();
+                ops.push(Op::LoadLit { dst: lit, val: *key_val as i32 });
+                let cmp = self.alloc();
+                ops.push(Op::CmpEq { dst: cmp, a: key_slot, b: lit });
+                let branch_idx = ops.len();
+                ops.push(Op::BranchIfZero { cond: cmp, target: 0 });
+
+                ops.extend_from_slice(entry_ops);
+                ops.push(Op::LoadSlot { dst: result_slot, src: *entry_result });
+                jumps_to_end.push(ops.len());
+                ops.push(Op::Jump { target: 0 });
+
+                let next_idx = ops.len() as u32;
+                if let Op::BranchIfZero { target, .. } = &mut ops[branch_idx] {
+                    *target = next_idx;
+                }
+            }
+            let end_idx = ops.len() as u32;
+            for idx in jumps_to_end {
+                if let Op::Jump { target } = &mut ops[idx] {
+                    *target = end_idx;
+                }
+            }
+
+            self.dispatch_tables.insert(name.to_string(), table);
+            for (param_name, old) in saved {
+                match old {
+                    Some(s) => { self.property_slots.insert(param_name, s); }
+                    None => { self.property_slots.remove(&param_name); }
+                }
+            }
+            return result_slot;
+        }
+
         self.dispatch_tables.insert(name.to_string(), table);
         for (param_name, old) in saved {
             match old {
@@ -2490,6 +2897,7 @@ pub fn render_progress(phase: &str, done: usize, total: usize, elapsed: f64) {
 pub fn compile(
     assignments: &[Assignment],
     broadcast_writes: &[BroadcastWrite],
+    packed_broadcast_ports: &[crate::pattern::packed_broadcast_write::PackedSlotPort],
     functions: &HashMap<String, FunctionDef>,
     dispatch_tables: &HashMap<String, DispatchTable>,
 ) -> CompiledProgram {
@@ -2566,6 +2974,60 @@ pub fn compile(
     log::info!("[compile detail] broadcast writes total ({} items): {:.2}s",
         broadcast_writes.len(), _ct.elapsed().as_secs_f64());
 
+    // Compile packed-broadcast write ports. Each port becomes a
+    // CompiledPackedBroadcastWrite whose runtime arm reads gate/addr/val,
+    // looks up the cell's state address in cell_table, splices the byte,
+    // and writes back. property_slots was populated above by the assignment
+    // loop, so the lookup for `gate`/`addr`/`val` slots resolves directly
+    // (these properties are always registered by the assignment loop because
+    // the recogniser only fires when their assignments exist).
+    let _ct = web_time::Instant::now();
+    let mut compiled_packed_bw: Vec<CompiledPackedBroadcastWrite> =
+        Vec::with_capacity(packed_broadcast_ports.len());
+    for port in packed_broadcast_ports {
+        // Resolve slots. If any is missing, skip the port — better to fall
+        // back to the non-absorbed `--mc{N}` evaluation than to silently
+        // splice from slot 0.
+        let (Some(&gate_slot), Some(&addr_slot), Some(&val_slot)) = (
+            compiler.property_slots.get(&port.gate_property),
+            compiler.property_slots.get(&port.addr_property),
+            compiler.property_slots.get(&port.val_property),
+        ) else {
+            log::warn!(
+                "Packed broadcast port {} {} {}: missing slot binding, skipping",
+                port.gate_property, port.addr_property, port.val_property
+            );
+            continue;
+        };
+        // Build the dense cell_table indexed by cell index (byte_addr / pack).
+        let pack = port.pack as usize;
+        let max_cell_idx: usize = port
+            .address_map
+            .keys()
+            .map(|&byte_addr| (byte_addr as usize) / pack)
+            .max()
+            .unwrap_or(0);
+        let mut cell_table: Vec<i32> = vec![0; max_cell_idx + 1];
+        for (&byte_addr, var_name) in &port.address_map {
+            let idx = (byte_addr as usize) / pack;
+            if let Some(state_addr) = property_to_address(var_name) {
+                cell_table[idx] = state_addr;
+            }
+        }
+        compiled_packed_bw.push(CompiledPackedBroadcastWrite {
+            gate_slot,
+            addr_slot,
+            val_slot,
+            pack: port.pack,
+            cell_table,
+        });
+    }
+    log::info!(
+        "[compile detail] packed broadcast writes ({} ports): {:.2}s",
+        compiled_packed_bw.len(),
+        _ct.elapsed().as_secs_f64()
+    );
+
     let mut program = CompiledProgram {
         ops,
         slot_count: compiler.next_slot,
@@ -2576,6 +3038,9 @@ pub fn compile(
         flat_dispatch_arrays: compiler.compiled_flat_arrays,
         functions: compiler.compiled_functions,
         property_slots: compiler.property_slots,
+        packed_cell_tables: compiler.packed_cell_tables,
+        packed_exception_tables: compiler.packed_exception_tables,
+        packed_broadcast_writes: compiled_packed_bw,
     };
 
     // Expand all Op::Call sites inline. Op::Call was a compile-time device to
@@ -3488,6 +3953,18 @@ fn compact_slots(program: &mut CompiledProgram) {
         }
     }
 
+    // Remap packed-broadcast write ports. gate/addr/val are main-scope
+    // property slots — they were either pre-pinned via property_slots or via
+    // collect_main_pinned, and slot_map covers them. unwrap_or(orig) is a
+    // safety belt: if for some reason the slot wasn't seen, leave it (the
+    // out-of-range read at runtime will panic loudly rather than silently
+    // splice from the wrong slot).
+    for port in &mut program.packed_broadcast_writes {
+        port.gate_slot = slot_map.get(&port.gate_slot).copied().unwrap_or(port.gate_slot);
+        port.addr_slot = slot_map.get(&port.addr_slot).copied().unwrap_or(port.addr_slot);
+        port.val_slot = slot_map.get(&port.val_slot).copied().unwrap_or(port.val_slot);
+    }
+
     program.slot_count = alloc.high_water;
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -3525,6 +4002,17 @@ fn collect_main_pinned(program: &CompiledProgram) -> Vec<Slot> {
         if let Some(ref spillover) = bw.spillover {
             pinned.push(spillover.guard_slot);
         }
+    }
+    // Packed broadcast write ports: gate/addr/val slots are read at writeback
+    // time after the main op stream completes, so they must survive compaction
+    // even though no main op references them by index. They should already be
+    // pinned via property_slots above (the recogniser only fires on properties
+    // the assignment loop registered), but listing them explicitly is cheap
+    // insurance.
+    for port in &program.packed_broadcast_writes {
+        pinned.push(port.gate_slot);
+        pinned.push(port.addr_slot);
+        pinned.push(port.val_slot);
     }
     pinned.sort_unstable();
     pinned.dedup();
@@ -3809,6 +4297,7 @@ fn op_slots_read(op: &Op) -> Vec<Slot> {
         Op::LoadState { .. } => vec![],
         Op::LoadMem { addr_slot, .. } => vec![*addr_slot],
         Op::LoadMem16 { addr_slot, .. } => vec![*addr_slot],
+        Op::LoadPackedByte { key_slot, .. } => vec![*key_slot],
         Op::Add { a, b, .. }
         | Op::Sub { a, b, .. }
         | Op::Mul { a, b, .. }
@@ -3860,6 +4349,7 @@ fn op_dst(op: &Op) -> Option<Slot> {
         | Op::LoadState { dst, .. }
         | Op::LoadMem { dst, .. }
         | Op::LoadMem16 { dst, .. }
+        | Op::LoadPackedByte { dst, .. }
         | Op::Add { dst, .. }
         | Op::Sub { dst, .. }
         | Op::Mul { dst, .. }
@@ -3915,6 +4405,10 @@ fn map_op_slots(op: &mut Op, slot_map: &mut HashMap<Slot, Slot>, alloc: &mut Slo
         }
         Op::LoadMem16 { dst, addr_slot } => {
             *addr_slot = alloc.get_or_alloc(*addr_slot, slot_map);
+            *dst = alloc.get_or_alloc(*dst, slot_map);
+        }
+        Op::LoadPackedByte { dst, key_slot, .. } => {
+            *key_slot = alloc.get_or_alloc(*key_slot, slot_map);
             *dst = alloc.get_or_alloc(*dst, slot_map);
         }
         Op::Add { dst, a, b }
@@ -4057,6 +4551,7 @@ fn seed_from_parent(
         Op::LoadSlot { src, .. } => { seed(*src); }
         Op::LoadState { .. } => {}
         Op::LoadMem { addr_slot, .. } | Op::LoadMem16 { addr_slot, .. } => { seed(*addr_slot); }
+        Op::LoadPackedByte { key_slot, .. } => { seed(*key_slot); }
         Op::Add { a, b, .. } | Op::Sub { a, b, .. } | Op::Mul { a, b, .. }
         | Op::Div { a, b, .. } | Op::Mod { a, b, .. } | Op::And { a, b, .. }
         | Op::Shr { a, b, .. } | Op::Shl { a, b, .. } => { seed(*a); seed(*b); }
@@ -4172,7 +4667,7 @@ pub fn execute(program: &CompiledProgram, state: &mut State, slots: &mut Vec<i32
     }
 
     // Execute main ops
-    exec_ops(&program.ops, &program.dispatch_tables, &program.chain_tables, &program.flat_dispatch_arrays, &program.functions, state, slots);
+    exec_ops(&program.ops, &program.dispatch_tables, &program.chain_tables, &program.flat_dispatch_arrays, &program.functions, &program.packed_cell_tables, &program.packed_exception_tables, state, slots);
 
     // Writeback: apply computed values to state
     for &(slot, addr) in &program.writeback {
@@ -4195,7 +4690,7 @@ pub fn execute(program: &CompiledProgram, state: &mut State, slots: &mut Vec<i32
         let dest = slots[bw.dest_slot as usize];
         let dest_i64 = dest as i64;
         if bw.address_map.contains_key(&dest_i64) {
-            exec_ops(&bw.value_ops, &program.dispatch_tables, &program.chain_tables, &program.flat_dispatch_arrays, &program.functions, state, slots);
+            exec_ops(&bw.value_ops, &program.dispatch_tables, &program.chain_tables, &program.flat_dispatch_arrays, &program.functions, &program.packed_cell_tables, &program.packed_exception_tables, state, slots);
             let value = slots[bw.value_slot as usize];
             state.write_mem(dest, value);
         }
@@ -4204,11 +4699,47 @@ pub fn execute(program: &CompiledProgram, state: &mut State, slots: &mut Vec<i32
             let guard = slots[spillover.guard_slot as usize];
             if guard == 1 {
                 if let Some((ref spill_ops, spill_slot)) = spillover.entries.get(&dest_i64) {
-                    exec_ops(spill_ops, &program.dispatch_tables, &program.chain_tables, &program.flat_dispatch_arrays, &program.functions, state, slots);
+                    exec_ops(spill_ops, &program.dispatch_tables, &program.chain_tables, &program.flat_dispatch_arrays, &program.functions, &program.packed_cell_tables, &program.packed_exception_tables, state, slots);
                     let value = slots[*spill_slot as usize];
                     state.write_mem(dest + 1, value);
                 }
             }
+        }
+    }
+
+    // Packed broadcast writes: one port per CSS-DOS write slot. Replaces
+    // the absorbed `--mc{N}: --applySlot(...)` chain. We iterate ports in
+    // REVERSE order so slot 0 fires LAST — matching the CSS semantics where
+    // slot 0 is the outermost --applySlot wrapper and wins same-cell
+    // collisions over slots 1..5.
+    for port in program.packed_broadcast_writes.iter().rev() {
+        if slots[port.gate_slot as usize] != 1 {
+            continue;
+        }
+        let byte_addr = slots[port.addr_slot as usize];
+        if byte_addr < 0 {
+            continue;
+        }
+        let pack = port.pack as i32;
+        let cell_idx = (byte_addr / pack) as usize;
+        let off = byte_addr % pack;
+        if cell_idx >= port.cell_table.len() {
+            continue;
+        }
+        let cell_state_addr = port.cell_table[cell_idx];
+        if cell_state_addr == 0 {
+            continue;
+        }
+        let val = slots[port.val_slot as usize] & 0xFF;
+        let prev = state.read_mem(cell_state_addr);
+        let new_cell = if off == 0 {
+            (prev & !0xFF) | val
+        } else {
+            // off == 1: replace high byte (bits 8..15)
+            (prev & 0xFF) | (val << 8)
+        };
+        if new_cell != prev {
+            state.write_mem(cell_state_addr, new_cell);
         }
     }
 
@@ -4469,7 +5000,9 @@ pub fn exec_ops_for_test(ops: &[Op], state: &mut State, slots: &mut [i32]) {
     let chain_tables: Vec<DispatchChainTable> = Vec::new();
     let flat_dispatch_arrays: Vec<FlatDispatchArray> = Vec::new();
     let functions: Vec<CompiledFunction> = Vec::new();
-    exec_ops(ops, &dispatch_tables, &chain_tables, &flat_dispatch_arrays, &functions, state, slots);
+    let packed_cell_tables: Vec<Vec<i32>> = Vec::new();
+    let packed_exception_tables: Vec<PackedExceptionTable> = Vec::new();
+    exec_ops(ops, &dispatch_tables, &chain_tables, &flat_dispatch_arrays, &functions, &packed_cell_tables, &packed_exception_tables, state, slots);
 }
 
 fn exec_ops(
@@ -4478,6 +5011,8 @@ fn exec_ops(
     chain_tables: &[DispatchChainTable],
     flat_dispatch_arrays: &[FlatDispatchArray],
     functions: &[CompiledFunction],
+    packed_cell_tables: &[Vec<i32>],
+    packed_exception_tables: &[PackedExceptionTable],
     state: &mut State,
     slots: &mut [i32],
 ) {
@@ -4539,6 +5074,28 @@ fn exec_ops(
             Op::LoadMem16 { dst, addr_slot } => {
                 let addr = sload!(*addr_slot);
                 let v = if addr < 0 { state.read_mem(addr) } else { state.read_mem16(addr) };
+                sstore!(*dst, v);
+            }
+            Op::LoadPackedByte { dst, key_slot, table_id, pack } => {
+                let key = sload!(*key_slot);
+                let tid = *table_id as usize;
+                let v = if key < 0 {
+                    0
+                } else if let Some(lit) = packed_exception_tables[tid].get(key) {
+                    lit
+                } else {
+                    let pack_i = *pack as i32;
+                    let n = (key / pack_i) as usize;
+                    let off = key % pack_i;
+                    let table = &packed_cell_tables[tid];
+                    let cell_addr = if n < table.len() { table[n] } else { 0 };
+                    let cell = if cell_addr == 0 { 0 } else { state.read_mem(cell_addr) };
+                    if off == 0 {
+                        cell.rem_euclid(256)
+                    } else {
+                        cell.div_euclid(256).rem_euclid(256)
+                    }
+                };
                 sstore!(*dst, v);
             }
             Op::Add { dst, a, b } => {
@@ -4716,10 +5273,10 @@ fn exec_ops(
                 let key_val = sload!(*key) as i64;
                 let table = unsafe { dispatch_tables.get_unchecked(*table_id as usize) };
                 if let Some((entry_ops, result_slot)) = table.entries.get(&key_val) {
-                    exec_ops(entry_ops, dispatch_tables, chain_tables, flat_dispatch_arrays, functions, state, slots);
+                    exec_ops(entry_ops, dispatch_tables, chain_tables, flat_dispatch_arrays, functions, packed_cell_tables, packed_exception_tables, state, slots);
                     sstore!(*dst, sload!(*result_slot));
                 } else {
-                    exec_ops(&table.fallback_ops, dispatch_tables, chain_tables, flat_dispatch_arrays, functions, state, slots);
+                    exec_ops(&table.fallback_ops, dispatch_tables, chain_tables, flat_dispatch_arrays, functions, packed_cell_tables, packed_exception_tables, state, slots);
                     sstore!(*dst, sload!(table.fallback_slot));
                 }
             }
@@ -4741,7 +5298,7 @@ fn exec_ops(
                     sstore!(param, sload!(*arg));
                 }
                 // Run the cached body (uses its own internal slots + the param slots).
-                exec_ops(&func.body_ops, dispatch_tables, chain_tables, flat_dispatch_arrays, functions, state, slots);
+                exec_ops(&func.body_ops, dispatch_tables, chain_tables, flat_dispatch_arrays, functions, packed_cell_tables, packed_exception_tables, state, slots);
                 sstore!(*dst, sload!(func.result_slot));
             }
             Op::StoreState { addr, src } => {
@@ -4820,7 +5377,7 @@ pub fn execute_profiled(
     profile.slot_reset += t1.duration_since(t0).as_secs_f64();
 
     // Main ops (profiled — fills dispatch_time, counts, etc. directly)
-    exec_ops_profiled(&program.ops, &program.dispatch_tables, &program.chain_tables, &program.flat_dispatch_arrays, &program.functions, state, slots, profile);
+    exec_ops_profiled(&program.ops, &program.dispatch_tables, &program.chain_tables, &program.flat_dispatch_arrays, &program.functions, &program.packed_cell_tables, &program.packed_exception_tables, state, slots, profile);
     let t2 = Instant::now();
     profile.main_ops += t2.duration_since(t1).as_secs_f64();
     profile.linear_ops = profile.main_ops - profile.dispatch_time;
@@ -4852,7 +5409,7 @@ pub fn execute_profiled(
         let dest = slots[bw.dest_slot as usize];
         let dest_i64 = dest as i64;
         if bw.address_map.contains_key(&dest_i64) {
-            exec_ops(&bw.value_ops, &program.dispatch_tables, &program.chain_tables, &program.flat_dispatch_arrays, &program.functions, state, slots);
+            exec_ops(&bw.value_ops, &program.dispatch_tables, &program.chain_tables, &program.flat_dispatch_arrays, &program.functions, &program.packed_cell_tables, &program.packed_exception_tables, state, slots);
             let value = slots[bw.value_slot as usize];
             state.write_mem(dest, value);
             bw_fired += 1;
@@ -4861,11 +5418,41 @@ pub fn execute_profiled(
             let guard = slots[spillover.guard_slot as usize];
             if guard == 1 {
                 if let Some((ref spill_ops, spill_slot)) = spillover.entries.get(&dest_i64) {
-                    exec_ops(spill_ops, &program.dispatch_tables, &program.chain_tables, &program.flat_dispatch_arrays, &program.functions, state, slots);
+                    exec_ops(spill_ops, &program.dispatch_tables, &program.chain_tables, &program.flat_dispatch_arrays, &program.functions, &program.packed_cell_tables, &program.packed_exception_tables, state, slots);
                     let value = slots[*spill_slot as usize];
                     state.write_mem(dest + 1, value);
                 }
             }
+        }
+    }
+    // Packed broadcast writes (mirror the unprofiled path; see execute()).
+    for port in program.packed_broadcast_writes.iter().rev() {
+        if slots[port.gate_slot as usize] != 1 {
+            continue;
+        }
+        let byte_addr = slots[port.addr_slot as usize];
+        if byte_addr < 0 {
+            continue;
+        }
+        let pack = port.pack as i32;
+        let cell_idx = (byte_addr / pack) as usize;
+        let off = byte_addr % pack;
+        if cell_idx >= port.cell_table.len() {
+            continue;
+        }
+        let cell_state_addr = port.cell_table[cell_idx];
+        if cell_state_addr == 0 {
+            continue;
+        }
+        let val = slots[port.val_slot as usize] & 0xFF;
+        let prev = state.read_mem(cell_state_addr);
+        let new_cell = if off == 0 {
+            (prev & !0xFF) | val
+        } else {
+            (prev & 0xFF) | (val << 8)
+        };
+        if new_cell != prev {
+            state.write_mem(cell_state_addr, new_cell);
         }
     }
     let t4 = Instant::now();
@@ -4881,6 +5468,8 @@ fn exec_ops_profiled(
     chain_tables: &[DispatchChainTable],
     flat_dispatch_arrays: &[FlatDispatchArray],
     functions: &[CompiledFunction],
+    packed_cell_tables: &[Vec<i32>],
+    packed_exception_tables: &[PackedExceptionTable],
     state: &mut State,
     slots: &mut [i32],
     profile: &mut TickProfile,
@@ -4924,6 +5513,29 @@ fn exec_ops_profiled(
                 } else {
                     slots[*dst as usize] = state.read_mem16(addr);
                 }
+            }
+            Op::LoadPackedByte { dst, key_slot, table_id, pack } => {
+                count_op!(profile, "LoadPackedByte");
+                let key = slots[*key_slot as usize];
+                let tid = *table_id as usize;
+                let v = if key < 0 {
+                    0
+                } else if let Some(lit) = packed_exception_tables[tid].get(key) {
+                    lit
+                } else {
+                    let pack_i = *pack as i32;
+                    let n = (key / pack_i) as usize;
+                    let off = key % pack_i;
+                    let table = &packed_cell_tables[tid];
+                    let cell_addr = if n < table.len() { table[n] } else { 0 };
+                    let cell = if cell_addr == 0 { 0 } else { state.read_mem(cell_addr) };
+                    if off == 0 {
+                        cell.rem_euclid(256)
+                    } else {
+                        cell.div_euclid(256).rem_euclid(256)
+                    }
+                };
+                slots[*dst as usize] = v;
             }
             Op::Add { dst, a, b } => {
                 count_op!(profile, "Add");
@@ -5172,11 +5784,11 @@ fn exec_ops_profiled(
                 let table = &dispatch_tables[*table_id as usize];
                 if let Some((entry_ops, result_slot)) = table.entries.get(&key_val) {
                     profile.dispatch_sub_ops_count += entry_ops.len() as u64;
-                    exec_ops(entry_ops, dispatch_tables, chain_tables, flat_dispatch_arrays, functions, state, slots);
+                    exec_ops(entry_ops, dispatch_tables, chain_tables, flat_dispatch_arrays, functions, packed_cell_tables, packed_exception_tables, state, slots);
                     slots[*dst as usize] = slots[*result_slot as usize];
                 } else {
                     profile.dispatch_sub_ops_count += table.fallback_ops.len() as u64;
-                    exec_ops(&table.fallback_ops, dispatch_tables, chain_tables, flat_dispatch_arrays, functions, state, slots);
+                    exec_ops(&table.fallback_ops, dispatch_tables, chain_tables, flat_dispatch_arrays, functions, packed_cell_tables, packed_exception_tables, state, slots);
                     slots[*dst as usize] = slots[table.fallback_slot as usize];
                 }
                 profile.dispatch_time += td.elapsed().as_secs_f64();
@@ -5199,7 +5811,7 @@ fn exec_ops_profiled(
                 for (arg, &param) in arg_slots.iter().zip(func.param_slots.iter()) {
                     slots[param as usize] = slots[*arg as usize];
                 }
-                exec_ops(&func.body_ops, dispatch_tables, chain_tables, flat_dispatch_arrays, functions, state, slots);
+                exec_ops(&func.body_ops, dispatch_tables, chain_tables, flat_dispatch_arrays, functions, packed_cell_tables, packed_exception_tables, state, slots);
                 slots[*dst as usize] = slots[func.result_slot as usize];
             }
             Op::StoreState { addr, src } => {
@@ -5290,6 +5902,8 @@ pub fn exec_ops_traced(
     chain_tables: &[DispatchChainTable],
     flat_dispatch_arrays: &[FlatDispatchArray],
     functions: &[CompiledFunction],
+    packed_cell_tables: &[Vec<i32>],
+    packed_exception_tables: &[PackedExceptionTable],
     state: &mut State,
     slots: &mut [i32],
     op_range: Option<(usize, usize)>,
@@ -5357,6 +5971,31 @@ pub fn exec_ops_traced(
                         pc, op: format!("LoadMem16 dst={} addr_slot={} addr={} → {}", dst, addr_slot, addr, val),
                         dst_slot: Some(*dst), dst_value: Some(val),
                         inputs: vec![(*addr_slot, addr)], branch_taken: None, depth,
+                    });
+                }
+            }
+            Op::LoadPackedByte { dst, key_slot, table_id, pack } => {
+                let key = slots[*key_slot as usize];
+                let tid = *table_id as usize;
+                let val = if key < 0 {
+                    0
+                } else if let Some(lit) = packed_exception_tables[tid].get(key) {
+                    lit
+                } else {
+                    let pack_i = *pack as i32;
+                    let n = (key / pack_i) as usize;
+                    let off = key % pack_i;
+                    let table = &packed_cell_tables[tid];
+                    let cell_addr = if n < table.len() { table[n] } else { 0 };
+                    let cell = if cell_addr == 0 { 0 } else { state.read_mem(cell_addr) };
+                    if off == 0 { cell.rem_euclid(256) } else { cell.div_euclid(256).rem_euclid(256) }
+                };
+                slots[*dst as usize] = val;
+                if should_trace {
+                    trace.push(TraceEntry {
+                        pc, op: format!("LoadPackedByte dst={} key_slot={} key={} table_id={} pack={} → {}", dst, key_slot, key, table_id, pack, val),
+                        dst_slot: Some(*dst), dst_value: Some(val),
+                        inputs: vec![(*key_slot, key)], branch_taken: None, depth,
                     });
                 }
             }
@@ -5655,7 +6294,7 @@ pub fn exec_ops_traced(
                 let table = &dispatch_tables[*table_id as usize];
                 if let Some((entry_ops, result_slot)) = table.entries.get(&key_val) {
                     if should_trace {
-                        let mut sub = exec_ops_traced(entry_ops, dispatch_tables, chain_tables, flat_dispatch_arrays, functions, state, slots, None, depth + 1);
+                        let mut sub = exec_ops_traced(entry_ops, dispatch_tables, chain_tables, flat_dispatch_arrays, functions, packed_cell_tables, packed_exception_tables, state, slots, None, depth + 1);
                         trace.push(TraceEntry {
                             pc, op: format!("Dispatch dst={} key={}({}) table={} → entry (result_slot={}={})", dst, key, key_val, table_id, result_slot, slots[*result_slot as usize]),
                             dst_slot: Some(*dst), dst_value: Some(slots[*result_slot as usize]),
@@ -5663,13 +6302,13 @@ pub fn exec_ops_traced(
                         });
                         trace.append(&mut sub);
                     } else {
-                        exec_ops(entry_ops, dispatch_tables, chain_tables, flat_dispatch_arrays, functions, state, slots);
+                        exec_ops(entry_ops, dispatch_tables, chain_tables, flat_dispatch_arrays, functions, packed_cell_tables, packed_exception_tables, state, slots);
                     }
                     slots[*dst as usize] = slots[*result_slot as usize];
                 } else {
                     if should_trace {
-                        let mut sub = exec_ops_traced(&table.fallback_ops, dispatch_tables, chain_tables, flat_dispatch_arrays, functions, state, slots, None, depth + 1);
-                        exec_ops(&table.fallback_ops, dispatch_tables, chain_tables, flat_dispatch_arrays, functions, state, slots);
+                        let mut sub = exec_ops_traced(&table.fallback_ops, dispatch_tables, chain_tables, flat_dispatch_arrays, functions, packed_cell_tables, packed_exception_tables, state, slots, None, depth + 1);
+                        exec_ops(&table.fallback_ops, dispatch_tables, chain_tables, flat_dispatch_arrays, functions, packed_cell_tables, packed_exception_tables, state, slots);
                         trace.push(TraceEntry {
                             pc, op: format!("Dispatch dst={} key={}({}) table={} → fallback (fallback_slot={}={})", dst, key, key_val, table_id, table.fallback_slot, slots[table.fallback_slot as usize]),
                             dst_slot: Some(*dst), dst_value: Some(slots[table.fallback_slot as usize]),
@@ -5677,7 +6316,7 @@ pub fn exec_ops_traced(
                         });
                         trace.append(&mut sub);
                     } else {
-                        exec_ops(&table.fallback_ops, dispatch_tables, chain_tables, flat_dispatch_arrays, functions, state, slots);
+                        exec_ops(&table.fallback_ops, dispatch_tables, chain_tables, flat_dispatch_arrays, functions, packed_cell_tables, packed_exception_tables, state, slots);
                     }
                     slots[*dst as usize] = slots[table.fallback_slot as usize];
                 }
@@ -5706,7 +6345,7 @@ pub fn exec_ops_traced(
                     slots[param as usize] = slots[*arg as usize];
                 }
                 if should_trace {
-                    let mut sub = exec_ops_traced(&func.body_ops, dispatch_tables, chain_tables, flat_dispatch_arrays, functions, state, slots, None, depth + 1);
+                    let mut sub = exec_ops_traced(&func.body_ops, dispatch_tables, chain_tables, flat_dispatch_arrays, functions, packed_cell_tables, packed_exception_tables, state, slots, None, depth + 1);
                     let result = slots[func.result_slot as usize];
                     trace.push(TraceEntry {
                         pc, op: format!("Call dst={} fn_id={} args={:?} → {}", dst, fn_id, arg_slots, result),
@@ -5716,7 +6355,7 @@ pub fn exec_ops_traced(
                     });
                     trace.append(&mut sub);
                 } else {
-                    exec_ops(&func.body_ops, dispatch_tables, chain_tables, flat_dispatch_arrays, functions, state, slots);
+                    exec_ops(&func.body_ops, dispatch_tables, chain_tables, flat_dispatch_arrays, functions, packed_cell_tables, packed_exception_tables, state, slots);
                 }
                 slots[*dst as usize] = slots[func.result_slot as usize];
             }
@@ -5833,6 +6472,8 @@ pub fn trace_property(
         &program.chain_tables,
         &program.flat_dispatch_arrays,
         &program.functions,
+        &program.packed_cell_tables,
+        &program.packed_exception_tables,
         state,
         slots,
         None, // trace all ops
@@ -5916,7 +6557,7 @@ mod tests {
 
         let mut state = State::default();
         let mut slots = vec![0i32; compiler.next_slot as usize];
-        exec_ops(&ops, &[], &[], &[], &[], &mut state, &mut slots);
+        exec_ops(&ops, &[], &[], &[], &[], &[], &[], &mut state, &mut slots);
         assert_eq!(slots[slot as usize], 42);
     }
 
@@ -5934,7 +6575,7 @@ mod tests {
 
         let mut state = State::default();
         let mut slots = vec![0i32; compiler.next_slot as usize];
-        exec_ops(&ops, &[], &[], &[], &[], &mut state, &mut slots);
+        exec_ops(&ops, &[], &[], &[], &[], &[], &[], &mut state, &mut slots);
         assert_eq!(slots[slot as usize], 30);
     }
 
@@ -5953,7 +6594,7 @@ mod tests {
 
         state.set_var("AX", 0x1234);
         let mut slots = vec![0i32; compiler.next_slot as usize];
-        exec_ops(&ops, &[], &[], &[], &[], &mut state, &mut slots);
+        exec_ops(&ops, &[], &[], &[], &[], &[], &[], &mut state, &mut slots);
         assert_eq!(slots[slot as usize], 0x1234);
     }
 
@@ -5987,7 +6628,7 @@ mod tests {
 
         state.set_var("AX", 2);
         let mut slots = vec![0i32; compiler.next_slot as usize];
-        exec_ops(&ops, &[], &[], &[], &[], &mut state, &mut slots);
+        exec_ops(&ops, &[], &[], &[], &[], &[], &[], &mut state, &mut slots);
         assert_eq!(slots[slot as usize], 200);
     }
 
@@ -6054,7 +6695,7 @@ mod tests {
 
         state.set_var("AX", 42);
         let mut slots = vec![0i32; compiler.next_slot as usize];
-        exec_ops(&ops, &compiler.compiled_dispatches, &[], &compiler.compiled_flat_arrays, &compiler.compiled_functions, &mut state, &mut slots);
+        exec_ops(&ops, &compiler.compiled_dispatches, &[], &compiler.compiled_flat_arrays, &compiler.compiled_functions, &compiler.packed_cell_tables, &compiler.packed_exception_tables, &mut state, &mut slots);
         assert_eq!(slots[slot as usize], 42);
     }
 
@@ -6105,7 +6746,7 @@ mod tests {
 
         let mut state = State::default();
         let mut slots = vec![0i32; compiler.next_slot as usize];
-        exec_ops(&ops, &[], &[], &[], &[], &mut state, &mut slots);
+        exec_ops(&ops, &[], &[], &[], &[], &[], &[], &mut state, &mut slots);
         assert_eq!(slots[slot as usize], 15);
     }
 
@@ -6123,7 +6764,7 @@ mod tests {
             },
         ];
 
-        let program = compile(&assignments, &[], &HashMap::new(), &HashMap::new());
+        let program = compile(&assignments, &[], &[], &HashMap::new(), &HashMap::new());
 
         let mut slots = Vec::new();
         execute(&program, &mut state, &mut slots);
@@ -6165,7 +6806,7 @@ mod tests {
 
         let mut state = State::default();
         let mut slots = vec![0i32; compiler.next_slot as usize];
-        exec_ops(&ops, &[], &[], &[], &compiler.compiled_functions, &mut state, &mut slots);
+        exec_ops(&ops, &[], &[], &[], &compiler.compiled_functions, &[], &[], &mut state, &mut slots);
         assert_eq!(slots[slot as usize], 42);
     }
 
@@ -6192,7 +6833,7 @@ mod tests {
             },
         ];
 
-        let program = compile(&assignments, &[], &HashMap::new(), &HashMap::new());
+        let program = compile(&assignments, &[], &[], &HashMap::new(), &HashMap::new());
 
         let mut slots = Vec::new();
         execute(&program, &mut state, &mut slots);
@@ -6243,7 +6884,7 @@ mod tests {
             },
         }];
 
-        let program = compile(&assignments, &[], &functions, &dispatch_tables);
+        let program = compile(&assignments, &[], &[], &functions, &dispatch_tables);
 
         let mut state = State::default();
         let mut slots = Vec::new();
@@ -6331,6 +6972,8 @@ mod tests {
             &[],
             &compiler.compiled_flat_arrays,
             &compiler.compiled_functions,
+            &compiler.packed_cell_tables,
+            &compiler.packed_exception_tables,
             &mut state,
             &mut slots,
         );
@@ -6350,6 +6993,8 @@ mod tests {
             &[],
             &compiler.compiled_flat_arrays,
             &compiler.compiled_functions,
+            &compiler.packed_cell_tables,
+            &compiler.packed_exception_tables,
             &mut state,
             &mut slots2,
         );

@@ -15,3 +15,4 @@
 
 pub mod broadcast_write;
 pub mod dispatch_table;
+pub mod packed_broadcast_write;

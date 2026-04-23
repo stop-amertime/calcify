@@ -58,7 +58,8 @@
 use std::collections::HashMap;
 
 use crate::pattern::broadcast_write::BroadcastWrite;
-use crate::types::{CssValue, Expr, PropertyDef, StyleBranch, StyleTest};
+use crate::pattern::packed_broadcast_write::PackedSlotPort;
+use crate::types::{CalcOp, CssValue, Expr, PropertyDef, StyleBranch, StyleTest};
 
 /// What the fast-path produces.
 ///
@@ -70,6 +71,11 @@ pub struct FastPathResult {
     pub properties: Vec<PropertyDef>,
     /// Pre-built `BroadcastWrite`s from assignment-templated runs.
     pub broadcast_writes: Vec<BroadcastWrite>,
+    /// Pre-built `PackedSlotPort`s from packed `--applySlot` assignment runs
+    /// (CSS-DOS PACK_SIZE=2 memory cells). Each port covers every absorbed
+    /// cell; downstream packed_broadcast_write merges these with any ports
+    /// the post-parse recogniser finds on non-absorbed assignments.
+    pub packed_broadcast_ports: Vec<PackedSlotPort>,
     /// Property names the caller should treat as already consumed — the
     /// ordinary assignment loop won't see them, but the caller needs to
     /// know they're "absorbed" so dispatch-table recognition and the
@@ -86,6 +92,7 @@ impl FastPathResult {
         Self {
             properties: Vec::new(),
             broadcast_writes: Vec::new(),
+            packed_broadcast_ports: Vec::new(),
             absorbed_properties: std::collections::HashSet::new(),
             blank_ranges: Vec::new(),
         }
@@ -550,6 +557,54 @@ fn emit_assignment_run(
         }
     };
 
+    // Try packed `--applySlot(...)` chain shape first (CSS-DOS PACK_SIZE=2
+    // memory cells). If that doesn't match, fall back to the flat broadcast
+    // `if(style(...))` shape.
+    //
+    // The packed shape is a nested function-call chain where each layer
+    // encodes one write slot; we extract (gate, addr, val) for each slot
+    // and replicate across all entries as `PackedSlotPort`s. Matches what
+    // `pattern::packed_broadcast_write` does on fully-parsed assignments.
+    if let Some(skeletons) =
+        extract_packed_port_skeletons(&parsed_expr, &synth_property, ra_addr)
+    {
+        // Every entry's cell_byte_addr is `addr * pack` (pack is hard-coded
+        // 2 in both kiln and the post-parse recogniser).
+        let pack: i64 = 2;
+        let mut ports: Vec<PackedSlotPort> = skeletons
+            .into_iter()
+            .map(|sk| PackedSlotPort {
+                gate_property: sk.gate_property,
+                addr_property: sk.addr_property,
+                val_property: sk.val_property,
+                address_map: HashMap::with_capacity(entries.len()),
+                pack: pack as u8,
+            })
+            .collect();
+        for &(_, _, a) in entries {
+            let cell_byte_addr = (a as i64) * pack;
+            let cell_name = format!("--{}{}", prefix_str, a);
+            for port in &mut ports {
+                port.address_map.insert(cell_byte_addr, cell_name.clone());
+            }
+        }
+        let port_count = ports.len();
+        result.packed_broadcast_ports.extend(ports);
+
+        for &(s, e, a) in entries {
+            result.absorbed_properties.insert(format!("--{}{}", prefix_str, a));
+            result.blank_ranges.push((s, e));
+        }
+        log::info!(
+            "[fast-path] assignment run `--{}` absorbed {} entries ({} bytes) → {} pre-built packed slot ports",
+            prefix_str,
+            entries.len(),
+            entries.last().map(|e| e.1 - entries[0].0).unwrap_or(0),
+            port_count,
+        );
+        return;
+    }
+
     // Now collect ports from this single Expr the same way
     // `broadcast_write::extract_broadcast_ports` does. We replicate the
     // logic here in condensed form to avoid exposing private fns from the
@@ -606,6 +661,143 @@ fn emit_assignment_run(
         entries.last().map(|e| e.1 - entries[0].0).unwrap_or(0),
         result.broadcast_writes.len(),
     );
+}
+
+/// Skeleton of one packed slot port from the learned template. We extract
+/// `(gate, addr, val)` from the template Expr (where the addr-offset was
+/// materialised as `ra_addr * pack`); downstream code fills address_map
+/// by iterating every entry in the run.
+struct PackedPortSkeleton {
+    gate_property: String,
+    addr_property: String,
+    val_property: String,
+}
+
+/// Walk a parsed template Expr, trying to decompose it as a nested
+/// `--applySlot(...)` chain. Returns one skeleton per layer (outermost first),
+/// or None if the shape doesn't match the packed pattern.
+///
+/// Each layer must match exactly:
+///   `--applySlot(<inner>, var(--gate), calc(var(--addr) - K), var(--val))`
+/// and the chain must terminate at `var(--__1{cell_property})` or similar.
+/// The constant `K` in the template equals `ra_addr * pack` (the ref addr's
+/// byte offset) — we check it matches for consistency, but the per-entry
+/// address_map is built from each entry's own addr, not from `K`.
+fn extract_packed_port_skeletons(
+    expr: &Expr,
+    cell_property: &str,
+    ra_addr: u64,
+) -> Option<Vec<PackedPortSkeleton>> {
+    let pack: i64 = 2;
+    let expected_k = (ra_addr as i64) * pack;
+
+    let mut layers: Vec<PackedPortSkeleton> = Vec::new();
+    let mut cur = expr;
+    loop {
+        match cur {
+            Expr::FunctionCall { name, args } => {
+                if !name.ends_with("applySlot") || args.len() != 4 {
+                    return None;
+                }
+                let (gate_property, addr_property, val_property, k) =
+                    extract_apply_slot_template_layer(&args[1], &args[2], &args[3])?;
+                if k != expected_k {
+                    return None;
+                }
+                layers.push(PackedPortSkeleton {
+                    gate_property,
+                    addr_property,
+                    val_property,
+                });
+                cur = &args[0];
+            }
+            Expr::Var { name, .. } => {
+                if is_packed_keep_var(name, cell_property) {
+                    if layers.is_empty() {
+                        return None;
+                    }
+                    return Some(layers);
+                }
+                return None;
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// Decompose one applySlot layer's trailing three args into its parts and
+/// the constant byte-offset subtracted from the addr variable.
+fn extract_apply_slot_template_layer(
+    gate_arg: &Expr,
+    off_arg: &Expr,
+    val_arg: &Expr,
+) -> Option<(String, String, String, i64)> {
+    let gate_property = match gate_arg {
+        Expr::Var { name, .. } => name.clone(),
+        _ => return None,
+    };
+    let val_property = match val_arg {
+        Expr::Var { name, .. } => name.clone(),
+        _ => return None,
+    };
+    let (addr_property, k) = match off_arg {
+        Expr::Calc(CalcOp::Sub(lhs, rhs)) => {
+            let addr_name = match lhs.as_ref() {
+                Expr::Var { name, .. } => name.clone(),
+                _ => return None,
+            };
+            let k = const_eval_literal(rhs.as_ref())?;
+            if k < 0 {
+                return None;
+            }
+            (addr_name, k)
+        }
+        Expr::Var { name, .. } => (name.clone(), 0),
+        _ => return None,
+    };
+    Some((gate_property, addr_property, val_property, k))
+}
+
+/// Evaluate a literal-only Expr (bare literal or Add/Sub/Mul/Div of
+/// literals) to an integer. Mirrors
+/// `packed_broadcast_write::const_eval` but kept local here so the
+/// parser module stays independent of pattern internals.
+fn const_eval_literal(expr: &Expr) -> Option<i64> {
+    match expr {
+        Expr::Literal(v) => Some(*v as i64),
+        Expr::Calc(op) => match op {
+            CalcOp::Add(a, b) => Some(const_eval_literal(a)? + const_eval_literal(b)?),
+            CalcOp::Sub(a, b) => Some(const_eval_literal(a)? - const_eval_literal(b)?),
+            CalcOp::Mul(a, b) => Some(const_eval_literal(a)? * const_eval_literal(b)?),
+            CalcOp::Div(a, b) => {
+                let bv = const_eval_literal(b)?;
+                if bv == 0 {
+                    return None;
+                }
+                Some(const_eval_literal(a)? / bv)
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Match the innermost keep-var of a packed applySlot chain, e.g.
+/// `var(--__1mc42)` for cell `--mc42`. Mirrors
+/// `packed_broadcast_write::is_simple_keep_var`.
+fn is_packed_keep_var(var_name: &str, cell_property: &str) -> bool {
+    let bare_var = if let Some(rest) = var_name.strip_prefix("--__") {
+        if rest.is_empty() {
+            return false;
+        }
+        &rest[1..]
+    } else if let Some(rest) = var_name.strip_prefix("--") {
+        rest
+    } else {
+        return false;
+    };
+    let bare_cell = cell_property.strip_prefix("--").unwrap_or(cell_property);
+    bare_var == bare_cell
 }
 
 /// Pick three entries to learn the template from. We want three distinct

@@ -10,8 +10,8 @@ use std::collections::{HashMap, HashSet};
 use web_time::Instant;
 
 use crate::compile::{
-    self, is_bit_extract, is_dispatch_identity_read, is_left_shift, is_mod_pow2, is_mul_refs,
-    is_pow2_dispatch, is_right_shift, is_var_ref, CompiledProgram,
+    self, is_bit_extract, is_dispatch_identity_read, is_left_shift,
+    is_mod_pow2, is_mul_refs, is_pow2_dispatch, is_right_shift, is_var_ref, CompiledProgram,
 };
 use crate::pattern::broadcast_write::{self, BroadcastWrite};
 use crate::pattern::dispatch_table::{self, DispatchTable};
@@ -228,6 +228,58 @@ impl Evaluator {
                 gate,
             );
         }
+        // Packed broadcast writes: CSS-DOS PACK_SIZE=2 cell writes via the
+        // nested --applySlot chain. Replaces ~190K ops/tick with ~6 port
+        // checks. The absorbed property set is merged into broadcast_result
+        // so the assignment loop drops them.
+        let mut packed_bw_result =
+            crate::pattern::packed_broadcast_write::recognise_packed_broadcast(
+                &program.assignments,
+            );
+        for name in &packed_bw_result.absorbed_properties {
+            broadcast_result.absorbed_properties.insert(name.clone());
+        }
+        // Merge prebuilt packed ports from the parser fast-path. For any
+        // (gate, addr, val) triple already present in the AST-recognised
+        // result, union the address_map; otherwise push a new port.
+        if !program.prebuilt_packed_broadcast_ports.is_empty() {
+            use std::collections::HashMap;
+            let mut idx_by_key: HashMap<(String, String, String), usize> = HashMap::new();
+            for (i, port) in packed_bw_result.ports.iter().enumerate() {
+                idx_by_key.insert(
+                    (
+                        port.gate_property.clone(),
+                        port.addr_property.clone(),
+                        port.val_property.clone(),
+                    ),
+                    i,
+                );
+            }
+            for pre in &program.prebuilt_packed_broadcast_ports {
+                let key = (
+                    pre.gate_property.clone(),
+                    pre.addr_property.clone(),
+                    pre.val_property.clone(),
+                );
+                if let Some(&i) = idx_by_key.get(&key) {
+                    for (&addr, name) in &pre.address_map {
+                        packed_bw_result.ports[i]
+                            .address_map
+                            .insert(addr, name.clone());
+                    }
+                } else {
+                    idx_by_key.insert(key, packed_bw_result.ports.len());
+                    packed_bw_result.ports.push(pre.clone());
+                }
+            }
+        }
+        for port in &packed_bw_result.ports {
+            log::info!(
+                "Recognised packed broadcast port: gate={} addr={} val={} → {} cells (pack={})",
+                port.gate_property, port.addr_property, port.val_property,
+                port.address_map.len(), packed_bw_result.pack,
+            );
+        }
 
         log::info!("[compile phase] broadcast recognition: {:.2}s", _t.elapsed().as_secs_f64());
         let _t = Instant::now();
@@ -308,6 +360,7 @@ impl Evaluator {
         let compiled = compile::compile(
             &assignments,
             &broadcast_result.writes,
+            &packed_bw_result.ports,
             &functions,
             &dispatch_tables,
         );
@@ -1327,7 +1380,7 @@ fn detect_function_patterns(
             }
         }
 
-        // Dispatch table identity-read
+        // Dispatch table identity-read (one byte per @property)
         if let Some(table) = dispatch_tables.get(name) {
             if is_dispatch_identity_read(table) {
                 patterns.insert(name.clone(), FunctionPattern::IdentityRead);
@@ -1338,8 +1391,12 @@ fn detect_function_patterns(
 
     // Second pass: detect 16-bit read pattern.
     // A function that calls an identity-read function and constructs a word
-    // (lo + hi*256) is a 16-bit read. We detect this by checking if the function
-    // calls an IdentityRead function in its body.
+    // (lo + hi*256) is a 16-bit read. The runtime fast-path uses
+    // `state.read_mem16` which reads from `state.memory[]` directly — that's
+    // ONLY safe for the unpacked layout where bytes live in `memory`. For the
+    // PACK_SIZE=2 layout, bytes live in state_var cells (`mcN`), so we must
+    // NOT promote — let those readers evaluate their bodies normally, which
+    // dispatches through the underlying PackedByteRead fast path twice.
     let identity_read_names: Vec<String> = patterns
         .iter()
         .filter(|(_, p)| matches!(p, FunctionPattern::IdentityRead))
@@ -1868,7 +1925,7 @@ mod tests {
         dispatch_tables: HashMap<String, DispatchTable>,
     ) -> (Evaluator, State) {
         let state = install_test_address_map();
-        let compiled = crate::compile::compile(&[], &[], &functions, &dispatch_tables);
+        let compiled = crate::compile::compile(&[], &[], &[], &functions, &dispatch_tables);
         let function_patterns = detect_function_patterns(&functions, &dispatch_tables);
         let evaluator = Evaluator {
             functions,
