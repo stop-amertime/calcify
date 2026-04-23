@@ -10,8 +10,8 @@ use std::collections::{HashMap, HashSet};
 use web_time::Instant;
 
 use crate::compile::{
-    self, is_bit_extract, is_dispatch_identity_read, is_left_shift, is_mod_pow2, is_mul_refs,
-    is_pow2_dispatch, is_right_shift, is_var_ref, CompiledProgram,
+    self, is_bit_extract, is_dispatch_identity_read, is_left_shift,
+    is_mod_pow2, is_mul_refs, is_pow2_dispatch, is_right_shift, is_var_ref, CompiledProgram,
 };
 use crate::pattern::broadcast_write::{self, BroadcastWrite};
 use crate::pattern::dispatch_table::{self, DispatchTable};
@@ -1327,7 +1327,7 @@ fn detect_function_patterns(
             }
         }
 
-        // Dispatch table identity-read
+        // Dispatch table identity-read (one byte per @property)
         if let Some(table) = dispatch_tables.get(name) {
             if is_dispatch_identity_read(table) {
                 patterns.insert(name.clone(), FunctionPattern::IdentityRead);
@@ -1338,8 +1338,12 @@ fn detect_function_patterns(
 
     // Second pass: detect 16-bit read pattern.
     // A function that calls an identity-read function and constructs a word
-    // (lo + hi*256) is a 16-bit read. We detect this by checking if the function
-    // calls an IdentityRead function in its body.
+    // (lo + hi*256) is a 16-bit read. The runtime fast-path uses
+    // `state.read_mem16` which reads from `state.memory[]` directly — that's
+    // ONLY safe for the unpacked layout where bytes live in `memory`. For the
+    // PACK_SIZE=2 layout, bytes live in state_var cells (`mcN`), so we must
+    // NOT promote — let those readers evaluate their bodies normally, which
+    // dispatches through the underlying PackedByteRead fast path twice.
     let identity_read_names: Vec<String> = patterns
         .iter()
         .filter(|(_, p)| matches!(p, FunctionPattern::IdentityRead))
