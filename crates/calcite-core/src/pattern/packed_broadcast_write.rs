@@ -248,16 +248,21 @@ fn extract_apply_slot_layer(
         Expr::Var { name, .. } => name.clone(),
         _ => return None,
     };
-    // off_arg should be `calc(var(--addr) - K)` where K is a non-negative literal.
+    // off_arg should be `calc(var(--addr) - K)` where K is a non-negative constant.
+    // K may be either a bare literal or `<literal> * <literal>` (kiln emits
+    // `${cellIdx} * ${PACK_SIZE}` so the cell index sits at a position the
+    // parser fast-path can template as an Addr hole; without that split, the
+    // pre-folded base would be classified as a Free hole and the fast-path
+    // would bail on the entire run).
     let (addr_property, cell_byte_addr) = match off_arg {
         Expr::Calc(CalcOp::Sub(lhs, rhs)) => {
             let addr_name = match lhs.as_ref() {
                 Expr::Var { name, .. } => name.clone(),
                 _ => return None,
             };
-            let k = match rhs.as_ref() {
-                Expr::Literal(v) => *v as i64,
-                _ => return None,
+            let k = match const_eval(rhs.as_ref()) {
+                Some(v) => v,
+                None => return None,
             };
             if k < 0 {
                 return None;
@@ -275,6 +280,31 @@ fn extract_apply_slot_layer(
         val_property,
         cell_byte_addr,
     })
+}
+
+/// Evaluate a constant-only expression tree to an integer, or return None
+/// if the expression references any variables or function calls.
+/// Supports bare literals and literal-only Add/Sub/Mul/Div calcs so we can
+/// accept both `K` and `${cellIdx} * ${PACK_SIZE}` as the RHS of the byte
+/// offset subtraction.
+fn const_eval(expr: &Expr) -> Option<i64> {
+    match expr {
+        Expr::Literal(v) => Some(*v as i64),
+        Expr::Calc(op) => match op {
+            CalcOp::Add(a, b) => Some(const_eval(a)? + const_eval(b)?),
+            CalcOp::Sub(a, b) => Some(const_eval(a)? - const_eval(b)?),
+            CalcOp::Mul(a, b) => Some(const_eval(a)? * const_eval(b)?),
+            CalcOp::Div(a, b) => {
+                let bv = const_eval(b)?;
+                if bv == 0 {
+                    return None;
+                }
+                Some(const_eval(a)? / bv)
+            }
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// Match `var(--{prefix}{cell_property})` where prefix is "__0", "__1", "__2",
@@ -310,13 +340,26 @@ mod tests {
         Expr::Literal(v)
     }
 
-    /// Build `calc(var(--addr) - k)`.
+    /// Build `calc(var(--addr) - k)` with a bare literal subtrahend.
+    /// Models the legacy pre-folded emit shape.
     fn off(addr: &str, k: i64) -> Expr {
         if k == 0 {
             // Mirror what the parser may produce for cell 0.
             return var(addr);
         }
         Expr::Calc(CalcOp::Sub(Box::new(var(addr)), Box::new(lit(k as f64))))
+    }
+
+    /// Build `calc(var(--addr) - cellIdx * pack)` with the subtrahend as a
+    /// `Mul(Literal, Literal)`. Models the current kiln emit shape.
+    fn off_mul(addr: &str, cell_idx: i64, pack: i64) -> Expr {
+        Expr::Calc(CalcOp::Sub(
+            Box::new(var(addr)),
+            Box::new(Expr::Calc(CalcOp::Mul(
+                Box::new(lit(cell_idx as f64)),
+                Box::new(lit(pack as f64)),
+            ))),
+        ))
     }
 
     /// Build a six-deep applySlot chain for cell N.
@@ -362,6 +405,38 @@ mod tests {
                 port.address_map.get(&1998).map(|s| s.as_str()),
                 Some("--mc999")
             );
+        }
+    }
+
+    #[test]
+    fn recognises_packed_broadcast_with_mul_offset() {
+        // Build 200 cells whose offset is `calc(var(--addr) - idx * 2)` rather
+        // than the pre-folded `calc(var(--addr) - base)`.  Every other shape
+        // matches the first test.
+        let mut assignments = Vec::new();
+        for cell_idx in 0..200u32 {
+            let cell_prop = format!("--mc{cell_idx}");
+            let mut expr = var(&format!("--__1mc{cell_idx}"));
+            for slot in (0..6).rev() {
+                expr = Expr::FunctionCall {
+                    name: "--applySlot".to_string(),
+                    args: vec![
+                        expr,
+                        var(&format!("--_slot{slot}Live")),
+                        off_mul(&format!("--memAddr{slot}"), cell_idx as i64, 2),
+                        var(&format!("--memVal{slot}")),
+                    ],
+                };
+            }
+            assignments.push(Assignment { property: cell_prop, value: expr });
+        }
+        let result = recognise_packed_broadcast(&assignments);
+        assert_eq!(result.ports.len(), 6);
+        assert_eq!(result.absorbed_properties.len(), 200);
+        for port in &result.ports {
+            assert_eq!(port.address_map.len(), 200);
+            // Cell 7 → byte addr 14.
+            assert_eq!(port.address_map.get(&14).map(|s| s.as_str()), Some("--mc7"));
         }
     }
 

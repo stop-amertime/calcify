@@ -232,12 +232,46 @@ impl Evaluator {
         // nested --applySlot chain. Replaces ~190K ops/tick with ~6 port
         // checks. The absorbed property set is merged into broadcast_result
         // so the assignment loop drops them.
-        let packed_bw_result =
+        let mut packed_bw_result =
             crate::pattern::packed_broadcast_write::recognise_packed_broadcast(
                 &program.assignments,
             );
         for name in &packed_bw_result.absorbed_properties {
             broadcast_result.absorbed_properties.insert(name.clone());
+        }
+        // Merge prebuilt packed ports from the parser fast-path. For any
+        // (gate, addr, val) triple already present in the AST-recognised
+        // result, union the address_map; otherwise push a new port.
+        if !program.prebuilt_packed_broadcast_ports.is_empty() {
+            use std::collections::HashMap;
+            let mut idx_by_key: HashMap<(String, String, String), usize> = HashMap::new();
+            for (i, port) in packed_bw_result.ports.iter().enumerate() {
+                idx_by_key.insert(
+                    (
+                        port.gate_property.clone(),
+                        port.addr_property.clone(),
+                        port.val_property.clone(),
+                    ),
+                    i,
+                );
+            }
+            for pre in &program.prebuilt_packed_broadcast_ports {
+                let key = (
+                    pre.gate_property.clone(),
+                    pre.addr_property.clone(),
+                    pre.val_property.clone(),
+                );
+                if let Some(&i) = idx_by_key.get(&key) {
+                    for (&addr, name) in &pre.address_map {
+                        packed_bw_result.ports[i]
+                            .address_map
+                            .insert(addr, name.clone());
+                    }
+                } else {
+                    idx_by_key.insert(key, packed_bw_result.ports.len());
+                    packed_bw_result.ports.push(pre.clone());
+                }
+            }
         }
         for port in &packed_bw_result.ports {
             log::info!(

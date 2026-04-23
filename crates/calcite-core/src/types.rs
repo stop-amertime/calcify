@@ -270,6 +270,12 @@ pub struct ParsedProgram {
     /// with whatever `pattern::broadcast_write::recognise_broadcast` finds
     /// in `assignments`.
     pub prebuilt_broadcast_writes: Vec<crate::pattern::broadcast_write::BroadcastWrite>,
+    /// Packed slot ports pre-recognised by the fast-path (CSS-DOS PACK_SIZE=2
+    /// `--applySlot(...)` chain shape). Merged with whatever the post-parse
+    /// `pattern::packed_broadcast_write::recognise_packed_broadcast` finds
+    /// on non-absorbed assignments.
+    pub prebuilt_packed_broadcast_ports:
+        Vec<crate::pattern::packed_broadcast_write::PackedSlotPort>,
     /// Property names already absorbed by the fast-path. The evaluator
     /// filters these out of `assignments` and broadcast-write phase 2 by
     /// union with `BroadcastResult::absorbed_properties`.
