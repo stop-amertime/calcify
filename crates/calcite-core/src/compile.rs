@@ -465,6 +465,12 @@ pub struct CompiledProgram {
     /// LoadPackedByte runtime; if returns Some(byte), used instead of the packed
     /// extract. Dense base-keyed Vec avoids HashMap overhead in the hot path.
     pub packed_exception_tables: Vec<PackedExceptionTable>,
+    /// Packed-broadcast write ports (one per CSS-DOS write slot). Each port
+    /// covers all packed `--mc{N}` cells through one slot — at writeback time
+    /// the executor checks the gate, looks up the cell from the byte address,
+    /// and splices in the new byte. Replaces ~190K ops/tick of nested
+    /// `--applySlot` calls with ~6 port checks.
+    pub packed_broadcast_writes: Vec<CompiledPackedBroadcastWrite>,
 }
 
 /// Dense base-keyed lookup table for packed-byte literal exceptions.
@@ -555,6 +561,32 @@ pub struct CompiledSpillover {
     pub guard_slot: Slot,
     /// Map from dest address → (ops to compute high byte, result slot).
     pub entries: HashMap<i64, (Vec<Op>, Slot)>,
+}
+
+/// A compiled packed-broadcast write port — one per memory write slot.
+///
+/// At runtime, when `gate_slot` reads 1, the executor reads the byte address
+/// from `addr_slot`, looks up the cell's state address in `addr_to_cell_addr`
+/// (dense base-keyed Vec), reads the previous cell value, splices in the byte
+/// from `val_slot` based on `addr & 1`, and writes the result back.
+///
+/// One CompiledPackedBroadcastWrite covers all packed cells through one slot.
+/// Slot 0 is applied last so it wins same-cell collisions (matching the CSS
+/// `--applySlot` chain's outermost-wins semantics).
+#[derive(Debug)]
+pub struct CompiledPackedBroadcastWrite {
+    /// Slot holding the per-tick gate (`--_slotKLive`). Skip the port when 0.
+    pub gate_slot: Slot,
+    /// Slot holding the byte address (`--memAddrK`).
+    pub addr_slot: Slot,
+    /// Slot holding the byte value (`--memValK`).
+    pub val_slot: Slot,
+    /// Pack size — bytes per cell (currently always 2).
+    pub pack: u8,
+    /// Dense cell-index → cell-state-address lookup. Index by `byte_addr / pack`.
+    /// 0 means "no cell at this index — drop the write" (state-var addresses
+    /// are always negative, so 0 is a safe sentinel).
+    pub cell_table: Vec<i32>,
 }
 
 /// A flat-array dispatch table — dense `Vec<i32>` keyed by (key - base_key).
@@ -2865,6 +2897,7 @@ pub fn render_progress(phase: &str, done: usize, total: usize, elapsed: f64) {
 pub fn compile(
     assignments: &[Assignment],
     broadcast_writes: &[BroadcastWrite],
+    packed_broadcast_ports: &[crate::pattern::packed_broadcast_write::PackedSlotPort],
     functions: &HashMap<String, FunctionDef>,
     dispatch_tables: &HashMap<String, DispatchTable>,
 ) -> CompiledProgram {
@@ -2941,6 +2974,60 @@ pub fn compile(
     log::info!("[compile detail] broadcast writes total ({} items): {:.2}s",
         broadcast_writes.len(), _ct.elapsed().as_secs_f64());
 
+    // Compile packed-broadcast write ports. Each port becomes a
+    // CompiledPackedBroadcastWrite whose runtime arm reads gate/addr/val,
+    // looks up the cell's state address in cell_table, splices the byte,
+    // and writes back. property_slots was populated above by the assignment
+    // loop, so the lookup for `gate`/`addr`/`val` slots resolves directly
+    // (these properties are always registered by the assignment loop because
+    // the recogniser only fires when their assignments exist).
+    let _ct = web_time::Instant::now();
+    let mut compiled_packed_bw: Vec<CompiledPackedBroadcastWrite> =
+        Vec::with_capacity(packed_broadcast_ports.len());
+    for port in packed_broadcast_ports {
+        // Resolve slots. If any is missing, skip the port — better to fall
+        // back to the non-absorbed `--mc{N}` evaluation than to silently
+        // splice from slot 0.
+        let (Some(&gate_slot), Some(&addr_slot), Some(&val_slot)) = (
+            compiler.property_slots.get(&port.gate_property),
+            compiler.property_slots.get(&port.addr_property),
+            compiler.property_slots.get(&port.val_property),
+        ) else {
+            log::warn!(
+                "Packed broadcast port {} {} {}: missing slot binding, skipping",
+                port.gate_property, port.addr_property, port.val_property
+            );
+            continue;
+        };
+        // Build the dense cell_table indexed by cell index (byte_addr / pack).
+        let pack = port.pack as usize;
+        let max_cell_idx: usize = port
+            .address_map
+            .keys()
+            .map(|&byte_addr| (byte_addr as usize) / pack)
+            .max()
+            .unwrap_or(0);
+        let mut cell_table: Vec<i32> = vec![0; max_cell_idx + 1];
+        for (&byte_addr, var_name) in &port.address_map {
+            let idx = (byte_addr as usize) / pack;
+            if let Some(state_addr) = property_to_address(var_name) {
+                cell_table[idx] = state_addr;
+            }
+        }
+        compiled_packed_bw.push(CompiledPackedBroadcastWrite {
+            gate_slot,
+            addr_slot,
+            val_slot,
+            pack: port.pack,
+            cell_table,
+        });
+    }
+    log::info!(
+        "[compile detail] packed broadcast writes ({} ports): {:.2}s",
+        compiled_packed_bw.len(),
+        _ct.elapsed().as_secs_f64()
+    );
+
     let mut program = CompiledProgram {
         ops,
         slot_count: compiler.next_slot,
@@ -2953,6 +3040,7 @@ pub fn compile(
         property_slots: compiler.property_slots,
         packed_cell_tables: compiler.packed_cell_tables,
         packed_exception_tables: compiler.packed_exception_tables,
+        packed_broadcast_writes: compiled_packed_bw,
     };
 
     // Expand all Op::Call sites inline. Op::Call was a compile-time device to
@@ -4596,6 +4684,42 @@ pub fn execute(program: &CompiledProgram, state: &mut State, slots: &mut Vec<i32
         }
     }
 
+    // Packed broadcast writes: one port per CSS-DOS write slot. Replaces
+    // the absorbed `--mc{N}: --applySlot(...)` chain. We iterate ports in
+    // REVERSE order so slot 0 fires LAST — matching the CSS semantics where
+    // slot 0 is the outermost --applySlot wrapper and wins same-cell
+    // collisions over slots 1..5.
+    for port in program.packed_broadcast_writes.iter().rev() {
+        if slots[port.gate_slot as usize] != 1 {
+            continue;
+        }
+        let byte_addr = slots[port.addr_slot as usize];
+        if byte_addr < 0 {
+            continue;
+        }
+        let pack = port.pack as i32;
+        let cell_idx = (byte_addr / pack) as usize;
+        let off = byte_addr % pack;
+        if cell_idx >= port.cell_table.len() {
+            continue;
+        }
+        let cell_state_addr = port.cell_table[cell_idx];
+        if cell_state_addr == 0 {
+            continue;
+        }
+        let val = slots[port.val_slot as usize] & 0xFF;
+        let prev = state.read_mem(cell_state_addr);
+        let new_cell = if off == 0 {
+            (prev & !0xFF) | val
+        } else {
+            // off == 1: replace high byte (bits 8..15)
+            (prev & 0xFF) | (val << 8)
+        };
+        if new_cell != prev {
+            state.write_mem(cell_state_addr, new_cell);
+        }
+    }
+
     // Runtime REP fast-forward: after the CSS has applied one iteration of a
     // REP string op, collapse the remaining iterations into one bulk memory
     // operation. See rep_fast_forward() for the detection rules.
@@ -5276,6 +5400,36 @@ pub fn execute_profiled(
                     state.write_mem(dest + 1, value);
                 }
             }
+        }
+    }
+    // Packed broadcast writes (mirror the unprofiled path; see execute()).
+    for port in program.packed_broadcast_writes.iter().rev() {
+        if slots[port.gate_slot as usize] != 1 {
+            continue;
+        }
+        let byte_addr = slots[port.addr_slot as usize];
+        if byte_addr < 0 {
+            continue;
+        }
+        let pack = port.pack as i32;
+        let cell_idx = (byte_addr / pack) as usize;
+        let off = byte_addr % pack;
+        if cell_idx >= port.cell_table.len() {
+            continue;
+        }
+        let cell_state_addr = port.cell_table[cell_idx];
+        if cell_state_addr == 0 {
+            continue;
+        }
+        let val = slots[port.val_slot as usize] & 0xFF;
+        let prev = state.read_mem(cell_state_addr);
+        let new_cell = if off == 0 {
+            (prev & !0xFF) | val
+        } else {
+            (prev & 0xFF) | (val << 8)
+        };
+        if new_cell != prev {
+            state.write_mem(cell_state_addr, new_cell);
         }
     }
     let t4 = Instant::now();
@@ -6587,7 +6741,7 @@ mod tests {
             },
         ];
 
-        let program = compile(&assignments, &[], &HashMap::new(), &HashMap::new());
+        let program = compile(&assignments, &[], &[], &HashMap::new(), &HashMap::new());
 
         let mut slots = Vec::new();
         execute(&program, &mut state, &mut slots);
@@ -6656,7 +6810,7 @@ mod tests {
             },
         ];
 
-        let program = compile(&assignments, &[], &HashMap::new(), &HashMap::new());
+        let program = compile(&assignments, &[], &[], &HashMap::new(), &HashMap::new());
 
         let mut slots = Vec::new();
         execute(&program, &mut state, &mut slots);
@@ -6707,7 +6861,7 @@ mod tests {
             },
         }];
 
-        let program = compile(&assignments, &[], &functions, &dispatch_tables);
+        let program = compile(&assignments, &[], &[], &functions, &dispatch_tables);
 
         let mut state = State::default();
         let mut slots = Vec::new();

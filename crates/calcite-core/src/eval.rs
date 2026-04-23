@@ -228,6 +228,24 @@ impl Evaluator {
                 gate,
             );
         }
+        // Packed broadcast writes: CSS-DOS PACK_SIZE=2 cell writes via the
+        // nested --applySlot chain. Replaces ~190K ops/tick with ~6 port
+        // checks. The absorbed property set is merged into broadcast_result
+        // so the assignment loop drops them.
+        let packed_bw_result =
+            crate::pattern::packed_broadcast_write::recognise_packed_broadcast(
+                &program.assignments,
+            );
+        for name in &packed_bw_result.absorbed_properties {
+            broadcast_result.absorbed_properties.insert(name.clone());
+        }
+        for port in &packed_bw_result.ports {
+            log::info!(
+                "Recognised packed broadcast port: gate={} addr={} val={} → {} cells (pack={})",
+                port.gate_property, port.addr_property, port.val_property,
+                port.address_map.len(), packed_bw_result.pack,
+            );
+        }
 
         log::info!("[compile phase] broadcast recognition: {:.2}s", _t.elapsed().as_secs_f64());
         let _t = Instant::now();
@@ -308,6 +326,7 @@ impl Evaluator {
         let compiled = compile::compile(
             &assignments,
             &broadcast_result.writes,
+            &packed_bw_result.ports,
             &functions,
             &dispatch_tables,
         );
@@ -1872,7 +1891,7 @@ mod tests {
         dispatch_tables: HashMap<String, DispatchTable>,
     ) -> (Evaluator, State) {
         let state = install_test_address_map();
-        let compiled = crate::compile::compile(&[], &[], &functions, &dispatch_tables);
+        let compiled = crate::compile::compile(&[], &[], &[], &functions, &dispatch_tables);
         let function_patterns = detect_function_patterns(&functions, &dispatch_tables);
         let evaluator = Evaluator {
             functions,

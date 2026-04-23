@@ -49,6 +49,10 @@ pub struct PackedSlotPort {
     /// Map from byte address (cell_index * 2) → cell variable name (e.g. `--mc42`).
     /// Each port covers all cells; the runtime looks up `addr & !1` here.
     pub address_map: HashMap<i64, String>,
+    /// Pack size in bytes per cell (matches PackedBroadcastResult::pack).
+    /// Carried per-port so downstream code doesn't have to thread the result
+    /// alongside the port slice.
+    pub pack: u8,
 }
 
 /// Result of packed-broadcast pattern recognition.
@@ -122,6 +126,7 @@ pub fn recognise_packed_broadcast(assignments: &[Assignment]) -> PackedBroadcast
                     addr_property: layer.addr_property,
                     val_property: layer.val_property,
                     address_map: HashMap::new(),
+                    pack: 2,
                 });
             port.address_map.insert(cell_byte_addr, assignment.property.clone());
         }
