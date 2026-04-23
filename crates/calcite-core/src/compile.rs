@@ -6380,7 +6380,7 @@ mod tests {
 
         let mut state = State::default();
         let mut slots = vec![0i32; compiler.next_slot as usize];
-        exec_ops(&ops, &[], &[], &[], &[], &[], &mut state, &mut slots);
+        exec_ops(&ops, &[], &[], &[], &[], &[], &[], &mut state, &mut slots);
         assert_eq!(slots[slot as usize], 42);
     }
 
@@ -6398,7 +6398,7 @@ mod tests {
 
         let mut state = State::default();
         let mut slots = vec![0i32; compiler.next_slot as usize];
-        exec_ops(&ops, &[], &[], &[], &[], &[], &mut state, &mut slots);
+        exec_ops(&ops, &[], &[], &[], &[], &[], &[], &mut state, &mut slots);
         assert_eq!(slots[slot as usize], 30);
     }
 
@@ -6417,7 +6417,7 @@ mod tests {
 
         state.set_var("AX", 0x1234);
         let mut slots = vec![0i32; compiler.next_slot as usize];
-        exec_ops(&ops, &[], &[], &[], &[], &[], &mut state, &mut slots);
+        exec_ops(&ops, &[], &[], &[], &[], &[], &[], &mut state, &mut slots);
         assert_eq!(slots[slot as usize], 0x1234);
     }
 
@@ -6451,7 +6451,7 @@ mod tests {
 
         state.set_var("AX", 2);
         let mut slots = vec![0i32; compiler.next_slot as usize];
-        exec_ops(&ops, &[], &[], &[], &[], &[], &mut state, &mut slots);
+        exec_ops(&ops, &[], &[], &[], &[], &[], &[], &mut state, &mut slots);
         assert_eq!(slots[slot as usize], 200);
     }
 
@@ -6518,7 +6518,7 @@ mod tests {
 
         state.set_var("AX", 42);
         let mut slots = vec![0i32; compiler.next_slot as usize];
-        exec_ops(&ops, &compiler.compiled_dispatches, &[], &compiler.compiled_flat_arrays, &compiler.compiled_functions, &compiler.packed_cell_tables, &mut state, &mut slots);
+        exec_ops(&ops, &compiler.compiled_dispatches, &[], &compiler.compiled_flat_arrays, &compiler.compiled_functions, &compiler.packed_cell_tables, &compiler.packed_exception_tables, &mut state, &mut slots);
         assert_eq!(slots[slot as usize], 42);
     }
 
@@ -6569,7 +6569,7 @@ mod tests {
 
         let mut state = State::default();
         let mut slots = vec![0i32; compiler.next_slot as usize];
-        exec_ops(&ops, &[], &[], &[], &[], &[], &mut state, &mut slots);
+        exec_ops(&ops, &[], &[], &[], &[], &[], &[], &mut state, &mut slots);
         assert_eq!(slots[slot as usize], 15);
     }
 
@@ -6629,7 +6629,7 @@ mod tests {
 
         let mut state = State::default();
         let mut slots = vec![0i32; compiler.next_slot as usize];
-        exec_ops(&ops, &[], &[], &[], &compiler.compiled_functions, &[], &mut state, &mut slots);
+        exec_ops(&ops, &[], &[], &[], &compiler.compiled_functions, &[], &[], &mut state, &mut slots);
         assert_eq!(slots[slot as usize], 42);
     }
 
@@ -6796,6 +6796,7 @@ mod tests {
             &compiler.compiled_flat_arrays,
             &compiler.compiled_functions,
             &compiler.packed_cell_tables,
+            &compiler.packed_exception_tables,
             &mut state,
             &mut slots,
         );
@@ -6816,6 +6817,7 @@ mod tests {
             &compiler.compiled_flat_arrays,
             &compiler.compiled_functions,
             &compiler.packed_cell_tables,
+            &compiler.packed_exception_tables,
             &mut state,
             &mut slots2,
         );
