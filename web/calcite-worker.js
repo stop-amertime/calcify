@@ -250,7 +250,7 @@ self.onmessage = async function (event) {
           const vram = engine.read_memory_range(mode.vramAddr, 0x4000);
           const palReg = engine.read_memory_range(0x04F3, 1)[0] | 0;
           outRGBA = getOutBuffer();
-          decodeCga4(vram, palReg, outRGBA);
+          decodeCga4(vram, palReg, outRGBA, { mono: !!mode.mono });
           rendered = true;
         }
 

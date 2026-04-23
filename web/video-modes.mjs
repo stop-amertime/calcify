@@ -79,7 +79,7 @@ export function pickMode(modeByte) {
   return MODE_TABLE[modeByte] || null;
 }
 
-// ---------- CGA mode 0x04 decoder ----------
+// ---------- CGA mode 0x04 / 0x05 decoder ----------
 //
 // 320×200 at 2 bits per pixel, with even/odd scanline interleave:
 //   0xB8000 + offset  even scanlines (0, 2, 4, ... 198)
@@ -93,6 +93,14 @@ export function pickMode(modeByte) {
 // In real CGA "brown" becomes "yellow" when the intensity bit flips for
 // colour 3 — we use the same VGA_PALETTE_U32 indices DOSBox picks
 // (index 6 = brown, 14 = yellow).
+//
+// Mode 0x05 is bit-identical to 0x04 except the CGA colour-burst signal
+// is disabled; on a composite monitor this collapses the three colours
+// to three shades of grey. On TTL (digital RGB) monitors mode 5 and
+// mode 4 look the same — but games that request mode 5 want the mono
+// look, so we render mode 5 with a black/dark-grey/light-grey/white
+// palette regardless of the palette-register bits. The background byte
+// (0x04F3 bits 3..0) is honoured in mode 5 just like mode 4.
 const CGA_PAL_VGA_INDICES = [
   // [_, colour1, colour2, colour3], colour 0 is the bg from reg bits 3..0
   // palette 0, intensity 0
@@ -105,11 +113,26 @@ const CGA_PAL_VGA_INDICES = [
   [null, 11, 13, 15],
 ];
 
-export function decodeCga4(vram16k, paletteReg, outRGBA) {
-  const palette1 = (paletteReg >> 5) & 1;
-  const intensity = (paletteReg >> 4) & 1;
+// Mode 5 fixed palette: four greys, ignoring palette-select & intensity.
+// Chosen to match DOSBox's composite-monitor approximation:
+//   colour 1 = dark grey (VGA index  8 = 0x555555)
+//   colour 2 = light grey (VGA index 7 = 0xAAAAAA)
+//   colour 3 = white     (VGA index 15 = 0xFFFFFF)
+// Colour 0 still comes from the bg-register nibble so programs that
+// change mode-5 background still work.
+const CGA_MONO_INDICES = [null, 8, 7, 15];
+
+export function decodeCga4(vram16k, paletteReg, outRGBA, opts = {}) {
+  const mono = !!opts.mono;
   const bgIdx = paletteReg & 0x0F;
-  const bank = CGA_PAL_VGA_INDICES[palette1 * 2 + intensity];
+  let bank;
+  if (mono) {
+    bank = CGA_MONO_INDICES;
+  } else {
+    const palette1 = (paletteReg >> 5) & 1;
+    const intensity = (paletteReg >> 4) & 1;
+    bank = CGA_PAL_VGA_INDICES[palette1 * 2 + intensity];
+  }
   const pal = [
     VGA_PALETTE_U32[bgIdx],
     VGA_PALETTE_U32[bank[1]],
