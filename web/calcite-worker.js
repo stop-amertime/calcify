@@ -37,7 +37,7 @@
  * file that both renderers already consume.
  */
 
-import { pickMode, decodeCga4, rasteriseText } from './video-modes.mjs';
+import { pickMode, decodeCga4, decodeCga2, rasteriseText } from './video-modes.mjs';
 
 let engine = null;
 let sharedFramebuffer = null;  // Uint8Array view over the main-thread SAB
@@ -251,6 +251,12 @@ self.onmessage = async function (event) {
           const palReg = engine.read_memory_range(0x04F3, 1)[0] | 0;
           outRGBA = getOutBuffer();
           decodeCga4(vram, palReg, outRGBA, { mono: !!mode.mono });
+          rendered = true;
+        } else if (mode && mode.kind === 'cga2') {
+          const vram = engine.read_memory_range(mode.vramAddr, 0x4000);
+          const palReg = engine.read_memory_range(0x04F3, 1)[0] | 0;
+          outRGBA = getOutBuffer();
+          decodeCga2(vram, palReg, outRGBA);
           rendered = true;
         }
 

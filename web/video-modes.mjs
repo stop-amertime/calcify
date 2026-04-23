@@ -48,6 +48,7 @@ export const MODE_TABLE = {
   0x03: { kind: 'text',   width: 640, height: 400, vramAddr: 0xB8000, textCols: 80, textRows: 25 },
   0x04: { kind: 'cga4',   width: 320, height: 200, vramAddr: 0xB8000 },
   0x05: { kind: 'cga4',   width: 320, height: 200, vramAddr: 0xB8000, mono: true },
+  0x06: { kind: 'cga2',   width: 640, height: 200, vramAddr: 0xB8000 },
   0x07: { kind: 'text',   width: 720, height: 400, vramAddr: 0xB8000, textCols: 80, textRows: 25 },
   0x13: { kind: 'mode13', width: 320, height: 200, vramAddr: 0xA0000 },
 };
@@ -157,6 +158,64 @@ export function decodeCga4(vram16k, paletteReg, outRGBA, opts = {}) {
         out32[px + 1] = pal[(b >> 4) & 3];
         out32[px + 2] = pal[(b >> 2) & 3];
         out32[px + 3] = pal[ b       & 3];
+      }
+    }
+  }
+}
+
+// ---------- CGA mode 0x06 decoder ----------
+//
+// 640×200 at 1 bit per pixel — CGA's "high res" mode. Same even/odd
+// scanline interleave as mode 0x04, and the same 16 KB aperture at
+// 0xB8000 (plane 0 at 0x0000, plane 1 at 0x2000), but now each byte
+// packs 8 pixels (MSB-first, bit 7 = leftmost).
+//
+// Colours: the IBM CGA spec says colour 0 is fixed black and colour 1
+// is white. On a real card the palette register at port 0x3D9 is
+// largely ignored in mode 6 — the low nibble of that register does
+// pick the "foreground" colour on some CGA clones (and on later VGA
+// cards emulating CGA), so we honour bits 3..0 of the palette reg as
+// the colour-1 index. Bits 4/5 are unused. Colour 0 is always black.
+//
+// The overwhelming majority of mode-6 software writes black-on-white
+// (palette reg untouched → foreground = 0 = black, OR intensity bit
+// accidentally flipped → foreground = 8 → dark grey). To match real
+// hardware for the common case, foreground defaults to white (VGA 15)
+// when the palette-reg low nibble is 0; games that actively program
+// the low nibble to a non-zero value get the colour they asked for.
+export function decodeCga2(vram16k, paletteReg, outRGBA) {
+  const fgNibble = paletteReg & 0x0F;
+  // IBM stock behaviour: fg is always white. Clones vary. We honour a
+  // non-zero nibble (so games that choose a colour get it), and fall
+  // through to white when the nibble is 0 (the standard "no palette
+  // write" case after INT 10h AH=00h sets mode 6).
+  const fgIdx = (fgNibble === 0) ? 15 : fgNibble;
+  const pal = [
+    VGA_PALETTE_U32[0],      // colour 0 = black (hard-wired)
+    VGA_PALETTE_U32[fgIdx],  // colour 1 = foreground
+  ];
+  const out32 = new Uint32Array(outRGBA.buffer, outRGBA.byteOffset, (outRGBA.byteLength / 4) | 0);
+  // Same scanline interleave as mode 4, just at 640 pixels wide and
+  // 1 bpp instead of 2 bpp. Each plane holds 100 scanlines × 80 bytes
+  // = 8000 bytes; the remaining 192 bytes per plane are unused.
+  const SCANLINE_BYTES = 80;
+  for (let plane = 0; plane < 2; plane++) {
+    const planeBase = plane * 0x2000;
+    for (let py = 0; py < 100; py++) {
+      const y = py * 2 + plane;
+      const srcRow = planeBase + py * SCANLINE_BYTES;
+      const dstRow = y * 640;
+      for (let bx = 0; bx < SCANLINE_BYTES; bx++) {
+        const b = vram16k[srcRow + bx];
+        const px = dstRow + bx * 8;
+        out32[px    ] = pal[(b >> 7) & 1];
+        out32[px + 1] = pal[(b >> 6) & 1];
+        out32[px + 2] = pal[(b >> 5) & 1];
+        out32[px + 3] = pal[(b >> 4) & 1];
+        out32[px + 4] = pal[(b >> 3) & 1];
+        out32[px + 5] = pal[(b >> 2) & 1];
+        out32[px + 6] = pal[(b >> 1) & 1];
+        out32[px + 7] = pal[ b       & 1];
       }
     }
   }
