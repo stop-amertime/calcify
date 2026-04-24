@@ -226,6 +226,19 @@ Key facts (2026-04-14, v4 CSS):
 
 ### Conformance testing — the main debugging workflow
 
+**The conformance harness lives in `../CSS-DOS/tests/harness/`.** Use
+
+    node ../CSS-DOS/tests/harness/pipeline.mjs fulldiff <cabinet>.css --max-ticks=10000
+
+as the first-line divergence finder. See
+[`../CSS-DOS/docs/TESTING.md`](../CSS-DOS/docs/TESTING.md) and
+`../CSS-DOS/tests/harness/README.md` for the full tool list.
+
+The legacy tools in `tools/fulldiff.mjs`, `tools/ref-dos.mjs`, and
+`tools/diagnose.mjs` depend on the deleted `../CSS-DOS/transpiler/` and
+don't run — their headers now say so. Don't try to "fix" them; the
+harness is the replacement.
+
 **Read `docs/conformance-testing.md` before doing any debugging work.** It
 has the full tool reference, usage examples, and step-by-step workflows.
 

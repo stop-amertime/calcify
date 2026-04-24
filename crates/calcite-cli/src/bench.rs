@@ -462,6 +462,7 @@ fn main() {
     let mut state = calcite_core::State::default();
     state.load_properties(&parsed.properties);
     let mut evaluator = calcite_core::Evaluator::from_parsed(&parsed);
+    evaluator.wire_state_for_packed_memory(&mut state);
     let compile_time = t_compile_start.elapsed().as_secs_f64();
 
     let halt_addr: Option<i32> = args.halt.as_ref().map(|s| {
@@ -511,6 +512,7 @@ fn main() {
             state = calcite_core::State::default();
             state.load_properties(&parsed.properties);
             evaluator = calcite_core::Evaluator::from_parsed(&parsed);
+            evaluator.wire_state_for_packed_memory(&mut state);
             if args.warmup > 0 {
                 for _ in 0..args.warmup {
                     evaluator.tick(&mut state);

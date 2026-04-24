@@ -291,6 +291,12 @@ fn main() {
             let mut evaluator = calcite_core::Evaluator::from_parsed(&parsed);
             let compile_time = t1.elapsed();
 
+            // Packed-cell cabinets (PACK_SIZE > 1) keep guest memory in
+            // `mcN` state vars, not in `state.memory[]`. Without this call
+            // every positive-address read returns 0 even though the CPU
+            // wrote the value — see Evaluator::wire_state_for_packed_memory.
+            evaluator.wire_state_for_packed_memory(&mut state);
+
             // Interactive iff --ticks is omitted; in that case run unlimited.
             let interactive = cli.ticks.is_none();
             let ticks_limit: u32 = cli.ticks.unwrap_or(u32::MAX);

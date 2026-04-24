@@ -121,6 +121,136 @@ fn default_mem_len() -> usize {
     256
 }
 
+/// Params for `diff_packed_memory`. Two sessions are stepped forward in
+/// lockstep; at each tick a byte-level view of memory derived from the
+/// appropriate storage (plain per-byte state vars in `ref_session`,
+/// packed `mc{N}` cells in `test_session`) is compared. The tool returns
+/// the first (tick, linear_addr) where the byte views disagree, or
+/// reports convergence if `max_ticks` is exhausted without a mismatch.
+#[derive(Deserialize, schemars::JsonSchema)]
+struct DiffPackedMemoryParams {
+    /// Reference session name — expected to use per-byte `--m{N}` storage (PACK_SIZE=1).
+    ref_session: String,
+    /// Test session name — expected to use packed `--mc{N}` storage (PACK_SIZE=2).
+    test_session: String,
+    /// Maximum ticks to step before giving up. Defaults to 10,000.
+    #[serde(default = "default_diff_max")]
+    max_ticks: u32,
+    /// Inclusive linear start address. Defaults to 0.
+    #[serde(default)]
+    addr_start: Option<i32>,
+    /// Exclusive linear end address. Defaults to 0xA0000 (640 KB conventional).
+    #[serde(default)]
+    addr_end: Option<i32>,
+    /// Pack size of the test session's cells (bytes per cell). Defaults to 2.
+    #[serde(default = "default_diff_pack")]
+    pack: u8,
+}
+fn default_diff_max() -> u32 { 10_000 }
+fn default_diff_pack() -> u8 { 2 }
+
+#[derive(Serialize, schemars::JsonSchema)]
+struct DiffPackedMemoryResult {
+    /// True if both sessions agreed byte-for-byte through `ticks_stepped`.
+    converged: bool,
+    /// Ticks actually stepped. Equals `max_ticks` on convergence, or the tick
+    /// where divergence was detected (both sessions are advanced to this tick).
+    ticks_stepped: u32,
+    /// Linear address of the first divergence, or None if converged.
+    first_diff_addr: Option<i32>,
+    /// Reference byte at `first_diff_addr`, or None if converged.
+    ref_byte: Option<u8>,
+    /// Test byte at `first_diff_addr`, or None if converged.
+    test_byte: Option<u8>,
+    /// CPU state (CS/IP, all six write slots) from the ref session at the
+    /// divergence tick. Enough context to determine whether the two
+    /// sessions intended the same memory write or diverged earlier in
+    /// decode. None when converged.
+    ref_cpu: Option<DiffCpuContext>,
+    /// Same for the test session.
+    test_cpu: Option<DiffCpuContext>,
+    /// Human-readable summary.
+    summary: String,
+}
+
+/// CPU context captured at the divergence tick — just enough to tell
+/// whether the CPU in both sessions was trying to do the same write.
+#[derive(Serialize, schemars::JsonSchema)]
+struct DiffCpuContext {
+    cs: i32,
+    ip: i32,
+    /// `(addr, val)` for every write slot whose addr is non-negative
+    /// (the CPU's encoding uses -1 for "unused"). In slot order 0..5.
+    writes: Vec<DiffWriteSlot>,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+struct DiffWriteSlot {
+    slot: u8,
+    addr: i32,
+    val: i32,
+    live: i32,
+}
+
+/// Params for `inspect_packed_cell_table`. Looks up a cell index in the
+/// compiled packed-cell address table and reads back the current state
+/// value (and the interpreter's view, for cross-check).
+#[derive(Deserialize, schemars::JsonSchema)]
+struct InspectPackedCellParams {
+    /// Session name. Required.
+    session: String,
+    /// Cell index (N in `mcN`) to inspect.
+    cell_index: u32,
+    /// Which packed cell table to read from. Defaults to 0 (the first / usually only).
+    #[serde(default)]
+    table_id: Option<u32>,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+struct InspectPackedCellResult {
+    /// Cell index that was inspected.
+    cell_index: u32,
+    /// Number of entries in the chosen packed cell table. `cell_index >= table_len`
+    /// means LoadPackedByte would fall back to cell_addr=0 and return 0.
+    table_len: usize,
+    /// The state-var address stored in `packed_cell_tables[table_id][cell_index]`.
+    /// Should be negative (state var) for a valid cell. 0 means "no entry" — any
+    /// LoadPackedByte for a byte inside this cell will return 0.
+    cell_addr: i32,
+    /// `state.read_mem(cell_addr)`. If `cell_addr` is 0 this is also 0. Otherwise
+    /// the current packed cell value (two bytes, low in bits 0..7, high in 8..15).
+    cell_value_via_cell_addr: i32,
+    /// The state-var index that `mcN` is actually assigned to, via the address map.
+    /// Negative (state-var convention). `None` if `mcN` is not a recognised state var.
+    expected_state_var_addr: Option<i32>,
+    /// State-var value read through the expected address, independent of the
+    /// packed cell table. If `cell_value_via_cell_addr != this` the packed
+    /// cell table entry is wrong (mismatched address → LoadPackedByte reads
+    /// a different cell than the CSS intended).
+    expected_state_var_value: Option<i32>,
+    /// If there's a literal-exception entry in `packed_exception_tables[table_id]`
+    /// for the low byte at cell_index*pack, its value. Takes precedence over the
+    /// packed extract in LoadPackedByte.
+    exception_low: Option<i32>,
+    /// Same for the high byte at cell_index*pack + 1.
+    exception_high: Option<i32>,
+    /// Pack size (bytes per cell) for this table.
+    pack: u8,
+    /// Total number of packed cell tables in the compiled program.
+    total_tables: usize,
+    /// Whether `mcN` exists in state.state_var_index (bare name, no dashes).
+    state_var_index_has_bare: bool,
+    /// state_var index for `mcN` if present.
+    state_var_index_value: Option<usize>,
+    /// Lookup result for `property_to_address("mcN")` — without the `--` prefix.
+    /// This is what `get_or_build_packed_cell_table` actually calls. If this
+    /// is `None` while `expected_state_var_addr` is `Some`, there's a
+    /// dash-stripping bug in property_to_address.
+    property_to_address_without_dashes: Option<i32>,
+    /// Summary string explaining the result.
+    summary: String,
+}
+
 #[derive(Deserialize, schemars::JsonSchema)]
 struct ScreenParams {
     /// Linear address of video memory. Defaults to detected video region or 0xB8000.
@@ -1377,6 +1507,29 @@ struct RunJob {
 
 static JOB_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+/// Snapshot CS/IP and every live memory write slot on a state. Used by
+/// `diff_packed_memory` to attach CPU context to a divergence report.
+///
+/// The 6 write slots mirror the CSS-DOS convention: per-tick `--memAddrN`
+/// / `--memValN` / `--_slotNLive` triples. Live==0 means the slot was
+/// not requested this tick; we include it anyway so the caller can see
+/// "no slot fired" vs "slot fired but with zeros".
+fn snapshot_cpu_context(state: &calcite_core::State) -> DiffCpuContext {
+    let cs = state.get_var("CS").unwrap_or(0);
+    let ip = state.get_var("IP").unwrap_or(0);
+    let mut writes = Vec::with_capacity(6);
+    for slot in 0u8..6 {
+        let addr = state.get_var(&format!("memAddr{slot}")).unwrap_or(-1);
+        let val = state.get_var(&format!("memVal{slot}")).unwrap_or(0);
+        // Slot-live is an underscore-prefixed helper (`--_slotNLive`).
+        // `to_bare_name` strips `--__1` etc. but not `_` — the name in
+        // state_var_index is the leading-underscore form.
+        let live = state.get_var(&format!("_slot{slot}Live")).unwrap_or(0);
+        writes.push(DiffWriteSlot { slot, addr, val, live });
+    }
+    DiffCpuContext { cs, ip, writes }
+}
+
 fn invalid_params(msg: impl Into<String>) -> ErrorData {
     ErrorData::invalid_params(msg.into(), None)
 }
@@ -1429,6 +1582,14 @@ fn load_css(path: &std::path::Path, base_interval: u32) -> Result<DebugSession, 
     if let Some(table) = evaluator.dispatch_tables.get("--readMem") {
         state.populate_memory_from_readmem(table);
     }
+
+    // Packed-cell cabinets (PACK_SIZE > 1) store guest memory in `mcN`
+    // state-var cells, not in `state.memory[]`. `State::read_mem` has a
+    // cell-lookup code path, but it's gated on `state.packed_cell_table`
+    // being populated — the compiled program has the data, but nothing
+    // was copying it into State. Use the shared helper so every consumer
+    // (debugger, wasm, CLI, tests) stays in sync.
+    evaluator.wire_state_for_packed_memory(&mut state);
 
     let property_names: Vec<String> = evaluator
         .assignments
@@ -1922,6 +2083,215 @@ impl DebuggerHandler {
             register_diffs,
             memory_diffs,
             total_diffs,
+        }))
+    }
+
+    #[tool(
+        description = "Step two sessions in lockstep, comparing a byte-level view of memory derived from their respective storage conventions (per-byte `--m{N}` vars in `ref_session`, packed `--mc{N}` cells in `test_session`). Returns the first (tick, linear_addr) where the byte views diverge, or reports convergence if `max_ticks` exhausts. Designed specifically for diagnosing PACK_SIZE=1 vs PACK_SIZE=2 correctness regressions — the two cabinets run the same program, so any byte-level divergence is a packed-memory bug."
+    )]
+    fn diff_packed_memory(
+        &self,
+        Parameters(p): Parameters<DiffPackedMemoryParams>,
+    ) -> Result<Json<DiffPackedMemoryResult>, ErrorData> {
+        let ref_arc = self.get_session(&p.ref_session)?;
+        let test_arc = self.get_session(&p.test_session)?;
+        if Arc::ptr_eq(&ref_arc, &test_arc) {
+            return Err(invalid_params(
+                "ref_session and test_session must be distinct".to_string(),
+            ));
+        }
+        // Deadlock guard: always lock in (ref, test) order. Since distinct
+        // sessions are distinct Mutexes there's no cross-locking hazard with
+        // other tools, but defining a consistent order is still good hygiene.
+        let mut ref_guard = ref_arc.lock().unwrap();
+        let mut test_guard = test_arc.lock().unwrap();
+
+        let addr_start = p.addr_start.unwrap_or(0);
+        let addr_end = p.addr_end.unwrap_or(0xA_0000);
+        let pack = p.pack.max(1) as i32;
+        if addr_end <= addr_start {
+            return Err(invalid_params(
+                format!("addr_end ({addr_end}) must be > addr_start ({addr_start})"),
+            ));
+        }
+
+        // Pre-resolve test-session cell state var slots for every cell that
+        // overlaps [addr_start, addr_end). Skipping name lookups in the inner
+        // loop turns the per-tick cost from a HashMap probe per byte into a
+        // direct array index per byte.
+        let first_cell = (addr_start as i64 / pack as i64) as usize;
+        let last_cell_inclusive = ((addr_end as i64 - 1) / pack as i64) as usize;
+        let mut cell_slot: Vec<Option<usize>> = Vec::with_capacity(last_cell_inclusive + 1 - first_cell);
+        for cell_n in first_cell..=last_cell_inclusive {
+            let name = format!("mc{cell_n}");
+            cell_slot.push(test_guard.state.var_slot(&name));
+        }
+
+        // Helper that extracts the test-session byte at linear `addr`.
+        // Uses the precomputed `cell_slot` for the enclosing cell.
+        let read_test_byte = |test: &DebugSession, addr: i32| -> u8 {
+            let addr_usize = addr as i64;
+            let cell_n = (addr_usize / pack as i64) as usize;
+            let rel = cell_n - first_cell;
+            let slot = cell_slot.get(rel).copied().flatten();
+            match slot {
+                Some(i) => {
+                    let cell = test.state.state_vars[i];
+                    let off = (addr_usize % pack as i64) as u32;
+                    ((cell >> (8 * off)) & 0xFF) as u8
+                }
+                None => {
+                    // No packed cell declared for this address. Fall back to
+                    // the plain memory array so addresses outside the packed
+                    // set (if any — shouldn't happen for well-formed carts)
+                    // still get a value rather than a bogus zero.
+                    (test.state.read_mem(addr) & 0xFF) as u8
+                }
+            }
+        };
+
+        let max_ticks = p.max_ticks;
+        for _ in 0..max_ticks {
+            ref_guard.step_one_no_log();
+            test_guard.step_one_no_log();
+            // Check tick-aligned after both step. This means on divergence
+            // both sessions have executed the SAME number of ticks, making
+            // the "first tick of divergence" report symmetric.
+            for addr in addr_start..addr_end {
+                let ref_byte = (ref_guard.state.read_mem(addr) & 0xFF) as u8;
+                let test_byte = read_test_byte(&test_guard, addr);
+                if ref_byte != test_byte {
+                    let tick = ref_guard.current_tick();
+                    let ref_cpu = snapshot_cpu_context(&ref_guard.state);
+                    let test_cpu = snapshot_cpu_context(&test_guard.state);
+                    return Ok(Json(DiffPackedMemoryResult {
+                        converged: false,
+                        ticks_stepped: tick,
+                        first_diff_addr: Some(addr),
+                        ref_byte: Some(ref_byte),
+                        test_byte: Some(test_byte),
+                        ref_cpu: Some(ref_cpu),
+                        test_cpu: Some(test_cpu),
+                        summary: format!(
+                            "diverged at tick {tick}, addr 0x{addr:X}: ref=0x{ref_byte:02X} test=0x{test_byte:02X}"
+                        ),
+                    }));
+                }
+            }
+        }
+        Ok(Json(DiffPackedMemoryResult {
+            converged: true,
+            ticks_stepped: max_ticks,
+            first_diff_addr: None,
+            ref_byte: None,
+            test_byte: None,
+            ref_cpu: None,
+            test_cpu: None,
+            summary: format!("converged through {max_ticks} ticks over [0x{addr_start:X}, 0x{addr_end:X})"),
+        }))
+    }
+
+    // (snapshot_cpu_context is defined below as a free fn — it doesn't need
+    // self, and keeping it free-standing avoids extra method plumbing for a
+    // helper used only by diff_packed_memory.)
+
+    #[tool(
+        description = "Inspect an entry in the compiled packed-cell address table for a PACK_SIZE>1 cabinet. Returns the state-var address stored in `packed_cell_tables[table_id][cell_index]`, the current cell value read through that address, and the value read directly from the state-var by name for cross-check. If `cell_addr == 0` or `cell_value_via_cell_addr != expected_state_var_value`, the packed cell table has a bad entry and LoadPackedByte will return wrong values for any byte in this cell. Also reports any literal-exception entries that would override the packed extract."
+    )]
+    fn inspect_packed_cell(
+        &self,
+        Parameters(p): Parameters<InspectPackedCellParams>,
+    ) -> Result<Json<InspectPackedCellResult>, ErrorData> {
+        let sess = self.get_session(&p.session)?;
+        let guard = sess.lock().unwrap();
+        let s = &*guard;
+        let compiled = s.evaluator.compiled();
+        let total_tables = compiled.packed_cell_tables.len();
+        let tid = p.table_id.unwrap_or(0) as usize;
+        if tid >= total_tables {
+            return Err(invalid_params(format!(
+                "table_id {tid} out of range (compiled program has {total_tables} packed cell tables)"
+            )));
+        }
+        let table = &compiled.packed_cell_tables[tid];
+        let table_len = table.len();
+        let cell_index = p.cell_index as usize;
+        let cell_addr = if cell_index < table_len { table[cell_index] } else { 0 };
+        let cell_value_via_cell_addr = if cell_addr == 0 { 0 } else { s.state.read_mem(cell_addr) };
+
+        // Cross-check: resolve `mcN` via the address map directly. This is the
+        // address the cell table SHOULD contain (modulo 0 for "cell not present").
+        let cell_name = format!("--mc{}", p.cell_index);
+        let expected_state_var_addr = calcite_core::eval::property_to_address(&cell_name);
+        let expected_state_var_value = expected_state_var_addr.map(|addr| s.state.read_mem(addr));
+
+        // Cross-check: what does property_to_address see WITHOUT the leading `--`?
+        // This is what `get_or_build_packed_cell_table` actually calls.
+        let bare_name = format!("mc{}", p.cell_index);
+        let property_to_address_without_dashes =
+            calcite_core::eval::property_to_address(&bare_name);
+
+        // Cross-check: bare name lookup via state.get_var.
+        let state_var_index_value = s.state.get_var(&bare_name).map(|_| 0usize);
+        let _ = state_var_index_value; // placeholder (exact index is not exposed)
+        let state_var_index_has_bare = s.state.get_var(&bare_name).is_some();
+        let state_var_index_value: Option<usize> = if state_var_index_has_bare {
+            // Look up by name in state_var_names for a linear scan — only cheap
+            // for diagnostics; fine here.
+            s.state
+                .state_var_names
+                .iter()
+                .position(|n| n == &bare_name)
+        } else {
+            None
+        };
+
+        // Pack size — read from the first broadcast-write port if available.
+        // Packed writes and packed reads must agree on pack size.
+        let pack = compiled.packed_broadcast_writes.first().map(|p| p.pack).unwrap_or(2);
+
+        // Literal exceptions at this cell's byte addresses.
+        let exc = &compiled.packed_exception_tables[tid];
+        let low_key = (cell_index * pack as usize) as i32;
+        let high_key = low_key + 1;
+        let exception_low = exc.get(low_key);
+        let exception_high = exc.get(high_key);
+
+        let summary = if cell_addr == 0 {
+            format!(
+                "cell_index={} has cell_addr=0 in table {} (len={}). LoadPackedByte will return 0 for bytes {} and {}. Expected state-var addr: {:?}",
+                p.cell_index, tid, table_len, low_key, high_key, expected_state_var_addr
+            )
+        } else if expected_state_var_addr != Some(cell_addr) {
+            format!(
+                "cell_addr MISMATCH: table has {}, but expected {:?} (cell_name={}). LoadPackedByte is reading the WRONG state var for cells that hash to this index.",
+                cell_addr, expected_state_var_addr, cell_name
+            )
+        } else {
+            format!(
+                "cell OK: addr={}, value={} (low={}, high={}). Expected addr matches.",
+                cell_addr,
+                cell_value_via_cell_addr,
+                cell_value_via_cell_addr & 0xFF,
+                (cell_value_via_cell_addr >> 8) & 0xFF
+            )
+        };
+
+        Ok(Json(InspectPackedCellResult {
+            cell_index: p.cell_index,
+            table_len,
+            cell_addr,
+            cell_value_via_cell_addr,
+            expected_state_var_addr,
+            expected_state_var_value,
+            exception_low,
+            exception_high,
+            pack,
+            total_tables,
+            state_var_index_has_bare,
+            state_var_index_value,
+            property_to_address_without_dashes,
+            summary,
         }))
     }
 

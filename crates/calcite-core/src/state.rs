@@ -71,6 +71,16 @@ pub struct State {
     /// Optional per-tick write log. When `Some`, every `write_mem` call
     /// appends `(addr, value)`. Used by the memoisation-viability probe.
     pub write_log: Option<Vec<(i32, i32)>>,
+    /// Packed-memory cell table: `packed_cell_table[cell_idx] = state_var_addr`
+    /// (always negative; 0 means "no cell at this index"). When non-empty, it's
+    /// installed at compile time by `CalciteEngine::new` from the compiled
+    /// program's `packed_broadcast_writes[0].cell_table`. Reads through
+    /// `read_mem` at positive linear addresses consult this table first so
+    /// consumers (renderer, debugger, video-mode probes) see packed bytes as
+    /// if they lived at their natural linear addresses.
+    pub packed_cell_table: Vec<i32>,
+    /// Bytes per packed cell (2 in current CSS-DOS). 0 means "no packed layout".
+    pub packed_cell_size: u8,
 }
 
 impl State {
@@ -86,6 +96,8 @@ impl State {
             frame_counter: 0,
             read_log: std::cell::RefCell::new(None),
             write_log: None,
+            packed_cell_table: Vec::new(),
+            packed_cell_size: 0,
         }
     }
 
@@ -184,6 +196,14 @@ impl State {
     /// Address conventions:
     /// - Negative: state variables (slot index = -addr - 1)
     /// - `0..`: memory bytes
+    ///
+    /// Packed cabinets store guest memory in state-var cells, not in
+    /// `self.memory[]`. For positive guest addresses we consult the packed
+    /// cell table first — that is the authoritative storage that the CPU's
+    /// compiled LoadPackedByte op reads. Only on a miss (no cell declared
+    /// for this byte) do we fall back to the flat `self.memory[]` shadow.
+    /// On unpacked cabinets `packed_cell_table` is empty and the shadow is
+    /// authoritative.
     pub fn read_mem(&self, addr: i32) -> i32 {
         let v = if addr < 0 {
             let idx = (-addr - 1) as usize;
@@ -194,6 +214,29 @@ impl State {
             }
         } else {
             let addr_u = addr as usize;
+            // Packed-cell path first, for any positive address. Packed
+            // cells cover conventional RAM (0..0xA0000) on most cabinets
+            // and also out-of-range regions like the VGA DAC at 0x100000
+            // that live above 1 MB; those cells are emitted by kiln for
+            // both, so a single lookup covers both cases.
+            if !self.packed_cell_table.is_empty() && self.packed_cell_size > 0 {
+                let pack = self.packed_cell_size as usize;
+                let cell_idx = addr_u / pack;
+                if cell_idx < self.packed_cell_table.len() {
+                    let cell_addr = self.packed_cell_table[cell_idx];
+                    if cell_addr < 0 {
+                        let sidx = (-cell_addr - 1) as usize;
+                        if sidx < self.state_vars.len() {
+                            let cell = self.state_vars[sidx];
+                            let off = addr_u % pack;
+                            return ((cell >> (8 * off as u32)) & 0xFF) as i32;
+                        }
+                    }
+                }
+                // Cell table exists but no entry for this address — fall
+                // through to the legacy paths below (extended HashMap for
+                // out-of-1MB regions; flat shadow for BIOS ROM literals).
+            }
             if addr_u >= 0xF0000 {
                 self.extended.get(&addr).copied().unwrap_or(0)
             } else if addr_u < self.memory.len() {
@@ -219,6 +262,14 @@ impl State {
     }
 
     /// Write a value to the unified address space.
+    ///
+    /// Positive addresses below 0xF0000 are treated as single-byte guest
+    /// memory stores. On a packed cabinet (where guest memory lives in
+    /// `state_vars[]` indexed via `packed_cell_table`) the write is routed
+    /// into the appropriate cell. The flat `self.memory[]` shadow is kept
+    /// updated in parallel so read paths that bypass packing (e.g., the
+    /// renderer staging in `read_framebuffer_rgba`, or uninitialised BIOS
+    /// populate) still see the latest byte.
     pub fn write_mem(&mut self, addr: i32, value: i32) {
         if let Some(ref mut log) = self.write_log {
             log.push((addr, value));
@@ -228,15 +279,99 @@ impl State {
             if idx < self.state_vars.len() {
                 self.state_vars[idx] = value;
             }
-        } else {
-            let addr_u = addr as usize;
-            if addr_u >= 0xF0000 {
-                self.extended.insert(addr, value);
-                return;
+            return;
+        }
+        let addr_u = addr as usize;
+        if addr_u >= 0xF0000 {
+            self.extended.insert(addr, value);
+            return;
+        }
+        let byte = (value & 0xFF) as u8;
+        self.write_byte_packed_aware(addr_u, byte);
+    }
+
+    /// Internal: store a single byte at a positive linear address,
+    /// honouring the packed-cell layout when active.
+    #[inline]
+    fn write_byte_packed_aware(&mut self, addr: usize, byte: u8) {
+        // Always update the flat memory shadow so code paths that read it
+        // directly see the same value. (Renderer/debugger tooling uses it.)
+        if addr < self.memory.len() {
+            self.memory[addr] = byte;
+        }
+        // If a packed cell layout is active, also splice the byte into the
+        // state-var backing the cell. Without this, packed cabinets ignore
+        // writes coming from runtime helpers (REP fast-forward, BDA
+        // keyboard pushes, etc.) since the CPU's CSS read path consults
+        // state_vars, not self.memory.
+        if !self.packed_cell_table.is_empty() && self.packed_cell_size > 0 {
+            let pack = self.packed_cell_size as usize;
+            let cell_idx = addr / pack;
+            if cell_idx < self.packed_cell_table.len() {
+                let cell_addr = self.packed_cell_table[cell_idx];
+                if cell_addr < 0 {
+                    let sidx = (-cell_addr - 1) as usize;
+                    if sidx < self.state_vars.len() {
+                        let off = addr % pack;
+                        let cell = self.state_vars[sidx];
+                        let shift = 8 * off as u32;
+                        let mask = !(0xFFi32 << shift);
+                        self.state_vars[sidx] =
+                            (cell & mask) | ((byte as i32) << shift);
+                    }
+                }
             }
-            if addr_u < self.memory.len() {
-                self.memory[addr_u] = (value & 0xFF) as u8;
-            }
+        }
+    }
+
+    /// Fill a byte range through the packed-aware write path. Semantically
+    /// equivalent to calling `write_mem(addr, byte)` for each byte, but
+    /// avoids the per-byte boundary re-checks and keeps the flat
+    /// `self.memory[]` in lock-step with the state-var cells.
+    pub fn bulk_fill_byte(&mut self, addr: usize, count: usize, byte: u8) {
+        if count == 0 { return; }
+        let end = addr.saturating_add(count);
+        let mem_end = self.memory.len();
+        // Update the flat shadow first (cheap, keeps raw readers consistent).
+        if addr < mem_end {
+            let hi = end.min(mem_end);
+            self.memory[addr..hi].fill(byte);
+        }
+        if self.packed_cell_table.is_empty() || self.packed_cell_size == 0 {
+            return;
+        }
+        let pack = self.packed_cell_size as usize;
+        let table_len = self.packed_cell_table.len();
+        for i in addr..end {
+            let cell_idx = i / pack;
+            if cell_idx >= table_len { break; }
+            let cell_addr = self.packed_cell_table[cell_idx];
+            if cell_addr >= 0 { continue; }
+            let sidx = (-cell_addr - 1) as usize;
+            if sidx >= self.state_vars.len() { continue; }
+            let off = i % pack;
+            let cell = self.state_vars[sidx];
+            let shift = 8 * off as u32;
+            let mask = !(0xFFi32 << shift);
+            self.state_vars[sidx] =
+                (cell & mask) | ((byte as i32) << shift);
+        }
+    }
+
+    /// Copy a byte range through the packed-aware write path. Handles
+    /// `src`/`dst` regions that may overlap in either direction.
+    pub fn bulk_copy_bytes(&mut self, src: usize, dst: usize, count: usize) {
+        if count == 0 { return; }
+        // Snapshot source bytes first so overlapping src/dst regions
+        // behave like a left-to-right copy from a stable read view.
+        let mut buf = vec![0u8; count];
+        for i in 0..count {
+            let sa = (src + i) as i32;
+            buf[i] = (self.read_mem(sa) & 0xFF) as u8;
+        }
+        // Now write them out through the packed-aware path.
+        for i in 0..count {
+            self.write_byte_packed_aware(dst + i, buf[i]);
         }
     }
 

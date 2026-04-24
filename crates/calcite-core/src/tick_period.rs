@@ -787,12 +787,27 @@ impl PeriodTracker {
                 // Only fast-path when the entire range fits in state.memory
                 // and write_log is disabled. If write_log is on we still
                 // want correctness; use the slow path.
+                let mem_end = {
+                    let flat = state.memory.len();
+                    if state.packed_cell_size > 0 && !state.packed_cell_table.is_empty() {
+                        flat.max(state.packed_cell_table.len()
+                            .saturating_mul(state.packed_cell_size as usize))
+                    } else { flat }
+                };
                 if state.write_log.is_none()
                     && addr_u < 0xF0000
-                    && end <= state.memory.len()
+                    && end <= mem_end
                     && first >= 0
                 {
-                    state.memory[addr_u..end].fill(byte);
+                    // `bulk_fill_byte` updates the flat `state.memory[]`
+                    // shadow AND splices the byte into the packed cell
+                    // state-vars when a packed layout is active. Before
+                    // we wired that up, projection on packed cabinets
+                    // filled only the flat shadow — so the guest CPU
+                    // (which reads from state-vars via the cell table)
+                    // saw untouched memory and either looped forever or
+                    // landed on zeros, silently corrupting boot.
+                    state.bulk_fill_byte(addr_u, n, byte);
                     self.stats.bytes_memset += n as u64;
                 } else {
                     for i in 0..count {

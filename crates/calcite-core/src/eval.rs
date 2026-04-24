@@ -81,6 +81,12 @@ pub struct Evaluator {
     pub dispatch_tables: HashMap<String, DispatchTable>,
     /// Recognised broadcast write patterns.
     pub broadcast_writes: Vec<BroadcastWrite>,
+    /// Recognised packed-cell broadcast ports (one per CSS-DOS write slot).
+    /// Each port covers all `--mcN` cell assignments absorbed into a single
+    /// (gate, addr, val) shape. The interpreter runs these after the
+    /// per-assignment loop so packed cabinets see the same memory writes
+    /// the compiled path produces via `Op::PackedBroadcast*`.
+    pub packed_broadcast_ports: Vec<crate::pattern::packed_broadcast_write::PackedSlotPort>,
     /// Precomputed function body patterns for the interpreter fast-path.
     function_patterns: HashMap<String, FunctionPattern>,
     /// Property values computed during the current tick. Reused across ticks.
@@ -164,6 +170,62 @@ impl Evaluator {
     #[doc(hidden)]
     pub fn compiled(&self) -> &CompiledProgram {
         &self.compiled
+    }
+
+    /// Populate `state.packed_cell_table` + `packed_cell_size` so
+    /// `State::read_mem` / `write_mem` can route positive guest addresses
+    /// through the packed `mcN` state vars instead of the flat shadow
+    /// (which isn't populated for packed cabinets).
+    ///
+    /// Every consumer of `State` + `Evaluator` MUST call this after
+    /// `state.load_properties` and before running any ticks — the wasm
+    /// runtime, the CLI, the debugger, and any test harness that holds its
+    /// own State. Forgetting this call is a "reads return 0 even though
+    /// the CPU wrote them correctly" footgun because the write path goes
+    /// directly to `state_vars[]` via slot addresses while the read path
+    /// sees an empty cell table and falls through to the unused shadow.
+    ///
+    /// The table chosen is:
+    /// - `compiled.packed_cell_tables[0]` if present — that's the dense
+    ///   lookup the runtime `LoadPackedByte` op uses. It covers every
+    ///   cell the CSS reads from, which is a superset of what any single
+    ///   write-port covers.
+    /// - Otherwise the union of every `packed_broadcast_writes[i].cell_table`
+    ///   merged by cell index (entries from lower-slot ports win, matching
+    ///   the write-priority order the evaluator applies per-tick).
+    /// - If neither table exists, the cabinet isn't packed; nothing to do.
+    pub fn wire_state_for_packed_memory(&self, state: &mut crate::State) {
+        let compiled = &self.compiled;
+        // Read-side table is the most complete; prefer it.
+        if let Some(first) = compiled.packed_cell_tables.first() {
+            state.packed_cell_table = first.clone();
+            let pack = compiled
+                .packed_broadcast_writes
+                .first()
+                .map(|bw| bw.pack)
+                .unwrap_or(2);
+            state.packed_cell_size = pack;
+            return;
+        }
+        // Fallback: merge all the write-port tables. Lower slot index wins
+        // on collision — that matches the "slot 0 applies last" semantics
+        // so collision winners stay stable whether you read or write.
+        if !compiled.packed_broadcast_writes.is_empty() {
+            let mut merged: Vec<i32> = Vec::new();
+            let pack = compiled.packed_broadcast_writes[0].pack;
+            for port in compiled.packed_broadcast_writes.iter().rev() {
+                if port.cell_table.len() > merged.len() {
+                    merged.resize(port.cell_table.len(), 0);
+                }
+                for (i, &cell_addr) in port.cell_table.iter().enumerate() {
+                    if cell_addr != 0 {
+                        merged[i] = cell_addr;
+                    }
+                }
+            }
+            state.packed_cell_table = merged;
+            state.packed_cell_size = pack;
+        }
     }
 
     /// Build an evaluator from a `ParsedProgram`.
@@ -387,6 +449,7 @@ impl Evaluator {
             assignments,
             dispatch_tables,
             broadcast_writes: broadcast_result.writes,
+            packed_broadcast_ports: packed_bw_result.ports,
             function_patterns,
             pre_tick_hooks: Vec::new(),
             properties: HashMap::with_capacity(properties_capacity),
@@ -691,6 +754,33 @@ impl Evaluator {
                     }
                 }
             }
+        }
+
+        // Packed broadcast writes — the `--mcN` cell assignments were
+        // absorbed out of the assignment loop (they would just be a cascade
+        // of --applySlot, which semantically IS the port logic). Running
+        // the ports here produces the same state-var cell updates that
+        // the compiled path's packed_broadcast_writes runtime produces.
+        // Without this, packed cabinets executed via the interpreter never
+        // actually apply any memory writes — every `--mcN` stays at its
+        // initial value. Iterate in REVERSE so slot 0 fires LAST, matching
+        // the CSS semantics where slot 0 is the outermost --applySlot and
+        // wins on same-cell collisions.
+        let packed_ports_ptr = self.packed_broadcast_ports.as_ptr();
+        let packed_ports_len = self.packed_broadcast_ports.len();
+        for i in (0..packed_ports_len).rev() {
+            let port = unsafe { &*packed_ports_ptr.add(i) };
+            let gate = self.resolve_property(&port.gate_property, state).as_number();
+            if (gate as i64) != 1 { continue; }
+            let byte_addr = self.resolve_property(&port.addr_property, state).as_number() as i32;
+            if byte_addr < 0 { continue; }
+            let val = (self.resolve_property(&port.val_property, state).as_number() as i32) & 0xFF;
+            // write_mem is packed-aware: it splices the single byte into
+            // the state-var cell when a cell is declared, and keeps the
+            // flat shadow in sync. Do not filter by address_map — the
+            // compiled path doesn't; write_mem handles missing cells
+            // correctly on its own (updates the shadow only).
+            state.write_mem(byte_addr, val);
         }
 
         // Evaluate string assignments
@@ -1197,13 +1287,21 @@ fn is_buffer_copy(name: &str) -> bool {
 
 /// Extract the bare register/memory name from a CSS custom property name.
 ///
-/// Strips the `--` prefix and any triple-buffer prefix (`__0`, `__1`, `__2`):
+/// Strips the `--` prefix (if present) and any triple-buffer prefix
+/// (`__0`, `__1`, `__2`):
 /// - `"--AX"` → `"AX"`
+/// - `"AX"` → `"AX"`
 /// - `"--__0AX"` → `"AX"`
-/// - `"--__1flags"` → `"flags"`
+/// - `"__1flags"` → `"flags"`
 /// - `"--m42"` → `"m42"`
+/// - `"mc42"` → `"mc42"`
+///
+/// Callers may pass either the CSS form (`--foo`) or the bare form (`foo`);
+/// both resolve to the same canonical name. This keeps the function safe when
+/// called from code paths that build names programmatically (e.g. the packed
+/// cell table builder formats `"mc{}"` without the leading `--`).
 fn to_bare_name(name: &str) -> &str {
-    let after_dashes = &name[2..]; // skip leading "--"
+    let after_dashes = name.strip_prefix("--").unwrap_or(name);
     if let Some(rest) = after_dashes.strip_prefix("__0") {
         rest
     } else if let Some(rest) = after_dashes.strip_prefix("__1") {
@@ -1932,6 +2030,7 @@ mod tests {
             assignments: vec![],
             dispatch_tables,
             broadcast_writes: vec![],
+            packed_broadcast_ports: vec![],
             function_patterns,
             pre_tick_hooks: Vec::new(),
             properties: HashMap::with_capacity(16),
@@ -2167,6 +2266,23 @@ mod tests {
         assert_eq!(parse_mem_address(""), None);
         assert_eq!(parse_mem_address("abc"), None);
         assert_eq!(parse_mem_address("12x"), None);
+    }
+
+    #[test]
+    fn to_bare_name_accepts_dashed_and_bare_forms() {
+        // The dashed CSS form.
+        assert_eq!(to_bare_name("--AX"), "AX");
+        assert_eq!(to_bare_name("--__1flags"), "flags");
+        assert_eq!(to_bare_name("--mc42"), "mc42");
+        // The bare form — used by code paths that build names
+        // programmatically (e.g. get_or_build_packed_cell_table formats
+        // "mc{}" without the `--` prefix). The previous implementation
+        // unconditionally did `&name[2..]`, which silently stripped the
+        // first two characters of a bare name ("mc42" → "42"), causing
+        // the packed cell table to be populated entirely with zeros.
+        assert_eq!(to_bare_name("AX"), "AX");
+        assert_eq!(to_bare_name("mc42"), "mc42");
+        assert_eq!(to_bare_name("__1flags"), "flags");
     }
 
     #[test]

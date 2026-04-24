@@ -1,7 +1,14 @@
 # calcite-debugger
 
-HTTP debug server for stepping through CSS execution, inspecting state, and
-comparing compiled vs interpreted evaluation paths.
+Debug server for stepping through CSS execution, inspecting state, and
+comparing compiled vs interpreted evaluation paths. Speaks both HTTP (port
+3333 by default) and MCP (stdio or TCP); the MCP surface is what agents and
+the test harness drive.
+
+> If you are an agent driving this from Claude Code or the harness, read the
+> **[Agent-oriented tooling](#agent-oriented-tooling)** section first — it
+> lists the tools that were added specifically to stop agents hanging on
+> `run_until`, chasing bytes, or failing to isolate divergences.
 
 ## Quick start
 

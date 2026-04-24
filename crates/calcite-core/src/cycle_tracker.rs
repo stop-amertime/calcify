@@ -651,14 +651,26 @@ impl CycleTracker {
             let first_of_anchor = self.first_write_addr_of_anchor_cycle();
             if let Some(base) = first_of_anchor {
                 let stride = addr_stride_per_cycle;
-                let val = fill_value.unwrap() & 0xFF;
+                let val = (fill_value.unwrap() & 0xFF) as u8;
                 for iter in 0..n {
                     let cycle_first = base
                         .wrapping_add(stride.wrapping_mul((k + 1 + iter) as i32));
+                    let mem_end = {
+                        let flat = state.memory.len();
+                        if state.packed_cell_size > 0 && !state.packed_cell_table.is_empty() {
+                            flat.max(state.packed_cell_table.len()
+                                .saturating_mul(state.packed_cell_size as usize))
+                        } else { flat }
+                    };
                     for &off in &write_offsets {
                         let addr = cycle_first.wrapping_add(off);
-                        if addr >= 0 && (addr as usize) < state.memory.len() {
-                            state.memory[addr as usize] = val as u8;
+                        if addr >= 0 && (addr as usize) < mem_end {
+                            // `bulk_fill_byte` is packed-aware — it updates
+                            // both the flat `state.memory[]` shadow and the
+                            // state-var cell the guest CPU actually reads
+                            // on a packed cabinet. Writing to memory[]
+                            // alone would leave the cell stale.
+                            state.bulk_fill_byte(addr as usize, 1, val);
                         }
                     }
                 }

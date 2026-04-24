@@ -1,4 +1,16 @@
 #!/usr/bin/env node
+//
+// ====================================================================
+// BROKEN — DO NOT USE. Imports ../CSS-DOS/transpiler/ which was deleted
+// in the builder/Kiln rewrite. Use the new harness instead:
+//
+//   node ../CSS-DOS/tests/harness/fulldiff.mjs <cabinet.css>
+//
+// The new harness uses sidecar .bios.bin / .kernel.bin / .disk.bin that
+// the new builder emits alongside each cabinet. See
+// ../CSS-DOS/tests/harness/README.md.
+// ====================================================================
+//
 // fulldiff.mjs — Find the FIRST divergence between JS reference emulator and calcite.
 //
 // Compares ALL registers including ALL 16 bits of FLAGS (no masking).

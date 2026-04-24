@@ -1,4 +1,12 @@
 #!/usr/bin/env node
+//
+// ====================================================================
+// BROKEN — DO NOT USE. Imports ../CSS-DOS/transpiler/ which was deleted
+// in the builder/Kiln rewrite. The new harness stands up a reference
+// emulator per-cabinet using that cabinet's own BIOS/kernel/disk sidecar
+// bytes. See ../CSS-DOS/tests/harness/lib/ref-machine.mjs.
+// ====================================================================
+//
 // ref-dos.mjs — Run the JS reference 8086 emulator in DOS boot mode.
 // No calcite, no CSS — just the JS emulator with our BIOS and DOS kernel.
 // Useful for debugging BIOS issues independently of CSS or calcite.

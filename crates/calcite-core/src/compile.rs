@@ -4739,7 +4739,36 @@ pub fn execute(program: &CompiledProgram, state: &mut State, slots: &mut Vec<i32
             (prev & 0xFF) | (val << 8)
         };
         if new_cell != prev {
-            state.write_mem(cell_state_addr, new_cell);
+            // Write directly to state_vars — this path writes a whole cell
+            // value (two bytes packed into an i32). Using `write_mem` on
+            // the negative state-var address would log `(negative_addr,
+            // cell_i32)` to the write_log, which the affine projectors
+            // (tick_period.rs, cycle_tracker.rs) filter out as state-var
+            // noise. We want the projectors to see this as a single-byte
+            // guest memory write at `byte_addr`, which is how pack=1's
+            // broadcast_writes log it. Without that, the projectors never
+            // lock on byte-fill loops in packed cabinets and the CPU runs
+            // at the un-projected per-tick rate — which was the cause of
+            // pack=2 being ~10x slower per guest-cycle than pack=1 on
+            // splash/fill workloads.
+            let sidx = (-cell_state_addr - 1) as usize;
+            if sidx < state.state_vars.len() {
+                state.state_vars[sidx] = new_cell;
+            }
+            // Keep the flat shadow in step so code paths that read via
+            // `self.memory[..]` (renderer staging, debugger tools) see
+            // the same byte. `new_cell` contains the updated byte in
+            // `val` at position `off`; the other half is unchanged.
+            let addr_u = byte_addr as usize;
+            if addr_u < state.memory.len() {
+                state.memory[addr_u] = val as u8;
+            }
+            // Log as a single-byte guest write at the positive linear
+            // address, matching pack=1's log shape. Projectors can then
+            // detect affine stride evolution across ticks.
+            if let Some(ref mut log) = state.write_log {
+                log.push((byte_addr, val));
+            }
         }
     }
 
@@ -4807,30 +4836,33 @@ fn rep_fast_forward(program: &CompiledProgram, state: &mut State, slots: &[i32])
 
     // Snapshot every field the hook needs up-front so we can release the
     // state borrow before any mutations.
-    let opcode = match read_prop(program, state, slots, "--opcode") { Some(v) => v, None => return };
+    rep_diag_bail("00-entered");
+    let opcode = match read_prop(program, state, slots, "--opcode") { Some(v) => v, None => { rep_diag_bail("no-opcode"); return; } };
     if opcode != 0xAA && opcode != 0xAB && opcode != 0xA4 && opcode != 0xA5 {
+        rep_diag_bail("opcode-not-string");
         return;
     }
-    if read_prop(program, state, slots, "--hasREP").unwrap_or(0) != 1 { return; }
-    if read_prop(program, state, slots, "--repType").unwrap_or(0) != 1 { return; }
+    rep_diag_bail("01-opcode-is-string");
+    if read_prop(program, state, slots, "--hasREP").unwrap_or(0) != 1 { rep_diag_bail("no-hasREP"); return; }
+    if read_prop(program, state, slots, "--repType").unwrap_or(0) != 1 { rep_diag_bail("repType-ne-1"); return; }
     let cx = match read_prop(program, state, slots, "--CX") {
         Some(v) => v,
-        None => return,
+        None => { rep_diag_bail("no-CX"); return; }
     };
-    if cx <= 0 { return; }
+    if cx <= 0 { rep_diag_bail("cx-le-0"); return; }
     let flags = read_prop(program, state, slots, "--flags").unwrap_or(0);
-    if (flags >> 10) & 1 != 0 { return; }
-    if read_prop(program, state, slots, "--hasSegOverride").unwrap_or(0) != 0 { return; }
+    if (flags >> 10) & 1 != 0 { rep_diag_bail("DF-set"); return; }
+    if read_prop(program, state, slots, "--hasSegOverride").unwrap_or(0) != 0 { rep_diag_bail("seg-override"); return; }
 
     let step: i32 = if opcode == 0xAB || opcode == 0xA5 { 2 } else { 1 };
     let n = cx;
     let di = read_prop(program, state, slots, "--DI").unwrap_or(0);
     let di_end = di as i64 + (n as i64) * (step as i64);
-    if di_end > 0xFFFF { return; }
+    if di_end > 0xFFFF { rep_diag_bail("DI-wrap"); return; }
     let si_end_opt = if opcode == 0xA4 || opcode == 0xA5 {
         let si = read_prop(program, state, slots, "--SI").unwrap_or(0);
         let e = si as i64 + (n as i64) * (step as i64);
-        if e > 0xFFFF { return; }
+        if e > 0xFFFF { rep_diag_bail("SI-wrap"); return; }
         Some((si, e))
     } else {
         None
@@ -4849,6 +4881,7 @@ fn rep_fast_forward(program: &CompiledProgram, state: &mut State, slots: &[i32])
     //   [0xD0000, 0xD0200)  — ROM-disk window (read-only via --readDiskByte)
     //   [0xF0000, 0x100000) — BIOS ROM (extended map, not state.memory)
     if ranges_overlap_virtual(dst_linear, n_bytes) {
+        rep_diag_bail("dst-virtual-range");
         return;
     }
 
@@ -4872,6 +4905,7 @@ fn rep_fast_forward(program: &CompiledProgram, state: &mut State, slots: &[i32])
     if opcode == 0xA4 || opcode == 0xA5 {
         let src_linear = (ds as i64) * 16 + si_end_opt.unwrap().0 as i64;
         if ranges_overlap_virtual(src_linear, n_bytes) {
+            rep_diag_bail("src-virtual-range");
             return;
         }
     }
@@ -4919,6 +4953,79 @@ fn rep_fast_forward(program: &CompiledProgram, state: &mut State, slots: &[i32])
     if let Some(cc) = state.get_var("cycleCount") {
         state.set_var("cycleCount", cc.wrapping_add(n.wrapping_mul(per_iter)));
     }
+    rep_diag_fire(opcode, n);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+mod rep_diag {
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+    use std::collections::HashMap;
+    pub(super) static COUNTS: OnceLock<Mutex<HashMap<&'static str, u64>>> = OnceLock::new();
+    // (stosb, movsb, stosw, movsw, total_iters)
+    pub(super) static FIRES: OnceLock<Mutex<(u64, u64, u64, u64, i64)>> = OnceLock::new();
+    pub(super) static ENABLED: OnceLock<bool> = OnceLock::new();
+    pub(super) fn enabled() -> bool {
+        *ENABLED.get_or_init(|| std::env::var("CALCITE_REP_DIAG").is_ok())
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn rep_diag_bail(reason: &'static str) {
+    if !rep_diag::enabled() { return; }
+    let m = rep_diag::COUNTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    *m.lock().unwrap().entry(reason).or_insert(0) += 1;
+}
+#[cfg(target_arch = "wasm32")]
+fn rep_diag_bail(_reason: &'static str) {}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn rep_diag_fire(opcode: i32, n: i32) {
+    if !rep_diag::enabled() { return; }
+    let m = rep_diag::FIRES.get_or_init(|| std::sync::Mutex::new((0, 0, 0, 0, 0)));
+    let mut m = m.lock().unwrap();
+    match opcode {
+        0xAA => m.0 += 1,
+        0xAB => m.2 += 1,
+        0xA4 => m.1 += 1,
+        0xA5 => m.3 += 1,
+        _ => {}
+    }
+    m.4 += n as i64;
+}
+#[cfg(target_arch = "wasm32")]
+fn rep_diag_fire(_opcode: i32, _n: i32) {}
+
+pub fn rep_diag_reset() {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        rep_diag::COUNTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+            .lock().unwrap().clear();
+        *rep_diag::FIRES.get_or_init(|| std::sync::Mutex::new((0, 0, 0, 0, 0)))
+            .lock().unwrap() = (0, 0, 0, 0, 0);
+    }
+}
+
+pub fn rep_diag_report() -> String {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let bails = rep_diag::COUNTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+            .lock().unwrap().clone();
+        let fires = *rep_diag::FIRES.get_or_init(|| std::sync::Mutex::new((0, 0, 0, 0, 0)))
+            .lock().unwrap();
+        let mut s = String::new();
+        s.push_str(&format!("rep_fast_forward fires: STOSB={} STOSW={} MOVSB={} MOVSW={} total_iters={}\n",
+            fires.0, fires.2, fires.1, fires.3, fires.4));
+        s.push_str("rep_fast_forward bails:\n");
+        let mut items: Vec<_> = bails.iter().collect();
+        items.sort_by(|a, b| b.1.cmp(a.1));
+        for (k, v) in items {
+            s.push_str(&format!("  {}: {}\n", k, v));
+        }
+        return s;
+    }
+    #[cfg(target_arch = "wasm32")]
+    { String::new() }
 }
 
 /// Returns true if [start, start+len) overlaps a memory region that isn't
@@ -4941,43 +5048,58 @@ fn ranges_overlap_virtual(start: i64, len: i64) -> bool {
 }
 
 fn bulk_store_byte(state: &mut State, addr: i64, val: u8) {
-    // Inline implementation that skips write_log; mirrors MemoryFill/MemoryCopy
-    // discipline (bulk path is diagnostic-silent).
+    // Mirrors MemoryFill/MemoryCopy discipline (bulk path is
+    // diagnostic-silent: no write_log entries). Routes through
+    // `bulk_fill_byte(count=1)` so packed cabinets land the byte in the
+    // correct state-var cell in addition to the flat shadow.
     if addr < 0 { return; }
     if addr >= 0xF0000 {
         state.extended.insert(addr as i32, val as i32);
         return;
     }
-    let idx = addr as usize;
-    if idx < state.memory.len() {
-        state.memory[idx] = val;
+    state.bulk_fill_byte(addr as usize, 1, val);
+}
+
+/// Effective upper bound for guest memory. Packed cabinets keep the flat
+/// `state.memory` at its default small size and store real bytes in packed
+/// cells; we must count those too or bulk writes above `state.memory.len()`
+/// silently drop (which for a long time was the cause of pack=2 diverging
+/// from pack=1 on REP STOS/MOVS at high linear addresses).
+#[inline]
+fn effective_guest_mem_end(state: &State) -> usize {
+    let flat = state.memory.len();
+    if state.packed_cell_size > 0 && !state.packed_cell_table.is_empty() {
+        let packed_end = state
+            .packed_cell_table
+            .len()
+            .saturating_mul(state.packed_cell_size as usize);
+        return flat.max(packed_end);
     }
+    flat
 }
 
 #[inline]
 fn bulk_fill(state: &mut State, dst: i64, count: usize, val: u8) {
     if count == 0 || dst < 0 { return; }
-    let mem_len = state.memory.len();
+    let mem_len = effective_guest_mem_end(state);
     if (dst as usize) >= mem_len { return; }
     let lo = dst as usize;
     let hi = (dst as i64 + count as i64).min(mem_len as i64) as usize;
     if hi > lo {
-        state.memory[lo..hi].fill(val);
+        state.bulk_fill_byte(lo, hi - lo, val);
     }
 }
 
 #[inline]
 fn bulk_copy(state: &mut State, src: i64, dst: i64, count: usize) {
     if count == 0 || src < 0 || dst < 0 { return; }
-    let mem_len = state.memory.len();
+    let mem_len = effective_guest_mem_end(state);
     if (src as usize) >= mem_len || (dst as usize) >= mem_len { return; }
     let max_by_src = (mem_len as i64) - src;
     let max_by_dst = (mem_len as i64) - dst;
     let n = (count as i64).min(max_by_src).min(max_by_dst) as usize;
     if n > 0 {
-        let s = src as usize;
-        let d = dst as usize;
-        state.memory.copy_within(s..s + n, d);
+        state.bulk_copy_bytes(src as usize, dst as usize, n);
     }
 }
 
@@ -5311,12 +5433,12 @@ fn exec_ops(
                 let dst = sload!(*dst_slot);
                 let count = sload!(*count_slot);
                 let val_byte = (sload!(*val_slot) & 0xFF) as u8;
-                let mem_len = state.memory.len();
+                let mem_len = effective_guest_mem_end(state);
                 if count > 0 && dst >= 0 && (dst as usize) < mem_len {
                     let lo = dst as usize;
                     let hi = (dst as i64 + count as i64).min(mem_len as i64) as usize;
                     if hi > lo {
-                        state.memory[lo..hi].fill(val_byte);
+                        state.bulk_fill_byte(lo, hi - lo, val_byte);
                     }
                 }
                 sstore!(*dst_slot, dst.wrapping_add(count));
@@ -5328,7 +5450,7 @@ fn exec_ops(
                 let src = sload!(*src_slot);
                 let dst = sload!(*dst_slot);
                 let count = sload!(*count_slot);
-                let mem_len = state.memory.len();
+                let mem_len = effective_guest_mem_end(state);
                 if count > 0 && src >= 0 && dst >= 0
                     && (src as usize) < mem_len && (dst as usize) < mem_len
                 {
@@ -5339,7 +5461,7 @@ fn exec_ops(
                     if n > 0 {
                         let s = src as usize;
                         let d = dst as usize;
-                        state.memory.copy_within(s..s + n, d);
+                        state.bulk_copy_bytes(s, d, n);
                     }
                 }
                 sstore!(*src_slot, src.wrapping_add(count));
@@ -5827,12 +5949,12 @@ fn exec_ops_profiled(
                 let dst = slots[*dst_slot as usize];
                 let count = slots[*count_slot as usize];
                 let val_byte = (slots[*val_slot as usize] & 0xFF) as u8;
-                let mem_len = state.memory.len();
+                let mem_len = effective_guest_mem_end(state);
                 if count > 0 && dst >= 0 && (dst as usize) < mem_len {
                     let lo = dst as usize;
                     let hi = (dst as i64 + count as i64).min(mem_len as i64) as usize;
                     if hi > lo {
-                        state.memory[lo..hi].fill(val_byte);
+                        state.bulk_fill_byte(lo, hi - lo, val_byte);
                     }
                 }
                 slots[*dst_slot as usize] = dst.wrapping_add(count);
@@ -5845,7 +5967,7 @@ fn exec_ops_profiled(
                 let src = slots[*src_slot as usize];
                 let dst = slots[*dst_slot as usize];
                 let count = slots[*count_slot as usize];
-                let mem_len = state.memory.len();
+                let mem_len = effective_guest_mem_end(state);
                 if count > 0 && src >= 0 && dst >= 0
                     && (src as usize) < mem_len && (dst as usize) < mem_len
                 {
@@ -5855,7 +5977,7 @@ fn exec_ops_profiled(
                     if n > 0 {
                         let s = src as usize;
                         let d = dst as usize;
-                        state.memory.copy_within(s..s + n, d);
+                        state.bulk_copy_bytes(s, d, n);
                     }
                 }
                 slots[*src_slot as usize] = src.wrapping_add(count);
@@ -6374,12 +6496,12 @@ pub fn exec_ops_traced(
                 let count = slots[*count_slot as usize];
                 let val = slots[*val_slot as usize];
                 let val_byte = (val & 0xFF) as u8;
-                let mem_len = state.memory.len();
+                let mem_len = effective_guest_mem_end(state);
                 if count > 0 && dst >= 0 && (dst as usize) < mem_len {
                     let lo = dst as usize;
                     let hi = (dst as i64 + count as i64).min(mem_len as i64) as usize;
                     if hi > lo {
-                        state.memory[lo..hi].fill(val_byte);
+                        state.bulk_fill_byte(lo, hi - lo, val_byte);
                     }
                 }
                 let new_dst = dst.wrapping_add(count);
@@ -6404,7 +6526,7 @@ pub fn exec_ops_traced(
                 let src = slots[*src_slot as usize];
                 let dst = slots[*dst_slot as usize];
                 let count = slots[*count_slot as usize];
-                let mem_len = state.memory.len();
+                let mem_len = effective_guest_mem_end(state);
                 if count > 0 && src >= 0 && dst >= 0
                     && (src as usize) < mem_len && (dst as usize) < mem_len
                 {
@@ -6414,7 +6536,7 @@ pub fn exec_ops_traced(
                     if n > 0 {
                         let s = src as usize;
                         let d = dst as usize;
-                        state.memory.copy_within(s..s + n, d);
+                        state.bulk_copy_bytes(s, d, n);
                     }
                 }
                 let new_src = src.wrapping_add(count);

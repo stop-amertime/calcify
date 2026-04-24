@@ -61,3 +61,7 @@ path = "src/bin/probe_parse_cost.rs"
 [[bin]]
 name = "probe-cell-template"
 path = "src/bin/probe_cell_template.rs"
+
+[[bin]]
+name = "probe-pack-diff"
+path = "src/bin/probe_pack_diff.rs"
