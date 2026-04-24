@@ -163,3 +163,88 @@ curl -sX POST localhost:3333/screen
 -p, --port <PORT>               HTTP port (default: 3333)
     --snapshot-interval <N>     Ticks between auto-checkpoints (default: 1000)
 ```
+
+## Agent-oriented tooling
+
+The debugger exposes an MCP surface alongside the HTTP server. Agents and
+the CSS-DOS test harness drive it via MCP; the tools listed below were added
+specifically to address the recurring failure modes of agentic debugging
+(hanging on `run_until`, chasing individual bytes instead of isolating where
+a divergence lives, having no known-good baseline to diff against).
+
+For harness-side access, every tool here is wrapped in
+[`CSS-DOS/tests/harness/lib/debugger-client.mjs`](../../CSS-DOS/tests/harness/lib/debugger-client.mjs),
+which folds the `session` parameter in automatically. For agent access
+directly from Claude Code, register the server (stdio or HTTP) and call
+the `mcp__calcite-debugger__*` tools.
+
+Every MCP tool takes a `session` parameter. Use `open` to create or rehydrate
+a session and name it; subsequent calls must use the same name.
+
+### Bug isolation
+
+| Tool | When to use |
+|------|-------------|
+| `inspect_packed_cell` | Given a cell index, reports the state-var address, its current value, and whether the packed-cell table matches expectations. First tool to reach for when "a write appears to go nowhere" — proves whether the cell exists in the compiled program. |
+| `diff_packed_memory` | Compares packed-cell backing across snapshots or sessions. Spot where two runs diverge without byte-scanning the whole address space. |
+| `compare_paths` | Runs both the compiled and interpreted evaluators on the current state, reports which properties differ. First-line check for calcite correctness bugs. |
+| `compare_reference` | Diffs calcite against the js8086 reference emulator. Use when chasing "is this our bug or the CSS's bug?". |
+| `compare_state` | Diffs current registers/memory against an expected snapshot you supply. For regression tests. |
+| `entry_state_check` | Validates the post-compile initial state matches what kiln emitted. Catches state-wiring regressions (e.g. `packed_cell_table` never populated from compiled program) that would otherwise show up as silent read-zeros much later in the run. |
+
+### Navigating execution with safety rails
+
+| Tool | When to use |
+|------|-------------|
+| `run_until` / `run_until_poll` / `run_until_cancel` | Job-based async `run_until` — kick off a long run, poll status, cancel cleanly. Replaces the synchronous `run_until` that hung indefinitely when conditions never matched. |
+| `seek(tick)` | Jump directly to a target tick using the nearest checkpoint. Avoids stepping one tick at a time. |
+| `watchpoint(addr, max_ticks, expected?)` | Runs until the byte at `addr` changes (or reaches `expected` if supplied). The fast way to find the tick a specific byte flips. |
+| `tick(count)` | Advances N ticks. Count is bounded — agents can't ask for millions in one call without hitting the MCP-side budget. Prefer `seek` for bulk advancement. |
+| `snapshots` | `{action: "create"}` checkpoints the current state; `{action: "list"}` shows all checkpoints. Makes `seek` cheap for repeated exploration. |
+
+### Inspection
+
+| Tool | When to use |
+|------|-------------|
+| `read_memory(addr, len)` | Reads through the unified address space (packed cells → extended HashMap → flat shadow, in that priority). Always authoritative for what the CPU would see. |
+| `render_screen` | Returns framebuffer (mode 13h) or text VRAM as structured data plus a textual rendering. Visual inspection without round-tripping through screenshots. |
+| `trace_property` | Records a property's value every tick across a range. For watching how a signal evolves. |
+| `slot_map` / `dump_ops` | Exposes the compiled program's slot assignments and op sequence, so `run_until` / watchpoint output can be correlated to bytecode. |
+| `execution_summary` / `summarise` | Compact per-tick summary (opcode, IP, key register deltas) for skimming thousands of ticks without drowning in JSON. |
+
+### Session plumbing
+
+| Tool | When to use |
+|------|-------------|
+| `open(path, session)` | Load a cabinet and name the session. Supports multiple concurrent sessions in one debugger process — pass different `session` names to diff PACK=1 vs PACK=2 side-by-side. |
+| `close_session(session)` | Tears down a session (frees memory, closes file handle). |
+| `info` | Server-wide session list and snapshot state. Cheap liveness check. |
+| `send_key(value, target?)` | Injects a keystroke into the BDA/keyboard. For driving interactive programs through boot sequences. |
+
+### Typical agent workflow
+
+1. `open` the cabinet(s) under session names.
+2. `seek` to the suspected divergence tick (or `watchpoint` on a specific byte if the tick is unknown).
+3. `compare_reference` or `compare_paths` to localise which side is wrong.
+4. `inspect_packed_cell` / `read_memory` / `trace_property` to confirm the exact misbehavior.
+5. `snapshots` + `run_until_poll` to keep repeated exploration cheap.
+
+### Concrete example — finding the PACK=2 framebuffer bug (2026-04-23)
+
+A PACK=2 zork1 splash rendered black where PACK=1 rendered gray. The bug was
+isolated in minutes rather than hours by following the workflow above:
+
+1. `open` zork-p1.css as `p1`, zork-p2.css as `p2` (one debugger, two
+   sessions).
+2. `seek` both to tick 140000.
+3. `read_memory(0xA0000, 128)` on both — `p1` showed `08 08 08 08 …`, `p2`
+   showed all zeros. Framebuffer diverges.
+4. `read_memory(0x100000, 48)` on both — DAC bytes byte-identical. Rules
+   out a palette problem.
+5. `inspect_packed_cell(327680)` on `p2` — `cell_addr=0`, meaning the
+   framebuffer cell is missing from the compiled CSS entirely. Root
+   cause: the cart's `memory.gfx: false` pruned the mode 13h zone even
+   though Corduroy's splash always writes it.
+
+The step that would otherwise have taken an agent hours (staring at memory
+diffs, guessing) collapsed to a single `inspect_packed_cell` call.
