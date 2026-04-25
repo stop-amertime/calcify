@@ -67,6 +67,32 @@ struct Cli {
     #[arg(long, value_name = "TICK")]
     dump_tick: Option<u32>,
 
+    /// Dump state at multiple ticks in a single run.
+    ///
+    /// Comma-separated list of ticks (e.g. `--dump-ticks=100000,200000,300000`).
+    /// Compiles once, runs forward, dumps at each tick. Much faster than
+    /// invoking the CLI multiple times for sampling a property over time.
+    /// Combine with --sample-cells for compact per-tick output.
+    #[arg(long, value_name = "LIST", value_delimiter = ',')]
+    dump_ticks: Vec<u32>,
+
+    /// Only print these memory cells in dumps (comma-separated packed-cell indices).
+    ///
+    /// Example: `--sample-cells=2344,632` prints just those cells. Combine with
+    /// --dump-tick or --dump-ticks to track specific memory cells across time.
+    /// Without this flag, dumps include all state-var and cell values.
+    #[arg(long, value_name = "LIST", value_delimiter = ',')]
+    sample_cells: Vec<u32>,
+
+    /// Log every tick when a specified cell changes value.
+    ///
+    /// Comma-separated list of packed-cell indices to watch. Runs the program
+    /// tick-by-tick (no batching) and prints a line whenever any watched cell
+    /// changes: `tick=N mcIDX: OLD -> NEW (CS:IP)`. Use with --ticks N to bound
+    /// the run. Slower than batched execution but finer-grained than sampling.
+    #[arg(long, value_name = "LIST", value_delimiter = ',')]
+    watch_cell: Vec<u32>,
+
     /// Output a JSON register trace for conformance comparison.
     ///
     /// Each tick produces a JSON object with register values.
@@ -453,61 +479,162 @@ fn main() {
                 }
             };
 
-            // --dump-tick: run to specific tick and dump all computed properties
-            if let Some(target_tick) = cli.dump_tick {
-                // Run tick-by-tick when key events need injection
-                if !key_events.is_empty() {
-                    for tick in 0..=target_tick {
-                        for &(ev_tick, ev_val) in &key_events {
-                            if ev_tick == tick {
-                                state.set_var("keyboard", ev_val);
+            // --dump-tick / --dump-ticks: run to specific tick(s) and dump state
+            // Build a sorted list of targets: either the single --dump-tick value,
+            // or all values from --dump-ticks (combined if both given).
+            let mut dump_targets: Vec<u32> = cli.dump_ticks.clone();
+            if let Some(t) = cli.dump_tick {
+                dump_targets.push(t);
+            }
+            if !dump_targets.is_empty() {
+                dump_targets.sort_unstable();
+                dump_targets.dedup();
+                let compact = !cli.sample_cells.is_empty();
+
+                // Print a header so callers can tell this is the dump output.
+                if compact {
+                    // Header: tick + register names + sampled cell indices.
+                    print!("# tick");
+                    for name in ["AX","BX","CX","DX","SP","BP","SI","DI","IP","CS","DS","ES","SS","flags","cycleCount"] {
+                        print!(" {}", name);
+                    }
+                    for &idx in &cli.sample_cells {
+                        print!(" mc{}", idx);
+                    }
+                    println!();
+                }
+
+                // Advance to each target in order, dumping along the way.
+                let mut cursor: u32 = 0;
+                for &target in &dump_targets {
+                    // Advance from cursor to target. Run tick-by-tick when key events
+                    // need injection; otherwise use run_batch + a final tick.
+                    if !key_events.is_empty() {
+                        for tick in cursor..target {
+                            for &(ev_tick, ev_val) in &key_events {
+                                if ev_tick == tick {
+                                    state.set_var("keyboard", ev_val);
+                                }
                             }
+                            evaluator.tick(&mut state);
+                        }
+                    } else if target > cursor {
+                        let batch = target - cursor;
+                        if batch > 1 {
+                            evaluator.run_batch(&mut state, batch - 1);
                         }
                         evaluator.tick(&mut state);
                     }
-                } else {
-                    if target_tick > 0 {
-                        evaluator.run_batch(&mut state, target_tick);
+                    cursor = target;
+
+                    if compact {
+                        // One line per tick: tick + core regs + sampled cells.
+                        print!("{}", target);
+                        for name in ["AX","BX","CX","DX","SP","BP","SI","DI","IP","CS","DS","ES","SS","flags","cycleCount"] {
+                            let v = state.state_var_names.iter().position(|n| n == name)
+                                .map(|i| state.state_vars[i]).unwrap_or(0);
+                            print!(" {}", v);
+                        }
+                        // Sampled cells — look up by "mcN" state-var name (how kiln
+                        // emits packed cells) and fall back to 0 for unknown cells.
+                        for &idx in &cli.sample_cells {
+                            let name = format!("mc{}", idx);
+                            let v = state.state_var_names.iter().position(|n| n == &name)
+                                .map(|i| state.state_vars[i]).unwrap_or(0);
+                            print!(" {}", v);
+                        }
+                        println!();
+                    } else {
+                        // Full slot dump (existing behavior, now usable for each target)
+                        println!("=== Slot dump at tick {} ===", target);
+                        print!("Registers:");
+                        for (i, name) in state.state_var_names.iter().enumerate() {
+                            print!(" {}={}", name, state.state_vars[i]);
+                        }
+                        println!();
+                        let props = [
+                            "--csBase", "--ipAddr", "--q0", "--q1", "--q2", "--q3",
+                            "--opcode", "--mod", "--reg", "--rm",
+                            "--modrmExtra", "--ea", "--eaSeg", "--eaOff",
+                            "--immOff", "--immByte", "--immWord", "--imm8", "--imm16",
+                            "--rmVal8", "--rmVal16", "--regVal8", "--regVal16",
+                            "--memAddr", "--memVal",
+                            "--memAddr0", "--memVal0", "--memAddr1", "--memVal1",
+                            "--memAddr2", "--memVal2",
+                            "--addrDestA", "--addrDestB", "--addrDestC",
+                            "--addrValA", "--addrValA1", "--addrValA2", "--addrValB", "--addrValC",
+                            "--isWordWrite", "--instId", "--instLen",
+                            "--modRm", "--modRm_mod", "--modRm_reg", "--modRm_rm",
+                            "--moveStack", "--moveSI", "--moveDI", "--jumpCS", "--addrJump",
+                            "--AX", "--CX", "--DX", "--BX",
+                            "--AL", "--CL", "--DL", "--BL",
+                            "--AH", "--CH", "--DH", "--BH",
+                            "--SP", "--BP", "--SI", "--DI", "--IP",
+                            "--ES", "--CS", "--SS", "--DS", "--flags",
+                            "--halt", "--uOp",
+                        ];
+                        println!("\nComputed properties:");
+                        for name in &props {
+                            if let Some(val) = evaluator.get_slot_value(name) {
+                                println!("  {}: {} (0x{:X})", name, val, val as u32);
+                            }
+                        }
+                    }
+                }
+                return;
+            }
+
+            // --watch-cell: tick-by-tick monitor, print only transitions.
+            if !cli.watch_cell.is_empty() {
+                // Resolve each watched cell-idx to its state-var slot index up front.
+                let watched: Vec<(u32, Option<usize>, i32)> = cli.watch_cell
+                    .iter()
+                    .map(|&idx| {
+                        let name = format!("mc{}", idx);
+                        let slot = state.state_var_names.iter().position(|n| n == &name);
+                        let val = slot.map(|i| state.state_vars[i]).unwrap_or(0);
+                        (idx, slot, val)
+                    })
+                    .collect();
+                let mut last: Vec<i32> = watched.iter().map(|(_, _, v)| *v).collect();
+                // Header: name the columns so the output is self-describing.
+                print!("# watch-cell: tick");
+                for (idx, _, _) in &watched { print!(" mc{}", idx); }
+                println!(" | CS IP");
+                // Initial values at tick 0.
+                print!("0");
+                for v in &last { print!(" {}", v); }
+                let cs0 = state.get_var("CS").unwrap_or(0);
+                let ip0 = state.get_var("IP").unwrap_or(0);
+                println!(" | {} {}", cs0, ip0);
+
+                for tick in 1..=ticks_limit {
+                    for &(ev_tick, ev_val) in &key_events {
+                        if ev_tick == tick { state.set_var("keyboard", ev_val); }
                     }
                     evaluator.tick(&mut state);
-                }
-                println!("=== Slot dump at tick {} ===", target_tick);
-                print!("Registers:");
-                for (i, name) in state.state_var_names.iter().enumerate() {
-                    print!(" {}={}", name, state.state_vars[i]);
-                }
-                println!();
-                // Dump key computed properties
-                let props = [
-                    // v2 decode properties
-                    "--csBase", "--ipAddr", "--q0", "--q1", "--q2", "--q3",
-                    "--opcode", "--mod", "--reg", "--rm",
-                    "--modrmExtra", "--ea", "--eaSeg", "--eaOff",
-                    "--immOff", "--immByte", "--immWord", "--imm8", "--imm16",
-                    "--rmVal8", "--rmVal16", "--regVal8", "--regVal16",
-                    // v3 memory write
-                    "--memAddr", "--memVal",
-                    // v2 legacy memory write (kept for compatibility)
-                    "--memAddr0", "--memVal0", "--memAddr1", "--memVal1",
-                    "--memAddr2", "--memVal2",
-                    // v1 legacy properties
-                    "--addrDestA", "--addrDestB", "--addrDestC",
-                    "--addrValA", "--addrValA1", "--addrValA2", "--addrValB", "--addrValC",
-                    "--isWordWrite", "--instId", "--instLen",
-                    "--modRm", "--modRm_mod", "--modRm_reg", "--modRm_rm",
-                    "--moveStack", "--moveSI", "--moveDI", "--jumpCS", "--addrJump",
-                    // registers
-                    "--AX", "--CX", "--DX", "--BX",
-                    "--AL", "--CL", "--DL", "--BL",
-                    "--AH", "--CH", "--DH", "--BH",
-                    "--SP", "--BP", "--SI", "--DI", "--IP",
-                    "--ES", "--CS", "--SS", "--DS", "--flags",
-                    "--halt", "--uOp",
-                ];
-                println!("\nComputed properties:");
-                for name in &props {
-                    if let Some(val) = evaluator.get_slot_value(name) {
-                        println!("  {}: {} (0x{:X})", name, val, val as u32);
+                    let mut any_change = false;
+                    let mut now: Vec<i32> = Vec::with_capacity(watched.len());
+                    for (_, slot, _) in &watched {
+                        let v = slot.map(|i| state.state_vars[i]).unwrap_or(0);
+                        now.push(v);
+                    }
+                    for i in 0..watched.len() {
+                        if now[i] != last[i] { any_change = true; break; }
+                    }
+                    if any_change {
+                        print!("{}", tick);
+                        for v in &now { print!(" {}", v); }
+                        let cs = state.get_var("CS").unwrap_or(0);
+                        let ip = state.get_var("IP").unwrap_or(0);
+                        println!(" | {} {}", cs, ip);
+                        last = now;
+                    }
+                    if let Some(addr) = halt_addr {
+                        if state.read_mem(addr) != 0 {
+                            eprintln!("Halt: memory 0x{:X} set at tick {}", addr, tick);
+                            break;
+                        }
                     }
                 }
                 return;
