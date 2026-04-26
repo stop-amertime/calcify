@@ -106,6 +106,23 @@ struct Args {
     #[arg(long)]
     screenshot: bool,
 
+    /// Search 1MB conventional memory for an ASCII needle (e.g. "DPPISTOL")
+    /// at every chunk boundary. Reports first match address.
+    #[arg(long)]
+    find_string: Option<String>,
+
+    /// Dump N bytes at this hex linear address each chunk.
+    #[arg(long)]
+    dump_at: Option<String>,
+
+    /// Length to dump (default 64).
+    #[arg(long, default_value = "64")]
+    dump_len: u32,
+
+    /// Find a 16-bit little-endian word in 1MB conv mem each chunk.
+    #[arg(long)]
+    find_word: Option<String>,
+
     #[arg(long, default_value = "/tmp/doom-walk")]
     out_dir: PathBuf,
 
@@ -257,6 +274,69 @@ fn main() {
                 }
                 let path = args.out_dir.join(format!("shot-tick-{:08}.txt", tick));
                 let _ = std::fs::write(path, text);
+            }
+        }
+
+        if let Some(addr_str) = &args.dump_at {
+            let addr = if let Some(s) = addr_str.strip_prefix("0x") {
+                i32::from_str_radix(s, 16).unwrap_or(0)
+            } else {
+                addr_str.parse::<i32>().unwrap_or(0)
+            };
+            let mut s = String::new();
+            for off in 0..(args.dump_len as i32) {
+                let b = state.read_mem(addr + off) & 0xFF;
+                s += &format!("{:02X} ", b);
+                if off % 16 == 15 { s.push('\n'); }
+            }
+            eprintln!("    dump @ 0x{:X} (+{} bytes):\n{}", addr, args.dump_len, s);
+        }
+
+        if let Some(w) = &args.find_word {
+            let val: u32 = if let Some(s) = w.strip_prefix("0x") {
+                u32::from_str_radix(s, 16).unwrap_or(0)
+            } else { w.parse().unwrap_or(0) };
+            let lo = (val & 0xFF) as u8;
+            let hi = ((val >> 8) & 0xFF) as u8;
+            let mut count = 0;
+            let mut hits = Vec::new();
+            for i in 0..(0x100000 - 1) {
+                let b0 = state.read_mem(i as i32) as u8;
+                let b1 = state.read_mem((i + 1) as i32) as u8;
+                if b0 == lo && b1 == hi {
+                    hits.push(i);
+                    count += 1;
+                    if count >= 20 { break; }
+                }
+            }
+            if hits.is_empty() {
+                eprintln!("    find_word 0x{:04X}: NOT FOUND", val);
+            } else {
+                eprintln!("    find_word 0x{:04X}: {} hits at: {}", val, count,
+                    hits.iter().take(15).map(|x| format!("0x{:05X}", x)).collect::<Vec<_>>().join(" "));
+            }
+        }
+
+        if let Some(needle) = &args.find_string {
+            let bytes = needle.as_bytes();
+            let mut hits = Vec::new();
+            // Scan first 1MB
+            let mut buf = vec![0u8; 0x100000];
+            for i in 0..0x100000 {
+                buf[i] = state.read_mem(i as i32) as u8;
+            }
+            for i in 0..(buf.len() - bytes.len()) {
+                if &buf[i..i + bytes.len()] == bytes {
+                    hits.push(i);
+                    if hits.len() >= 5 { break; }
+                }
+            }
+            if hits.is_empty() {
+                eprintln!("    find_string '{}': NOT FOUND in [0..0x100000)", needle);
+            } else {
+                for h in &hits {
+                    eprintln!("    find_string '{}' @ linear 0x{:05X}", needle, h);
+                }
             }
         }
 
