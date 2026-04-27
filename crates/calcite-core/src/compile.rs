@@ -4854,6 +4854,28 @@ fn rep_fast_forward(program: &CompiledProgram, state: &mut State, slots: &[i32])
     if (flags >> 10) & 1 != 0 { rep_diag_bail("DF-set"); return; }
     if read_prop(program, state, slots, "--hasSegOverride").unwrap_or(0) != 0 { rep_diag_bail("seg-override"); return; }
 
+    // rep_fast_forward runs at end-of-tick, AFTER the CSS writeback that
+    // applies --IP/--CS/--SP/etc. to state-vars. If a hardware IRQ (or TF
+    // trap) was delivered THIS tick, those registers already hold the IVT
+    // vector (CS:IP = handler) and the saved IRET frame is on the stack.
+    // The string-op opcode (--opcode = 0xA4..0xA7) is still in slots[]
+    // because decode ran against the OLD CS:IP — but proceeding would smash
+    // the post-IRQ IP with `0 + 1 + prefix_len = 2`, skipping the first two
+    // bytes of the handler.
+    //
+    // Symptom (Doom8088, 2026-04-26): PIT fires during a libc memcpy REP
+    // MOVSW. CSS computes IRQ override (--IP = IVT[8].IP = 0, --CS = 0x2BC2),
+    // writeback updates state-vars. rep_fast_forward then reads IP=0 and
+    // writes IP=2, skipping `PUSH CX; PUSH AX`. Handler still pops them on
+    // exit → IRET reads a bogus frame from above its own stack window → CPU
+    // lands in a PSP/data area → halts on OUTSB (0x6E).
+    let irq_active = read_prop(program, state, slots, "--_irqActive").unwrap_or(0);
+    let tf_active  = read_prop(program, state, slots, "--_tf").unwrap_or(0);
+    if irq_active != 0 || tf_active != 0 {
+        rep_diag_bail("irq-or-tf-this-tick");
+        return;
+    }
+
     let step: i32 = if opcode == 0xAB || opcode == 0xA5 { 2 } else { 1 };
     let n = cx;
     let di = read_prop(program, state, slots, "--DI").unwrap_or(0);
@@ -4896,19 +4918,15 @@ fn rep_fast_forward(program: &CompiledProgram, state: &mut State, slots: &[i32])
         0
     };
 
-    // For MOVS, the source is the much bigger concern: the ROM-disk window
-    // at DS:SI → linear 0xD0000..0xD01FF is dispatched *per byte read* to
-    // `--readDiskByte(lba*512 + offset)`, so the bytes in `state.memory`
-    // at that window are never populated — a `copy_within` here pulls
-    // zeros. CSS-DOS's INT 13h handler does exactly this (rep movsw from
-    // DS=0xD000). Must bail.
-    if opcode == 0xA4 || opcode == 0xA5 {
-        let src_linear = (ds as i64) * 16 + si_end_opt.unwrap().0 as i64;
-        if ranges_overlap_virtual(src_linear, n_bytes) {
-            rep_diag_bail("src-virtual-range");
-            return;
-        }
-    }
+    // For MOVS, the source has two virtual regions to worry about:
+    //   - ROM-disk window at 0xD0000..0xD01FF: serviced by `state.read_mem`
+    //     when `state.disk_image` is loaded (calcite-cli loads it from the
+    //     `<cabinet>.disk.bin` sidecar). Hot path: Doom8088's BIOS hits
+    //     this REP hundreds of times during init.
+    //   - BIOS ROM at 0xF0000..0x100000: lives in `state.extended` and is
+    //     resolved by `read_mem` too. No bail needed.
+    // Both are handled by `bulk_copy_bytes`'s per-byte read path.
+    let _ = (ds, n_bytes); // suppress unused-warning for refactored bail
     let ip = state.get_var("IP").unwrap_or(0);
     let prefix_len = read_prop(program, state, slots, "--prefixLen").unwrap_or(1);
 
@@ -5094,13 +5112,21 @@ fn bulk_fill(state: &mut State, dst: i64, count: usize, val: u8) {
 fn bulk_copy(state: &mut State, src: i64, dst: i64, count: usize) {
     if count == 0 || src < 0 || dst < 0 { return; }
     let mem_len = effective_guest_mem_end(state);
-    if (src as usize) >= mem_len || (dst as usize) >= mem_len { return; }
-    let max_by_src = (mem_len as i64) - src;
+    // Destination must be inside writable guest memory. (BIOS-as-dst is
+    // bailed by the rep_fast_forward overlap check.)
+    if (dst as usize) >= mem_len { return; }
     let max_by_dst = (mem_len as i64) - dst;
-    let n = (count as i64).min(max_by_src).min(max_by_dst) as usize;
+    let mut n = count.min(max_by_dst as usize);
+    // Source may extend into the BIOS ROM region (0xF0000..0x100000) which
+    // lives in `state.extended`, not `state.memory`. `bulk_copy_bytes` uses
+    // `state.read_mem` per byte, which transparently handles extended, so we
+    // only need to ensure the dst window is valid; src bytes are always
+    // resolvable via read_mem (returns 0 for unmapped addresses).
     if n > 0 {
         state.bulk_copy_bytes(src as usize, dst as usize, n);
     }
+    // Suppress unused warning about `n` reassignment.
+    let _ = &mut n;
 }
 
 /// Execute a sequence of ops against the slot array.

@@ -124,6 +124,37 @@ struct Cli {
     /// Injects key 'a' (scan=0x1E, ascii=0x61) at tick 50, release at tick 100.
     #[arg(long, value_name = "EVENTS")]
     key_events: Option<String>,
+
+    /// Dump a flat byte range of guest memory to a binary file at end of run.
+    ///
+    /// Format: `ADDR:LEN:PATH`. ADDR and LEN may be decimal or 0xHEX. Writes
+    /// `LEN` bytes starting at linear address `ADDR` to `PATH`. Repeat the
+    /// flag to dump multiple regions in one run.
+    ///
+    /// Designed as the cheap data-source for an external screenshot tool:
+    /// run `calcite-cli` to a target tick, dump VRAM (and the BDA video-mode
+    /// byte) to disk, then let a Node-side rasteriser turn the bytes into
+    /// pixels. Avoids the per-tick chunked-IPC cost of going through
+    /// `calcite-debugger` and avoids re-implementing the rasterisers in Rust.
+    ///
+    /// Example: `--dump-mem-range=0xB8000:4000:vram.bin --dump-mem-range=0x449:1:mode.bin`
+    #[arg(long = "dump-mem-range", value_name = "ADDR:LEN:PATH")]
+    dump_mem_ranges: Vec<String>,
+
+    /// Trace the moment haltCode goes 0->nonzero.
+    ///
+    /// Runs tick-by-tick, keeps a small ring buffer of (CS, IP, AX, BX, CX, DX,
+    /// SS, SP, opcode) values, and prints the last N entries when haltCode
+    /// transitions to non-zero. Useful for finding the exact instruction that
+    /// branched the CPU into garbage. Stops at the first halt; combine with
+    /// --ticks N as an upper bound.
+    #[arg(long)]
+    trace_halt: bool,
+
+    /// Fast-forward (run_batch) to this tick before starting tick-by-tick tracing.
+    /// Useful with --trace-halt when you already know the halt is far in.
+    #[arg(long, value_name = "N")]
+    trace_halt_skip: Option<u32>,
 }
 
 
@@ -236,6 +267,43 @@ impl KeyCodeAscii for KeyCode {
     }
 }
 
+/// Parse and execute a `--dump-mem-range=ADDR:LEN:PATH` spec: write `LEN`
+/// bytes from guest linear address `ADDR` to `PATH`. Returns a stringified
+/// error on parse or write failure. Numbers may be decimal or `0x`-prefixed.
+///
+/// Out-of-range reads return zeros (matching `state.read_mem` semantics) so a
+/// dump request that overshoots the cabinet's allocated memory still produces
+/// a file of the requested length — the caller can decide whether all-zeros
+/// means "VRAM not yet written" or "wrong address".
+fn dump_mem_range(spec: &str, state: &calcite_core::State) -> Result<(), String> {
+    let parts: Vec<&str> = spec.splitn(3, ':').collect();
+    if parts.len() != 3 {
+        return Err(format!("expected ADDR:LEN:PATH, got {spec:?}"));
+    }
+    let parse_num = |s: &str, what: &str| -> Result<i64, String> {
+        let s = s.trim();
+        let v = if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+            i64::from_str_radix(hex, 16)
+        } else {
+            s.parse::<i64>()
+        };
+        v.map_err(|e| format!("invalid {what} {s:?}: {e}"))
+    };
+    let addr = parse_num(parts[0], "ADDR")?;
+    let len = parse_num(parts[1], "LEN")?;
+    if len < 0 {
+        return Err(format!("LEN must be non-negative, got {len}"));
+    }
+    let path = parts[2];
+    let mut out = vec![0u8; len as usize];
+    for i in 0..(len as usize) {
+        out[i] = (state.read_mem(addr as i32 + i as i32) & 0xFF) as u8;
+    }
+    std::fs::write(path, &out).map_err(|e| format!("write {path:?}: {e}"))?;
+    eprintln!("dump-mem-range: {} bytes from 0x{:X} -> {}", len, addr, path);
+    Ok(())
+}
+
 fn main() {
     env_logger::init();
     let cli = Cli::parse();
@@ -312,6 +380,24 @@ fn main() {
             // variable addresses are in the address map before compilation.
             let mut state = calcite_core::State::default();
             state.load_properties(&parsed.properties);
+
+            // Load the cabinet's disk sidecar so REP MOVSW from the rom-disk
+            // window can fast-forward in bulk. Without this, every BIOS
+            // sector load (Doom8088 hits hundreds during init) costs 256
+            // ticks for the per-byte CSS dispatch instead of 1 in bulk —
+            // calcite never reaches the demo loop within feasible tick budgets.
+            // Sidecar is `<cabinet>.disk.bin` next to the .css.
+            {
+                let mut disk_path = input_path.clone();
+                let stem = disk_path.file_stem().map(|s| s.to_string_lossy().to_string());
+                if let Some(stem) = stem {
+                    disk_path.set_file_name(format!("{}.disk.bin", stem));
+                    if let Ok(bytes) = std::fs::read(&disk_path) {
+                        eprintln!("loaded disk sidecar: {} ({} bytes)", disk_path.display(), bytes.len());
+                        state.disk_image = Some(bytes);
+                    }
+                }
+            }
 
             let t1 = std::time::Instant::now();
             let mut evaluator = calcite_core::Evaluator::from_parsed(&parsed);
@@ -581,6 +667,17 @@ fn main() {
                         }
                     }
                 }
+                // --dump-mem-range pairs naturally with --dump-tick — same
+                // "stop at this tick and report what's there" model. Run them
+                // here too so callers can `--dump-tick=N --dump-mem-range=...`
+                // without also passing --ticks (which the eval block below
+                // requires).
+                for spec in &cli.dump_mem_ranges {
+                    if let Err(e) = dump_mem_range(spec, &state) {
+                        eprintln!("--dump-mem-range={spec}: {e}");
+                        std::process::exit(1);
+                    }
+                }
                 return;
             }
 
@@ -637,6 +734,73 @@ fn main() {
                         }
                     }
                 }
+                return;
+            }
+
+            // --trace-halt: tick-by-tick monitor that prints a ring buffer of
+            // recent CPU state when haltCode goes 0 -> nonzero. Designed for
+            // finding the exact instruction that branches the CPU into garbage
+            // (the symptom is "haltCode=110/OUTSB" suddenly latching after
+            // millions of clean ticks). Slow — runs unbatched — so cap with
+            // --ticks N when looking near a known halt window.
+            if cli.trace_halt {
+                let names = ["CS","IP","AX","BX","CX","DX","SI","DI","SS","SP","BP","DS","ES","flags","cycleCount","haltCode","_irqActive","_tf","picPending","picMask","picInService","_irqBit","_pitFired","_kbdEdge","picVector","prevKeyboard","keyboard","pitCounter"];
+                let slots: Vec<Option<usize>> = names.iter()
+                    .map(|n| state.state_var_names.iter().position(|x| x == n))
+                    .collect();
+                let halt_idx = names.iter().position(|n| *n == "haltCode").unwrap();
+                let halt_slot = slots[halt_idx];
+                let cs_slot   = slots[0];
+                let ip_slot   = slots[1];
+                const RING: usize = 2048;
+                let mut ring: Vec<(u32, Vec<i32>, u8, u8, u8, u8)> = Vec::with_capacity(RING + 4);
+                // Fast-forward via run_batch if --trace-halt-skip was given.
+                let skip = cli.trace_halt_skip.unwrap_or(0);
+                let mut start_tick: u32 = 1;
+                if skip > 0 && skip <= ticks_limit {
+                    eprintln!("# trace-halt: fast-forwarding to tick {}", skip);
+                    evaluator.run_batch(&mut state, skip);
+                    let halt_now = halt_slot.map(|i| state.state_vars[i]).unwrap_or(0);
+                    eprintln!("# trace-halt: post-skip haltCode={}", halt_now);
+                    start_tick = skip + 1;
+                }
+                let mut prev_halt: i32 = halt_slot.map(|i| state.state_vars[i]).unwrap_or(0);
+                eprintln!("# trace-halt: running tick-by-tick from {} to {}", start_tick, ticks_limit);
+                for tick in start_tick..=ticks_limit {
+                    for &(ev_tick, ev_val) in &key_events {
+                        if ev_tick == tick { state.set_var("keyboard", ev_val); }
+                    }
+                    evaluator.tick(&mut state);
+                    // Read each watched state-var.
+                    let vals: Vec<i32> = slots.iter()
+                        .map(|s| s.map(|i| state.state_vars[i]).unwrap_or(0))
+                        .collect();
+                    // Read 4 bytes at CS:IP for instruction context.
+                    let cs = cs_slot.map(|i| state.state_vars[i]).unwrap_or(0);
+                    let ip = ip_slot.map(|i| state.state_vars[i]).unwrap_or(0);
+                    let lin = (cs as i32) * 16 + (ip as i32);
+                    let b0 = (state.read_mem(lin)     & 0xFF) as u8;
+                    let b1 = (state.read_mem(lin + 1) & 0xFF) as u8;
+                    let b2 = (state.read_mem(lin + 2) & 0xFF) as u8;
+                    let b3 = (state.read_mem(lin + 3) & 0xFF) as u8;
+                    if ring.len() == RING { ring.remove(0); }
+                    ring.push((tick, vals.clone(), b0, b1, b2, b3));
+                    let halt = vals[halt_idx];
+                    if prev_halt == 0 && halt != 0 {
+                        eprintln!("\n=== haltCode 0 -> {} (0x{:02X}) at tick {} ===", halt, halt & 0xFF, tick);
+                        eprintln!("(last {} ticks; columns: {})", ring.len(), names.join(","));
+                        for (t, v, a, b, c, d) in &ring {
+                            print!("tick={} ", t);
+                            for (i, name) in names.iter().enumerate() {
+                                print!("{}={} ", name, v[i]);
+                            }
+                            println!("bytes_at_csip={:02x} {:02x} {:02x} {:02x}", a, b, c, d);
+                        }
+                        return;
+                    }
+                    prev_halt = halt;
+                }
+                eprintln!("# trace-halt: ticks_limit reached ({}), no halt detected", ticks_limit);
                 return;
             }
 
@@ -846,6 +1010,11 @@ fn main() {
                     ip,
                 );
             }
+            // Diagnostic: dump REP fast-forward fire/bail counts when
+            // CALCITE_REP_DIAG is set. Cheap (~free) when not enabled.
+            if std::env::var("CALCITE_REP_DIAG").is_ok() {
+                eprint!("{}", calcite_core::compile::rep_diag_report());
+            }
             eprintln!(
                 "Elapsed: {:.3}s ({} ticks, {:.0} ticks/sec)",
                 tick_time.as_secs_f64(),
@@ -888,6 +1057,17 @@ fn main() {
                     }
                 } else {
                     eprintln!("--framebuffer-out: current video mode is 0x{video_mode:02X}, not Mode 13h — nothing written");
+                }
+            }
+
+            // --dump-mem-range: write raw byte regions from guest memory to
+            // disk so an external tool (e.g. tests/harness/fast-shoot.mjs)
+            // can render screenshots without re-implementing video decode in
+            // Rust or paying per-tick IPC cost through calcite-debugger.
+            for spec in &cli.dump_mem_ranges {
+                if let Err(e) = dump_mem_range(spec, &state) {
+                    eprintln!("--dump-mem-range={spec}: {e}");
+                    std::process::exit(1);
                 }
             }
         }

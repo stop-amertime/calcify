@@ -163,10 +163,19 @@ fn memory_copy_negative_src_noop_memory() {
 fn memory_copy_forward_overlap_dst_after_src() {
     // src = 0x1000, dst = 0x1004, count = 8
     // Bytes at 0x1000..0x1008 are [0,1,2,3,4,5,6,7].
-    // copy_within copies [0..8] to [4..12], yielding at 0x1000..0x100C:
-    //   [0,1,2,3, 0,1,2,3,4,5,6,7]
-    // (i.e. the source view at the time of the copy is snapshotted byte-by-byte
-    //  from index 0 upward, which `copy_within` does correctly even when dst > src).
+    //
+    // This is the LZ77 self-reference pattern: copy starts reading 4 bytes
+    // before dst, and after 4 iterations starts re-reading the bytes it
+    // just wrote. REP MOVSB on x86 does this byte-at-a-time, so the
+    // overlap region MUST repeat the prefix (NOT pull stale source bytes
+    // — that's `memmove`/snapshot semantics, which would silently break
+    // any LZ-style decompressor like UPX).
+    //
+    // Iter-by-iter: read [0]=0 → write [4]; read [1]=1 → write [5];
+    // read [2]=2 → write [6]; read [3]=3 → write [7]; now [4]==0 (just
+    // written) → read it → write [8]; etc. So the trailing 4 bytes
+    // become 0,1,2,3 — the same as the leading 4. Final layout
+    // 0x1000..0x100C: [0,1,2,3, 0,1,2,3, 0,1,2,3].
     let ops = vec![Op::MemoryCopy {
         src_slot: 0,
         dst_slot: 1,
@@ -181,8 +190,7 @@ fn memory_copy_forward_overlap_dst_after_src() {
 
     exec_ops_for_test(&ops, &mut state, &mut slots);
 
-    // First 4 bytes: original source prefix untouched by the copy (dst starts at +4).
-    let expected = [0u8, 1, 2, 3, 0, 1, 2, 3, 4, 5, 6, 7];
+    let expected = [0u8, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3];
     for (i, want) in expected.iter().enumerate() {
         assert_eq!(
             state.memory[0x1000 + i],

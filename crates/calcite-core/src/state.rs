@@ -81,6 +81,16 @@ pub struct State {
     pub packed_cell_table: Vec<i32>,
     /// Bytes per packed cell (2 in current CSS-DOS). 0 means "no packed layout".
     pub packed_cell_size: u8,
+    /// Optional disk image — when present, `read_mem` services the rom-disk
+    /// window at linear `[0xD0000, 0xD0200)` from `disk_image[lba*512 + off]`
+    /// where `lba = read_mem16(0x4F0)`. Mirrors the `--readDiskByte` dispatch
+    /// that the cabinet's CSS implements as a giant per-byte if-chain.
+    /// Loaded by `calcite-cli` from the cabinet's `<name>.disk.bin` sidecar
+    /// so REP MOVSW from `DS=0xD000` can fast-forward via `bulk_copy_bytes`
+    /// instead of hitting per-byte CSS evaluation. Without this, every BIOS
+    /// sector load (Doom8088 hits this hundreds of times during init) costs
+    /// 256 ticks instead of 1, and calcite never reaches the demo loop.
+    pub disk_image: Option<Vec<u8>>,
 }
 
 impl State {
@@ -98,6 +108,7 @@ impl State {
             write_log: None,
             packed_cell_table: Vec::new(),
             packed_cell_size: 0,
+            disk_image: None,
         }
     }
 
@@ -214,6 +225,31 @@ impl State {
             }
         } else {
             let addr_u = addr as usize;
+            // ROM-disk window: linear [0xD0000, 0xD0200) is a 1-sector
+            // sliding window; the cabinet's INT 13h handler writes the
+            // current LBA word to linear 0x4F0 and the program then reads
+            // the sector via REP MOVSW from DS=0xD000. The CSS path
+            // synthesises this via `--readDiskByte` per byte; the native
+            // path uses `disk_image` (loaded by calcite-cli from the
+            // cabinet's `<name>.disk.bin` sidecar). Without this short-
+            // circuit, REP MOVSW from DS=0xD000 falls through to the
+            // packed-cell path below, finds nothing, returns 0, and
+            // bulk-fast-forward copies zeros instead of sector bytes.
+            if addr_u >= 0xD_0000 && addr_u < 0xD_0200 {
+                if let Some(ref disk) = self.disk_image {
+                    let lba_lo = if (0x4F0_usize) < self.memory.len() { self.memory[0x4F0] as usize } else { 0 };
+                    let lba_hi = if (0x4F1_usize) < self.memory.len() { self.memory[0x4F1] as usize } else { 0 };
+                    let lba = lba_lo | (lba_hi << 8);
+                    let off = lba * 512 + (addr_u - 0xD_0000);
+                    if off < disk.len() {
+                        let v = disk[off] as i32;
+                        if let Ok(mut borrow) = self.read_log.try_borrow_mut() {
+                            if let Some(ref mut log) = *borrow { log.push((addr, v)); }
+                        }
+                        return v;
+                    }
+                }
+            }
             // Packed-cell path first, for any positive address. Packed
             // cells cover conventional RAM (0..0xA0000) on most cabinets
             // and also out-of-range regions like the VGA DAC at 0x100000
@@ -358,20 +394,30 @@ impl State {
         }
     }
 
-    /// Copy a byte range through the packed-aware write path. Handles
-    /// `src`/`dst` regions that may overlap in either direction.
+    /// Copy a byte range through the packed-aware write path, matching the
+    /// per-byte read-then-write semantics of REP MOVSB on x86 (forward
+    /// direction — the only direction this is called from, since
+    /// `rep_fast_forward` bails on DF=1).
+    ///
+    /// **Overlap matters here.** If `dst > src` and the ranges overlap,
+    /// later iterations read bytes that were *just written* by earlier
+    /// iterations. That is exactly the LZ77 self-reference UPX (and any
+    /// LZ-style decompressor) relies on: `MOV SI,dst-N; MOV CX,len;
+    /// REP MOVSB` to repeat the last N bytes. A `memmove`-style snapshot
+    /// would break that — the copy would pull stale source bytes and
+    /// produce garbage. Symptom: UPX-packed COMMAND.COM exits via INT 20h
+    /// because its decompression output is corrupt, kernel reads it as
+    /// "shell exited cleanly" and prints "Bad or missing command interpreter".
+    ///
+    /// Forward-overlap with `src > dst` is fine either way (writes don't
+    /// touch unread source bytes); backward-overlap (REP MOVSB with DF=1)
+    /// would be wrong with this implementation, but the fast-forward bails
+    /// before getting here in that case.
     pub fn bulk_copy_bytes(&mut self, src: usize, dst: usize, count: usize) {
         if count == 0 { return; }
-        // Snapshot source bytes first so overlapping src/dst regions
-        // behave like a left-to-right copy from a stable read view.
-        let mut buf = vec![0u8; count];
         for i in 0..count {
-            let sa = (src + i) as i32;
-            buf[i] = (self.read_mem(sa) & 0xFF) as u8;
-        }
-        // Now write them out through the packed-aware path.
-        for i in 0..count {
-            self.write_byte_packed_aware(dst + i, buf[i]);
+            let byte = (self.read_mem((src + i) as i32) & 0xFF) as u8;
+            self.write_byte_packed_aware(dst + i, byte);
         }
     }
 
@@ -931,5 +977,47 @@ mod tests {
 
         state.write_mem(-2, -2);
         assert_eq!(state.state_vars[1], -2);
+    }
+
+    /// REP MOVSB with forward-overlap is the LZ77 self-reference pattern
+    /// that UPX (and any LZ-style decompressor) depends on. Each iteration
+    /// reads then writes one byte, so when SI catches up to the bytes DI
+    /// just wrote, those new bytes get re-copied — repeating the run.
+    /// `bulk_copy_bytes` must mirror this; a `memmove`-style snapshot
+    /// would silently break LZ77 and any UPX-packed program would produce
+    /// garbage on decompression. Concrete consequence we hit in the wild:
+    /// UPX-packed COMMAND.COM exiting via INT 20h instead of running its
+    /// shell loop, kernel reporting "Bad or missing command interpreter".
+    #[test]
+    fn bulk_copy_bytes_lz77_repeat() {
+        let mut state = State::default();
+        state.write_mem(0x100, b'A' as i32);
+        state.write_mem(0x101, b'B' as i32);
+        state.write_mem(0x102, b'C' as i32);
+        // Copy 6 bytes from 0x100 to 0x103 — LZ-style "repeat last 3".
+        // Per-iteration semantics: write A→0x103, B→0x104, C→0x105,
+        // then read 0x103 (now 'A') → write 0x106, etc.
+        state.bulk_copy_bytes(0x100, 0x103, 6);
+        assert_eq!(state.read_mem(0x103), b'A' as i32);
+        assert_eq!(state.read_mem(0x104), b'B' as i32);
+        assert_eq!(state.read_mem(0x105), b'C' as i32);
+        assert_eq!(state.read_mem(0x106), b'A' as i32);
+        assert_eq!(state.read_mem(0x107), b'B' as i32);
+        assert_eq!(state.read_mem(0x108), b'C' as i32);
+    }
+
+    /// Sister case: non-overlapping copy must still work — and copying
+    /// with `src > dst` (no overlap into source) must not be perturbed
+    /// by the per-byte loop.
+    #[test]
+    fn bulk_copy_bytes_disjoint() {
+        let mut state = State::default();
+        for i in 0..4 { state.write_mem(0x200 + i, (i + 1) as i32); }
+        state.bulk_copy_bytes(0x200, 0x300, 4);
+        for i in 0..4 {
+            assert_eq!(state.read_mem(0x300 + i), (i + 1) as i32);
+            // Source unchanged.
+            assert_eq!(state.read_mem(0x200 + i), (i + 1) as i32);
+        }
     }
 }
