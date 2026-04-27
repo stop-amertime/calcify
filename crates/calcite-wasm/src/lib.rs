@@ -148,6 +148,24 @@ impl CalciteEngine {
         self.state.set_var("keyboard", key & 0xFFFF);
     }
 
+    /// Load a disk image so REP MOVS from `DS=0xD000` (the rom-disk window
+    /// at linear `[0xD0000, 0xD0200)`) can fast-forward in O(1) instead of
+    /// bailing to per-byte CSS evaluation.
+    ///
+    /// Without a disk image, calcite-core's `rep_fast_forward` bails on the
+    /// rom-disk source range (the bail relies on the CSS path to invoke
+    /// `--readDiskByte` for the right bytes). With one, `state.read_mem`
+    /// services those addresses directly from the byte slice, mirroring the
+    /// cabinet's `--readDiskByte` dispatch but in O(1).
+    ///
+    /// The disk image should be the FAT12 floppy bytes that would be the
+    /// `<cabinet>.disk.bin` sidecar in calcite-cli usage. The browser
+    /// cabinet builder has these bytes in scope (`buildFloppyInBrowser`
+    /// returns them) and should pass them in here right after `compile`.
+    pub fn set_disk_image(&mut self, bytes: &[u8]) {
+        self.state.disk_image = Some(bytes.to_vec());
+    }
+
     /// Get the current value of a register (for debugging).
     pub fn get_register(&self, index: usize) -> i32 {
         if index < self.state.state_vars.len() {

@@ -155,6 +155,40 @@ struct Cli {
     /// Useful with --trace-halt when you already know the halt is far in.
     #[arg(long, value_name = "N")]
     trace_halt_skip: Option<u32>,
+
+    /// Scripted action to fire at a specific tick. Repeatable.
+    ///
+    /// Format: `TICK:KIND[:ARGS...]`. TICK may be decimal or 0xHEX. KIND is
+    /// one of:
+    ///
+    ///   `kbd:VALUE`               — set --keyboard to VALUE at TICK.
+    ///                               VALUE = (scan << 8) | ascii. Decimal or 0xHEX.
+    ///   `tap:VALUE[:HOLD]`        — press VALUE at TICK, release at TICK+HOLD.
+    ///                               HOLD defaults to 5000 ticks. Use this for
+    ///                               menu/key input — a single `kbd` doesn't
+    ///                               produce a release edge, so subsequent
+    ///                               keys are sometimes ignored.
+    ///   `dump:ADDR:LEN:PATH`      — write LEN bytes from guest linear ADDR to PATH.
+    ///   `regs[:TAG]`              — print one line of regs to stdout, prefixed `tag=TAG`.
+    ///   `halt`                    — stop the run at TICK.
+    ///
+    /// Examples:
+    ///   `--script-event=2000000:tap:0x1c0d` (Enter at 2M ticks)
+    ///   `--script-event=10000000:dump:0xa0000:64000:vga@10m.bin`
+    ///   `--script-event=15000000:regs:title-check`
+    ///   `--script-event=30000000:halt`
+    ///
+    /// Events are sorted by TICK; between events calcite uses run_batch
+    /// for full speed. This is the way to script multi-step interactions
+    /// (press a key, wait, dump, press another key) without paying the
+    /// per-tick cost of `--key-events`.
+    #[arg(long = "script-event", value_name = "TICK:KIND[:ARGS]")]
+    script_events: Vec<String>,
+
+    /// Read additional --script-event entries from a file, one per line.
+    /// Lines starting with `#` and blank lines are ignored.
+    #[arg(long = "script-file", value_name = "PATH")]
+    script_file: Option<PathBuf>,
 }
 
 
@@ -302,6 +336,144 @@ fn dump_mem_range(spec: &str, state: &calcite_core::State) -> Result<(), String>
     std::fs::write(path, &out).map_err(|e| format!("write {path:?}: {e}"))?;
     eprintln!("dump-mem-range: {} bytes from 0x{:X} -> {}", len, addr, path);
     Ok(())
+}
+
+/// One scheduled action during a run. Parsed from `--script-event` strings
+/// of the form `TICK:KIND[:ARGS...]`. See the flag's clap help for syntax.
+#[derive(Debug, Clone)]
+enum ScriptAction {
+    Kbd { value: i32 },
+    DumpMem { addr: i64, len: i64, path: String },
+    Regs { tag: String },
+    Halt,
+}
+
+#[derive(Debug, Clone)]
+struct ScriptEvent {
+    tick: u32,
+    action: ScriptAction,
+}
+
+fn parse_int_flexible(s: &str, what: &str) -> Result<i64, String> {
+    let s = s.trim();
+    let v = if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        i64::from_str_radix(hex, 16)
+    } else {
+        s.parse::<i64>()
+    };
+    v.map_err(|e| format!("invalid {what} {s:?}: {e}"))
+}
+
+/// Returns one or more events (a `tap` becomes a press + release pair).
+fn parse_script_event(spec: &str) -> Result<Vec<ScriptEvent>, String> {
+    let mut iter = spec.splitn(2, ':');
+    let tick_s = iter.next().ok_or_else(|| format!("empty script-event {spec:?}"))?;
+    let rest = iter.next().ok_or_else(|| format!("script-event missing KIND: {spec:?}"))?;
+    let tick = parse_int_flexible(tick_s, "TICK")?;
+    if tick < 0 || tick > u32::MAX as i64 {
+        return Err(format!("TICK out of range in {spec:?}"));
+    }
+    let mut kind_iter = rest.splitn(2, ':');
+    let kind = kind_iter.next().unwrap_or("").trim();
+    let args = kind_iter.next().unwrap_or("");
+    match kind {
+        "kbd" => {
+            let v = parse_int_flexible(args, "VALUE")?;
+            Ok(vec![ScriptEvent { tick: tick as u32, action: ScriptAction::Kbd { value: v as i32 } }])
+        }
+        "tap" => {
+            // tap:VALUE[:HOLD_TICKS] — synthesize a press + release pair so
+            // the cabinet sees an _kbdPress edge then an _kbdRelease edge.
+            // Without the release, --prevKeyboard stays non-zero and the
+            // next "kbd <- VAL" only triggers a press if VAL differs from
+            // prev. Default hold = 5000 ticks, plenty for the 18.2 Hz PIT
+            // to fire IRQ 1 several times.
+            let parts: Vec<&str> = args.splitn(2, ':').collect();
+            let v = parse_int_flexible(parts[0], "VALUE")?;
+            let hold = if parts.len() == 2 {
+                parse_int_flexible(parts[1], "HOLD_TICKS")? as u32
+            } else { 5000 };
+            let release_tick = (tick as u32).saturating_add(hold);
+            Ok(vec![
+                ScriptEvent { tick: tick as u32, action: ScriptAction::Kbd { value: v as i32 } },
+                ScriptEvent { tick: release_tick, action: ScriptAction::Kbd { value: 0 } },
+            ])
+        }
+        "dump" => {
+            let parts: Vec<&str> = args.splitn(3, ':').collect();
+            if parts.len() != 3 {
+                return Err(format!("dump expects ADDR:LEN:PATH, got {args:?}"));
+            }
+            let addr = parse_int_flexible(parts[0], "ADDR")?;
+            let len = parse_int_flexible(parts[1], "LEN")?;
+            if len < 0 { return Err(format!("LEN must be non-negative, got {len}")); }
+            Ok(vec![ScriptEvent { tick: tick as u32, action: ScriptAction::DumpMem { addr, len, path: parts[2].to_string() } }])
+        }
+        "regs" => {
+            let tag = if args.is_empty() { String::new() } else { args.to_string() };
+            Ok(vec![ScriptEvent { tick: tick as u32, action: ScriptAction::Regs { tag } }])
+        }
+        "halt" => Ok(vec![ScriptEvent { tick: tick as u32, action: ScriptAction::Halt }]),
+        _ => Err(format!("unknown script-event KIND {kind:?} in {spec:?}")),
+    }
+}
+
+fn load_script_events(specs: &[String], file: Option<&std::path::Path>) -> Result<Vec<ScriptEvent>, String> {
+    let mut out: Vec<ScriptEvent> = Vec::new();
+    for s in specs {
+        out.extend(parse_script_event(s)?);
+    }
+    if let Some(p) = file {
+        let text = std::fs::read_to_string(p).map_err(|e| format!("read {p:?}: {e}"))?;
+        for (i, line) in text.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') { continue; }
+            out.extend(parse_script_event(line).map_err(|e| format!("{p:?} line {}: {e}", i + 1))?);
+        }
+    }
+    out.sort_by_key(|e| e.tick);
+    Ok(out)
+}
+
+fn execute_script_action(action: &ScriptAction, state: &mut calcite_core::State, current_tick: u32) -> bool {
+    // Returns true if execution should halt after this action.
+    match action {
+        ScriptAction::Kbd { value } => {
+            state.set_var("keyboard", *value);
+            eprintln!("[script {}] kbd <- 0x{:04x}", current_tick, *value as u32 & 0xFFFF);
+            false
+        }
+        ScriptAction::DumpMem { addr, len, path } => {
+            let mut buf = vec![0u8; *len as usize];
+            for i in 0..(*len as usize) {
+                buf[i] = (state.read_mem(*addr as i32 + i as i32) & 0xFF) as u8;
+            }
+            if let Err(e) = std::fs::write(path, &buf) {
+                eprintln!("[script {}] dump 0x{:X}+{} -> {}: ERROR {}", current_tick, addr, len, path, e);
+            } else {
+                eprintln!("[script {}] dump 0x{:X}+{} -> {}", current_tick, addr, len, path);
+            }
+            false
+        }
+        ScriptAction::Regs { tag } => {
+            // Print a compact one-line regs dump prefixed with the tag.
+            let names = ["AX","BX","CX","DX","SP","BP","SI","DI","IP","CS","DS","ES","SS","flags","cycleCount"];
+            let mut line = format!("[script {} regs", current_tick);
+            if !tag.is_empty() { line.push_str(&format!(" tag={}", tag)); }
+            line.push(']');
+            for name in names {
+                let v = state.state_var_names.iter().position(|n| n == name)
+                    .map(|i| state.state_vars[i]).unwrap_or(0);
+                line.push_str(&format!(" {}={}", name, v));
+            }
+            println!("{}", line);
+            false
+        }
+        ScriptAction::Halt => {
+            eprintln!("[script {}] halt", current_tick);
+            true
+        }
+    }
 }
 
 fn main() {
@@ -458,6 +630,18 @@ fn main() {
                     })
                     .collect()
             }).unwrap_or_default();
+
+            // Parse --script-event / --script-file. Sorted by tick.
+            let script_events: Vec<ScriptEvent> = match load_script_events(
+                &cli.script_events,
+                cli.script_file.as_deref(),
+            ) {
+                Ok(v) => v,
+                Err(e) => { eprintln!("script: {e}"); std::process::exit(1); }
+            };
+            if !script_events.is_empty() {
+                eprintln!("loaded {} script event(s)", script_events.len());
+            }
 
             let t2 = std::time::Instant::now();
 
@@ -982,6 +1166,28 @@ fn main() {
                         }
                     }
                 }
+            } else if !script_events.is_empty() {
+                // Run in chunks bounded by script-event ticks. Between events
+                // use run_batch for full speed.
+                let mut cursor: u32 = 0;
+                let mut halted = false;
+                for ev in &script_events {
+                    if ev.tick > ticks_limit { break; }
+                    if ev.tick > cursor {
+                        let batch = ev.tick - cursor;
+                        evaluator.run_batch(&mut state, batch);
+                        cursor = ev.tick;
+                    }
+                    if execute_script_action(&ev.action, &mut state, cursor) {
+                        halted = true;
+                        break;
+                    }
+                }
+                if !halted && cursor < ticks_limit {
+                    evaluator.run_batch(&mut state, ticks_limit - cursor);
+                    cursor = ticks_limit;
+                }
+                ticks_run = cursor;
             } else {
                 evaluator.run_batch(&mut state, ticks_limit);
                 ticks_run = ticks_limit;

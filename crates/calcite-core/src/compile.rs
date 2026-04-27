@@ -4838,13 +4838,21 @@ fn rep_fast_forward(program: &CompiledProgram, state: &mut State, slots: &[i32])
     // state borrow before any mutations.
     rep_diag_bail("00-entered");
     let opcode = match read_prop(program, state, slots, "--opcode") { Some(v) => v, None => { rep_diag_bail("no-opcode"); return; } };
-    if opcode != 0xAA && opcode != 0xAB && opcode != 0xA4 && opcode != 0xA5 {
+    // Two opcode groups handled below:
+    //   STOS/MOVS (0xAA/AB/A4/A5): write-side, repType must be 1.
+    //   CMPS/SCAS (0xA6/A7/AE/AF): read-only with early exit on flag
+    //     condition; repType 1 (REPE) or 2 (REPNE) are both meaningful.
+    let is_stos_movs = matches!(opcode, 0xAA | 0xAB | 0xA4 | 0xA5);
+    let is_cmps_scas = matches!(opcode, 0xA6 | 0xA7 | 0xAE | 0xAF);
+    if !is_stos_movs && !is_cmps_scas {
         rep_diag_bail("opcode-not-string");
         return;
     }
     rep_diag_bail("01-opcode-is-string");
     if read_prop(program, state, slots, "--hasREP").unwrap_or(0) != 1 { rep_diag_bail("no-hasREP"); return; }
-    if read_prop(program, state, slots, "--repType").unwrap_or(0) != 1 { rep_diag_bail("repType-ne-1"); return; }
+    let rep_type = read_prop(program, state, slots, "--repType").unwrap_or(0);
+    if is_stos_movs && rep_type != 1 { rep_diag_bail("repType-ne-1"); return; }
+    if is_cmps_scas && rep_type != 1 && rep_type != 2 { rep_diag_bail("repType-bad"); return; }
     let cx = match read_prop(program, state, slots, "--CX") {
         Some(v) => v,
         None => { rep_diag_bail("no-CX"); return; }
@@ -4873,6 +4881,35 @@ fn rep_fast_forward(program: &CompiledProgram, state: &mut State, slots: &[i32])
     let tf_active  = read_prop(program, state, slots, "--_tf").unwrap_or(0);
     if irq_active != 0 || tf_active != 0 {
         rep_diag_bail("irq-or-tf-this-tick");
+        return;
+    }
+
+    // Handle CMPS / SCAS (read-only string ops with early exit on flag
+    // condition) in a separate path. These don't write memory; they walk
+    // through ES:DI (and DS:SI for CMPS) byte/word at a time, comparing
+    // and updating flags, stopping when CX hits 0 or when the REPE/REPNE
+    // condition flips.
+    //
+    // The CSS already executed one iteration BEFORE this hook fires.
+    // Crucially, that iteration may have already terminated the REP via
+    // its ZF condition — in which case post-tick IP has advanced past
+    // the prefix and we must NOT do another iteration. Detect this from
+    // post-tick flags: REPE exits when ZF=0 (after a non-equal compare),
+    // REPNE exits when ZF=1 (after an equal compare). `cx` here is
+    // post-tick (CSS decremented CX by 1 unconditionally); a fresh check
+    // against 0 happens after we factor in that early-exit.
+    if is_cmps_scas {
+        let zf_post = (flags >> 6) & 1;
+        let rep_already_exited =
+            (rep_type == 1 && zf_post == 0) ||  // REPE: stop on inequality
+            (rep_type == 2 && zf_post == 1);    // REPNE: stop on equality
+        if rep_already_exited {
+            // CSS finished the REP this tick; post-tick IP, CX, SI, DI,
+            // flags are already correct. Don't touch anything.
+            rep_diag_bail("cmps-scas-already-exited");
+            return;
+        }
+        rep_fast_forward_cmps_scas(program, state, slots, opcode, rep_type, cx, flags);
         return;
     }
 
@@ -4920,13 +4957,23 @@ fn rep_fast_forward(program: &CompiledProgram, state: &mut State, slots: &[i32])
 
     // For MOVS, the source has two virtual regions to worry about:
     //   - ROM-disk window at 0xD0000..0xD01FF: serviced by `state.read_mem`
-    //     when `state.disk_image` is loaded (calcite-cli loads it from the
-    //     `<cabinet>.disk.bin` sidecar). Hot path: Doom8088's BIOS hits
-    //     this REP hundreds of times during init.
+    //     ONLY when `state.disk_image` is populated. calcite-cli loads it
+    //     from the `<cabinet>.disk.bin` sidecar; calcite-wasm currently
+    //     does not. When `disk_image` is None, `read_mem` falls through
+    //     to the packed-cell path, which has no entries for the rom-disk
+    //     window and returns 0 — silently corrupting every disk read. The
+    //     CSS path resolves these via the `--readDiskByte` function in the
+    //     dispatch table, so we MUST bail to per-byte CSS evaluation.
     //   - BIOS ROM at 0xF0000..0x100000: lives in `state.extended` and is
-    //     resolved by `read_mem` too. No bail needed.
-    // Both are handled by `bulk_copy_bytes`'s per-byte read path.
-    let _ = (ds, n_bytes); // suppress unused-warning for refactored bail
+    //     resolved by `read_mem` regardless of disk_image — no bail needed.
+    if (opcode == 0xA4 || opcode == 0xA5) && state.disk_image.is_none() {
+        let src_linear = (ds as i64) * 16 + si_end_opt.unwrap().0 as i64;
+        if src_linear < 0xD_0200 && (src_linear + n_bytes) > 0xD_0000 {
+            rep_diag_bail("src-rom-disk-no-image");
+            return;
+        }
+    }
+    let _ = (ds, n_bytes); // suppress unused-warning when both branches are inert
     let ip = state.get_var("IP").unwrap_or(0);
     let prefix_len = read_prop(program, state, slots, "--prefixLen").unwrap_or(1);
 
@@ -4972,6 +5019,193 @@ fn rep_fast_forward(program: &CompiledProgram, state: &mut State, slots: &[i32])
         state.set_var("cycleCount", cc.wrapping_add(n.wrapping_mul(per_iter)));
     }
     rep_diag_fire(opcode, n);
+}
+
+/// Fast-forward REPE/REPNE CMPS{B,W} and SCAS{B,W}.
+///
+/// Each iteration:
+///   - if CX == 0: exit (already filtered upstream by cx<=0 bail)
+///   - read source (AL/AX for SCAS, [DS:SI] for CMPS) and dest [ES:DI]
+///   - update flags as if a SUB (dst - src) had been executed
+///   - decrement CX, advance DI (and SI for CMPS) by step (DF=0 forward)
+///   - if REPE (rep_type=1) and ZF=0: exit
+///   - if REPNE (rep_type=2) and ZF=1: exit
+///
+/// Walks linearly via state.read_mem (handles BIOS ROM, packed cells,
+/// disk window, etc. transparently). Word ops read low byte then high
+/// byte and combine, matching the kiln-emitted `--read2` semantics.
+fn rep_fast_forward_cmps_scas(
+    program: &CompiledProgram,
+    state: &mut State,
+    slots: &[i32],
+    opcode: i32,
+    rep_type: i32,
+    cx_in: i32,
+    flags_in: i32,
+) {
+    fn read_prop(program: &CompiledProgram, state: &State, slots: &[i32], name: &str) -> Option<i32> {
+        if let Some(&s) = program.property_slots.get(name) {
+            return Some(slots[s as usize]);
+        }
+        let bare = name.strip_prefix("--").unwrap_or(name);
+        state.get_var(bare)
+    }
+
+    let is_word = matches!(opcode, 0xA7 | 0xAF);
+    let is_cmps = matches!(opcode, 0xA6 | 0xA7);
+    let step: i32 = if is_word { 2 } else { 1 };
+
+    let di_start = read_prop(program, state, slots, "--DI").unwrap_or(0) & 0xFFFF;
+    let es = read_prop(program, state, slots, "--ES").unwrap_or(0) & 0xFFFF;
+    let es_base = (es as i64) * 16;
+
+    // SCAS pulls its source from AL/AX; CMPS pulls from [DS:SI].
+    let (si_start, ds_base) = if is_cmps {
+        let si = read_prop(program, state, slots, "--SI").unwrap_or(0) & 0xFFFF;
+        let ds = read_prop(program, state, slots, "--DS").unwrap_or(0) & 0xFFFF;
+        (si, (ds as i64) * 16)
+    } else {
+        (0, 0)
+    };
+    let scas_acc = if !is_cmps {
+        if is_word {
+            read_prop(program, state, slots, "--AX").unwrap_or(0) & 0xFFFF
+        } else {
+            read_prop(program, state, slots, "--AL").unwrap_or(0) & 0xFF
+        }
+    } else {
+        0
+    };
+
+    let ip = state.get_var("IP").unwrap_or(0);
+    let prefix_len = read_prop(program, state, slots, "--prefixLen").unwrap_or(1);
+
+    // Walk forward. Track post-iteration state at the moment we exit.
+    let mut cx = cx_in;
+    let mut di = di_start;
+    let mut si = si_start;
+    let mut last_dst: i32 = 0;
+    let mut last_src: i32 = 0;
+    let mut iters = 0i32;
+    // 16-bit wrap on DI/SI is the actual hardware behavior. Iterate at
+    // most cx_in times.
+    while cx > 0 {
+        // Read dst at ES:DI.
+        let dst_lin = (es_base + di as i64) & 0xFFFFF;
+        let dst_v = if is_word {
+            let lo = state.read_mem(dst_lin as i32) & 0xFF;
+            let hi = state.read_mem(((dst_lin + 1) & 0xFFFFF) as i32) & 0xFF;
+            lo | (hi << 8)
+        } else {
+            state.read_mem(dst_lin as i32) & 0xFF
+        };
+        // Read src.
+        let src_v = if is_cmps {
+            let src_lin = (ds_base + si as i64) & 0xFFFFF;
+            if is_word {
+                let lo = state.read_mem(src_lin as i32) & 0xFF;
+                let hi = state.read_mem(((src_lin + 1) & 0xFFFFF) as i32) & 0xFF;
+                lo | (hi << 8)
+            } else {
+                state.read_mem(src_lin as i32) & 0xFF
+            }
+        } else {
+            scas_acc
+        };
+
+        // For CMPS the SUB is (mem[DS:SI] - mem[ES:DI]) per Intel manual
+        // (subFlags8(_strSrcByte, _strDstByte) in kiln); for SCAS it's
+        // (AL - mem[ES:DI]).
+        let (cmp_dst, cmp_src) = if is_cmps {
+            (src_v, dst_v) // CMPS: subFlags(src, dst) -> ZF if src==dst
+        } else {
+            (scas_acc, dst_v) // SCAS: subFlags(AL, dst) -> ZF if AL==dst
+        };
+
+        last_dst = dst_v;
+        last_src = src_v;
+        let _ = (cmp_dst, cmp_src);
+
+        // Advance pointers and CX.
+        di = (di + step) & 0xFFFF;
+        if is_cmps {
+            si = (si + step) & 0xFFFF;
+        }
+        cx -= 1;
+        iters += 1;
+
+        // Check REP termination based on the comparison just made.
+        // ZF set iff equal.
+        let zf = if is_cmps { src_v == dst_v } else { scas_acc == dst_v };
+        if rep_type == 1 && !zf { break; }   // REPE: stop on inequality
+        if rep_type == 2 && zf { break; }    // REPNE: stop on equality
+    }
+
+    // Compute flags from the LAST comparison: subFlags(last_cmp_dst, last_cmp_src)
+    // For CMPS: dst_arg = last_src (mem[DS:SI]),  src_arg = last_dst (mem[ES:DI]).
+    // For SCAS: dst_arg = scas_acc (AL/AX),       src_arg = last_dst (mem[ES:DI]).
+    let (fl_dst, fl_src) = if is_cmps {
+        (last_src, last_dst)
+    } else {
+        (scas_acc, last_dst)
+    };
+    let new_flags = compute_sub_flags(fl_dst, fl_src, is_word, flags_in);
+
+    // Commit: CX, DI, (SI), flags, IP, cycleCount.
+    state.set_var("CX", cx & 0xFFFF);
+    state.set_var("DI", di);
+    if is_cmps {
+        state.set_var("SI", si);
+    }
+    state.set_var("flags", new_flags);
+
+    // IP: when CX reached 0 OR rep condition broke, the REP completes.
+    // post-tick IP = IP_at_prefix + instrLen(=1) + prefixLen(=1).
+    state.set_var("IP", (ip + 1 + prefix_len) & 0xFFFF);
+
+    // Cycle count: kiln charges 22/iter for CMPS, 15/iter for SCAS.
+    let per_iter = if is_cmps { 22 } else { 15 };
+    if let Some(cc) = state.get_var("cycleCount") {
+        state.set_var("cycleCount", cc.wrapping_add(iters.wrapping_mul(per_iter)));
+    }
+    rep_diag_fire(opcode, iters);
+}
+
+/// Compute the 8086 flag word produced by SUB(dst, src), preserving the
+/// upper control bits (TF=0x100, IF=0x200, DF=0x400) from `prev_flags`.
+/// Mirrors kiln's `--subFlags8` / `--subFlags16` + `+ and(prev, 1792)`.
+fn compute_sub_flags(dst: i32, src: i32, is_word: bool, prev_flags: i32) -> i32 {
+    let mask: i32 = if is_word { 0xFFFF } else { 0xFF };
+    let sign_bit: i32 = if is_word { 0x8000 } else { 0x80 };
+    let dst_u = dst & mask;
+    let src_u = src & mask;
+    let res = (dst_u.wrapping_sub(src_u)) & mask;
+
+    // CF: borrow from MSB → src > dst as unsigned.
+    let cf = if (src_u as u32) > (dst_u as u32) { 1 } else { 0 };
+    // PF: parity of low byte of result.
+    let low = (res & 0xFF) as u8;
+    let pf = if (low.count_ones() & 1) == 0 { 4 } else { 0 };
+    // AF: borrow from bit 4 of low nibble.
+    let af = if ((src_u & 0xF) as u32) > ((dst_u & 0xF) as u32) { 0x10 } else { 0 };
+    // ZF.
+    let zf = if res == 0 { 0x40 } else { 0 };
+    // SF.
+    let sf = if (res & sign_bit) != 0 { 0x80 } else { 0 };
+    // OF: signed overflow of dst - src.
+    //   sign(dst) != sign(src) AND sign(res) != sign(dst)
+    let of = if ((dst_u ^ src_u) & sign_bit) != 0 && ((dst_u ^ res) & sign_bit) != 0 {
+        0x800
+    } else {
+        0
+    };
+    // Bit 1 (always set on x86 flags).
+    let base = 2;
+    // Preserve TF/IF/DF (bits 8/9/10 = 0x700) from previous flags. (kiln
+    // uses 1792 = 0x700.)
+    let preserved = prev_flags & 0x700;
+
+    cf + pf + af + zf + sf + of + base + preserved
 }
 
 #[cfg(not(target_arch = "wasm32"))]
