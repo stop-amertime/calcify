@@ -104,8 +104,7 @@ so Phase 1 doesn't paint into a corner.
 | `LitStr(String)` | `Expr::StringLiteral` | Only used by string-syntax props (textBuffer). |
 | `LoadVar { slot, kind: TickPosition }` | `Expr::Var { name, .. }` (resolved) | One node covers both "this tick" and "previous tick" reads. `kind` is `Current` for `--foo`, `Prev` for `--__1foo` / `--__2foo`. The walker uses `kind` to choose between the per-tick property cache and committed state — see § State model. |
 | `Calc { op, args }` | `Expr::Calc(CalcOp::*)` | Generic arithmetic. Op enum mirrors `CalcOp`: Add, Sub, Mul, Div, Mod, Min, Max, Clamp, Round(strategy), Pow, Sign, Abs, Neg. |
-| `BitOp { op, args }` | `Expr::FunctionCall { name, .. }` for known pure-bit `@function` names | Recognised at lowering time. The exact name list is loaded from `css-lib.mjs` during Phase 1 day-1 (open question 1) — candidates include `--and`, `--or`, `--xor`, `--not`, `--shl`, `--shr`, `--bit`, `--lowerBytes`, `--rightShift`, but the list isn't finalised here. Bodies are pure bit ops; lowering bypasses the call frame. Falls back to `FuncCall` if unrecognised. |
-| `FuncCall { fn_id, args }` | `Expr::FunctionCall { name, .. }` for user `@function`s | Pure call. The function body is its own sub-DAG. |
+| `FuncCall { fn_id, args }` | `Expr::FunctionCall { name, .. }` (all calls, Phase 1) | Pure call. The function body is its own sub-DAG. **Phase 1 lowers every `FunctionCall` to `FuncCall` — no name-based fast-path.** v1's `FunctionPattern` enum classifies by body shape (Bitmask, RightShift, BitExtract, IdentityRead, …), which is more general than name matching and is the right model. v2 promotes that to a Phase 2 idiom-recogniser pass that emits `BitOp`/`BitField` super-nodes from body shape, regardless of `@function` name. |
 | `If { branches: Vec<(StyleCondNode, NodeId)>, fallback: NodeId }` | `Expr::StyleCondition { branches, fallback }` | Branch-shape conditional. Phase 2 collapses long branches into `Switch`. |
 | `StyleCond { property: SlotId, value: NodeId }` | `StyleTest::Single` | Note: a `StyleTest` is only meaningful as the predicate of a branch — it's not a full DAG node, but a sub-AST attached to `If` branches. |
 | `StyleAnd(Vec<StyleCondNode>)`, `StyleOr(...)` | `StyleTest::And` / `StyleTest::Or` | Same — sub-AST of `If`. |
@@ -152,31 +151,38 @@ Direct, mechanical, no idiom recognition (Phase 1):
 
 4. **`Expr::Var { name, fallback }` → `LoadVar { slot, kind }`.**
    - Strip the `--` prefix.
-   - If the name starts with `__1` or `__2`, `kind = Prev`; else
-     `kind = Current`. (v1's `strip_prop_prefixes` treats `__0`/`__1`/
-     `__2` identically — they all resolve to the same slot. v2 follows.)
-   - `slot = slot_of(stripped_name)` against the slot map.
-   - `fallback` handling is **deferred** — Phase 1 sub-task: read v1's
-     `compile.rs` (search `Expr::Var` lowering) and v1's
-     `eval::resolve_property` to determine whether `fallback` is ever
-     runtime-meaningful in the cabinets we run. If only `--__2*`
-     fallbacks fire at runtime and they're constant, lower the constant
-     into the slot's initial value at load. If runtime-meaningful, emit
-     a `VarOrFallback` node. The cabinet shapes in `kiln/emit-css.mjs`
-     suggest only `--__2mN: var(--__1mN, init)` and the buffer-copy
-     shape need this — both are single-assignment shapes that never
-     reach the walker (see assignment filtering rule below).
+   - If the name starts with `__0`, `__1`, or `__2`, `kind = Prev`; else
+     `kind = Current`. (v1's `strip_prop_prefixes` treats all three
+     prefixes identically — they all resolve to the same slot. v2
+     follows.)
+   - Slot resolution is in two phases (matching v1's `compile_var`,
+     `compile.rs:1680-1707`):
+     1. Strip prefixes; look up the bare name in the slot map.
+     2. If found → emit `LoadVar { slot, kind }`. Discard fallback —
+        v1 does the same. Known properties never use fallback because
+        they always resolve.
+     3. If not found and `fallback` is present → lower the fallback
+        expression and emit *that* node. Discard the original `Var`.
+     4. If not found and no fallback → emit `Lit(0)`. Matches v1's
+        `Op::LoadLit { val: 0 }` for unknown properties.
+   - In practice all properties resolve (CSS-DOS cabinets fully
+     declare via `@property`), so the fallback path is mostly dead
+     code. The shapes that *would* exercise it (`--__1mN: var(--__2mN,
+     init)`) are skipped as buffer copies before lowering. The rule
+     is here for spec compliance and small-cabinet robustness.
 
 5. **`Expr::Calc(op)` → `Calc { op, args: lowered }`.** Map each
    `CalcOp` variant 1:1 to a `Calc` op kind. Arity matches.
 
-6. **`Expr::FunctionCall { name, args }`:**
-   - If `name` matches a known pure-bit `@function` (final list pinned
-     during Phase 1 day 1 — see open question 1), lower to
-     `BitOp { op, args: lowered }` directly, bypassing the call.
-   - Else, lower to `FuncCall { fn_id, args: lowered }`. Each user
-     `@function` is its own sub-DAG keyed by `fn_id`, rooted at the
-     function's `result` expression.
+6. **`Expr::FunctionCall { name, args }` → `FuncCall { fn_id, args: lowered }`.**
+   No name-based fast-path in Phase 1. The function body is its own
+   sub-DAG keyed by `fn_id`, rooted at the function's `result`
+   expression. Phase 2's idiom recogniser will classify function
+   bodies by *shape* (matching v1's `FunctionPattern` taxonomy) and
+   replace recognised shapes with `BitOp`/`BitField`/`Switch` super-
+   nodes — that pass operates on the DAG, not on the lowering, so
+   it's cabinet-shape-driven rather than name-driven (cardinal-rule
+   stronger).
 
 7. **`Expr::StyleCondition { branches, fallback }` → `If { branches:
    lowered, fallback: lowered }`.** Each branch's `StyleTest` lowers to
@@ -377,11 +383,15 @@ the cabinet computes.
 
 ## Open questions to resolve before Phase 1 lands
 
-1. **Exact set of pure-bit `@function` names to fast-path in lowering.**
-   Pulled from `../CSS-DOS/kiln/css-lib.mjs`. Phase 1 day-1 task: grep
-   that file for the canonical list and pin it in `dag/lowering.rs`
-   constants. The list is structural (CSS standard library shapes),
-   not cabinet content.
+1. ~~Pure-bit `@function` name list.~~ **Resolved during self-review:**
+   v1's body-shape classification (`FunctionPattern` enum in `eval.rs`)
+   is the right model, not name matching. Phase 1 lowers all
+   `FunctionCall` to `FuncCall`; Phase 2 introduces a body-shape
+   recogniser that promotes recognised function bodies to `BitOp` /
+   `BitField` / `Switch` super-nodes regardless of name. Cardinal-rule
+   stronger: a user-defined `@function --myMask` with body
+   `mod(a, pow(2, b))` gets the same fast-path as the standard-library
+   `--and`. No name list needed.
 
 2. **Differential test cabinet pick.** Pick the smallest cabinet that
    exercises broadcast writes, `@function` calls, and the per-tick
@@ -396,14 +406,12 @@ the cabinet computes.
    no value in two implementations. Revisit if Phase 2's DAG-level
    matcher does the job naturally.
 
-4. **`Var` fallback runtime semantics.** Whether `Expr::Var.fallback`
-   ever fires at runtime in the cabinets we run, or whether it's
-   purely a compile-time initial-value marker. Phase 1 day-1 task:
-   check v1's `eval::resolve_property` and the `compile.rs` lowering;
-   confirm the only runtime-meaningful use is the `--__2mN: var(..., init)`
-   shape (which is filtered out by the buffer-copy skip rule); pin
-   the rule in `dag/lowering.rs`. If runtime-meaningful elsewhere,
-   add a `VarOrFallback` node.
+4. ~~`Var` fallback runtime semantics.~~ **Resolved during self-review:**
+   v1's `compile_var` (`compile.rs:1680`) only consults `fallback`
+   for *unknown* properties (no slot in the map). Known properties
+   ignore it. The lowering rule (§ Lowering rules step 4) handles
+   both cases without a runtime check. No `VarOrFallback` node
+   needed.
 
 5. **Walker write commit timing.** v1 has a writeback phase at end-of-
    tick; v2 walker can commit eagerly (simpler) or batch (fewer
