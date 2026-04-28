@@ -2,6 +2,10 @@
   "description": "literal positive integer assignment",
   "ticks": 1,
   "read": [
-    { "property": "--x", "type": "integer", "expected_str": "42" }
+    {
+      "property": "--x",
+      "type": "integer",
+      "expected_str": "42"
+    }
   ]
 }

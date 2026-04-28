@@ -58,11 +58,25 @@ python -m http.server 8731 --bind 127.0.0.1 \
 #   browser_evaluate('() => window.readProps([...])')
 ```
 
-### CI path: `run-primitives.mjs` (Phase 0.5.4)
+### CI path: `run-primitives.mjs`
 
-A Node script using `playwright` directly. Walks `primitives/`, loads
-each fixture, reads the requested properties, diffs against
-`expected_str`, and exits non-zero on first mismatch.
+```sh
+cd tests/conformance
+npm install                       # one-time: install playwright
+npx playwright install chromium   # one-time: download Chromium binary
+node run-primitives.mjs           # CHECK mode — exit 1 on first mismatch
+node run-primitives.mjs --capture # write Chrome's values into expected_str
+node run-primitives.mjs --filter=calc  # only run fixtures with "calc" in name
+```
+
+`--capture` is the authoring aid: write a new fixture's `.css`, leave
+`expected_str` blank or guess, then run capture to fill it in from
+Chrome. Always review the resulting JSON diffs before committing —
+capture mode trusts Chrome and overwrites silently.
+
+Default mode loads each fixture, reads the requested properties via
+`getComputedStyle`, diffs against `expected_str`, prints a PASS/FAIL
+summary and exits non-zero on first mismatch.
 
 ### Calcite path: cargo test (Phase 0.5.5)
 
