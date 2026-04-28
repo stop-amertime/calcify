@@ -69,6 +69,13 @@ pub enum SymExpr {
     Mod(Box<SymExpr>, Box<SymExpr>),
     Neg(Box<SymExpr>),
     Floor(Box<SymExpr>),
+    Div(Box<SymExpr>, Box<SymExpr>),
+    /// `(val >> idx) & 1` — calcite's Bit op.
+    BitExtract(Box<SymExpr>, Box<SymExpr>),
+    Min(Vec<SymExpr>),
+    Max(Vec<SymExpr>),
+    Abs(Box<SymExpr>),
+    Sign(Box<SymExpr>),
     /// True bitwise ops, all 16-bit-truncated as in calcite.
     BitAnd16(Box<SymExpr>, Box<SymExpr>),
     BitOr16(Box<SymExpr>, Box<SymExpr>),
@@ -201,6 +208,55 @@ impl SymExpr {
                     _ => BitNot16(Box::new(a)),
                 }
             }
+            Div(a, b) => {
+                let a = a.simplify();
+                let b = b.simplify();
+                match (&a, &b) {
+                    (Const(x), Const(y)) if *y != 0 => Const(x.wrapping_div(*y)),
+                    (_, Const(1)) => a,
+                    _ => Div(Box::new(a), Box::new(b)),
+                }
+            }
+            BitExtract(v, i) => {
+                let v = v.simplify();
+                let i = i.simplify();
+                match (&v, &i) {
+                    (Const(x), Const(idx)) => Const((x >> (*idx as u32)) & 1),
+                    _ => BitExtract(Box::new(v), Box::new(i)),
+                }
+            }
+            Min(args) => {
+                let args: Vec<SymExpr> = args.into_iter().map(|a| a.simplify()).collect();
+                if args.iter().all(|a| matches!(a, Const(_))) {
+                    let m = args.iter().filter_map(|a| match a { Const(v) => Some(*v), _ => None }).min().unwrap_or(0);
+                    Const(m)
+                } else {
+                    Min(args)
+                }
+            }
+            Max(args) => {
+                let args: Vec<SymExpr> = args.into_iter().map(|a| a.simplify()).collect();
+                if args.iter().all(|a| matches!(a, Const(_))) {
+                    let m = args.iter().filter_map(|a| match a { Const(v) => Some(*v), _ => None }).max().unwrap_or(0);
+                    Const(m)
+                } else {
+                    Max(args)
+                }
+            }
+            Abs(a) => {
+                let a = a.simplify();
+                match &a {
+                    Const(x) => Const(x.wrapping_abs()),
+                    _ => Abs(Box::new(a)),
+                }
+            }
+            Sign(a) => {
+                let a = a.simplify();
+                match &a {
+                    Const(x) => Const(x.signum()),
+                    _ => Sign(Box::new(a)),
+                }
+            }
             _ => self,
         }
     }
@@ -235,6 +291,34 @@ impl SymExpr {
             BitOr16(a, b) => Some((a.eval_concrete(slot_env)? | b.eval_concrete(slot_env)?) & 0xFFFF),
             BitXor16(a, b) => Some((a.eval_concrete(slot_env)? ^ b.eval_concrete(slot_env)?) & 0xFFFF),
             BitNot16(a) => Some((!a.eval_concrete(slot_env)?) & 0xFFFF),
+            Div(a, b) => {
+                let bv = b.eval_concrete(slot_env)?;
+                if bv == 0 { return None; }
+                Some(a.eval_concrete(slot_env)?.wrapping_div(bv))
+            }
+            BitExtract(v, i) => {
+                let vv = v.eval_concrete(slot_env)?;
+                let iv = i.eval_concrete(slot_env)?;
+                Some((vv >> (iv as u32)) & 1)
+            }
+            Min(args) => {
+                let mut min_v: Option<i64> = None;
+                for a in args {
+                    let v = a.eval_concrete(slot_env)?;
+                    min_v = Some(min_v.map_or(v, |m| m.min(v)));
+                }
+                min_v
+            }
+            Max(args) => {
+                let mut max_v: Option<i64> = None;
+                for a in args {
+                    let v = a.eval_concrete(slot_env)?;
+                    max_v = Some(max_v.map_or(v, |m| m.max(v)));
+                }
+                max_v
+            }
+            Abs(a) => Some(a.eval_concrete(slot_env)?.wrapping_abs()),
+            Sign(a) => Some(a.eval_concrete(slot_env)?.signum()),
         }
     }
 }
@@ -419,6 +503,61 @@ fn simulate_op_with_cfg(
         Floor { dst, src } => {
             let v = read_slot(env, *src);
             env.insert(*dst, SymExpr::Floor(Box::new(v)).simplify());
+        }
+        Div { dst, a, b } => bin_op(env, *dst, *a, *b, |x, y| SymExpr::Div(Box::new(x), Box::new(y))),
+        Bit { dst, val, idx } => {
+            let v = read_slot(env, *val);
+            let i = read_slot(env, *idx);
+            env.insert(*dst, SymExpr::BitExtract(Box::new(v), Box::new(i)).simplify());
+        }
+        Min { dst, args } => {
+            let xs: Vec<SymExpr> = args.iter().map(|s| read_slot(env, *s)).collect();
+            env.insert(*dst, SymExpr::Min(xs).simplify());
+        }
+        Max { dst, args } => {
+            let xs: Vec<SymExpr> = args.iter().map(|s| read_slot(env, *s)).collect();
+            env.insert(*dst, SymExpr::Max(xs).simplify());
+        }
+        Abs { dst, src } => {
+            let v = read_slot(env, *src);
+            env.insert(*dst, SymExpr::Abs(Box::new(v)).simplify());
+        }
+        Sign { dst, src } => {
+            let v = read_slot(env, *src);
+            env.insert(*dst, SymExpr::Sign(Box::new(v)).simplify());
+        }
+        // Round: dst = round(val, interval) per RoundStrategy. For symbolic
+        // composition, we represent it by collapsing to the val expression
+        // when interval is Const(1) (round-to-int is a no-op on integers
+        // for our purposes); otherwise bail. This matches the typical
+        // calcite emit pattern where Round-with-interval-1 is just Floor.
+        Round { dst, strategy: _, val, interval } => {
+            let v = read_slot(env, *val);
+            let i = read_slot(env, *interval);
+            if let SymExpr::Const(1) = i {
+                env.insert(*dst, SymExpr::Floor(Box::new(v)).simplify());
+            } else {
+                return Err(BailReason::Unsupported("Round (non-1 interval)"));
+            }
+        }
+        Clamp { dst, min, val, max } => {
+            // clamp(val, min, max) = max(min, min(val, max))
+            let mn = read_slot(env, *min);
+            let v = read_slot(env, *val);
+            let mx = read_slot(env, *max);
+            let inner = SymExpr::Min(vec![v, mx]);
+            let outer = SymExpr::Max(vec![mn, inner]);
+            env.insert(*dst, outer.simplify());
+        }
+        CmpEq { dst, a, b } => {
+            // Symbolic equality: only resolvable if both Const.
+            let ax = read_slot(env, *a);
+            let bx = read_slot(env, *b);
+            if let (SymExpr::Const(x), SymExpr::Const(y)) = (&ax, &bx) {
+                env.insert(*dst, SymExpr::Const(if x == y { 1 } else { 0 }));
+            } else {
+                return Err(BailReason::Unsupported("CmpEq (non-const operands)"));
+            }
         }
 
         // ---- Assumption-aware loads + branches ----
