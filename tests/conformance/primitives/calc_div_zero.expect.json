@@ -1,0 +1,12 @@
+{
+  "description": "calc(1 / 0) — Chrome serialises infinity as f64::MAX in scientific notation",
+  "ticks": 1,
+  "xfail_v1": "calcite v1 returns 0 for div-by-zero; Chrome surfaces 1.79769e+308 (f64::MAX). Fixing this requires (a) eval producing infinity-typed values and (b) serialising them the way Chrome does. Phase 1+ should match Chrome's serialisation.",
+  "read": [
+    {
+      "property": "--r",
+      "type": "integer",
+      "expected_str": "1.79769e+308"
+    }
+  ]
+}

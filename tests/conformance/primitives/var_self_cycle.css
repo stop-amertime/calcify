@@ -1,0 +1,12 @@
+@property --x {
+  syntax: "<integer>";
+  inherits: false;
+  initial-value: 5;
+}
+
+:root {
+  /* Self-reference. Per CSS spec, dependency cycles make the variable's
+     value the guaranteed-invalid value, which for registered <integer>
+     properties means the initial-value. Pinning Chrome's behaviour. */
+  --x: var(--x);
+}

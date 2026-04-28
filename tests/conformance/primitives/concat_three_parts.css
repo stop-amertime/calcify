@@ -1,0 +1,19 @@
+@property --first {
+  syntax: "*";
+  inherits: false;
+  initial-value: "a";
+}
+@property --second {
+  syntax: "*";
+  inherits: false;
+  initial-value: "b";
+}
+@property --r {
+  syntax: "*";
+  inherits: false;
+  initial-value: "";
+}
+
+:root {
+  --r: var(--first) "_" var(--second);
+}

@@ -1,0 +1,11 @@
+{
+  "description": "single-arg @function with calc() body",
+  "ticks": 1,
+  "read": [
+    {
+      "property": "--r",
+      "type": "integer",
+      "expected_str": "10"
+    }
+  ]
+}

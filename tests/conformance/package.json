@@ -1,0 +1,14 @@
+{
+  "name": "calcite-conformance",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Calcite primitive conformance — Chrome ground-truth runner.",
+  "scripts": {
+    "check": "node run-primitives.mjs",
+    "capture": "node run-primitives.mjs --capture"
+  },
+  "dependencies": {
+    "playwright": "^1.48.0"
+  }
+}

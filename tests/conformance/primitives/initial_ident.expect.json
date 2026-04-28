@@ -1,0 +1,11 @@
+{
+  "description": "@property syntax: '*' with bare ident initial-value",
+  "ticks": 1,
+  "read": [
+    {
+      "property": "--tag",
+      "type": "string",
+      "expected_str": "hello"
+    }
+  ]
+}

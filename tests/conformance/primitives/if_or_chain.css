@@ -1,0 +1,20 @@
+@property --a {
+  syntax: "<integer>";
+  inherits: false;
+  initial-value: 9;
+}
+@property --b {
+  syntax: "<integer>";
+  inherits: false;
+  initial-value: 2;
+}
+@property --r {
+  syntax: "<integer>";
+  inherits: false;
+  initial-value: 0;
+}
+
+:root {
+  /* --a=9 doesn't match, --b=2 does — or-chain, expect 88. */
+  --r: if(style(--a: 1) or style(--b: 2): 88; else: 0);
+}

@@ -1,0 +1,21 @@
+{
+  "description": "calc(a + b) with @property registered integers",
+  "ticks": 1,
+  "read": [
+    {
+      "property": "--a",
+      "type": "integer",
+      "expected_str": "10"
+    },
+    {
+      "property": "--b",
+      "type": "integer",
+      "expected_str": "32"
+    },
+    {
+      "property": "--sum",
+      "type": "integer",
+      "expected_str": "42"
+    }
+  ]
+}

@@ -504,6 +504,18 @@ pub struct CompiledProgram {
     /// window collapse to one state-var read + one array index, instead of
     /// walking the inline-exception CmpEq chain on every byte.
     pub disk_window: Option<CompiledDiskWindow>,
+    /// True iff the program defines an `--opcode` property — i.e. it
+    /// looks like a cabinet that emits REPed string ops. Gates
+    /// `rep_fast_forward` so non-emulator cabinets (toy CSS programs,
+    /// unit-test fixtures, future non-x86 cabinets with different DAG
+    /// shapes) skip the hook entirely. Real cabinets that have
+    /// `--opcode` but transiently produce a state `rep_fast_forward`
+    /// doesn't handle still panic loudly inside the hook — the
+    /// "no slow path" contract stays.
+    ///
+    /// Cardinal-rule clean: detection is "does the CSS declare
+    /// `--opcode`?" — a structural check, no x86 semantics.
+    pub has_rep_machinery: bool,
 }
 
 /// Compile-time half of the rom-disk fast path. The compiler can't resolve
@@ -1448,7 +1460,11 @@ fn fold_calc(op: &CalcOp) -> Expr {
             let fa = const_fold(a);
             let fb = const_fold(b);
             match (&fa, &fb) {
-                (Expr::Literal(x), Expr::Literal(y)) if *y != 0.0 => Expr::Literal(x % y),
+                // CSS mod() is euclidean (sign of divisor), not Rust's `%`
+                // (sign of dividend). a - floor(a/b)*b is the spec definition.
+                (Expr::Literal(x), Expr::Literal(y)) if *y != 0.0 => {
+                    Expr::Literal(x - (x / y).floor() * y)
+                }
                 _ => Expr::Calc(CalcOp::Mod(Box::new(fa), Box::new(fb))),
             }
         }
@@ -3274,6 +3290,7 @@ pub fn compile(
         _ct.elapsed().as_secs_f64()
     );
 
+    let has_rep_machinery = compiler.property_slots.contains_key("--opcode");
     let mut program = CompiledProgram {
         ops,
         slot_count: compiler.next_slot,
@@ -3288,6 +3305,7 @@ pub fn compile(
         packed_exception_tables: compiler.packed_exception_tables,
         packed_broadcast_writes: compiled_packed_bw,
         disk_window: compiler.recognised_disk_window.take(),
+        has_rep_machinery,
     };
 
     // Expand all Op::Call sites inline. Op::Call was a compile-time device to
@@ -5477,8 +5495,10 @@ pub fn execute(program: &CompiledProgram, state: &mut State, slots: &mut Vec<i32
     // REP string op, collapse the remaining iterations into one bulk memory
     // operation. See rep_fast_forward() for the detection rules.
     // Gated by CALCITE_REP_FASTFWD=0 env var for A/B debugging of
-    // regressions; on by default.
-    if rep_fastfwd_enabled() {
+    // regressions; on by default. Also skipped entirely for cabinets that
+    // don't define `--opcode` — they have no REP machinery to fast-forward
+    // (toy unit-test programs, future non-emulator cabinets).
+    if program.has_rep_machinery && rep_fastfwd_enabled() {
         rep_fast_forward(program, state, slots);
     }
 }
@@ -6410,7 +6430,15 @@ fn exec_ops(
             }
             Op::Mod { dst, a, b } => {
                 let divisor = sload!(*b);
-                let v = if divisor == 0 { 0 } else { sload!(*a) % divisor };
+                // CSS mod() takes the sign of the divisor (Knuth/floor mod),
+                // not the sign of the dividend like Rust's `%`.
+                let v = if divisor == 0 {
+                    0
+                } else {
+                    let dividend = sload!(*a);
+                    let r = dividend % divisor;
+                    if (r != 0) && ((r < 0) != (divisor < 0)) { r + divisor } else { r }
+                };
                 sstore!(*dst, v);
             }
             Op::Neg { dst, src } => {
@@ -6494,7 +6522,15 @@ fn exec_ops(
             }
             Op::ModLit { dst, a, val } => {
                 let divisor = *val;
-                sstore!(*dst, if divisor == 0 { 0 } else { sload!(*a) % divisor });
+                // Same Knuth/floor-mod fix as Op::Mod above.
+                let v = if divisor == 0 {
+                    0
+                } else {
+                    let dividend = sload!(*a);
+                    let r = dividend % divisor;
+                    if (r != 0) && ((r < 0) != (divisor < 0)) { r + divisor } else { r }
+                };
+                sstore!(*dst, v);
             }
             Op::Bit { dst, val, idx } => {
                 let v = sload!(*val);

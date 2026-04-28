@@ -1,0 +1,11 @@
+{
+  "description": "@property initial-value visible without assignment",
+  "ticks": 1,
+  "read": [
+    {
+      "property": "--x",
+      "type": "integer",
+      "expected_str": "123"
+    }
+  ]
+}

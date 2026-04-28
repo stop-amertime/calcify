@@ -1,0 +1,11 @@
+{
+  "description": "if(style(--cond: 1): 42; else: 0) — branch hit",
+  "ticks": 1,
+  "read": [
+    {
+      "property": "--r",
+      "type": "integer",
+      "expected_str": "42"
+    }
+  ]
+}

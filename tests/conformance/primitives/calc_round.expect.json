@@ -1,0 +1,11 @@
+{
+  "description": "round(7, 5) — nearest, default strategy",
+  "ticks": 1,
+  "read": [
+    {
+      "property": "--r",
+      "type": "integer",
+      "expected_str": "5"
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+@property --x {
+  syntax: "<integer>";
+  inherits: false;
+  initial-value: -42;
+}
+
+:root {}

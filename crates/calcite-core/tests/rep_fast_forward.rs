@@ -31,6 +31,10 @@ fn empty_program() -> CompiledProgram {
         property_slots: std::collections::HashMap::new(),
         functions: Vec::new(),
         disk_window: None,
+        // This test exercises rep_fast_forward directly; bypass the
+        // has-opcode gate so the hook fires regardless of the rigged
+        // (empty) property_slots.
+        has_rep_machinery: true,
     }
 }
 

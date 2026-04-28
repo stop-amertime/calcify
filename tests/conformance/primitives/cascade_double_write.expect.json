@@ -1,0 +1,11 @@
+{
+  "description": "two writes to --r in source order — Chrome takes the last (2)",
+  "ticks": 1,
+  "read": [
+    {
+      "property": "--r",
+      "type": "integer",
+      "expected_str": "2"
+    }
+  ]
+}

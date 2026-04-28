@@ -1,0 +1,13 @@
+@property --dst {
+  syntax: "<integer>";
+  inherits: false;
+  initial-value: 7;
+}
+
+:root {
+  /* --undef is undeclared and we give no fallback. Per CSS spec, the
+     declaration itself becomes invalid (computed-value-time error
+     handling), and --dst keeps its initial-value. Pinning Chrome's
+     exact behaviour. */
+  --dst: var(--undef);
+}

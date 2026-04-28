@@ -1,0 +1,11 @@
+{
+  "description": "identity @function — --id(var(--in)) == var(--in)",
+  "ticks": 1,
+  "read": [
+    {
+      "property": "--out",
+      "type": "integer",
+      "expected_str": "7"
+    }
+  ]
+}

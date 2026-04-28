@@ -1,0 +1,11 @@
+{
+  "description": "if(...) — no branch matches, else fires",
+  "ticks": 1,
+  "read": [
+    {
+      "property": "--r",
+      "type": "integer",
+      "expected_str": "7"
+    }
+  ]
+}

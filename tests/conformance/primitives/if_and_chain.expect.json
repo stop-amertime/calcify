@@ -1,0 +1,11 @@
+{
+  "description": "if(style(--a:1) and style(--b:2): 99; else: 0)",
+  "ticks": 1,
+  "read": [
+    {
+      "property": "--r",
+      "type": "integer",
+      "expected_str": "99"
+    }
+  ]
+}

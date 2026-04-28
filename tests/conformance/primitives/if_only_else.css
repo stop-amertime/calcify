@@ -1,0 +1,14 @@
+@property --cond {
+  syntax: "<integer>";
+  inherits: false;
+  initial-value: 0;
+}
+@property --r {
+  syntax: "<integer>";
+  inherits: false;
+  initial-value: 0;
+}
+
+:root {
+  --r: if(style(--cond: 99): 1; else: 7);
+}

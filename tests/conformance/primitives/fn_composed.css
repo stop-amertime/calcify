@@ -1,0 +1,23 @@
+@property --in {
+  syntax: "<integer>";
+  inherits: false;
+  initial-value: 3;
+}
+@property --r {
+  syntax: "<integer>";
+  inherits: false;
+  initial-value: 0;
+}
+
+@function --inc(--n <integer>) returns <integer> {
+  result: calc(var(--n) + 1);
+}
+
+@function --triple(--n <integer>) returns <integer> {
+  result: calc(var(--n) * 3);
+}
+
+:root {
+  /* Compose: inc then triple. 3 → inc → 4 → triple → 12. */
+  --r: --triple(--inc(var(--in)));
+}

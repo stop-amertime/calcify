@@ -1,0 +1,11 @@
+{
+  "description": "mod(13, 5) — euclidean modulo",
+  "ticks": 1,
+  "read": [
+    {
+      "property": "--r",
+      "type": "integer",
+      "expected_str": "3"
+    }
+  ]
+}

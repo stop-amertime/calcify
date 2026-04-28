@@ -1,0 +1,21 @@
+@property --a {
+  syntax: "<integer>";
+  inherits: false;
+  initial-value: 5;
+}
+@property --b {
+  syntax: "<integer>";
+  inherits: false;
+  initial-value: 3;
+}
+@property --r {
+  syntax: "<integer>";
+  inherits: false;
+  initial-value: 0;
+}
+
+:root {
+  /* style(--a: calc(...)) — non-literal rhs of the style() test. The
+     parser supports any Expr; need to confirm Chrome does too. */
+  --r: if(style(--a: calc(var(--b) + 2)): 11; else: 22);
+}

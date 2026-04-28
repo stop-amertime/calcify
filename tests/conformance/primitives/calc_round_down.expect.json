@@ -1,0 +1,11 @@
+{
+  "description": "round(down, 9, 5) — round toward -inf, expect 5",
+  "ticks": 1,
+  "read": [
+    {
+      "property": "--r",
+      "type": "integer",
+      "expected_str": "5"
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+@property --a {
+  syntax: "<integer>";
+  inherits: false;
+  initial-value: 10;
+}
+@property --b {
+  syntax: "<integer>";
+  inherits: false;
+  initial-value: 32;
+}
+@property --sum {
+  syntax: "<integer>";
+  inherits: false;
+  initial-value: 0;
+}
+
+:root {
+  --sum: calc(var(--a) + var(--b));
+}

@@ -1,0 +1,27 @@
+@property --r {
+  syntax: "<integer>";
+  inherits: false;
+  initial-value: 0;
+}
+@property --sel {
+  syntax: "<integer>";
+  inherits: false;
+  initial-value: 5;
+}
+
+:root {
+  /* 8-way dispatch — at >=4 branches the dispatch-table recogniser
+     fires in calcite. Real-world doom8088 shape (see --getReg16 in
+     phase0_dispatch.rs). */
+  --r: if(
+    style(--sel: 0): 100;
+    style(--sel: 1): 200;
+    style(--sel: 2): 300;
+    style(--sel: 3): 400;
+    style(--sel: 4): 500;
+    style(--sel: 5): 600;
+    style(--sel: 6): 700;
+    style(--sel: 7): 800;
+    else: -1
+  );
+}

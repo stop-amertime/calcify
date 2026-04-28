@@ -1,0 +1,14 @@
+@property --suffix {
+  syntax: "*";
+  inherits: false;
+  initial-value: "world";
+}
+@property --r {
+  syntax: "*";
+  inherits: false;
+  initial-value: "";
+}
+
+:root {
+  --r: "hello " var(--suffix);
+}

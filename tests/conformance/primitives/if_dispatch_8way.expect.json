@@ -1,0 +1,11 @@
+{
+  "description": "8-way dispatch on --sel (=5), expect 600",
+  "ticks": 1,
+  "read": [
+    {
+      "property": "--r",
+      "type": "integer",
+      "expected_str": "600"
+    }
+  ]
+}

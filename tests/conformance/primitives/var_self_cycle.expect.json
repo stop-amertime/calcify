@@ -1,0 +1,11 @@
+{
+  "description": "self-cycle var(--x) on --x — Chrome detects cycle and uses initial-value",
+  "ticks": 1,
+  "read": [
+    {
+      "property": "--x",
+      "type": "integer",
+      "expected_str": "5"
+    }
+  ]
+}

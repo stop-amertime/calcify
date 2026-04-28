@@ -1,0 +1,11 @@
+{
+  "description": "@function with locals chained — quadPlusOne(4) = 4*4*4+1 = 65",
+  "ticks": 1,
+  "read": [
+    {
+      "property": "--r",
+      "type": "integer",
+      "expected_str": "65"
+    }
+  ]
+}

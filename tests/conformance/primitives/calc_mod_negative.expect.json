@@ -1,0 +1,11 @@
+{
+  "description": "mod(-7, 3) — sign of divisor per CSS spec",
+  "ticks": 1,
+  "read": [
+    {
+      "property": "--r",
+      "type": "integer",
+      "expected_str": "2"
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+@property --r {
+  syntax: "<integer>";
+  inherits: false;
+  initial-value: 99;
+}
+
+:root {
+  /* Division by zero. Per CSS spec, calc(1/0) produces infinity, which
+     for a registered <integer> property is invalid at computed-value
+     time, so --r keeps its initial-value (99). Pinning Chrome's
+     behaviour. Calcite v1 returns 0 for div-by-zero — likely an xfail
+     until Phase 1 implements invalidity. */
+  --r: calc(1 / 0);
+}

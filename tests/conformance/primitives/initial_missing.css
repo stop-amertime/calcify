@@ -1,0 +1,10 @@
+@property --x {
+  syntax: "*";
+  inherits: false;
+  /* No initial-value. Per CSS spec, registered properties without an
+     initial-value descriptor are invalid (the @property rule is dropped).
+     For syntax: "*", initial-value is allowed to be absent — the
+     guaranteed-invalid value applies. Pinning Chrome's behaviour. */
+}
+
+:root {}

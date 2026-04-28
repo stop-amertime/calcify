@@ -1,0 +1,11 @@
+{
+  "description": "@property syntax: '*' with no initial-value — guaranteed-invalid",
+  "ticks": 1,
+  "read": [
+    {
+      "property": "--x",
+      "type": "string",
+      "expected_str": ""
+    }
+  ]
+}

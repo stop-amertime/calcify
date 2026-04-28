@@ -1,0 +1,11 @@
+{
+  "description": "abs(-99)",
+  "ticks": 1,
+  "read": [
+    {
+      "property": "--r",
+      "type": "integer",
+      "expected_str": "99"
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+@property --tag {
+  syntax: "*";
+  inherits: false;
+  initial-value: hello;
+}
+
+:root {}

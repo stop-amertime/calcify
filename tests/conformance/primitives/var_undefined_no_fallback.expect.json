@@ -1,0 +1,12 @@
+{
+  "description": "var(--undef) with no fallback — Chrome falls back to initial-value",
+  "ticks": 1,
+  "xfail_v1": "calcite v1 writes 0 instead of preserving --dst's initial-value: the declaration's invalid-at-computed-value-time semantics aren't implemented — the writeback fires regardless. Phase 1+ should implement this via DAG-level invalidity propagation.",
+  "read": [
+    {
+      "property": "--dst",
+      "type": "integer",
+      "expected_str": "7"
+    }
+  ]
+}

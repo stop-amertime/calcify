@@ -1,0 +1,11 @@
+{
+  "description": "literal zero overrides non-zero initial-value",
+  "ticks": 1,
+  "read": [
+    {
+      "property": "--x",
+      "type": "integer",
+      "expected_str": "0"
+    }
+  ]
+}

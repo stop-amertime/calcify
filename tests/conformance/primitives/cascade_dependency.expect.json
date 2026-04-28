@@ -1,0 +1,21 @@
+{
+  "description": "dependent assignments — --c depends on --b which depends on --a",
+  "ticks": 1,
+  "read": [
+    {
+      "property": "--a",
+      "type": "integer",
+      "expected_str": "5"
+    },
+    {
+      "property": "--b",
+      "type": "integer",
+      "expected_str": "50"
+    },
+    {
+      "property": "--c",
+      "type": "integer",
+      "expected_str": "51"
+    }
+  ]
+}
