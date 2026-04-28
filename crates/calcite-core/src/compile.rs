@@ -482,6 +482,14 @@ pub struct CompiledProgram {
     /// window collapse to one state-var read + one array index, instead of
     /// walking the inline-exception CmpEq chain on every byte.
     pub disk_window: Option<CompiledDiskWindow>,
+    /// True iff the program defines an `--opcode` property — i.e. it looks
+    /// like an 8086-emulator cabinet that emits REPed string ops. Gates
+    /// `rep_fast_forward` so non-emulator cabinets (toy CSS programs, unit
+    /// tests, future non-x86 cabinets with the same DAG shape) skip the hook
+    /// entirely. Real x86 cabinets that have `--opcode` but transiently
+    /// produce a state `rep_fast_forward` doesn't handle still panic loudly
+    /// inside the hook — the contract stays.
+    pub has_rep_machinery: bool,
 }
 
 /// Compile-time half of the rom-disk fast path. The compiler can't resolve
@@ -3244,6 +3252,7 @@ pub fn compile(
         _ct.elapsed().as_secs_f64()
     );
 
+    let has_rep_machinery = compiler.property_slots.contains_key("--opcode");
     let mut program = CompiledProgram {
         ops,
         slot_count: compiler.next_slot,
@@ -3258,6 +3267,7 @@ pub fn compile(
         packed_exception_tables: compiler.packed_exception_tables,
         packed_broadcast_writes: compiled_packed_bw,
         disk_window: compiler.recognised_disk_window.take(),
+        has_rep_machinery,
     };
 
     // Expand all Op::Call sites inline. Op::Call was a compile-time device to
@@ -4993,8 +5003,10 @@ pub fn execute(program: &CompiledProgram, state: &mut State, slots: &mut Vec<i32
     // REP string op, collapse the remaining iterations into one bulk memory
     // operation. See rep_fast_forward() for the detection rules.
     // Gated by CALCITE_REP_FASTFWD=0 env var for A/B debugging of
-    // regressions; on by default.
-    if rep_fastfwd_enabled() {
+    // regressions; on by default. Also skipped entirely for cabinets that
+    // don't define `--opcode` — they have no x86 machinery to fast-forward
+    // (toy unit-test programs, future non-emulator cabinets).
+    if program.has_rep_machinery && rep_fastfwd_enabled() {
         rep_fast_forward(program, state, slots);
     }
 }

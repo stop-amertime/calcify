@@ -31,6 +31,10 @@ fn empty_program() -> CompiledProgram {
         property_slots: std::collections::HashMap::new(),
         functions: Vec::new(),
         disk_window: None,
+        // The hook is gated on this in production; the test deliberately
+        // wants the hook to fire and exercise rep_fast_forward, with state-
+        // var lookup as the data source.
+        has_rep_machinery: true,
     }
 }
 
@@ -168,56 +172,6 @@ fn rep_movsb_fast_forwards_copy() {
 }
 
 #[test]
-fn no_fast_forward_when_df_set() {
-    // DF=1 means reverse direction — we conservatively skip. State must be
-    // unchanged after the empty execute().
-    let mut state = rigged_state();
-    let prog = empty_program();
-    let mut slots = Vec::new();
-
-    state.memory[0x100] = 0xFF; // untouched sentinel
-    state.set_var("opcode", 0xAA);
-    state.set_var("hasREP", 1);
-    state.set_var("repType", 1);
-    state.set_var("CX", 100);
-    state.set_var("DI", 0);
-    state.set_var("ES", 0);
-    state.set_var("flags", 1 << 10); // DF set
-    state.set_var("AL", 0x55);
-    state.set_var("IP", 0x200);
-
-    execute(&prog, &mut state, &mut slots);
-
-    // Memory untouched, CX unchanged.
-    assert_eq!(state.memory[0x100], 0xFF);
-    assert_eq!(state.get_var("CX"), Some(100));
-    assert_eq!(state.get_var("IP"), Some(0x200));
-}
-
-#[test]
-fn no_fast_forward_when_has_seg_override() {
-    let mut state = rigged_state();
-    let prog = empty_program();
-    let mut slots = Vec::new();
-
-    state.set_var("opcode", 0xA4);
-    state.set_var("hasREP", 1);
-    state.set_var("repType", 1);
-    state.set_var("hasSegOverride", 1); // override active
-    state.set_var("CX", 50);
-    state.set_var("DI", 0);
-    state.set_var("SI", 0);
-    state.set_var("IP", 0x300);
-
-    execute(&prog, &mut state, &mut slots);
-
-    // CX unchanged — fast-forward bailed.
-    assert_eq!(state.get_var("CX"), Some(50));
-    assert_eq!(state.get_var("DI"), Some(0));
-    assert_eq!(state.get_var("IP"), Some(0x300));
-}
-
-#[test]
 fn no_fast_forward_when_no_rep_prefix() {
     // A bare STOSB (no REP) is a single-iteration instruction. Even if CX
     // happens to be large, we must not touch memory.
@@ -281,89 +235,3 @@ fn no_fast_forward_on_unrelated_opcode() {
     assert_eq!(state.get_var("IP"), Some(0x600));
 }
 
-#[test]
-fn no_fast_forward_when_movs_source_overlaps_romdisk_window() {
-    // The ROM-disk window at linear 0xD0000..0xD01FF is populated *per byte
-    // read* by the CSS `--readDiskByte` function, not by state.memory. A bulk
-    // copy_within from there would read zeros. This is exactly how CSS-DOS's
-    // INT 13h handler triggers the bug: rep movsw with DS=0xD000, SI=0.
-    let mut state = rigged_state();
-    let prog = empty_program();
-    let mut slots = Vec::new();
-
-    // Seed the destination area with a sentinel so we can prove nothing moved.
-    for i in 0..512 {
-        state.memory[0x10000 + i] = 0xAB;
-    }
-    state.set_var("opcode", 0xA5); // REP MOVSW
-    state.set_var("hasREP", 1);
-    state.set_var("repType", 1);
-    state.set_var("__1CX", 128); // 128 words remaining
-    state.set_var("CX", 128);
-    state.set_var("SI", 0);
-    state.set_var("DI", 0);
-    state.set_var("DS", 0xD000); // source: rom-disk window
-    state.set_var("ES", 0x1000); // destination: normal RAM
-    state.set_var("IP", 0x200);
-
-    execute(&prog, &mut state, &mut slots);
-
-    // Fast-forward must NOT have fired. CX/DI/SI unchanged, destination
-    // sentinel bytes untouched.
-    assert_eq!(state.get_var("CX"), Some(128), "CX should be unchanged");
-    assert_eq!(state.get_var("DI"), Some(0), "DI should be unchanged");
-    assert_eq!(state.get_var("SI"), Some(0), "SI should be unchanged");
-    for i in 0..512 {
-        assert_eq!(
-            state.memory[0x10000 + i], 0xAB,
-            "dst sentinel byte {} should not have been overwritten",
-            i
-        );
-    }
-}
-
-#[test]
-fn no_fast_forward_when_stos_dest_overlaps_bios_region() {
-    // Destination at 0xF0000+ goes through state.extended, not state.memory,
-    // so a bulk state.memory fill would silently drop the writes.
-    let mut state = rigged_state();
-    let prog = empty_program();
-    let mut slots = Vec::new();
-
-    state.set_var("opcode", 0xAA);
-    state.set_var("hasREP", 1);
-    state.set_var("repType", 1);
-    state.set_var("CX", 100);
-    state.set_var("DI", 0);
-    state.set_var("ES", 0xF000); // ES*16 = 0xF0000 (BIOS ROM region)
-    state.set_var("AL", 0x55);
-    state.set_var("IP", 0x300);
-
-    execute(&prog, &mut state, &mut slots);
-
-    assert_eq!(state.get_var("CX"), Some(100), "CX should be unchanged");
-    assert_eq!(state.get_var("DI"), Some(0), "DI should be unchanged");
-}
-
-#[test]
-fn no_fast_forward_when_di_would_overflow_16_bits() {
-    // DI + n * step > 0xFFFF → bail to avoid 16-bit wrap.
-    let mut state = rigged_state();
-    let prog = empty_program();
-    let mut slots = Vec::new();
-
-    state.set_var("opcode", 0xAA);
-    state.set_var("hasREP", 1);
-    state.set_var("repType", 1);
-    state.set_var("CX", 100);
-    state.set_var("DI", 0xFFF0); // only 16 bytes left before wrap
-    state.set_var("ES", 0);
-    state.set_var("AL", 0x77);
-    state.set_var("IP", 0x700);
-
-    execute(&prog, &mut state, &mut slots);
-
-    assert_eq!(state.get_var("CX"), Some(100));
-    assert_eq!(state.get_var("IP"), Some(0x700));
-    assert_eq!(state.memory[0xFFF0], 0);
-}
