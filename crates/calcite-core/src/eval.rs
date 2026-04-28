@@ -106,6 +106,49 @@ pub struct Evaluator {
     pub(crate) compiled: CompiledProgram,
     /// Slot array reused across ticks (avoids per-tick allocation).
     slots: Vec<i32>,
+    /// Which evaluation backend drives the main-ops phase. Default is the
+    /// bytecode interpreter (`Backend::Bytecode`); the Phase 1 DAG walker
+    /// (`Backend::Dag`) is opt-in and produces identical results.
+    backend: Backend,
+    /// Lazily-built Phase 1 DAG. Some iff `backend == Backend::Dag`.
+    dag: Option<crate::dag::Dag>,
+}
+
+/// Which main-ops evaluation strategy `Evaluator` runs.
+///
+/// Phase 1 ships both backends side-by-side. `Bytecode` is the long-
+/// standing v1 path; `Dag` is the new Phase 1 walker. They must produce
+/// identical observable state — that's the Phase 1 acceptance gate.
+///
+/// Selection: by default `Bytecode`. Override with the `CALCITE_BACKEND`
+/// env var (`bytecode` | `dag`) on construction, or call
+/// `Evaluator::set_backend` after construction (rebuilds the DAG if
+/// switching to `Dag`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backend {
+    /// Linear `Vec<Op>` interpretation (the v1 path).
+    Bytecode,
+    /// Phase 1 DAG walker over an explicit CFG.
+    Dag,
+}
+
+impl Default for Backend {
+    fn default() -> Self {
+        Backend::Bytecode
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn backend_from_env() -> Backend {
+    match std::env::var("CALCITE_BACKEND").ok().as_deref() {
+        Some("dag") | Some("DAG") => Backend::Dag,
+        _ => Backend::Bytecode,
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn backend_from_env() -> Backend {
+    Backend::Bytecode
 }
 
 /// Granular timing breakdown from [`Evaluator::tick_profiled`].
@@ -489,6 +532,12 @@ impl Evaluator {
 
         let slot_count = compiled.slot_count as usize;
         let properties_capacity = assignments.len();
+        let backend = backend_from_env();
+        let dag = if matches!(backend, Backend::Dag) {
+            Some(crate::dag::build_dag(&compiled))
+        } else {
+            None
+        };
         Evaluator {
             functions,
             assignments,
@@ -503,6 +552,43 @@ impl Evaluator {
             string_property_names,
             compiled,
             slots: Vec::with_capacity(slot_count),
+            backend,
+            dag,
+        }
+    }
+
+    /// Switch the main-ops evaluation backend at runtime. Builds the DAG
+    /// lazily when switching to `Backend::Dag`. Idempotent.
+    pub fn set_backend(&mut self, backend: Backend) {
+        self.backend = backend;
+        if matches!(backend, Backend::Dag) && self.dag.is_none() {
+            self.dag = Some(crate::dag::build_dag(&self.compiled));
+        }
+    }
+
+    /// Return the active main-ops backend.
+    pub fn backend(&self) -> Backend {
+        self.backend
+    }
+
+    /// Drive one tick of the main-ops phase via the selected backend.
+    /// Both backends run the same post-main-ops phases; only the way the
+    /// op stream is dispatched differs.
+    #[inline]
+    fn run_main_ops(&mut self, state: &mut State) {
+        match self.backend {
+            Backend::Bytecode => {
+                compile::execute(&self.compiled, state, &mut self.slots);
+            }
+            Backend::Dag => {
+                // dag is built on construction (or via set_backend); the
+                // unwrap is unreachable unless somebody bypassed the API.
+                let dag = self
+                    .dag
+                    .as_ref()
+                    .expect("Backend::Dag selected but DAG not built");
+                crate::dag::dag_execute(&self.compiled, dag, state, &mut self.slots);
+            }
         }
     }
 
@@ -525,8 +611,8 @@ impl Evaluator {
         // Snapshot state vars for change detection
         let prev_vars = state.state_vars.clone();
 
-        // Execute numeric assignments via compiled bytecode
-        compile::execute(&self.compiled, state, &mut self.slots);
+        // Execute numeric assignments via the selected backend.
+        self.run_main_ops(state);
 
 
         // Evaluate string assignments via interpreter (after compiled pass,
@@ -654,7 +740,7 @@ impl Evaluator {
         for hook in &self.pre_tick_hooks {
             hook(state);
         }
-        compile::execute(&self.compiled, state, &mut self.slots);
+        self.run_main_ops(state);
         if !self.string_assignments.is_empty() {
             self.properties.clear();
             self.call_depth = 0;
@@ -2101,6 +2187,8 @@ mod tests {
             string_property_names: HashSet::new(),
             compiled,
             slots: Vec::new(),
+            backend: Backend::Bytecode,
+            dag: None,
         };
         (evaluator, state)
     }

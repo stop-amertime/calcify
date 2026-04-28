@@ -4900,6 +4900,18 @@ pub fn execute(program: &CompiledProgram, state: &mut State, slots: &mut Vec<i32
     // Execute main ops
     exec_ops(&program.ops, &program.dispatch_tables, &program.chain_tables, &program.flat_dispatch_arrays, &program.functions, &program.packed_cell_tables, &program.packed_exception_tables, state, slots);
 
+    execute_post_main_phases(program, state, slots);
+}
+
+/// Run every post-main-ops phase: writeback, broadcast writes, packed
+/// broadcast writes, REP fast-forward. Same code path as `execute` but
+/// factored out so the DAG walker (which replaces only the main-ops
+/// phase) can reuse it bit-for-bit.
+pub(crate) fn execute_post_main_phases(
+    program: &CompiledProgram,
+    state: &mut State,
+    slots: &mut Vec<i32>,
+) {
     // Writeback: apply computed values to state
     for &(slot, addr) in &program.writeback {
         let value = slots[slot as usize];
@@ -5824,7 +5836,7 @@ pub fn exec_ops_for_test(ops: &[Op], state: &mut State, slots: &mut [i32]) {
     exec_ops(ops, &dispatch_tables, &chain_tables, &flat_dispatch_arrays, &functions, &packed_cell_tables, &packed_exception_tables, state, slots);
 }
 
-fn exec_ops(
+pub(crate) fn exec_ops(
     ops: &[Op],
     dispatch_tables: &[CompiledDispatchTable],
     chain_tables: &[DispatchChainTable],

@@ -7,6 +7,8 @@
 
 /// CSS expression compiler — flattens Expr trees into flat bytecode.
 pub mod compile;
+/// Phase 1 dataflow DAG — alternative evaluation backend (CFG + walker).
+pub mod dag;
 /// Chrome conformance comparison utilities (requires `conformance` feature).
 #[cfg(feature = "conformance")]
 pub mod conformance;

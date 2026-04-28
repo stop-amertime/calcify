@@ -29,7 +29,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use calcite_core::eval::Evaluator;
+use calcite_core::eval::{Backend, Evaluator};
 use calcite_core::parser::parse_css;
 use calcite_core::State;
 
@@ -109,7 +109,7 @@ enum CaseResult {
     Fail(Vec<String>),
 }
 
-fn run_fixture(css_path: &Path, expect_path: &Path) -> CaseResult {
+fn run_fixture(css_path: &Path, expect_path: &Path, backend: Backend) -> CaseResult {
     let css = match fs::read_to_string(css_path) {
         Ok(s) => s,
         Err(e) => return CaseResult::Fail(vec![format!("read css: {e}")]),
@@ -137,6 +137,7 @@ fn run_fixture(css_path: &Path, expect_path: &Path) -> CaseResult {
     let mut state = State::default();
     state.load_properties(&parsed.properties);
     let mut evaluator = Evaluator::from_parsed(&parsed);
+    evaluator.set_backend(backend);
 
     for _ in 0..expect.ticks {
         evaluator.tick(&mut state);
@@ -170,11 +171,13 @@ fn run_fixture(css_path: &Path, expect_path: &Path) -> CaseResult {
     }
 }
 
-#[test]
-fn primitive_conformance() {
+fn run_suite(backend: Backend) {
     let dir = fixtures_dir();
     if !dir.is_dir() {
-        eprintln!("primitive_conformance: skipping — fixtures dir not found at {}", dir.display());
+        eprintln!(
+            "primitive_conformance ({backend:?}): skipping — fixtures dir not found at {}",
+            dir.display()
+        );
         return;
     }
 
@@ -196,6 +199,7 @@ fn primitive_conformance() {
     let mut failures: Vec<(String, Vec<String>)> = Vec::new();
     let mut xpasses: Vec<(String, String)> = Vec::new();
 
+    eprintln!("--- primitive_conformance backend = {backend:?} ---");
     for css in &entries {
         let stem = css.file_stem().unwrap().to_string_lossy().to_string();
         let expect = dir.join(format!("{stem}.expect.json"));
@@ -205,7 +209,7 @@ fn primitive_conformance() {
             failures.push((stem.clone(), vec!["missing .expect.json".into()]));
             continue;
         }
-        match run_fixture(css, &expect) {
+        match run_fixture(css, &expect, backend) {
             CaseResult::Pass => {
                 eprintln!("PASS  {stem}");
                 pass += 1;
@@ -234,12 +238,12 @@ fn primitive_conformance() {
     }
 
     eprintln!(
-        "\n{pass} passed, {fail} failed, {skip} skipped, {xfail} xfail, {xpass} xpass (of {} fixtures)",
+        "\n[{backend:?}] {pass} passed, {fail} failed, {skip} skipped, {xfail} xfail, {xpass} xpass (of {} fixtures)",
         entries.len(),
     );
 
     if fail > 0 {
-        let mut msg = String::from("primitive conformance failures:\n");
+        let mut msg = format!("primitive conformance ({backend:?}) failures:\n");
         for (name, fails) in &failures {
             msg.push_str(&format!("  {name}:\n"));
             for f in fails {
@@ -249,13 +253,25 @@ fn primitive_conformance() {
         panic!("{msg}");
     }
     if xpass > 0 {
-        let mut msg = String::from(
-            "primitive conformance: xfail_v1 markers should be removed (calcite \
-             now agrees with Chrome on these fixtures):\n",
+        let mut msg = format!(
+            "primitive conformance ({backend:?}): xfail_v1 markers should be \
+             removed (calcite now agrees with Chrome on these fixtures):\n",
         );
         for (name, reason) in &xpasses {
             msg.push_str(&format!("  {name}: {reason}\n"));
         }
         panic!("{msg}");
     }
+}
+
+#[test]
+fn primitive_conformance_bytecode() {
+    run_suite(Backend::Bytecode);
+}
+
+/// Phase 1 acceptance gate: the DAG walker produces identical results to
+/// the bytecode interpreter on every primitive fixture.
+#[test]
+fn primitive_conformance_dag() {
+    run_suite(Backend::Dag);
 }
