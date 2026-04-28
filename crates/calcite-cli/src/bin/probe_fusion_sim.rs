@@ -23,7 +23,9 @@ use std::path::PathBuf;
 
 use calcite_core::Evaluator;
 use calcite_core::compile::{CompiledProgram, Op, Slot};
-use calcite_core::pattern::fusion_sim::{simulate_ops, BailReason, SlotEnv};
+use calcite_core::pattern::fusion_sim::{
+    simulate_ops, simulate_ops_with, Assumptions, BailReason, SlotEnv,
+};
 use clap::Parser;
 
 #[derive(Parser, Debug)]
@@ -86,6 +88,7 @@ fn probe_table(
     table_id: usize,
     program: &CompiledProgram,
     keys: &[i64],
+    assumptions: &Assumptions,
 ) -> TableStats {
     let table = &program.dispatch_tables[table_id];
     let mut stats = TableStats::default();
@@ -95,7 +98,7 @@ fn probe_table(
         if let Some((ops, _result_slot)) = table.entries.get(&key) {
             stats.probed += 1;
             let mut env: SlotEnv = HashMap::new();
-            match simulate_ops(&mut env, ops) {
+            match simulate_ops_with(&mut env, ops, assumptions) {
                 Ok(()) => {
                     stats.composed_ok += 1;
                 }
@@ -222,6 +225,47 @@ fn main() {
         program.flat_dispatch_arrays.len()
     );
 
+    // First sweep without assumptions; find which state-var addresses appear
+    // in LoadState / LoadStateAndBranchIfNotEqLit inside bailing entries.
+    let mut state_addr_freq: HashMap<i32, usize> = HashMap::new();
+    for table in &program.dispatch_tables {
+        for &key in &keys {
+            if let Some((ops, _)) = table.entries.get(&key) {
+                let mut env: SlotEnv = HashMap::new();
+                if simulate_ops(&mut env, ops).is_err() {
+                    for op in ops {
+                        match op {
+                            Op::LoadState { addr, .. }
+                            | Op::LoadStateAndBranchIfNotEqLit { addr, .. } => {
+                                *state_addr_freq.entry(*addr).or_insert(0) += 1;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut sorted_state: Vec<(i32, usize)> =
+        state_addr_freq.into_iter().collect();
+    sorted_state.sort_by(|a, b| b.1.cmp(&a.1));
+    println!();
+    println!("== Top state-var addrs in bailing entries (LoadState / LoadStateAndBranch) ==");
+    for (addr, count) in sorted_state.iter().take(15) {
+        println!("    addr=0x{:x} ({}) — appears {} times", addr, addr, count);
+    }
+
+    // Build assumptions from the top state vars assuming "==0" — that's
+    // the typical "flag clear / no override active" baseline. If a state
+    // var is supposed to be non-zero in the fusion context, the caller
+    // must override before the fused expression fires.
+    let mut assumptions = Assumptions::new();
+    for (addr, _) in sorted_state.iter().take(10) {
+        assumptions = assumptions.with(*addr, 0);
+    }
+    println!();
+    println!("Re-running with assumptions: top {} state vars assumed = 0", sorted_state.iter().take(10).count());
+
     // Probe every dispatch table and report.
     println!("== Per-dispatch-table probe ==");
     let mut overall_probed = 0;
@@ -230,7 +274,7 @@ fn main() {
     let mut bail_op_counts: HashMap<&'static str, usize> = HashMap::new();
 
     for (i, table) in program.dispatch_tables.iter().enumerate() {
-        let stats = probe_table(i, program, &keys);
+        let stats = probe_table(i, program, &keys, &assumptions);
         if stats.probed == 0 {
             continue;
         }
@@ -259,7 +303,7 @@ fn main() {
         for &key in &keys {
             if let Some((ops, _)) = table.entries.get(&key) {
                 let mut env: SlotEnv = HashMap::new();
-                if simulate_ops(&mut env, ops).is_err() {
+                if simulate_ops_with(&mut env, ops, &assumptions).is_err() {
                     for op in ops {
                         *bail_op_counts.entry(op_name(op)).or_insert(0) += 1;
                     }
@@ -306,7 +350,7 @@ fn main() {
         for &key in &keys {
             if let Some((ops, result_slot)) = table.entries.get(&key) {
                 let mut env: SlotEnv = HashMap::new();
-                match simulate_ops(&mut env, ops) {
+                match simulate_ops_with(&mut env, ops, &assumptions) {
                     Ok(()) => {
                         let composed = env
                             .get(result_slot)

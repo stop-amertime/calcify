@@ -252,13 +252,74 @@ pub enum BailReason {
 /// Symbolic environment: slot index → current expression for that slot.
 pub type SlotEnv = HashMap<Slot, SymExpr>;
 
-/// Simulate one Op sequence symbolically against `env`. On bail, return
-/// the reason and leave `env` partially updated (caller should not trust it).
+/// Compile-time assumptions about state-var values at fusion entry.
+/// Maps `state.read_mem(addr)` results to a known constant. Used to
+/// resolve `LoadState` / `LoadStateAndBranchIfNotEqLit` and (transitively)
+/// branches whose condition slot becomes `Const` after assumption-aware
+/// loading.
+///
+/// Semantics: the caller asserts that for each `(addr, val)` in
+/// `state_vars`, `state.read_mem(addr)` will return `val` at the moment
+/// the fused entry fires. If the assertion is wrong, the fused
+/// expression returns wrong results — caller's responsibility.
+///
+/// On the doom column drawer, common assumptions are:
+///   --df = 0 (CLD has fired)
+///   --es-prefix-active = 0 (no segment override)
+#[derive(Debug, Clone, Default)]
+pub struct Assumptions {
+    pub state_vars: HashMap<i32, i32>,
+}
+
+impl Assumptions {
+    pub fn new() -> Self { Self::default() }
+    pub fn with(mut self, addr: i32, val: i32) -> Self {
+        self.state_vars.insert(addr, val);
+        self
+    }
+}
+
+/// Simulate one straight-line Op sequence (no control flow) against `env`.
+/// On bail, return the reason and leave `env` partially updated (caller
+/// should not trust it).
 pub fn simulate_ops(env: &mut SlotEnv, ops: &[Op]) -> Result<(), BailReason> {
-    for op in ops {
-        simulate_op(env, op)?;
+    let assumptions = Assumptions::default();
+    simulate_ops_with(env, ops, &assumptions)
+}
+
+/// Simulate one Op sequence with control-flow + assumptions support.
+/// Branches whose condition slot has a `Const` value are resolved
+/// statically; unresolvable branches bail.
+pub fn simulate_ops_with(
+    env: &mut SlotEnv,
+    ops: &[Op],
+    assumptions: &Assumptions,
+) -> Result<(), BailReason> {
+    let mut pc: usize = 0;
+    let mut steps: usize = 0;
+    let max_steps = ops.len() * 16; // bound runaway simulation
+    while pc < ops.len() {
+        if steps > max_steps {
+            return Err(BailReason::Branch("loop-or-runaway"));
+        }
+        steps += 1;
+        let op = &ops[pc];
+        match simulate_op_with_cfg(env, op, assumptions)? {
+            StepOutcome::Next => pc += 1,
+            StepOutcome::Jump(t) => pc = t,
+            StepOutcome::Halt => break,
+        }
     }
     Ok(())
+}
+
+enum StepOutcome {
+    /// Advance to pc+1.
+    Next,
+    /// Jump to the given absolute op index inside the current sequence.
+    Jump(usize),
+    /// Stop simulation (used by an unconditional Jump out of bounds, etc.).
+    Halt,
 }
 
 fn read_slot(env: &SlotEnv, s: Slot) -> SymExpr {
@@ -266,6 +327,18 @@ fn read_slot(env: &SlotEnv, s: Slot) -> SymExpr {
 }
 
 fn simulate_op(env: &mut SlotEnv, op: &Op) -> Result<(), BailReason> {
+    let assumptions = Assumptions::default();
+    match simulate_op_with_cfg(env, op, &assumptions)? {
+        StepOutcome::Next => Ok(()),
+        StepOutcome::Jump(_) | StepOutcome::Halt => Err(BailReason::Branch("branch")),
+    }
+}
+
+fn simulate_op_with_cfg(
+    env: &mut SlotEnv,
+    op: &Op,
+    assumptions: &Assumptions,
+) -> Result<StepOutcome, BailReason> {
     use Op::*;
     match op {
         LoadLit { dst, val } => {
@@ -348,17 +421,57 @@ fn simulate_op(env: &mut SlotEnv, op: &Op) -> Result<(), BailReason> {
             env.insert(*dst, SymExpr::Floor(Box::new(v)).simplify());
         }
 
-        // ---- Out of scope for first cut ----
-        LoadState { .. } => return Err(BailReason::SideEffect("LoadState")),
+        // ---- Assumption-aware loads + branches ----
+        LoadState { dst, addr } => {
+            // Resolve to Const if assumed; otherwise bail.
+            if let Some(&v) = assumptions.state_vars.get(addr) {
+                env.insert(*dst, SymExpr::Const(v as i64));
+            } else {
+                return Err(BailReason::SideEffect("LoadState"));
+            }
+        }
+        LoadStateAndBranchIfNotEqLit { dst, addr, val, target } => {
+            // Resolve LoadState under assumption, then statically resolve branch.
+            if let Some(&v) = assumptions.state_vars.get(addr) {
+                env.insert(*dst, SymExpr::Const(v as i64));
+                if v != *val {
+                    return Ok(StepOutcome::Jump(*target as usize));
+                }
+            } else {
+                return Err(BailReason::SideEffect("LoadState"));
+            }
+        }
+        BranchIfNotEqLit { a, val, target } => {
+            // If slot a is Const, statically resolve.
+            let cond = read_slot(env, *a);
+            if let SymExpr::Const(v) = cond {
+                if v != *val as i64 {
+                    return Ok(StepOutcome::Jump(*target as usize));
+                }
+            } else {
+                return Err(BailReason::Branch("BranchIfNotEqLit (non-const)"));
+            }
+        }
+        BranchIfZero { cond, target } => {
+            let c = read_slot(env, *cond);
+            if let SymExpr::Const(v) = c {
+                if v == 0 {
+                    return Ok(StepOutcome::Jump(*target as usize));
+                }
+            } else {
+                return Err(BailReason::Branch("BranchIfZero (non-const)"));
+            }
+        }
+        Jump { target } => {
+            return Ok(StepOutcome::Jump(*target as usize));
+        }
+
+        // ---- Out of scope ----
         StoreState { .. } | StoreMem { .. } => return Err(BailReason::SideEffect("StoreState/StoreMem")),
         LoadMem { .. } | LoadMem16 { .. } | LoadPackedByte { .. } => {
             return Err(BailReason::SideEffect("LoadMem*"));
         }
-        BranchIfNotEqLit { .. } | BranchIfZero { .. } | Jump { .. } => {
-            return Err(BailReason::Branch("branch"));
-        }
-        Dispatch { .. } | DispatchFlatArray { .. } | DispatchChain { .. }
-        | LoadStateAndBranchIfNotEqLit { .. } => {
+        Dispatch { .. } | DispatchFlatArray { .. } | DispatchChain { .. } => {
             return Err(BailReason::Unsupported("dispatch*"));
         }
         Call { .. } => return Err(BailReason::Unsupported("Call")),
@@ -370,7 +483,7 @@ fn simulate_op(env: &mut SlotEnv, op: &Op) -> Result<(), BailReason> {
         // Round, Abs, Sign, CmpEq, Bit). Add support as we encounter them.
         other => return Err(BailReason::Unsupported(op_variant_name(other))),
     }
-    Ok(())
+    Ok(StepOutcome::Next)
 }
 
 fn bin_op(
@@ -531,6 +644,69 @@ mod tests {
         let mut concrete: HashMap<Slot, i64> = HashMap::new();
         concrete.insert(0, 0x1234);
         assert_eq!(env[&1].eval_concrete(&concrete), Some(0x34));
+    }
+
+    #[test]
+    fn loadstate_resolves_under_assumption() {
+        // LoadState normally bails. With an assumption, it produces Const.
+        let mut env: SlotEnv = HashMap::new();
+        let ops = vec![
+            Op::LoadState { dst: 0, addr: 0xDEAD },
+            Op::AddLit { dst: 1, a: 0, val: 7 },
+        ];
+        let asm = Assumptions::new().with(0xDEAD, 5);
+        simulate_ops_with(&mut env, &ops, &asm).unwrap();
+        // env[1] = 5 + 7 = 12 (folded).
+        assert_eq!(env[&1], SymExpr::Const(12));
+    }
+
+    #[test]
+    fn loadstate_bails_without_assumption() {
+        let mut env: SlotEnv = HashMap::new();
+        let ops = vec![Op::LoadState { dst: 0, addr: 0xDEAD }];
+        let r = simulate_ops(&mut env, &ops);
+        assert!(matches!(r, Err(BailReason::SideEffect(_))));
+    }
+
+    #[test]
+    fn branch_resolves_when_condition_const() {
+        // r0 = 0 (const). BranchIfZero target=2 should skip op[1].
+        // The body sets r1 in op[1] and op[2]; if branch fires, only op[2] runs.
+        let mut env: SlotEnv = HashMap::new();
+        let ops = vec![
+            Op::LoadLit { dst: 0, val: 0 },         // pc=0: r0 = 0
+            Op::LoadLit { dst: 1, val: 100 },       // pc=1: r1 = 100  (skipped)
+            Op::BranchIfZero { cond: 0, target: 4 }, // pc=2: r0==0, jump to pc=4
+            Op::LoadLit { dst: 1, val: 200 },       // pc=3: skipped via Jump
+            Op::LoadLit { dst: 1, val: 300 },       // pc=4: r1 = 300
+        ];
+        let asm = Assumptions::new();
+        simulate_ops_with(&mut env, &ops, &asm).unwrap();
+        // We took op[0], op[1] (r1=100), op[2] (jump to 4), op[4] (r1=300).
+        // Final r1=300.
+        assert_eq!(env[&1], SymExpr::Const(300));
+    }
+
+    #[test]
+    fn loadstate_branch_combo_resolves() {
+        // The shape we hit on doom8088: LoadState(--df) +
+        // BranchIfNotEqLit(if df != 0, jump to target).
+        // With assumption --df=0, branch falls through.
+        let mut env: SlotEnv = HashMap::new();
+        let ops = vec![
+            Op::LoadStateAndBranchIfNotEqLit { dst: 0, addr: 0x500, val: 0, target: 3 },
+            // primary path: r1 = 99 (df==0)
+            Op::LoadLit { dst: 1, val: 99 },
+            Op::Jump { target: 4 },
+            // alt path: r1 = 11 (df != 0)
+            Op::LoadLit { dst: 1, val: 11 },
+            // end
+            Op::LoadLit { dst: 2, val: 1 },
+        ];
+        let asm = Assumptions::new().with(0x500, 0);
+        simulate_ops_with(&mut env, &ops, &asm).unwrap();
+        assert_eq!(env[&1], SymExpr::Const(99));
+        assert_eq!(env[&2], SymExpr::Const(1));
     }
 
     #[test]
