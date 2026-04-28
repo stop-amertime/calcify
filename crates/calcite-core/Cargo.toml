@@ -25,3 +25,11 @@ calcite-core = { path = ".", features = ["conformance"] }
 [[bench]]
 name = "x86css"
 harness = false
+
+[[bench]]
+name = "phase0_tick"
+harness = false
+
+[[bench]]
+name = "phase0_dispatch"
+harness = false
