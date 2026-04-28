@@ -150,26 +150,25 @@ Direct, mechanical, no idiom recognition (Phase 1):
 3. **`Expr::StringLiteral(s)` → `LitStr(s)`.**
 
 4. **`Expr::Var { name, fallback }` → `LoadVar { slot, kind }`.**
-   - Strip the `--` prefix.
-   - If the name starts with `__0`, `__1`, or `__2`, `kind = Prev`; else
-     `kind = Current`. (v1's `strip_prop_prefixes` treats all three
-     prefixes identically — they all resolve to the same slot. v2
-     follows.)
-   - Slot resolution is in two phases (matching v1's `compile_var`,
-     `compile.rs:1680-1707`):
-     1. Strip prefixes; look up the bare name in the slot map.
-     2. If found → emit `LoadVar { slot, kind }`. Discard fallback —
-        v1 does the same. Known properties never use fallback because
-        they always resolve.
+   - The triple-buffer convention (see § State model § The CSS
+     contract) maps `--foo`, `--__0foo`, `--__1foo`, `--__2foo` to
+     the same logical slot at different temporal positions. v2's
+     lowering reflects that:
+     - Strip the `--` prefix; if `__0`/`__1`/`__2` follows, set
+       `kind = Prev` and strip the buffer prefix.
+     - Otherwise `kind = Current`.
+   - Slot resolution:
+     1. Look up the bare name in the slot map.
+     2. If found → emit `LoadVar { slot, kind }`. The fallback is
+        unreachable in CSS terms because the property is declared
+        and always has a value; discard it.
      3. If not found and `fallback` is present → lower the fallback
-        expression and emit *that* node. Discard the original `Var`.
-     4. If not found and no fallback → emit `Lit(0)`. Matches v1's
-        `Op::LoadLit { val: 0 }` for unknown properties.
-   - In practice all properties resolve (CSS-DOS cabinets fully
-     declare via `@property`), so the fallback path is mostly dead
-     code. The shapes that *would* exercise it (`--__1mN: var(--__2mN,
-     init)`) are skipped as buffer copies before lowering. The rule
-     is here for spec compliance and small-cabinet robustness.
+        expression and emit *that* node. CSS spec: `var(--undef, X)`
+        evaluates to `X`.
+     4. If not found and no fallback → emit `Lit(0)`. CSS spec:
+        unresolved `var()` falls through to the property's
+        registered initial value (0 for `<integer>` syntax, our
+        sole numeric type).
 
 5. **`Expr::Calc(op)` → `Calc { op, args: lowered }`.** Map each
    `CalcOp` variant 1:1 to a `Calc` op kind. Arity matches.
@@ -178,11 +177,13 @@ Direct, mechanical, no idiom recognition (Phase 1):
    No name-based fast-path in Phase 1. The function body is its own
    sub-DAG keyed by `fn_id`, rooted at the function's `result`
    expression. Phase 2's idiom recogniser will classify function
-   bodies by *shape* (matching v1's `FunctionPattern` taxonomy) and
-   replace recognised shapes with `BitOp`/`BitField`/`Switch` super-
-   nodes — that pass operates on the DAG, not on the lowering, so
-   it's cabinet-shape-driven rather than name-driven (cardinal-rule
-   stronger).
+   bodies by *shape* (e.g. `mod(a, pow(2, b))` → bitmask;
+   `round(down, a / pow(2, b))` → right shift) and replace recognised
+   shapes with `BitOp`/`BitField`/`Switch` super-nodes. Body-shape
+   matching is cardinal-rule stronger than name matching: any
+   `@function` whose body is a bitmask gets the same fast-path,
+   regardless of whether it's named `--and`, `--mask8`, or
+   `--myUserDefinedHelper`.
 
 7. **`Expr::StyleCondition { branches, fallback }` → `If { branches:
    lowered, fallback: lowered }`.** Each branch's `StyleTest` lowers to
@@ -201,18 +202,22 @@ For each `Assignment { property, value }` in
 `program.assignments`:
 
 - **Skip if** the property name starts with `--__0`, `--__1`, or
-  `--__2`. These are CSS triple-buffer copies (e.g.
-  `--__1mN: var(--__2mN, init)`) that are no-ops in v1's flat mutable
-  state model (`eval.rs:413`); v2 follows the same elision. The
-  semantic effect of the buffer copy — making the previous tick's
-  value visible as `--__1mN` next tick — is achieved automatically
-  by writing `--mN` and reading `state.read_mem(slot_of(mN))`.
+  `--__2`. These assignments implement the CSS triple-buffer copy
+  (e.g. `--__1mN: var(--__2mN, init)`) — they shift the per-slot
+  history back one tick. The walker reconstructs the same shifted
+  history from the `LoadVar { kind: Prev }` mechanism (see § State
+  model § What `LoadVar { kind }` means), so the literal copy is
+  redundant. Eliding it produces identical observable end-of-tick
+  state — the buffered values are still visible to next tick's
+  `--__1foo` reads, just retrieved differently.
 
 - **Skip if** the property is in `program.fast_path_absorbed` or in
   the absorbed-properties set returned by
   `pattern::broadcast_write::recognise_broadcast` /
   `pattern::packed_broadcast_write::recognise_packed_broadcast` on
-  `program.assignments`.
+  `program.assignments`. These assignments are still evaluated, just
+  via the `IndirectStore` super-node instead of an individual
+  `WriteVar` per cell — the observable state is the same.
 
 - **Otherwise**, lower `value` to a `NodeId` and emit
   `WriteVar { slot: slot_of(property), value }`.
@@ -232,97 +237,148 @@ defined and don't require any Phase 2 recogniser to fire. (This is the
 one place where Phase 1 emits a super-node despite "no recognition" —
 it's the cheaper alternative to re-parsing 30 MB of memory cells.)
 
-## State model and the slot map
+## State model and tick semantics
 
-Reuses `State` (no changes). v1's address space is unified:
+### The CSS contract
 
-- **State-var slots** get *negative* addresses (-1, -2, …) keyed by
-  bare name and allocated in declaration order during
-  `state.load_properties` (see `state.rs:813-820`).
-- **Memory bytes** (properties named `mN` for integer N) get
-  *non-negative* addresses == N, indexing into `state.memory[]` (or
-  the packed-cell table for `mcN`).
-- **`State::read_mem(addr: i32)`** dispatches on the sign and routes
-  through packed-cell / disk-window / extended-memory tables as needed
-  (see `state.rs:251-`). The walker uses the same routing.
+Chrome is the spec. CSS evaluates all custom-property assignments on a
+single element *simultaneously* against the values they had on the
+prior style computation. There is no "before" or "after" within a
+tick — every `var(--foo)` reference resolves against the same
+prior-tick value pool, and every `--foo: <expr>` assignment commits
+into the next-tick value pool. There is no read-write ordering
+question because there are no sequenced reads or writes.
 
-The DAG builder's slot map is `HashMap<String, i32>` keyed by *bare*
-property name (no `--` prefix, no `__0`/`__1`/`__2` prefix), built
-post-`load_properties` because `load_properties` is what assigns the
-negative slot indices.
+The cabinet uses a *triple-buffer* convention to make multi-tick state
+visible:
 
-### `--__1<x>` and `--__2<x>` read semantics
+- `--mN` — the new value computed this tick.
+- `--__1mN` — the previous tick's `--mN` value.
+- `--__2mN` — two ticks ago.
 
-There is no separate "previous-tick" state array in v1 (`state.rs`
-contains no `prev_state_vars` field). The illusion of "previous-tick
-read" emerges from two mechanisms:
+Three structural CSS shapes implement the buffer pipeline:
 
-1. **Per-tick property cache.** `Evaluator` maintains
-   `self.properties: HashMap<String, Value>` during a tick — written by
-   each assignment, read by subsequent assignments referencing
-   `var(--foo)`. `--__1foo` reads explicitly *bypass* this cache
-   (`eval.rs:1800`) and read from committed `state` instead.
+1. `--mN: if(<this-tick write rules>; else: var(--__1mN))` — compute
+   the new value, falling back to last tick's value (hold).
+2. `--__1mN: var(--__2mN, init)` — copy the second-tick-back to the
+   one-tick-back slot.
+3. `--__2mN` carries forward by Chrome's normal cascade.
 
-2. **Topological sort on current-tick reads only.** `--__1*` reads
-   don't impose ordering constraints (`eval.rs:1231`), so writes to
-   slot S can be scheduled before reads of `--__1S` — and the read
-   sees whatever S was committed to last tick.
+When all three assignments evaluate simultaneously against the prior
+tick's pool, the end-of-tick state has each `--mN` updated and each
+`--__1mN` / `--__2mN` shifted back one position. Open the cabinet in
+Chrome and this is what happens.
 
-Memory cells (the broadcast-write targets) are written by ports near
-the end of the tick (after all reads), so `--__1mN` reads return prior-
-tick values naturally because no current-tick write has landed yet.
+### What v2 has to produce
 
-The v2 walker reproduces this:
+Same observable end-of-tick state as Chrome would produce on the same
+CSS. Nothing else.
 
-- `LoadVar { slot, kind: Current }` checks the per-tick cache (a
-  `Vec<Option<Value>>` indexed by slot, reset each tick); falls back
-  to `state.read_mem(slot)` if the cache slot is empty.
-- `LoadVar { slot, kind: Prev }` reads `state.read_mem(slot)`
-  directly, bypassing the cache.
-- `WriteVar { slot, value }` writes the computed value into the cache
-  *and* commits to `state.read_mem`/`write_mem` immediately. (v1
-  commits in a writeback phase at end-of-tick; v2 may match or may
-  commit eagerly — Phase 1 sub-task to decide. Eager commit is simpler
-  for the walker; lazy commit reduces redundant `state.write_mem` calls
-  for slots overwritten multiple times. Default to eager unless a perf
-  gate makes lazy preferable.)
+### How v2 produces it
 
-This is structurally subtle and its corner cases (write-before-prev-
-read, broadcast-write ordering, packed-cell timing) need pinning down
-before the walker is written. **Phase 1 day-1 sub-task: write a unit
-test in `tests/v2_tick_semantics.rs` that exercises each corner case
-against v1, and use it as the gate for the walker design.**
+The walker's contract is *observable end-of-tick state matches what
+Chrome would produce on the same CSS*. The mechanism is implementation
+choice — Phase 1 picks one and gates against Chrome.
+
+Two viable mechanisms, both correct:
+
+**(a) Two-pool snapshot.** Prior pool (read-only, populated at tick
+start) and next pool (write-only, populated by `WriteVar`). Every
+`var(...)` reads from prior; every assignment writes to next; pools
+swap at tick end. This is the literal simultaneous-evaluation
+semantics. Cost: one slot-array clone per tick.
+
+**(b) Cache-plus-topological-sort.** Maintain a per-tick cache that
+each `WriteVar` populates and each `LoadVar` reads with fall-through
+to committed state. Sort assignments so writers come before readers
+on every current-tick edge. `--__1*` reads bypass the cache and read
+committed state directly. Cost: one topo sort at compile time, one
+cache reset per tick.
+
+Both produce CSS-consistent observable state on every cabinet shape
+the kiln emits. Choice depends on perf and walker complexity. Phase 1
+sub-task: prototype both, gate against Chrome (Phase 0.5 conformance
+suite), pick the simpler one if perf is comparable.
+
+### Slot map
+
+State vars and memory bytes share v1's unified index space (negative
+addresses for state vars, non-negative for memory). v2 reuses
+`State`'s storage and slot allocation directly so committed state is
+exchangeable across walker boundaries. v2 does not invent a separate
+slot allocation.
+
+### What `LoadVar { kind }` means in the IR
+
+`kind` is a *lowering hint*, not a runtime mode:
+
+- `Current` is lowered from a bare `--foo` reference. In CSS terms
+  this is "read `--foo`'s value as the simultaneous-evaluation pool
+  has it." In a two-pool walker, that's the prior pool. In a
+  cache-plus-sort walker, that's the cache (post-sort, the cache
+  holds this-tick's value because the writer fired first).
+- `Prev` is lowered from `--__0` / `--__1` / `--__2` prefixed
+  references. The triple-buffer convention means these resolve to the
+  same slot but at a different temporal position. The walker's job is
+  to return whatever value Chrome would return — which, given the
+  buffer-copy mechanism Chrome uses, is the slot's value as of N
+  ticks ago for the `--__N` prefix.
+
+Phase 1 sub-task: confirm against Chrome (Phase 0.5 suite) what
+`var(--__1mN)` returns when an assignment to `--mN` exists earlier in
+the same `.cpu` block. CSS spec says the read sees the prior tick's
+`--mN`. Pin that as the v2 contract. The walker's mechanism (two-pool,
+cache-plus-sort, or otherwise) just has to deliver it.
 
 ## Phase 1 acceptance gates
 
-These are the only tests that have to pass before Phase 2 starts.
-Failure on any one of them means investigate, not push through.
+The contract is **Chrome is the oracle**. Every gate either runs CSS
+through Chrome and compares, or runs a check that doesn't depend on
+v1's behaviour.
 
-1. **`cargo test -p calcite-core` green** with the default backend
-   (Bytecode), no behavioural change.
-2. **Same tests green with `CALCITE_BACKEND=dag-v2`** set — the new
-   backend produces bit-identical state.
-3. **Phase 0.5 primitive conformance suite** produces the same
-   PASS/SKIP/XFAIL counts under both backends. Reference: 41 PASS / 5
-   SKIP / 3 XFAIL on main today (`tests/primitive_conformance.rs`).
-4. **Differential cabinet test.** A new
-   `tests/backend_equivalence_v2.rs` runs a real cabinet for N=1000
-   ticks under both backends from the same starting snapshot and
-   asserts bit-identical state vars and memory at the end. Cabinet
-   pick: **`output/rogue.css`** if it exists (small, ~6050 ticks/s at
-   v1 speed → 1000-tick differential <200ms), else the smallest
-   `tests/fixtures/*.css` that exercises broadcast writes and
-   `@function` calls. Decide at wire-up time.
-5. **`wasm-pack build crates/calcite-wasm --target web`** still
-   succeeds with no errors. The DAG walker links clean for wasm32.
-6. **No perf regression on `calcite-bench -i output/rogue.css -n
-   2000`** under default-backend (Bytecode). v2 ships dormant —
-   activated only by env flag in Phase 1. The web/CLI default stays
-   v1 until Phase 3.
+Gates that have to pass before Phase 2 starts:
 
-If gate 6 fails (i.e. shipping v2 dormant slowed the v1 hot path):
-investigate what got accidentally pulled in. Most likely culprit is
-sharing helpers v1 didn't import.
+1. **Phase 0.5 primitive conformance suite passes against v2.** The
+   suite is small `.css` snippets, each exercising one CSS primitive
+   (`var()`, `calc()`, `if(style())`, math functions, edge cases),
+   with expected post-evaluation state derived from Chrome via
+   Playwright `getComputedStyle`. Port from
+   `.claude/worktrees/calcite-v2/` (where it was authored for the
+   additive stream) or build fresh — see § Open questions.
+
+   This is the *direct* test of the cardinal-rule contract:
+   "calcite produces the same results Chrome would." It catches
+   primitive-level divergences that whole-cabinet tests can only
+   catch transitively through framebuffer drift.
+
+2. **`cargo test -p calcite-core` green** with v2 selected. Existing
+   integration tests are pre-existing on `main` and gate the
+   `Evaluator` API — they don't gate v2 semantics directly, but they
+   must keep passing.
+
+3. **`wasm-pack build crates/calcite-wasm --target web`** succeeds
+   with no errors. The walker compiles for `wasm32-unknown-unknown`.
+
+Diagnostic tools, not gates:
+
+- **v1 differential.** Running v1 and v2 on the same cabinet and
+  diffing end-of-tick state is a useful fast smoke check during
+  development — when it disagrees with v2, *one of them* is wrong vs
+  Chrome and the diff localises which assignment diverged. But "v2
+  matches v1" is not the contract. If v1 has a quirk Chrome doesn't,
+  v2 should diverge from v1 there. The Phase 0.5 suite is what
+  decides which side is right.
+
+- **Cabinet smoke run.** Loading a real cabinet (`output/rogue.css`
+  if it exists, else a `tests/fixtures/*.css`) and running for N
+  ticks under v2 without panic is a useful "does the walker handle
+  shapes that exist in the wild" check. Crashes are bugs; state
+  divergence vs v1 is a Phase 0.5 question, not a gate.
+
+- **No perf regression** on `calcite-bench` with v1 (default
+  backend). v2 ships dormant in Phase 1; if it's pulling shared
+  helpers that slow v1, that's a bug. Catch with `cargo bench` before
+  and after.
 
 ## What v1 code stays callable as a backstop
 
@@ -350,9 +406,13 @@ What v2 **does not** call:
 - `pattern::fusion_sim::*` — v1's bytecode-fusion experiments. Phase 3
   codegen is its own thing.
 
-The split is clean: v1 owns "Op stream and how to interpret/JIT it";
-v2 owns "DAG and how to walk/codegen it." Both consume the same
-`ParsedProgram` and write to the same `State`.
+The split: v2 is the new evaluator, derived from CSS. v1 stays in the
+tree as a backstop and as a fast smoke-check oracle during
+development, but it is not a peer implementation v2 has to match.
+Where they disagree, Chrome decides. Both consume the same
+`ParsedProgram` and read/write the same `State`, which is why running
+them side-by-side on the same cabinet is cheap and useful as a
+diagnostic.
 
 ## Cardinal-rule audit
 
@@ -383,67 +443,44 @@ the cabinet computes.
 
 ## Open questions to resolve before Phase 1 lands
 
-1. ~~Pure-bit `@function` name list.~~ **Resolved during self-review:**
-   v1's body-shape classification (`FunctionPattern` enum in `eval.rs`)
-   is the right model, not name matching. Phase 1 lowers all
-   `FunctionCall` to `FuncCall`; Phase 2 introduces a body-shape
-   recogniser that promotes recognised function bodies to `BitOp` /
-   `BitField` / `Switch` super-nodes regardless of name. Cardinal-rule
-   stronger: a user-defined `@function --myMask` with body
-   `mod(a, pow(2, b))` gets the same fast-path as the standard-library
-   `--and`. No name list needed.
+1. **Phase 0.5 primitive conformance suite — port or build fresh.**
+   The suite is the Phase 1 correctness gate. The additive worktree
+   (`.claude/worktrees/calcite-v2/`) reportedly has it. Phase 1
+   sub-task: locate it, port to this worktree, run against v2 once
+   the walker exists. If the additive version is incomplete, build
+   fresh from the catalogue of CSS primitives the cabinets use
+   (per `compiler-mission.md` § Phase 0.5).
 
-2. **Differential test cabinet pick.** Pick the smallest cabinet that
-   exercises broadcast writes, `@function` calls, and the per-tick
-   property cache. `output/rogue.css` is the leading candidate but its
-   existence and size aren't checked yet.
+2. **Walker mechanism: two-pool vs cache-plus-sort.** Both produce
+   CSS-consistent results (see § State model). Phase 1 sub-task:
+   prototype one, gate against Phase 0.5, switch if Phase 0.5 fails
+   in a way the other mechanism would catch. Default: cache-plus-
+   sort, because it reuses `State` directly with no per-tick clone.
 
 3. **Whether to call v1's `recognise_broadcast` directly or
-   reimplement.** Calling it is cheaper and preserves bug-for-bug
-   compatibility; reimplementing is cleaner but doubles the recogniser
-   surface area. Default to **call v1's**, on the grounds that the
-   matcher's contract is "find broadcast shapes" — same job either way,
-   no value in two implementations. Revisit if Phase 2's DAG-level
-   matcher does the job naturally.
-
-4. ~~`Var` fallback runtime semantics.~~ **Resolved during self-review:**
-   v1's `compile_var` (`compile.rs:1680`) only consults `fallback`
-   for *unknown* properties (no slot in the map). Known properties
-   ignore it. The lowering rule (§ Lowering rules step 4) handles
-   both cases without a runtime check. No `VarOrFallback` node
-   needed.
-
-5. **Walker write commit timing.** v1 has a writeback phase at end-of-
-   tick; v2 walker can commit eagerly (simpler) or batch (fewer
-   `state.write_mem` calls but harder to reason about). Phase 1 day-1
-   task: write the corner-case unit test (see § State model) and use
-   it to decide. Eager is the default unless the test fails.
-
-6. **Tick-semantics corner-case test.** Phase 1 cannot start writing
-   the walker until the corner cases are pinned. Concrete tests
-   needed:
-   - Write to slot S, then `--__1S` read in same tick (does it see
-     prior or current tick value? — depends on topological position).
-   - Broadcast write to memory cell M, then `--__1mM` read later in
-     tick (depends on broadcast-write-ordering policy).
-   - `var(--foo)` read where `--foo` has not yet been assigned this
-     tick (does it see committed state or property cache?).
-   These tests run against v1 first to pin v1's actual semantics, then
-   v2 has to match.
+   reimplement.** v1's recognisers operate on `Expr` shape, not on
+   v1's bytecode — so calling them is using shape-matching code, not
+   inheriting v1's bytecode decisions. Default: call v1's, on the
+   grounds that broadcast-shape recognition is the same job either
+   way and there's no value in two implementations. The cardinal-
+   rule contract is preserved as long as the recogniser's matcher is
+   pure CSS-shape over `Expr` (which it is — see
+   `pattern/broadcast_write.rs:61`).
 
 ## File layout
 
 ```
 crates/calcite-core/src/dag/
-  mod.rs           Public entry: build_dag(&ParsedProgram, &State) -> Dag
-                   plus Backend::DagV2 wiring.
+  mod.rs           Public entry: build_dag(&ParsedProgram, &State) -> Dag.
   types.rs         DagNode, NodeId, SlotId, StyleCondNode, Dag.
-  lowering.rs      Expr → DagNode. Slot map. Pure-bit-op fn name
-                   recognition.
-  walker.rs        Dag::eval(&mut State). Topological evaluator.
-  walker_test.rs   Differential test scaffolding (probably moves to
-                   tests/ before merge).
+  lowering.rs      Expr → DagNode. Mechanical, no idiom recognition.
+  walker.rs        walk(&Dag, &mut State) — one tick of evaluation.
 ```
+
+Phase 1 unit tests live alongside the module (`#[cfg(test)] mod tests`
+in `lowering.rs`). End-to-end tests against Chrome (the Phase 0.5
+suite) and against v1 (smoke diagnostic) live under
+`crates/calcite-core/tests/`.
 
 The `Evaluator` gains a `backend: Backend` field and a `Dag` alongside
 `compiled`. `tick()` dispatches on the backend at construction time
