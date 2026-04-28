@@ -344,18 +344,52 @@ listing the custom-property values to read after one tick (or after
 ## 5. Open questions for the conformance writer
 
 These need to be answered before fixtures are finalised; mark each
-either "matches Chrome" or "explicit gap" in the final suite.
+either "matches Chrome" or "explicit gap" in the final suite. Status
+updates as fixtures land.
 
 1. **`var(--x, var(--x))` self-reference fallback** — does Chrome's
    guaranteed-invalid resolution fire? Does calcite's slot read the
    pre-tick value or 0?
+   ✅ **Chrome falls back to initial-value**, confirmed by
+   `var_self_cycle` (returns 5). Calcite v1 also passes — the cycle
+   doesn't reach the eval path because the topological sort silently
+   drops the self-edge (`--x` keeps its pre-tick value, which equals
+   initial-value on tick 1).
 2. **`calc(1 / 0)`** — Chrome behaviour vs calcite's documented "0".
+   📎 Pending — fixture not yet written (calc edges group).
 3. **Unknown function call** (`--undefinedFunc(1)`) — Chrome resolves to
    guaranteed-invalid; calcite's behaviour is undocumented.
+   📎 Pending — fixture not yet written (function group).
 4. **`@function` recursion** — explicit gap or runtime contract?
+   📎 Pending — fixture not yet written (function group).
 5. **Mixed `and`/`or` inside `if(style())`** — explicit gap.
+   ✋ Confirmed parser limitation (see § 2.5). Won't fixture-test —
+   the suite avoids mixed forms; if(style()) fixtures use single-
+   operator chains only.
 6. **Number tokens out of i32 range** — explicit gap.
+   ✋ Phase 0.5 declares this out-of-scope (calcite's eval is i32-
+   centric); fixtures stick to in-range values.
 7. **Cascade order with 3+ writes** — does Chrome use last-wins? Does
    calcite topo-sort or last-wins?
+   📎 Pending — fixture not yet written (cascade group).
 
-Phase 0.5.6 reconciles these against Chrome and updates this doc.
+Additional findings landing during fixture authoring:
+
+- **Var on undeclared LHS, no fallback** (`--dst: var(--undef);` where
+  `--dst` has initial-value 7): Chrome preserves --dst's initial-value
+  (declaration becomes invalid at computed-value time). Calcite v1
+  writes 0 — the writeback fires regardless. Marked
+  `xfail_v1` on `var_undefined_no_fallback`. Phase 1+ should implement
+  invalidity propagation through the DAG so this fixture passes
+  without an xfail marker.
+
+- **Var fallback when --src is defined**: Chrome reads --src, ignores
+  the fallback. Calcite v1 matches. ✅
+- **Var fallback when --undef is undeclared**: Chrome reads the
+  fallback. Calcite v1 matches. ✅
+- **Initial-value with no assignment**: Chrome surfaces the
+  initial-value via getComputedStyle. Calcite v1 matches. ✅
+- **All 12 CalcOp variants on simple integer happy paths**: calcite v1
+  matches Chrome bit-for-bit. ✅
+
+Phase 0.5.6 reconciles remaining items and updates this doc.
