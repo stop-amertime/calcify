@@ -7,6 +7,10 @@
 
 /// CSS expression compiler — flattens Expr trees into flat bytecode.
 pub mod compile;
+/// v2 DAG IR — Phase 1 substrate for the calcite-v2 clean-rewrite stream.
+/// Ships dormant; activated only when Evaluator uses Backend::DagV2.
+/// See docs/v2-rewrite-design.md.
+pub mod dag;
 /// Chrome conformance comparison utilities (requires `conformance` feature).
 #[cfg(feature = "conformance")]
 pub mod conformance;
