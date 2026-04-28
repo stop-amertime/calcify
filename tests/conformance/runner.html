@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>calcite primitive conformance runner</title>
+  <link id="fixture" rel="stylesheet" href="">
+  <script>
+    const params = new URLSearchParams(location.search);
+    const css = params.get('css');
+    if (css) document.getElementById('fixture').href = css;
+    window.readProps = (names) => {
+      const root = document.documentElement;
+      const cs = getComputedStyle(root);
+      const out = {};
+      for (const n of names) {
+        out[n] = cs.getPropertyValue(n).trim();
+      }
+      return out;
+    };
+  </script>
+</head>
+<body>
+  <p>calcite primitive conformance runner — drive via Playwright.</p>
+</body>
+</html>
