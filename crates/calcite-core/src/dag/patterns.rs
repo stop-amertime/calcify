@@ -82,11 +82,10 @@ impl LitMerge {
                 let s = k1.checked_add(k2)?;
                 if s >= 0 && s < 64 { Some(s) } else { None }
             }
-            // AND: composing two masks is bitwise AND of the masks. The
-            // op semantics are `slot & ((1 << val) - 1)` (low-N-bits
-            // mask), so two consecutive AndLits produce a min(N1, N2)
-            // mask. We fold by taking the smaller width.
-            LitOp::And => Some(k1.min(k2)),
+            // AND: Op::AndLit val is the literal mask bits applied as
+            // `slot & val`. Composing two AndLits is `slot & k1 & k2`,
+            // which is `slot & (k1 & k2)`.
+            LitOp::And => Some(k1 & k2),
         }
     }
 }
@@ -134,11 +133,11 @@ impl Pattern for LitMerge {
     }
 }
 
-/// `ShrLit(_, shift)` followed by `AndLit(_, mask_width)` → bit-field
-/// extraction `(x >> shift) & ((1 << mask_width) - 1)`. The semantic is
-/// CSS's `--bit(...)` / byte-extraction shape, but the matcher itself
-/// reasons about the op pair, not the source CSS — so any cabinet
-/// emitting this op shape gets the annotation.
+/// `ShrLit(_, shift)` followed by `AndLit(_, mask)` → bit-field
+/// extraction `(x >> shift) & mask`. `Op::AndLit`'s `val` field is a
+/// precomputed mask (the compiler emits the mask bits directly, not
+/// the bit-width). The matcher reasons about op shape, not source
+/// CSS — so any cabinet emitting this op shape gets the annotation.
 ///
 /// ## Genericity probe
 ///
@@ -166,27 +165,29 @@ impl Pattern for BitFieldMatch {
             Op::ShrLit { dst, a, val } => (*dst, *a, *val),
             _ => return None,
         };
-        let (_and_dst, and_a, mask_width) = match &program.ops[start_pc as usize + 1] {
+        let (_and_dst, and_a, mask_lit) = match &program.ops[start_pc as usize + 1] {
             Op::AndLit { dst, a, val } => (*dst, *a, *val),
             _ => return None,
         };
         if and_a != shr_dst {
             return None;
         }
-        // Shift must be in [0, 31]; mask width must be in [0, 32]. Both
-        // are CSS-spec-respecting bounds — the bytecode evaluator
-        // already enforces them on the live path.
+        // Shift must be in [0, 31]. The CSS / bytecode evaluator
+        // already enforces this on the live path.
         if !(0..32).contains(&shift) {
             return None;
         }
-        if !(0..=32).contains(&mask_width) {
+        // Mask must be non-negative — Op::AndLit val is the literal
+        // mask bits, applied as `slot[a] & val`. Negative values
+        // would just be sign-extended ones; treating them as a
+        // BitField annotation is meaningless.
+        if mask_lit < 0 {
             return None;
         }
-        let mask: u32 = if mask_width >= 32 { u32::MAX } else { (1u32 << mask_width) - 1 };
         Some(Annotation {
             pc: start_pc,
             span: 2,
-            kind: IdiomKind::BitField { shift: shift as u8, mask },
+            kind: IdiomKind::BitField { shift: shift as u8, mask: mask_lit as u32 },
         })
     }
 }
@@ -523,7 +524,7 @@ mod tests {
         p.ops = vec![
             Op::LoadLit { dst: 0, val: 0xABCD },
             Op::ShrLit { dst: 1, a: 0, val: 8 },
-            Op::AndLit { dst: 2, a: 1, val: 8 }, // mask: low 8 bits
+            Op::AndLit { dst: 2, a: 1, val: 0xFF }, // mask: low 8 bits
         ];
         p.slot_count = 3;
         let dag = build_dag(&p);

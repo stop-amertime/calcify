@@ -110,8 +110,10 @@ pub struct Evaluator {
     /// bytecode interpreter (`Backend::Bytecode`); the Phase 1 DAG walker
     /// (`Backend::Dag`) is opt-in and produces identical results.
     backend: Backend,
-    /// Lazily-built Phase 1 DAG. Some iff `backend == Backend::Dag`.
+    /// Lazily-built Phase 1 DAG. Some iff backend == Dag or Closure.
     dag: Option<crate::dag::Dag>,
+    /// Lazily-built Phase 3 closure tree. Some iff backend == Closure.
+    closure: Option<crate::dag::ClosureProgram>,
 }
 
 /// Which main-ops evaluation strategy `Evaluator` runs.
@@ -130,6 +132,11 @@ pub enum Backend {
     Bytecode,
     /// Phase 1 DAG walker over an explicit CFG.
     Dag,
+    /// Phase 3 closure tree — each block is a `Vec<Box<dyn Fn>>` plus a
+    /// pre-resolved terminator. Most ops still defer to `exec_ops`
+    /// (single-op slice); the prototype's purpose is to validate the
+    /// lowering shape, not to ship a fast backend.
+    Closure,
 }
 
 impl Default for Backend {
@@ -554,15 +561,24 @@ impl Evaluator {
             slots: Vec::with_capacity(slot_count),
             backend,
             dag,
+            closure: None,
         }
     }
 
     /// Switch the main-ops evaluation backend at runtime. Builds the DAG
-    /// lazily when switching to `Backend::Dag`. Idempotent.
+    /// (and closure tree, if Closure) lazily. Idempotent.
     pub fn set_backend(&mut self, backend: Backend) {
         self.backend = backend;
-        if matches!(backend, Backend::Dag) && self.dag.is_none() {
+        if matches!(backend, Backend::Dag | Backend::Closure) && self.dag.is_none() {
             self.dag = Some(crate::dag::build_dag(&self.compiled));
+        }
+        if matches!(backend, Backend::Closure) && self.closure.is_none() {
+            let dag = self.dag.as_ref().expect("dag built above");
+            // SAFETY: ClosureProgram holds a raw pointer to self.compiled.
+            // self.compiled is owned by Evaluator and never reassigned;
+            // self.closure is set to None before any code that drops self
+            // could run. The closure tree never outlives the Evaluator.
+            self.closure = Some(crate::dag::ClosureProgram::build(&self.compiled, dag));
         }
     }
 
@@ -588,6 +604,21 @@ impl Evaluator {
                     .as_ref()
                     .expect("Backend::Dag selected but DAG not built");
                 crate::dag::dag_execute(&self.compiled, dag, state, &mut self.slots);
+            }
+            Backend::Closure => {
+                let closure = self
+                    .closure
+                    .as_ref()
+                    .expect("Backend::Closure selected but closure tree not built");
+                if self.slots.len() != self.compiled.slot_count as usize {
+                    self.slots.resize(self.compiled.slot_count as usize, 0);
+                }
+                closure.run_main_ops(state, &mut self.slots);
+                crate::compile::execute_post_main_phases(
+                    &self.compiled,
+                    state,
+                    &mut self.slots,
+                );
             }
         }
     }
@@ -2189,6 +2220,7 @@ mod tests {
             slots: Vec::new(),
             backend: Backend::Bytecode,
             dag: None,
+            closure: None,
         };
         (evaluator, state)
     }

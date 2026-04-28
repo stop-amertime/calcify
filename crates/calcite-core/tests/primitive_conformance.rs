@@ -275,3 +275,10 @@ fn primitive_conformance_bytecode() {
 fn primitive_conformance_dag() {
     run_suite(Backend::Dag);
 }
+
+/// Phase 3 acceptance gate: the Closure backend produces identical
+/// results to the bytecode interpreter on every primitive fixture.
+#[test]
+fn primitive_conformance_closure() {
+    run_suite(Backend::Closure);
+}

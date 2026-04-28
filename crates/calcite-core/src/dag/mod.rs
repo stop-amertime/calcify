@@ -6,12 +6,14 @@
 //! § Phase 1 for context.
 
 mod build;
+mod closure;
 mod normalise;
 mod patterns;
 mod types;
 mod walker;
 
 pub use build::build_dag;
+pub use closure::ClosureProgram;
 pub use normalise::{
     normalise, normalise_with, Annotation, IdiomKind, NormalisedDag, Pattern,
 };

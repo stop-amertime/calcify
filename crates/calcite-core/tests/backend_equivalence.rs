@@ -137,15 +137,22 @@ fn backends_agree_on_demo_cabinet() {
     eprintln!("running {TICKS} ticks under each backend");
     let bytecode_state = run_n_ticks(&css, Backend::Bytecode, TICKS);
     let dag_state = run_n_ticks(&css, Backend::Dag, TICKS);
+    let closure_state = run_n_ticks(&css, Backend::Closure, TICKS);
 
     let diffs = diff_states(&bytecode_state, &dag_state);
+    assert_no_diffs("DAG walker", &diffs);
+    let diffs = diff_states(&bytecode_state, &closure_state);
+    assert_no_diffs("Closure backend", &diffs);
+}
+
+fn assert_no_diffs(name: &str, diffs: &[String]) {
     if !diffs.is_empty() {
         let mut msg = format!(
-            "DAG walker diverged from bytecode interpreter after {TICKS} ticks ({} diff{}):\n",
+            "{name} diverged from bytecode interpreter after {TICKS} ticks ({} diff{}):\n",
             diffs.len(),
             if diffs.len() == 1 { "" } else { "s" },
         );
-        for d in &diffs {
+        for d in diffs {
             msg.push_str("  ");
             msg.push_str(d);
             msg.push('\n');
