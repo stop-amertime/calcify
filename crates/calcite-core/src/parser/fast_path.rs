@@ -577,6 +577,7 @@ fn emit_assignment_run(
                 gate_property: sk.gate_property,
                 addr_property: sk.addr_property,
                 val_property: sk.val_property,
+                width_property: sk.width_property,
                 address_map: HashMap::with_capacity(entries.len()),
                 pack: pack as u8,
             })
@@ -664,13 +665,14 @@ fn emit_assignment_run(
 }
 
 /// Skeleton of one packed slot port from the learned template. We extract
-/// `(gate, addr, val)` from the template Expr (where the addr-offset was
-/// materialised as `ra_addr * pack`); downstream code fills address_map
+/// `(gate, addr, val, width)` from the template Expr (where the addr-offset
+/// was materialised as `ra_addr * pack`); downstream code fills address_map
 /// by iterating every entry in the run.
 struct PackedPortSkeleton {
     gate_property: String,
     addr_property: String,
     val_property: String,
+    width_property: String,
 }
 
 /// Walk a parsed template Expr, trying to decompose it as a nested
@@ -678,7 +680,12 @@ struct PackedPortSkeleton {
 /// or None if the shape doesn't match the packed pattern.
 ///
 /// Each layer must match exactly:
-///   `--applySlot(<inner>, var(--gate), calc(var(--addr) - K), var(--val))`
+///   `--applySlot(<inner>,
+///                var(--gate),
+///                calc(var(--addr) - K),
+///                calc(var(--addr) + 1 - K),
+///                var(--val),
+///                var(--width))`
 /// and the chain must terminate at `var(--__1{cell_property})` or similar.
 /// The constant `K` in the template equals `ra_addr * pack` (the ref addr's
 /// byte offset) — we check it matches for consistency, but the per-entry
@@ -696,11 +703,13 @@ fn extract_packed_port_skeletons(
     loop {
         match cur {
             Expr::FunctionCall { name, args } => {
-                if !name.ends_with("applySlot") || args.len() != 4 {
+                if !name.ends_with("applySlot") || args.len() != 6 {
                     return None;
                 }
-                let (gate_property, addr_property, val_property, k) =
-                    extract_apply_slot_template_layer(&args[1], &args[2], &args[3])?;
+                let (gate_property, addr_property, val_property, width_property, k) =
+                    extract_apply_slot_template_layer(
+                        &args[1], &args[2], &args[3], &args[4], &args[5],
+                    )?;
                 if k != expected_k {
                     return None;
                 }
@@ -708,6 +717,7 @@ fn extract_packed_port_skeletons(
                     gate_property,
                     addr_property,
                     val_property,
+                    width_property,
                 });
                 cur = &args[0];
             }
@@ -725,13 +735,15 @@ fn extract_packed_port_skeletons(
     }
 }
 
-/// Decompose one applySlot layer's trailing three args into its parts and
+/// Decompose one applySlot layer's trailing five args into its parts and
 /// the constant byte-offset subtracted from the addr variable.
 fn extract_apply_slot_template_layer(
     gate_arg: &Expr,
-    off_arg: &Expr,
+    lo_off_arg: &Expr,
+    hi_off_arg: &Expr,
     val_arg: &Expr,
-) -> Option<(String, String, String, i64)> {
+    width_arg: &Expr,
+) -> Option<(String, String, String, String, i64)> {
     let gate_property = match gate_arg {
         Expr::Var { name, .. } => name.clone(),
         _ => return None,
@@ -740,7 +752,11 @@ fn extract_apply_slot_template_layer(
         Expr::Var { name, .. } => name.clone(),
         _ => return None,
     };
-    let (addr_property, k) = match off_arg {
+    let width_property = match width_arg {
+        Expr::Var { name, .. } => name.clone(),
+        _ => return None,
+    };
+    let (addr_property, k) = match lo_off_arg {
         Expr::Calc(CalcOp::Sub(lhs, rhs)) => {
             let addr_name = match lhs.as_ref() {
                 Expr::Var { name, .. } => name.clone(),
@@ -755,7 +771,47 @@ fn extract_apply_slot_template_layer(
         Expr::Var { name, .. } => (name.clone(), 0),
         _ => return None,
     };
-    Some((gate_property, addr_property, val_property, k))
+    // hi_off_arg must be `calc(var(--addr) + 1 - K)` over the same addr/K.
+    if !template_hi_off_matches(hi_off_arg, &addr_property, k) {
+        return None;
+    }
+    Some((gate_property, addr_property, val_property, width_property, k))
+}
+
+/// True iff `expr` evaluates to `var(addr) + (1 - k)` (i.e. the byte AFTER
+/// the lo offset). Walks calc add/sub algebraically to handle whatever
+/// associativity the parser produces.
+fn template_hi_off_matches(expr: &Expr, addr_property: &str, k: i64) -> bool {
+    eval_template_addr_offset(expr, addr_property) == Some(1 - k)
+}
+
+fn eval_template_addr_offset(expr: &Expr, addr_property: &str) -> Option<i64> {
+    match expr {
+        Expr::Var { name, .. } if name == addr_property => Some(0),
+        Expr::Calc(op) => match op {
+            CalcOp::Add(a, b) => {
+                if let Some(ac) = eval_template_addr_offset(a, addr_property) {
+                    let bc = const_eval_literal(b)?;
+                    Some(ac + bc)
+                } else if let Some(bc) = eval_template_addr_offset(b, addr_property) {
+                    let ac = const_eval_literal(a)?;
+                    Some(ac + bc)
+                } else {
+                    None
+                }
+            }
+            CalcOp::Sub(a, b) => {
+                if let Some(ac) = eval_template_addr_offset(a, addr_property) {
+                    let bc = const_eval_literal(b)?;
+                    Some(ac - bc)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// Evaluate a literal-only Expr (bare literal or Add/Sub/Mul/Div of

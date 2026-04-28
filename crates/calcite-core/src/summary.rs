@@ -139,9 +139,17 @@ impl EventLogger {
     }
 }
 
-/// Pull memAddr0/memVal0 .. memAddr7/memVal7 out of state. Skips addr==0
-/// (dead slot), and caps at `limit`. V4 has 8 slots; if a program later
-/// exposes more, bump the range.
+/// Pull --memAddrK/--memValK pairs (width-aware) out of state for the diagnostic
+/// event log. Skips dead slots (addr < 0). Caps at `limit`.
+///
+/// CSS-DOS V4 currently exposes 3 slots. We probe 0..=7 to be tolerant of
+/// future cabinets that change the slot count without needing to update this
+/// path — `state.get_var` returns None for absent properties so the loop
+/// naturally stops short.
+///
+/// Width handling: when --_slotKWidth is 2, the slot writes a 16-bit word
+/// with lo at addr and hi at addr+1. We record both byte-writes so the event
+/// log matches what the splice paths actually do to memory.
 fn append_writes(state: &State, out: &mut Vec<(i32, i32)>, limit: usize) {
     if limit == 0 {
         return;
@@ -153,15 +161,27 @@ fn append_writes(state: &State, out: &mut Vec<(i32, i32)>, limit: usize) {
         }
         let addr_name = format!("memAddr{i}");
         let val_name = format!("memVal{i}");
+        let width_name = format!("_slot{i}Width");
         let Some(addr) = state.get_var(&addr_name) else {
             continue;
         };
-        if addr == 0 {
+        if addr < 0 {
             continue;
         }
         let val = state.get_var(&val_name).unwrap_or(0);
-        out.push((addr, val));
-        added += 1;
+        let width = state.get_var(&width_name).unwrap_or(1);
+        if width == 2 {
+            out.push((addr, val & 0xFF));
+            added += 1;
+            if added >= limit {
+                break;
+            }
+            out.push((addr + 1, (val >> 8) & 0xFF));
+            added += 1;
+        } else {
+            out.push((addr, val & 0xFF));
+            added += 1;
+        }
     }
 }
 

@@ -8,26 +8,41 @@
 //! ```css
 //! --mcN: --applySlot(--applySlot(... --applySlot(
 //!    var(--__1mcN),
-//!    var(--_slot5Live), calc(var(--memAddr5) - 2N), var(--memVal5)),
-//!    var(--_slot4Live), calc(var(--memAddr4) - 2N), var(--memVal4)),
+//!    var(--_slot{K-1}Live),
+//!    calc(var(--memAddr{K-1}) - 2N),
+//!    calc(var(--memAddr{K-1}) + 1 - 2N),
+//!    var(--memVal{K-1}),
+//!    var(--_slot{K-1}Width)),
 //!    ...
-//!    var(--_slot0Live), calc(var(--memAddr0) - 2N), var(--memVal0));
+//!    var(--_slot0Live),
+//!    calc(var(--memAddr0) - 2N),
+//!    calc(var(--memAddr0) + 1 - 2N),
+//!    var(--memVal0),
+//!    var(--_slot0Width));
 //! ```
 //!
-//! `--applySlot(cell, live, off, val)` returns:
-//! - `cell` if `live == 0` or `off` is outside `0..=1`
-//! - `splice(cell, val, off)` otherwise — keeps the other byte, replaces the byte at `off`
+//! `--applySlot(cell, live, loOff, hiOff, val, width)` returns:
+//! - `cell` if `live == 0`
+//! - `lowerBytes(val, 16)` when width=2 AND loOff=0 AND hiOff=1
+//!   — width-2 aligned word write, whole cell becomes val.
+//! - `(val & 0xff) << 8 | (cell & 0xff)` when width=2 AND loOff=1
+//!   — width-2 straddle, slot's lo half lands here at off 1.
+//! - `(val >> 8) | (cell & 0xff00)` when width=2 AND hiOff=0
+//!   — width-2 straddle, slot's hi half lands here at off 0.
+//! - byte splice at loOff for width=1.
+//! - `cell` otherwise (slot doesn't touch this cell).
 //!
-//! Slot 0 is outermost (wins on collisions), slot 5 is innermost.
+//! Slot 0 is outermost (wins on collisions), slot K-1 is innermost.
 //!
 //! This module recognises the assignment shape and groups cells by
-//! (gate_property, address_property, value_property) — each group becomes one
-//! `PackedSlotPort` covering all cells written through that slot.
+//! (gate_property, address_property, value_property, width_property) — each
+//! group becomes one `PackedSlotPort` covering all cells written through that
+//! slot.
 //!
-//! At runtime, instead of evaluating ~60 ops per cell × 3152 cells per tick,
-//! the executor iterates ~6 ports (one per write slot): if the gate is live
-//! and the address is in range, look up the cell address from a dense table,
-//! splice the byte, write it back.
+//! At runtime, instead of evaluating ~30 ops per cell × thousands of cells
+//! per tick, the executor iterates K ports (one per write slot): if the gate
+//! is live and the address is in range, look up the cell address from a dense
+//! table, splice 1 or 2 bytes (width-aware) into the cell(s), write back.
 
 use std::collections::HashMap;
 
@@ -35,19 +50,25 @@ use crate::types::*;
 
 /// One write port through a single memory slot.
 ///
-/// Conceptually: `if --gate_property == 1, take address from --addr_property,
-/// take value from --val_property; for cell N at byte 2N, splice low or high
-/// byte based on (--addr_property - 2N) being 0 or 1`.
+/// Conceptually: `if --gate_property == 1, take address A from --addr_property,
+/// take value V from --val_property, and width W from --width_property`.
+/// Width=1 splices a single byte at A. Width=2 writes a 16-bit word with
+/// lo at A and hi at A+1 — the writes may straddle two adjacent cells when
+/// A is odd-aligned.
 #[derive(Debug, Clone)]
 pub struct PackedSlotPort {
     /// e.g. `--_slot0Live`. Per-tick gate; skip the port entirely when 0.
     pub gate_property: String,
-    /// e.g. `--memAddr0`. Byte address being written.
+    /// e.g. `--memAddr0`. Byte address being written (lo byte for width=2).
     pub addr_property: String,
-    /// e.g. `--memVal0`. Byte value to splice in.
+    /// e.g. `--memVal0`. Byte value (width=1) or 16-bit word (width=2;
+    /// lo at addr, hi at addr+1).
     pub val_property: String,
-    /// Map from byte address (cell_index * 2) → cell variable name (e.g. `--mc42`).
-    /// Each port covers all cells; the runtime looks up `addr & !1` here.
+    /// e.g. `--_slot0Width`. 1 = byte splice, 2 = word splice.
+    pub width_property: String,
+    /// Map from cell-base byte address → cell variable name (e.g. `--mc42`).
+    /// Each port covers every writable cell; the runtime looks up the
+    /// affected cell(s) via their byte-aligned cell base.
     pub address_map: HashMap<i64, String>,
     /// Pack size in bytes per cell (matches PackedBroadcastResult::pack).
     /// Carried per-port so downstream code doesn't have to thread the result
@@ -75,13 +96,13 @@ const MIN_CELLS_FOR_RECOGNITION: usize = 100;
 /// Walks each assignment whose property looks like `--mc{N}` (where N is a
 /// non-negative integer). For each one that successfully decomposes into a
 /// nested `--applySlot` chain ending in `var(--__1mcN)`, extracts the per-layer
-/// (gate, addr, val) and inserts (cell_byte_addr → property_name) into the
-/// matching port's address map.
+/// (gate, addr, val, width) and inserts (cell_byte_addr → property_name) into
+/// the matching port's address map.
 ///
 /// Returns empty result if fewer than `MIN_CELLS_FOR_RECOGNITION` cells matched.
 pub fn recognise_packed_broadcast(assignments: &[Assignment]) -> PackedBroadcastResult {
-    // Map from (gate, addr, val) → port being built.
-    type PortKey = (String, String, String);
+    // Map from (gate, addr, val, width) → port being built.
+    type PortKey = (String, String, String, String);
     let mut ports: HashMap<PortKey, PackedSlotPort> = HashMap::new();
     let mut absorbed: std::collections::HashSet<String> = std::collections::HashSet::new();
 
@@ -95,14 +116,15 @@ pub fn recognise_packed_broadcast(assignments: &[Assignment]) -> PackedBroadcast
             Some(layers) => layers,
             None => continue,
         };
-        // Every layer of every cell must have the same (gate, addr, val) shape
-        // OR at least be consistent across cells. We simply group each layer
-        // by its triple — slots 0..5 naturally form 6 distinct triples.
+        // Every layer of every cell must have the same (gate, addr, val, width)
+        // shape. We group layers by that quadruple — typically the cabinet
+        // produces NUM_WRITE_SLOTS distinct tuples (3 in the current scheme).
         for layer in layers {
             let key = (
                 layer.gate_property.clone(),
                 layer.addr_property.clone(),
                 layer.val_property.clone(),
+                layer.width_property.clone(),
             );
             // The byte-offset arithmetic the layer encodes must equal the
             // cell's byte address — i.e. `calc(var(--addr) - cell_byte_addr)`.
@@ -125,6 +147,7 @@ pub fn recognise_packed_broadcast(assignments: &[Assignment]) -> PackedBroadcast
                     gate_property: layer.gate_property,
                     addr_property: layer.addr_property,
                     val_property: layer.val_property,
+                    width_property: layer.width_property,
                     address_map: HashMap::new(),
                     pack: 2,
                 });
@@ -188,6 +211,7 @@ struct ApplySlotLayer {
     gate_property: String,
     addr_property: String,
     val_property: String,
+    width_property: String,
     /// The byte address this layer is checking against (the constant subtracted
     /// from the address arg). Must be consistent across all layers of the same
     /// cell.
@@ -198,8 +222,16 @@ struct ApplySlotLayer {
 /// into a flat list of layers (outermost first — slot 0 first in CSS-DOS layout).
 ///
 /// Each layer must match exactly:
-///   `--applySlot(<inner>, var(--gate), calc(var(--addr) - K), var(--val))`
-/// where K is a non-negative integer constant.
+///   `--applySlot(<inner>,
+///                var(--gate),
+///                calc(var(--addr) - K),
+///                calc(var(--addr) + 1 - K),
+///                var(--val),
+///                var(--width))`
+/// where K is a non-negative integer constant. The two off args must
+/// reference the same `--addr` and use K identical to the cell's byte
+/// base — the second arg differs by `+1` to expose the slot's hi half
+/// position to width=2 splice handling.
 ///
 /// The innermost `<inner>` must be `var(--__1{cell_property})` — the simple-keep
 /// fallback. Anything else means there's side-channel logic and we bail.
@@ -213,10 +245,10 @@ fn decompose_apply_slot_chain(expr: &Expr, cell_property: &str) -> Option<Vec<Ap
             Expr::FunctionCall { name, args } => {
                 // Accept anything ending with "applySlot" (handles future renames
                 // and per-cart prefixes uniformly with the rest of the codebase).
-                if !name.ends_with("applySlot") || args.len() != 4 {
+                if !name.ends_with("applySlot") || args.len() != 6 {
                     return None;
                 }
-                let layer = extract_apply_slot_layer(&args[1], &args[2], &args[3])?;
+                let layer = extract_apply_slot_layer(&args[1], &args[2], &args[3], &args[4], &args[5])?;
                 layers.push(layer);
                 cur = &args[0];
             }
@@ -234,11 +266,19 @@ fn decompose_apply_slot_chain(expr: &Expr, cell_property: &str) -> Option<Vec<Ap
     }
 }
 
-/// Extract one (gate, addr, val) triple from an applySlot's three trailing args.
+/// Extract one (gate, addr, val, width) tuple from an applySlot's five trailing args.
+/// args[0] is the inner cell expression (handled by the caller).
+/// args[1] = gate (var)
+/// args[2] = loOff = calc(var(--addr) - K)        — splice byte at addr
+/// args[3] = hiOff = calc(var(--addr) + 1 - K)    — splice hi byte at addr+1 (width=2 only)
+/// args[4] = val (var)
+/// args[5] = width (var)
 fn extract_apply_slot_layer(
     gate_arg: &Expr,
-    off_arg: &Expr,
+    lo_off_arg: &Expr,
+    hi_off_arg: &Expr,
     val_arg: &Expr,
+    width_arg: &Expr,
 ) -> Option<ApplySlotLayer> {
     let gate_property = match gate_arg {
         Expr::Var { name, .. } => name.clone(),
@@ -248,38 +288,110 @@ fn extract_apply_slot_layer(
         Expr::Var { name, .. } => name.clone(),
         _ => return None,
     };
-    // off_arg should be `calc(var(--addr) - K)` where K is a non-negative constant.
+    let width_property = match width_arg {
+        Expr::Var { name, .. } => name.clone(),
+        _ => return None,
+    };
+    // lo_off_arg should be `calc(var(--addr) - K)` where K is a non-negative constant.
     // K may be either a bare literal or `<literal> * <literal>` (kiln emits
     // `${cellIdx} * ${PACK_SIZE}` so the cell index sits at a position the
     // parser fast-path can template as an Addr hole; without that split, the
     // pre-folded base would be classified as a Free hole and the fast-path
     // would bail on the entire run).
-    let (addr_property, cell_byte_addr) = match off_arg {
+    let (addr_property, cell_byte_addr) = parse_byte_off_arg(lo_off_arg)?;
+    // hi_off_arg should be `calc(var(--addr) + 1 - K)` for the SAME addr and K.
+    // The parser may have associated this differently — accept any form whose
+    // const_eval over the non-addr atoms equals 1 - cell_byte_addr.
+    if !hi_off_matches(hi_off_arg, &addr_property, cell_byte_addr) {
+        return None;
+    }
+    Some(ApplySlotLayer {
+        gate_property,
+        addr_property,
+        val_property,
+        width_property,
+        cell_byte_addr,
+    })
+}
+
+/// Parse the lo-off argument shape `calc(var(--addr) - K)` (or bare `var(--addr)`
+/// when K=0).
+fn parse_byte_off_arg(off_arg: &Expr) -> Option<(String, i64)> {
+    match off_arg {
         Expr::Calc(CalcOp::Sub(lhs, rhs)) => {
             let addr_name = match lhs.as_ref() {
                 Expr::Var { name, .. } => name.clone(),
                 _ => return None,
             };
-            let k = match const_eval(rhs.as_ref()) {
-                Some(v) => v,
-                None => return None,
-            };
+            let k = const_eval(rhs.as_ref())?;
             if k < 0 {
                 return None;
             }
-            (addr_name, k)
+            Some((addr_name, k))
         }
         // Special case: cell 0 might emit `calc(var(--addr) - 0)`, which the
         // parser may or may not collapse to bare `var(--addr)`. Handle both.
-        Expr::Var { name, .. } => (name.clone(), 0),
-        _ => return None,
-    };
-    Some(ApplySlotLayer {
-        gate_property,
-        addr_property,
-        val_property,
-        cell_byte_addr,
-    })
+        Expr::Var { name, .. } => Some((name.clone(), 0)),
+        _ => None,
+    }
+}
+
+/// Match the hi-off shape: `calc(var(--addr) + 1 - K)` (or any algebraic
+/// rearrangement thereof) where addr matches `addr_property` and the
+/// constant offset evaluates to `1 - cell_byte_addr`.
+///
+/// Tolerated parse trees:
+///   calc(var(addr) + 1 - K)
+///   calc(var(addr) + (1 - K))
+///   calc(var(addr) + 1 - <const>)   where <const> evals to K
+///   calc(var(addr) - <const>)       where <const> evals to (K - 1) and K >= 1
+fn hi_off_matches(expr: &Expr, addr_property: &str, cell_byte_addr: i64) -> bool {
+    let target = 1 - cell_byte_addr;
+    matches_addr_plus_const(expr, addr_property, target)
+}
+
+/// True iff `expr` evaluates to `var(addr_property) + target_const` for some
+/// constant `target_const`. Walks the expression tree applying calc-add/sub
+/// algebra to find the offset.
+fn matches_addr_plus_const(expr: &Expr, addr_property: &str, target_const: i64) -> bool {
+    if let Some(c) = eval_addr_offset(expr, addr_property) {
+        return c == target_const;
+    }
+    false
+}
+
+/// Evaluate `expr` to `Some(c)` where it represents `var(addr_property) + c`,
+/// or `None` if the expression isn't of that form.
+fn eval_addr_offset(expr: &Expr, addr_property: &str) -> Option<i64> {
+    match expr {
+        Expr::Var { name, .. } if name == addr_property => Some(0),
+        Expr::Calc(op) => match op {
+            CalcOp::Add(a, b) => {
+                if let Some(ac) = eval_addr_offset(a, addr_property) {
+                    let bc = const_eval(b)?;
+                    Some(ac + bc)
+                } else if let Some(bc) = eval_addr_offset(b, addr_property) {
+                    let ac = const_eval(a)?;
+                    Some(ac + bc)
+                } else {
+                    None
+                }
+            }
+            CalcOp::Sub(a, b) => {
+                if let Some(ac) = eval_addr_offset(a, addr_property) {
+                    let bc = const_eval(b)?;
+                    Some(ac - bc)
+                } else {
+                    // var(addr) shows up only on the left side of a relevant
+                    // sub here — anything else means the expression doesn't
+                    // reduce to addr + const.
+                    None
+                }
+            }
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// Evaluate a constant-only expression tree to an integer, or return None
@@ -350,6 +462,24 @@ mod tests {
         Expr::Calc(CalcOp::Sub(Box::new(var(addr)), Box::new(lit(k as f64))))
     }
 
+    /// Build `calc(var(--addr) + 1 - k)` — the hiOff form passed as the 4th
+    /// applySlot arg. Differs from `off` by a constant +1 (the byte-after).
+    /// When k=0, kiln emits `calc(var(--addr) + 1 - 0 * pack)`; the parser
+    /// may collapse to `calc(var(--addr) + 1)`. Match the collapsed form.
+    fn hi_off(addr: &str, k: i64) -> Expr {
+        if k == 0 {
+            return Expr::Calc(CalcOp::Add(Box::new(var(addr)), Box::new(lit(1.0))));
+        }
+        // var(addr) + 1 - k
+        Expr::Calc(CalcOp::Sub(
+            Box::new(Expr::Calc(CalcOp::Add(
+                Box::new(var(addr)),
+                Box::new(lit(1.0)),
+            ))),
+            Box::new(lit(k as f64)),
+        ))
+    }
+
     /// Build `calc(var(--addr) - cellIdx * pack)` with the subtrahend as a
     /// `Mul(Literal, Literal)`. Models the current kiln emit shape.
     fn off_mul(addr: &str, cell_idx: i64, pack: i64) -> Expr {
@@ -362,20 +492,37 @@ mod tests {
         ))
     }
 
-    /// Build a six-deep applySlot chain for cell N.
+    /// Build `calc(var(--addr) + 1 - cellIdx * pack)`.
+    fn hi_off_mul(addr: &str, cell_idx: i64, pack: i64) -> Expr {
+        Expr::Calc(CalcOp::Sub(
+            Box::new(Expr::Calc(CalcOp::Add(
+                Box::new(var(addr)),
+                Box::new(lit(1.0)),
+            ))),
+            Box::new(Expr::Calc(CalcOp::Mul(
+                Box::new(lit(cell_idx as f64)),
+                Box::new(lit(pack as f64)),
+            ))),
+        ))
+    }
+
+    /// Build a NUM-deep applySlot chain for cell N. Three slots in the
+    /// post-2026-04-28 word-pair scheme.
     fn make_packed_cell(cell_idx: u32) -> Assignment {
         let cell_addr = (cell_idx as i64) * 2;
         let cell_prop = format!("--mc{cell_idx}");
         let mut expr = var(&format!("--__1mc{cell_idx}"));
-        // Slot 5 innermost, slot 0 outermost.
-        for slot in (0..6).rev() {
+        // Slot N-1 innermost, slot 0 outermost.
+        for slot in (0..3).rev() {
             expr = Expr::FunctionCall {
                 name: "--applySlot".to_string(),
                 args: vec![
                     expr,
                     var(&format!("--_slot{slot}Live")),
                     off(&format!("--memAddr{slot}"), cell_addr),
+                    hi_off(&format!("--memAddr{slot}"), cell_addr),
                     var(&format!("--memVal{slot}")),
+                    var(&format!("--_slot{slot}Width")),
                 ],
             };
         }
@@ -389,13 +536,14 @@ mod tests {
     fn recognises_thousand_cell_packed_broadcast() {
         let assignments: Vec<_> = (0..1000).map(make_packed_cell).collect();
         let result = recognise_packed_broadcast(&assignments);
-        assert_eq!(result.ports.len(), 6, "Should have 6 slot ports");
+        assert_eq!(result.ports.len(), 3, "Should have 3 slot ports");
         assert_eq!(result.absorbed_properties.len(), 1000);
         assert_eq!(result.pack, 2);
         for (i, port) in result.ports.iter().enumerate() {
             assert_eq!(port.gate_property, format!("--_slot{i}Live"));
             assert_eq!(port.addr_property, format!("--memAddr{i}"));
             assert_eq!(port.val_property, format!("--memVal{i}"));
+            assert_eq!(port.width_property, format!("--_slot{i}Width"));
             assert_eq!(port.address_map.len(), 1000);
             assert_eq!(
                 port.address_map.get(&0).map(|s| s.as_str()),
@@ -417,21 +565,23 @@ mod tests {
         for cell_idx in 0..200u32 {
             let cell_prop = format!("--mc{cell_idx}");
             let mut expr = var(&format!("--__1mc{cell_idx}"));
-            for slot in (0..6).rev() {
+            for slot in (0..3).rev() {
                 expr = Expr::FunctionCall {
                     name: "--applySlot".to_string(),
                     args: vec![
                         expr,
                         var(&format!("--_slot{slot}Live")),
                         off_mul(&format!("--memAddr{slot}"), cell_idx as i64, 2),
+                        hi_off_mul(&format!("--memAddr{slot}"), cell_idx as i64, 2),
                         var(&format!("--memVal{slot}")),
+                        var(&format!("--_slot{slot}Width")),
                     ],
                 };
             }
             assignments.push(Assignment { property: cell_prop, value: expr });
         }
         let result = recognise_packed_broadcast(&assignments);
-        assert_eq!(result.ports.len(), 6);
+        assert_eq!(result.ports.len(), 3);
         assert_eq!(result.absorbed_properties.len(), 200);
         for port in &result.ports {
             assert_eq!(port.address_map.len(), 200);
