@@ -347,17 +347,20 @@ impl Evaluator {
             broadcast_result.absorbed_properties.insert(name.clone());
         }
         // Merge prebuilt packed ports from the parser fast-path. For any
-        // (gate, addr, val) triple already present in the AST-recognised
-        // result, union the address_map; otherwise push a new port.
+        // (gate, addr, val, width) tuple already present in the
+        // AST-recognised result, union the address_map; otherwise push a
+        // new port.
         if !program.prebuilt_packed_broadcast_ports.is_empty() {
             use std::collections::HashMap;
-            let mut idx_by_key: HashMap<(String, String, String), usize> = HashMap::new();
+            let mut idx_by_key: HashMap<(String, String, String, String), usize> =
+                HashMap::new();
             for (i, port) in packed_bw_result.ports.iter().enumerate() {
                 idx_by_key.insert(
                     (
                         port.gate_property.clone(),
                         port.addr_property.clone(),
                         port.val_property.clone(),
+                        port.width_property.clone(),
                     ),
                     i,
                 );
@@ -367,6 +370,7 @@ impl Evaluator {
                     pre.gate_property.clone(),
                     pre.addr_property.clone(),
                     pre.val_property.clone(),
+                    pre.width_property.clone(),
                 );
                 if let Some(&i) = idx_by_key.get(&key) {
                     for (&addr, name) in &pre.address_map {
@@ -382,9 +386,9 @@ impl Evaluator {
         }
         for port in &packed_bw_result.ports {
             log::info!(
-                "Recognised packed broadcast port: gate={} addr={} val={} → {} cells (pack={})",
+                "Recognised packed broadcast port: gate={} addr={} val={} width={} → {} cells (pack={})",
                 port.gate_property, port.addr_property, port.val_property,
-                port.address_map.len(), packed_bw_result.pack,
+                port.width_property, port.address_map.len(), packed_bw_result.pack,
             );
         }
 
@@ -819,13 +823,19 @@ impl Evaluator {
             if (gate as i64) != 1 { continue; }
             let byte_addr = self.resolve_property(&port.addr_property, state).as_number() as i32;
             if byte_addr < 0 { continue; }
-            let val = (self.resolve_property(&port.val_property, state).as_number() as i32) & 0xFF;
+            let val = self.resolve_property(&port.val_property, state).as_number() as i32;
+            let width = self.resolve_property(&port.width_property, state).as_number() as i32;
             // write_mem is packed-aware: it splices the single byte into
             // the state-var cell when a cell is declared, and keeps the
             // flat shadow in sync. Do not filter by address_map — the
             // compiled path doesn't; write_mem handles missing cells
             // correctly on its own (updates the shadow only).
-            state.write_mem(byte_addr, val);
+            if width == 2 {
+                state.write_mem(byte_addr, val & 0xFF);
+                state.write_mem(byte_addr + 1, (val >> 8) & 0xFF);
+            } else {
+                state.write_mem(byte_addr, val & 0xFF);
+            }
         }
 
         // Evaluate string assignments

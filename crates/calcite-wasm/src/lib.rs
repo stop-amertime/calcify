@@ -99,6 +99,23 @@ impl CalciteEngine {
         Ok(CalciteEngine { state, evaluator, initial_properties })
     }
 
+    /// Diagnostic: number of recognised packed-broadcast ports.
+    /// 0 = recogniser didn't fire (cabinet falls back to slow per-cell eval).
+    /// 3 = current 3-slot scheme; 6 = legacy byte-slot scheme.
+    pub fn packed_broadcast_port_count(&self) -> u32 {
+        self.evaluator.compiled().packed_broadcast_writes.len() as u32
+    }
+
+    /// Diagnostic: total compiled-program op count.
+    pub fn compiled_op_count(&self) -> u32 {
+        self.evaluator.compiled().ops.len() as u32
+    }
+
+    /// Diagnostic: total compacted slot count.
+    pub fn compiled_slot_count(&self) -> u32 {
+        self.evaluator.compiled().slot_count
+    }
+
     /// Reset the engine's runtime state without recompiling the CSS.
     /// Equivalent to `new CalciteEngine(css)` but skips the parse +
     /// compile steps, which are the expensive ones for large cabinets.

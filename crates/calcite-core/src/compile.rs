@@ -620,14 +620,20 @@ pub struct CompiledSpillover {
 /// One CompiledPackedBroadcastWrite covers all packed cells through one slot.
 /// Slot 0 is applied last so it wins same-cell collisions (matching the CSS
 /// `--applySlot` chain's outermost-wins semantics).
+///
+/// Width semantics: `width_slot` reads 1 (byte splice at `addr_slot`) or 2
+/// (word splice with lo at `addr_slot` and hi at `addr_slot+1` — may straddle
+/// two adjacent cells when the address is odd-aligned).
 #[derive(Debug)]
 pub struct CompiledPackedBroadcastWrite {
     /// Slot holding the per-tick gate (`--_slotKLive`). Skip the port when 0.
     pub gate_slot: Slot,
     /// Slot holding the byte address (`--memAddrK`).
     pub addr_slot: Slot,
-    /// Slot holding the byte value (`--memValK`).
+    /// Slot holding the byte (width=1) or 16-bit word (width=2) value (`--memValK`).
     pub val_slot: Slot,
+    /// Slot holding the per-tick width gate (`--_slotKWidth`). 1 or 2.
+    pub width_slot: Slot,
     /// Pack size — bytes per cell (currently always 2).
     pub pack: u8,
     /// Dense cell-index → cell-state-address lookup. Index by `byte_addr / pack`.
@@ -3226,14 +3232,15 @@ pub fn compile(
         // Resolve slots. If any is missing, skip the port — better to fall
         // back to the non-absorbed `--mc{N}` evaluation than to silently
         // splice from slot 0.
-        let (Some(&gate_slot), Some(&addr_slot), Some(&val_slot)) = (
+        let (Some(&gate_slot), Some(&addr_slot), Some(&val_slot), Some(&width_slot)) = (
             compiler.property_slots.get(&port.gate_property),
             compiler.property_slots.get(&port.addr_property),
             compiler.property_slots.get(&port.val_property),
+            compiler.property_slots.get(&port.width_property),
         ) else {
             log::warn!(
-                "Packed broadcast port {} {} {}: missing slot binding, skipping",
-                port.gate_property, port.addr_property, port.val_property
+                "Packed broadcast port {} {} {} {}: missing slot binding, skipping",
+                port.gate_property, port.addr_property, port.val_property, port.width_property
             );
             continue;
         };
@@ -3256,6 +3263,7 @@ pub fn compile(
             gate_slot,
             addr_slot,
             val_slot,
+            width_slot,
             pack: port.pack,
             cell_table,
         });
@@ -4559,6 +4567,7 @@ fn compact_slots(program: &mut CompiledProgram) {
         port.gate_slot = slot_map.get(&port.gate_slot).copied().unwrap_or(port.gate_slot);
         port.addr_slot = slot_map.get(&port.addr_slot).copied().unwrap_or(port.addr_slot);
         port.val_slot = slot_map.get(&port.val_slot).copied().unwrap_or(port.val_slot);
+        port.width_slot = slot_map.get(&port.width_slot).copied().unwrap_or(port.width_slot);
     }
 
     program.slot_count = alloc.high_water;
@@ -4609,6 +4618,7 @@ fn collect_main_pinned(program: &CompiledProgram) -> Vec<Slot> {
         pinned.push(port.gate_slot);
         pinned.push(port.addr_slot);
         pinned.push(port.val_slot);
+        pinned.push(port.width_slot);
     }
     pinned.sort_unstable();
     pinned.dedup();
@@ -5266,6 +5276,108 @@ fn compile_broadcast_write(bw: &BroadcastWrite, compiler: &mut Compiler) -> Comp
 // Executor — runs a CompiledProgram against State
 // ---------------------------------------------------------------------------
 
+/// Splice one byte through a packed-broadcast port at a guest byte address.
+/// Reads the cell containing `byte_addr`, replaces the byte at `byte_addr`,
+/// writes back, keeps the flat shadow + write log in sync.
+///
+/// `val` is masked to 0xFF by the caller (or is implicitly within range).
+/// `byte_addr` is in guest memory — the cell index is `byte_addr / pack`.
+/// If the cell isn't in the port's table the splice is silently dropped
+/// (matches the v1 behaviour: ports cover every writable cell).
+#[inline]
+fn packed_splice_byte(
+    port: &CompiledPackedBroadcastWrite,
+    state: &mut State,
+    byte_addr: i32,
+    val: i32,
+) {
+    if byte_addr < 0 {
+        return;
+    }
+    let pack = port.pack as i32;
+    let cell_idx = (byte_addr / pack) as usize;
+    let off = byte_addr % pack;
+    if cell_idx >= port.cell_table.len() {
+        return;
+    }
+    let cell_state_addr = port.cell_table[cell_idx];
+    if cell_state_addr == 0 {
+        return;
+    }
+    let prev = state.read_mem(cell_state_addr);
+    let new_cell = if off == 0 {
+        (prev & !0xFF) | val
+    } else {
+        // off == 1: replace high byte (bits 8..15)
+        (prev & 0xFF) | (val << 8)
+    };
+    if new_cell != prev {
+        // Write directly to state_vars — the writeback logic for
+        // pack=2 cabinets logs single-byte guest writes (not whole-cell
+        // i32 writes) so the affine projectors can detect byte-fill loops.
+        // See the long comment in execute()'s previous version of this
+        // splice for why this matters for pack=2 perf.
+        let sidx = (-cell_state_addr - 1) as usize;
+        if sidx < state.state_vars.len() {
+            state.state_vars[sidx] = new_cell;
+        }
+        // Keep the flat shadow in step.
+        let addr_u = byte_addr as usize;
+        if addr_u < state.memory.len() {
+            state.memory[addr_u] = val as u8;
+        }
+        if let Some(ref mut log) = state.write_log {
+            log.push((byte_addr, val));
+        }
+    }
+}
+
+/// Splice an even-aligned 16-bit word through a packed-broadcast port.
+/// Caller guarantees `byte_addr & 1 == 0` so both bytes land in the same
+/// cell and the whole cell can be replaced in one read-modify-write.
+///
+/// `val` is a 16-bit value pre-masked to 0..=65535 by the caller. The
+/// affine projectors expect *byte-level* write_log entries even for word
+/// writes (so a STOSW loop's per-byte stride is visible), so we still
+/// emit two write_log entries — but the cell update itself is one op.
+#[inline]
+fn packed_splice_word_aligned(
+    port: &CompiledPackedBroadcastWrite,
+    state: &mut State,
+    byte_addr: i32,
+    val: i32,
+) {
+    debug_assert!(byte_addr >= 0 && byte_addr & 1 == 0);
+    let pack = port.pack as i32;
+    let cell_idx = (byte_addr / pack) as usize;
+    if cell_idx >= port.cell_table.len() {
+        return;
+    }
+    let cell_state_addr = port.cell_table[cell_idx];
+    if cell_state_addr == 0 {
+        return;
+    }
+    let prev = state.read_mem(cell_state_addr);
+    if val != prev {
+        let sidx = (-cell_state_addr - 1) as usize;
+        if sidx < state.state_vars.len() {
+            state.state_vars[sidx] = val;
+        }
+        let addr_u = byte_addr as usize;
+        if addr_u + 1 < state.memory.len() {
+            state.memory[addr_u]     = (val & 0xFF) as u8;
+            state.memory[addr_u + 1] = ((val >> 8) & 0xFF) as u8;
+        }
+        // Affine projectors lock on byte-stride patterns, so log byte
+        // writes (matching what byte-mode would produce) rather than
+        // logging a single (addr, word) entry.
+        if let Some(ref mut log) = state.write_log {
+            log.push((byte_addr, val & 0xFF));
+            log.push((byte_addr + 1, (val >> 8) & 0xFF));
+        }
+    }
+}
+
 /// Execute a compiled program for one tick.
 pub fn execute(program: &CompiledProgram, state: &mut State, slots: &mut Vec<i32>) {
     // Size slots appropriately; keep stale values between ticks. The compiler
@@ -5321,7 +5433,18 @@ pub fn execute(program: &CompiledProgram, state: &mut State, slots: &mut Vec<i32
     // the absorbed `--mc{N}: --applySlot(...)` chain. We iterate ports in
     // REVERSE order so slot 0 fires LAST — matching the CSS semantics where
     // slot 0 is the outermost --applySlot wrapper and wins same-cell
-    // collisions over slots 1..5.
+    // collisions over later slots.
+    //
+    // Width: each port reads a per-tick width slot (1 or 2). Width=1 splices
+    // a single byte at byte_addr. Width=2 writes a 16-bit word; when
+    // byte_addr is even the lo and hi halves both land in cell
+    // `byte_addr/2` (single read-modify-write of the whole cell), when odd
+    // they straddle (lo into b1 of cell N, hi into b0 of cell N+1).
+    //
+    // The aligned-width=2 path is hot — every PUSH/CALL/INT/IRQ frame and
+    // every word `MOV [m], r16` to even-aligned memory hits it. Inlining
+    // the splice and specialising the aligned case lets us avoid the
+    // double read-modify-write the naive two-byte-splice version would do.
     for port in program.packed_broadcast_writes.iter().rev() {
         if slots[port.gate_slot as usize] != 1 {
             continue;
@@ -5330,55 +5453,23 @@ pub fn execute(program: &CompiledProgram, state: &mut State, slots: &mut Vec<i32
         if byte_addr < 0 {
             continue;
         }
-        let pack = port.pack as i32;
-        let cell_idx = (byte_addr / pack) as usize;
-        let off = byte_addr % pack;
-        if cell_idx >= port.cell_table.len() {
-            continue;
-        }
-        let cell_state_addr = port.cell_table[cell_idx];
-        if cell_state_addr == 0 {
-            continue;
-        }
-        let val = slots[port.val_slot as usize] & 0xFF;
-        let prev = state.read_mem(cell_state_addr);
-        let new_cell = if off == 0 {
-            (prev & !0xFF) | val
+        let val = slots[port.val_slot as usize];
+        let width = slots[port.width_slot as usize];
+        if width == 2 {
+            if byte_addr & 1 == 0 {
+                // Aligned word: single cell, single read-modify-write.
+                // The whole cell becomes the 16-bit word value (masked to
+                // u16 so a sign-extended val doesn't bleed into bit 16+).
+                packed_splice_word_aligned(port, state, byte_addr, val & 0xFFFF);
+            } else {
+                // Straddle: lo half goes to cell N's high byte; hi half
+                // goes to cell N+1's low byte. Two cells, two splices.
+                packed_splice_byte(port, state, byte_addr, val & 0xFF);
+                packed_splice_byte(port, state, byte_addr + 1, (val >> 8) & 0xFF);
+            }
         } else {
-            // off == 1: replace high byte (bits 8..15)
-            (prev & 0xFF) | (val << 8)
-        };
-        if new_cell != prev {
-            // Write directly to state_vars — this path writes a whole cell
-            // value (two bytes packed into an i32). Using `write_mem` on
-            // the negative state-var address would log `(negative_addr,
-            // cell_i32)` to the write_log, which the affine projectors
-            // (tick_period.rs, cycle_tracker.rs) filter out as state-var
-            // noise. We want the projectors to see this as a single-byte
-            // guest memory write at `byte_addr`, which is how pack=1's
-            // broadcast_writes log it. Without that, the projectors never
-            // lock on byte-fill loops in packed cabinets and the CPU runs
-            // at the un-projected per-tick rate — which was the cause of
-            // pack=2 being ~10x slower per guest-cycle than pack=1 on
-            // splash/fill workloads.
-            let sidx = (-cell_state_addr - 1) as usize;
-            if sidx < state.state_vars.len() {
-                state.state_vars[sidx] = new_cell;
-            }
-            // Keep the flat shadow in step so code paths that read via
-            // `self.memory[..]` (renderer staging, debugger tools) see
-            // the same byte. `new_cell` contains the updated byte in
-            // `val` at position `off`; the other half is unchanged.
-            let addr_u = byte_addr as usize;
-            if addr_u < state.memory.len() {
-                state.memory[addr_u] = val as u8;
-            }
-            // Log as a single-byte guest write at the positive linear
-            // address, matching pack=1's log shape. Projectors can then
-            // detect affine stride evolution across ticks.
-            if let Some(ref mut log) = state.write_log {
-                log.push((byte_addr, val));
-            }
+            // Byte splice (width=1, the default).
+            packed_splice_byte(port, state, byte_addr, val & 0xFF);
         }
     }
 
@@ -6684,25 +6775,17 @@ pub fn execute_profiled(
         if byte_addr < 0 {
             continue;
         }
-        let pack = port.pack as i32;
-        let cell_idx = (byte_addr / pack) as usize;
-        let off = byte_addr % pack;
-        if cell_idx >= port.cell_table.len() {
-            continue;
-        }
-        let cell_state_addr = port.cell_table[cell_idx];
-        if cell_state_addr == 0 {
-            continue;
-        }
-        let val = slots[port.val_slot as usize] & 0xFF;
-        let prev = state.read_mem(cell_state_addr);
-        let new_cell = if off == 0 {
-            (prev & !0xFF) | val
+        let val = slots[port.val_slot as usize];
+        let width = slots[port.width_slot as usize];
+        if width == 2 {
+            if byte_addr & 1 == 0 {
+                packed_splice_word_aligned(port, state, byte_addr, val & 0xFFFF);
+            } else {
+                packed_splice_byte(port, state, byte_addr, val & 0xFF);
+                packed_splice_byte(port, state, byte_addr + 1, (val >> 8) & 0xFF);
+            }
         } else {
-            (prev & 0xFF) | (val << 8)
-        };
-        if new_cell != prev {
-            state.write_mem(cell_state_addr, new_cell);
+            packed_splice_byte(port, state, byte_addr, val & 0xFF);
         }
     }
     let t4 = Instant::now();
