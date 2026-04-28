@@ -471,6 +471,31 @@ pub struct CompiledProgram {
     /// and splices in the new byte. Replaces ~190K ops/tick of nested
     /// `--applySlot` calls with ~6 port checks.
     pub packed_broadcast_writes: Vec<CompiledPackedBroadcastWrite>,
+    /// Optional descriptor for a "windowed byte array" read pattern detected
+    /// in `--readMem`'s exception entries — i.e. a contiguous range of
+    /// addresses whose dispatch entries all redirect to a single
+    /// `--readDiskByte`-style flat-array dispatch with the same shape
+    /// `--funcname((cell_value) * stride + literal_offset)`. The
+    /// `key_cell_property` name is resolved to a state-var slot by
+    /// `Evaluator::wire_state_for_disk_window`, which builds the runtime
+    /// `state::DiskWindow` and installs it on `State` so reads inside the
+    /// window collapse to one state-var read + one array index, instead of
+    /// walking the inline-exception CmpEq chain on every byte.
+    pub disk_window: Option<CompiledDiskWindow>,
+}
+
+/// Compile-time half of the rom-disk fast path. The compiler can't resolve
+/// state-var slots (they're assigned by `State::load_properties`), so the
+/// descriptor carries the property NAME; the wiring step looks the slot up
+/// and builds the runtime `state::DiskWindow`.
+#[derive(Debug, Clone)]
+pub struct CompiledDiskWindow {
+    pub window_base: i32,
+    pub window_end: i32,
+    pub key_cell_property: String,
+    pub stride: i32,
+    pub byte_array_base_key: i32,
+    pub byte_array: std::sync::Arc<Vec<i32>>,
 }
 
 /// Dense base-keyed lookup table for packed-byte literal exceptions.
@@ -596,7 +621,10 @@ pub struct CompiledPackedBroadcastWrite {
 pub struct FlatDispatchArray {
     /// Values indexed by (key - base_key). Out-of-range indices yield the
     /// default value baked into the op.
-    pub values: Vec<i32>,
+    /// Stored behind an `Arc` so other parts of the runtime (e.g. the
+    /// `State::disk_window` short-circuit) can share the backing buffer
+    /// without cloning multi-MB byte payloads.
+    pub values: std::sync::Arc<Vec<i32>>,
 }
 
 /// A compiled dispatch table — kept for runtime HashMap lookup.
@@ -1106,6 +1134,170 @@ pub(crate) fn classify_near_packed_byte(table: &DispatchTable) -> Option<(u8, Ve
     Some((pack, exceptions))
 }
 
+/// Decoded shape of a single rom-disk-style dispatch entry.
+#[derive(Debug, Clone)]
+struct DiskEntryShape {
+    /// The wrapping function call's name (e.g. `"--readDiskByte"`).
+    func_name: String,
+    /// The property name that holds the lookup key (e.g. `"--__1mc632"`).
+    key_property: String,
+    /// Multiplier applied to the cell value before adding offset.
+    stride: i32,
+    /// Per-entry literal offset added to `cell * stride`.
+    offset: i32,
+}
+
+/// Try to match `mod(var(P), 256) + round(down, var(P) / 256) * 256` —
+/// the algebraic identity for "the u16 stored as low/high bytes in cell P".
+/// Returns the property name P on a match.
+fn match_u16_recompose(expr: &Expr) -> Option<&str> {
+    let Expr::Calc(CalcOp::Add(lo, hi_term)) = expr else { return None };
+    let Expr::Calc(CalcOp::Mod(lo_var, lo_div)) = lo.as_ref() else { return None };
+    let Expr::Var { name: p1, .. } = lo_var.as_ref() else { return None };
+    let Expr::Literal(d) = lo_div.as_ref() else { return None };
+    if *d != 256.0 { return None }
+    let Expr::Calc(CalcOp::Mul(round_term, mul_lit)) = hi_term.as_ref() else { return None };
+    let Expr::Literal(m) = mul_lit.as_ref() else { return None };
+    if *m != 256.0 { return None }
+    let Expr::Calc(CalcOp::Round(RoundStrategy::Down, val, interval)) = round_term.as_ref() else { return None };
+    if !matches!(interval.as_ref(), Expr::Literal(v) if *v == 1.0) { return None }
+    let Expr::Calc(CalcOp::Div(hi_var, hi_div)) = val.as_ref() else { return None };
+    let Expr::Var { name: p2, .. } = hi_var.as_ref() else { return None };
+    let Expr::Literal(d2) = hi_div.as_ref() else { return None };
+    if *d2 != 256.0 { return None }
+    if p1 != p2 { return None }
+    Some(p1)
+}
+
+/// Try to decode one dispatch entry as a `--func(cell * stride + offset)`
+/// shape with the inner cell expression being a u16 recomposition. Returns
+/// None for any other shape — the caller treats that as "this entry is not
+/// part of a disk window" and falls through to the generic inline-exception
+/// path.
+fn decode_disk_entry(expr: &Expr) -> Option<DiskEntryShape> {
+    let Expr::FunctionCall { name: func_name, args } = expr else { return None };
+    if args.len() != 1 { return None }
+    let Expr::Calc(CalcOp::Add(mul_term, off_lit)) = &args[0] else { return None };
+    let Expr::Literal(off) = off_lit.as_ref() else { return None };
+    let Expr::Calc(CalcOp::Mul(cell_term, stride_lit)) = mul_term.as_ref() else { return None };
+    let Expr::Literal(stride) = stride_lit.as_ref() else { return None };
+    let key_property = match_u16_recompose(cell_term.as_ref())?.to_string();
+    Some(DiskEntryShape {
+        func_name: func_name.clone(),
+        key_property,
+        stride: *stride as i32,
+        offset: *off as i32,
+    })
+}
+
+/// Scan the inline-exception entries of a `--readMem` dispatch table and
+/// extract a "windowed byte array" descriptor if a contiguous run of keys
+/// all decode to `--func((u16 cell) * stride + offset)` with offset matching
+/// `key - window_base`, all sharing the same (func, cell, stride).
+///
+/// The flat array `--func` compiles to is looked up in `flat_dispatch_cache`;
+/// a missing entry means `--func` itself isn't yet recognised as a flat
+/// dispatch — recognition is order-dependent (the inner function gets
+/// compiled first by demand) but in practice for CSS-DOS `--readDiskByte` is
+/// compiled before `--readMem`'s exceptions are walked here, so the cache hit
+/// is reliable. If we miss, we just bail and the read path falls through to
+/// the inline-exception chain (correct, but slower).
+///
+/// Returns `None` if no qualifying group is found. A real but small group
+/// (e.g. <16 entries) is treated as unrecognised — the perf win isn't worth
+/// the runtime check; classify-and-bail keeps the code path predictable.
+fn recognise_disk_window(
+    table: &DispatchTable,
+    inline_exception_keys: &[i64],
+    flat_dispatch_cache: &HashMap<String, (u32, i32, i32)>,
+    compiled_flat_arrays: &[FlatDispatchArray],
+) -> Option<CompiledDiskWindow> {
+    use std::collections::BTreeMap;
+    // Decode each inline-exception entry. Skip ones that aren't disk-shape.
+    let mut decoded: BTreeMap<i64, DiskEntryShape> = BTreeMap::new();
+    for &k in inline_exception_keys {
+        if let Some(entry) = table.entries.get(&k) {
+            if let Some(shape) = decode_disk_entry(entry) {
+                decoded.insert(k, shape);
+            }
+        }
+    }
+    if decoded.is_empty() {
+        return None;
+    }
+    // Find the longest contiguous run with consistent (func, key_property,
+    // stride) and offset == (key - first_key). BTreeMap is ordered so a
+    // single linear sweep suffices.
+    let mut best: Option<(i64, i64, DiskEntryShape)> = None; // (first_key, last_key, shape)
+    let mut run_start: Option<(i64, DiskEntryShape)> = None;
+    let mut prev_key: Option<i64> = None;
+    for (&k, shape) in &decoded {
+        let extends = match (&run_start, prev_key) {
+            (Some((start_k, start_shape)), Some(pk))
+                if k == pk + 1
+                    && start_shape.func_name == shape.func_name
+                    && start_shape.key_property == shape.key_property
+                    && start_shape.stride == shape.stride
+                    && shape.offset as i64 == k - start_k =>
+            {
+                true
+            }
+            _ => false,
+        };
+        if !extends {
+            // Close out previous run, if any, and start fresh. A new run can
+            // start here only if shape.offset == 0 (otherwise it can't anchor
+            // a window whose offset == key - window_base).
+            if let (Some((sk, ss)), Some(pk)) = (&run_start, prev_key) {
+                let len = (pk - sk + 1) as usize;
+                let better = best.as_ref().map_or(true, |b| (b.1 - b.0 + 1) < len as i64);
+                if better {
+                    best = Some((*sk, pk, ss.clone()));
+                }
+            }
+            if shape.offset == 0 {
+                run_start = Some((k, shape.clone()));
+            } else {
+                run_start = None;
+            }
+        }
+        prev_key = Some(k);
+    }
+    if let (Some((sk, ss)), Some(pk)) = (&run_start, prev_key) {
+        let len = (pk - sk + 1) as usize;
+        let better = best.as_ref().map_or(true, |b| (b.1 - b.0 + 1) < len as i64);
+        if better {
+            best = Some((*sk, pk, ss.clone()));
+        }
+    }
+    let (window_base, window_last, shape) = best?;
+    let span = (window_last - window_base + 1) as usize;
+    if span < 16 {
+        // Below this threshold the runtime check costs more than it saves.
+        return None;
+    }
+
+    // Look up the inner function's flat array. If it isn't in the cache, the
+    // recogniser's preconditions weren't met — skip silently.
+    let &(array_id, base_key, _default) = flat_dispatch_cache.get(&shape.func_name)?;
+    let arr = compiled_flat_arrays.get(array_id as usize)?;
+
+    log::info!(
+        "[disk-window] recognised: window=[0x{:X},0x{:X}) {} entries, key cell {}, stride {}, inner func {} (array_id {} base_key {} len {})",
+        window_base, window_last + 1, span, shape.key_property, shape.stride,
+        shape.func_name, array_id, base_key, arr.values.len()
+    );
+
+    Some(CompiledDiskWindow {
+        window_base: window_base as i32,
+        window_end: (window_last + 1) as i32,
+        key_cell_property: shape.key_property,
+        stride: shape.stride,
+        byte_array_base_key: base_key,
+        byte_array: arr.values.clone(),
+    })
+}
+
 /// Classify a dispatch table as "near-identity-read": most entries map key K → state[K],
 /// but a small number have non-identity expressions (e.g., computed values for special
 /// addresses like self-modifying code patches).
@@ -1379,6 +1571,11 @@ struct Compiler<'a> {
     compiled_functions: Vec<CompiledFunction>,
     /// Cache: function name → fn_id in `compiled_functions`.
     function_cache: HashMap<String, u32>,
+    /// "Windowed byte-array" descriptor extracted from the cabinet's
+    /// `--readMem` exception entries (see [`recognise_disk_window`]).
+    /// `None` until pattern recognition runs; consumed by `CompiledProgram`
+    /// at end-of-compile.
+    recognised_disk_window: Option<CompiledDiskWindow>,
 }
 
 impl<'a> Compiler<'a> {
@@ -1403,6 +1600,7 @@ impl<'a> Compiler<'a> {
             packed_exception_tables: Vec::new(),
             compiled_functions: Vec::new(),
             function_cache: HashMap::new(),
+            recognised_disk_window: None,
         }
     }
 
@@ -2443,6 +2641,24 @@ impl<'a> Compiler<'a> {
                     compiled_entries.push((key_val, entry_ops, result));
                 }
             }
+            // Try to recognise a "windowed byte array" shape across the inline
+            // exceptions: a contiguous run of keys whose entries all decode as
+            // `--func((u16 cell) * stride + offset)` with offset = key - window_base
+            // and the same (func, cell, stride). On success the descriptor is
+            // stashed on self for `CompiledProgram` to pick up later. Runs
+            // AFTER per-entry compilation so the inner function (e.g.
+            // `--readDiskByte`) is in `flat_dispatch_cache`. The inline
+            // branches are emitted regardless — the runtime State short-circuit
+            // catches reads first, but the inline path is the correct fallback
+            // for any cabinet/future shape that doesn't fit the recogniser.
+            if self.recognised_disk_window.is_none() && name == "--readMem" {
+                self.recognised_disk_window = recognise_disk_window(
+                    &table,
+                    &inline_exceptions,
+                    &self.flat_dispatch_cache,
+                    &self.compiled_flat_arrays,
+                );
+            }
             let result_slot = self.alloc();
             ops.push(Op::LoadSlot { dst: result_slot, src: dst });
 
@@ -2563,7 +2779,7 @@ impl<'a> Compiler<'a> {
         }
 
         let array_id = self.compiled_flat_arrays.len() as u32;
-        self.compiled_flat_arrays.push(FlatDispatchArray { values });
+        self.compiled_flat_arrays.push(FlatDispatchArray { values: std::sync::Arc::new(values) });
         let result = (array_id, base_key, default);
         self.flat_dispatch_cache.insert(name.to_string(), result);
         Some(result)
@@ -3041,6 +3257,7 @@ pub fn compile(
         packed_cell_tables: compiler.packed_cell_tables,
         packed_exception_tables: compiler.packed_exception_tables,
         packed_broadcast_writes: compiled_packed_bw,
+        disk_window: compiler.recognised_disk_window.take(),
     };
 
     // Expand all Op::Call sites inline. Op::Call was a compile-time device to
@@ -4836,8 +5053,26 @@ fn rep_fast_forward(program: &CompiledProgram, state: &mut State, slots: &[i32])
 
     // Snapshot every field the hook needs up-front so we can release the
     // state borrow before any mutations.
+    //
+    // CONTRACT: there is no slow path. Every REP variant the cabinet emits
+    // must fast-forward here. Conditions that mean "no work to do" return
+    // silently. Conditions that would have to fall back to per-byte CSS
+    // evaluation panic loudly with the offending state — the per-byte path
+    // is so slow (10-1000x slower per iteration than the bulk path) that
+    // long REPs make conformance testing untenable and DOOM never reaches
+    // its menu within a reasonable tick budget. When a panic fires, the
+    // fix is to extend rep_fast_forward to handle that variant, not to
+    // make the bail silent.
     rep_diag_bail("00-entered");
-    let opcode = match read_prop(program, state, slots, "--opcode") { Some(v) => v, None => { rep_diag_bail("no-opcode"); return; } };
+    let opcode = match read_prop(program, state, slots, "--opcode") {
+        Some(v) => v,
+        None => panic!(
+            "rep_fast_forward: no-opcode — cabinet has no --opcode slot. \
+             rep_fast_forward should not be invoked for cabinets that don't \
+             expose --opcode; either add the slot or guard the caller. No \
+             slow path."
+        ),
+    };
     // Two opcode groups handled below:
     //   STOS/MOVS (0xAA/AB/A4/A5): write-side, repType must be 1.
     //   CMPS/SCAS (0xA6/A7/AE/AF): read-only with early exit on flag
@@ -4845,22 +5080,76 @@ fn rep_fast_forward(program: &CompiledProgram, state: &mut State, slots: &[i32])
     let is_stos_movs = matches!(opcode, 0xAA | 0xAB | 0xA4 | 0xA5);
     let is_cmps_scas = matches!(opcode, 0xA6 | 0xA7 | 0xAE | 0xAF);
     if !is_stos_movs && !is_cmps_scas {
+        // Current instruction is not a string op at all. Most ticks land here.
         rep_diag_bail("opcode-not-string");
         return;
     }
     rep_diag_bail("01-opcode-is-string");
-    if read_prop(program, state, slots, "--hasREP").unwrap_or(0) != 1 { rep_diag_bail("no-hasREP"); return; }
+    let has_rep = read_prop(program, state, slots, "--hasREP").unwrap_or(0);
     let rep_type = read_prop(program, state, slots, "--repType").unwrap_or(0);
-    if is_stos_movs && rep_type != 1 { rep_diag_bail("repType-ne-1"); return; }
-    if is_cmps_scas && rep_type != 1 && rep_type != 2 { rep_diag_bail("repType-bad"); return; }
-    let cx = match read_prop(program, state, slots, "--CX") {
+    let cx_raw = read_prop(program, state, slots, "--CX");
+    let flags_raw = read_prop(program, state, slots, "--flags").unwrap_or(0);
+    let seg_override = read_prop(program, state, slots, "--hasSegOverride").unwrap_or(0);
+    #[cfg(not(target_arch = "wasm32"))]
+    if is_cmps_scas && rep_diag::trace_cmps_scas() {
+        eprintln!(
+            "[rep_entry] op={:#04x} hasREP={} repType={} CX={:?} flags={:#x} segOv={}",
+            opcode, has_rep, rep_type, cx_raw, flags_raw, seg_override,
+        );
+    }
+    if has_rep != 1 {
+        // String op without REP prefix: MOVSB/STOSB run as a single 1-iter
+        // op in the CSS, which is already 1 CSS tick. No fast-forward needed.
+        rep_diag_bail("no-hasREP");
+        return;
+    }
+    let cs_for_diag = read_prop(program, state, slots, "--CS").unwrap_or(0);
+    let ip_for_diag = state.get_var("IP").unwrap_or(0);
+    if is_stos_movs && rep_type != 1 {
+        // REPNE prefix on a STOS/MOVS. 8086 honors it (CX decrement loop with
+        // no early exit). Falling through to CSS would per-iter; that's slow.
+        rep_fast_forward_panic(
+            "repType-ne-1",
+            opcode, rep_type, cx_raw.unwrap_or(0), flags_raw, cs_for_diag, ip_for_diag,
+            "STOS/MOVS with REPNE prefix — extend rep_fast_forward to handle repType=2 for write-side string ops",
+        );
+    }
+    if is_cmps_scas && rep_type != 1 && rep_type != 2 {
+        // CMPS/SCAS with no REP prefix at all. CSS runs one iter and
+        // single-instruction execution is already 1 tick — no fast-forward
+        // needed. (This shouldn't happen because hasREP would be 0, caught
+        // above.) Silent.
+        rep_diag_bail("repType-bad");
+        return;
+    }
+    let cx = match cx_raw {
         Some(v) => v,
-        None => { rep_diag_bail("no-CX"); return; }
+        None => {
+            rep_fast_forward_panic(
+                "no-CX",
+                opcode, rep_type, 0, flags_raw, cs_for_diag, ip_for_diag,
+                "--CX slot missing — every cabinet should expose CX",
+            );
+        }
     };
-    if cx <= 0 { rep_diag_bail("cx-le-0"); return; }
-    let flags = read_prop(program, state, slots, "--flags").unwrap_or(0);
-    if (flags >> 10) & 1 != 0 { rep_diag_bail("DF-set"); return; }
-    if read_prop(program, state, slots, "--hasSegOverride").unwrap_or(0) != 0 { rep_diag_bail("seg-override"); return; }
+    if cx <= 0 {
+        // CX=0 entering REP: the body doesn't execute. CSS handles this in
+        // 1 tick. No work for the fast-forward.
+        rep_diag_bail("cx-le-0");
+        return;
+    }
+    let flags = flags_raw;
+    let df = ((flags >> 10) & 1) != 0;
+    if seg_override != 0 {
+        // Segment override prefix (e.g. ES: or CS:) on a REP changes the
+        // segment used for the source/dest. fast-forward currently assumes
+        // default segments (DS for source of MOVS/CMPS, ES for dest).
+        rep_fast_forward_panic(
+            "seg-override",
+            opcode, rep_type, cx, flags, cs_for_diag, ip_for_diag,
+            "REP with segment override — extend rep_fast_forward to honor --segOverrideValue",
+        );
+    }
 
     // rep_fast_forward runs at end-of-tick, AFTER the CSS writeback that
     // applies --IP/--CS/--SP/etc. to state-vars. If a hardware IRQ (or TF
@@ -4880,6 +5169,10 @@ fn rep_fast_forward(program: &CompiledProgram, state: &mut State, slots: &[i32])
     let irq_active = read_prop(program, state, slots, "--_irqActive").unwrap_or(0);
     let tf_active  = read_prop(program, state, slots, "--_tf").unwrap_or(0);
     if irq_active != 0 || tf_active != 0 {
+        // CSS already vectored this tick (registers point at IRQ/TF
+        // handler). Touching them would smash the post-IRQ state. Correct
+        // behavior is to leave the post-vector regs alone — CSS finished
+        // the iteration before vectoring. No fast-forward needed.
         rep_diag_bail("irq-or-tf-this-tick");
         return;
     }
@@ -4904,8 +5197,9 @@ fn rep_fast_forward(program: &CompiledProgram, state: &mut State, slots: &[i32])
             (rep_type == 1 && zf_post == 0) ||  // REPE: stop on inequality
             (rep_type == 2 && zf_post == 1);    // REPNE: stop on equality
         if rep_already_exited {
-            // CSS finished the REP this tick; post-tick IP, CX, SI, DI,
-            // flags are already correct. Don't touch anything.
+            // CSS finished the REP this tick (the single iter that ran in
+            // CSS satisfied the exit condition). Post-tick IP, CX, SI, DI,
+            // flags are already correct. No fast-forward needed.
             rep_diag_bail("cmps-scas-already-exited");
             return;
         }
@@ -4913,35 +5207,66 @@ fn rep_fast_forward(program: &CompiledProgram, state: &mut State, slots: &[i32])
         return;
     }
 
-    let step: i32 = if opcode == 0xAB || opcode == 0xA5 { 2 } else { 1 };
+    // Per-iteration step in bytes. Negated when DF=1.
+    let step_bytes: i32 = if opcode == 0xAB || opcode == 0xA5 { 2 } else { 1 };
+    let signed_step: i32 = if df { -step_bytes } else { step_bytes };
     let n = cx;
     let di = read_prop(program, state, slots, "--DI").unwrap_or(0);
-    let di_end = di as i64 + (n as i64) * (step as i64);
-    if di_end > 0xFFFF { rep_diag_bail("DI-wrap"); return; }
-    let si_end_opt = if opcode == 0xA4 || opcode == 0xA5 {
+    // 16-bit segment-bound check. Writes/reads at offset DI per iter +
+    // {0..step_bytes-1} for word ops. DF=0: lowest=DI, highest=DI+n*step-1.
+    // DF=1: lowest=DI-(n-1)*step, highest=DI+step-1. Either way the range
+    // must be entirely in [0, 0x10000).
+    let (di_lo, di_hi) = if df {
+        (di as i64 - (n as i64 - 1) * step_bytes as i64, di as i64 + step_bytes as i64)
+    } else {
+        (di as i64, di as i64 + n as i64 * step_bytes as i64)
+    };
+    if di_lo < 0 || di_hi > 0x10000 {
+        rep_fast_forward_panic(
+            "DI-wrap",
+            opcode, rep_type, cx, flags, cs_for_diag, ip_for_diag,
+            "REP MOVS/STOS would wrap DI past 0xFFFF — split into pre-wrap and post-wrap bulk ops",
+        );
+    }
+    let si_opt = if opcode == 0xA4 || opcode == 0xA5 {
         let si = read_prop(program, state, slots, "--SI").unwrap_or(0);
-        let e = si as i64 + (n as i64) * (step as i64);
-        if e > 0xFFFF { rep_diag_bail("SI-wrap"); return; }
-        Some((si, e))
+        let (si_lo, si_hi) = if df {
+            (si as i64 - (n as i64 - 1) * step_bytes as i64, si as i64 + step_bytes as i64)
+        } else {
+            (si as i64, si as i64 + n as i64 * step_bytes as i64)
+        };
+        if si_lo < 0 || si_hi > 0x10000 {
+            rep_fast_forward_panic(
+                "SI-wrap",
+                opcode, rep_type, cx, flags, cs_for_diag, ip_for_diag,
+                "REP MOVS would wrap SI past 0xFFFF — split into pre-wrap and post-wrap bulk ops",
+            );
+        }
+        Some(si)
     } else {
         None
     };
 
     let es = read_prop(program, state, slots, "--ES").unwrap_or(0);
     let es_base = (es as i64) * 16;
-    let dst_linear = es_base + di as i64;
-    let n_bytes = (n as i64) * (step as i64);
+    // Linear range covered by all destination writes.
+    let dst_lo_linear = es_base + di_lo;
+    let dst_hi_linear = es_base + di_hi;
+    let n_bytes = (n as i64) * (step_bytes as i64);
 
-    // Bail out if the destination range touches a region that isn't plain
+    // Panic out if the destination range touches a region that isn't plain
     // state.memory. Writes to those regions in the CSS go through dispatch
     // functions (not `--mN` state vars), so a bulk `state.memory` write
     // wouldn't match what the CSS would compute.
     //
     //   [0xD0000, 0xD0200)  — ROM-disk window (read-only via --readDiskByte)
     //   [0xF0000, 0x100000) — BIOS ROM (extended map, not state.memory)
-    if ranges_overlap_virtual(dst_linear, n_bytes) {
-        rep_diag_bail("dst-virtual-range");
-        return;
+    if ranges_overlap_virtual(dst_lo_linear, dst_hi_linear - dst_lo_linear) {
+        rep_fast_forward_panic(
+            "dst-virtual-range",
+            opcode, rep_type, cx, flags, cs_for_diag, ip_for_diag,
+            "REP dest overlaps a virtual region (BIOS ROM or disk window) — extend bulk path to route through write_mem for those ranges",
+        );
     }
 
     let al_or_ax = match opcode {
@@ -4955,54 +5280,86 @@ fn rep_fast_forward(program: &CompiledProgram, state: &mut State, slots: &[i32])
         0
     };
 
-    // For MOVS, the source has two virtual regions to worry about:
-    //   - ROM-disk window at 0xD0000..0xD01FF: serviced by `state.read_mem`
-    //     ONLY when `state.disk_image` is populated. calcite-cli loads it
-    //     from the `<cabinet>.disk.bin` sidecar; calcite-wasm currently
-    //     does not. When `disk_image` is None, `read_mem` falls through
-    //     to the packed-cell path, which has no entries for the rom-disk
-    //     window and returns 0 — silently corrupting every disk read. The
-    //     CSS path resolves these via the `--readDiskByte` function in the
-    //     dispatch table, so we MUST bail to per-byte CSS evaluation.
-    //   - BIOS ROM at 0xF0000..0x100000: lives in `state.extended` and is
-    //     resolved by `read_mem` regardless of disk_image — no bail needed.
-    if (opcode == 0xA4 || opcode == 0xA5) && state.disk_image.is_none() {
-        let src_linear = (ds as i64) * 16 + si_end_opt.unwrap().0 as i64;
-        if src_linear < 0xD_0200 && (src_linear + n_bytes) > 0xD_0000 {
-            rep_diag_bail("src-rom-disk-no-image");
-            return;
+    // For MOVS, source bytes flow through `state.read_mem` per byte. If
+    // a cabinet has a rom-disk dispatch in CSS but the recogniser failed
+    // to extract a descriptor, `read_mem` for the disk window would
+    // silently return 0 — panic so the caller knows to fix the recogniser.
+    if (opcode == 0xA4 || opcode == 0xA5) && state.disk_window.is_none() {
+        let src_lo_linear = (ds as i64) * 16 + si_opt.unwrap() as i64
+            - if df { (n as i64 - 1) * step_bytes as i64 } else { 0 };
+        if src_lo_linear < 0xD_0200 && (src_lo_linear + n_bytes) > 0xD_0000 {
+            rep_fast_forward_panic(
+                "src-rom-disk-no-descriptor",
+                opcode, rep_type, cx, flags, cs_for_diag, ip_for_diag,
+                "REP MOVS source overlaps disk window but cabinet has no disk_window descriptor — recogniser failed",
+            );
         }
     }
-    let _ = (ds, n_bytes); // suppress unused-warning when both branches are inert
+    let _ = (ds, n_bytes); // suppress unused-warning
     let ip = state.get_var("IP").unwrap_or(0);
     let prefix_len = read_prop(program, state, slots, "--prefixLen").unwrap_or(1);
 
     // Now mutate memory and state vars. State reads are done.
+    //
+    // For STOS{B,W} the same byte(s) are written to every iteration's
+    // address slot, so direction is irrelevant — fill the whole address
+    // range. For MOVS, walk per-byte in the hardware iteration order to
+    // preserve overlap semantics (LZ77 forward, backward stream copies).
     match opcode {
         0xAA => {
+            // STOSB: fill n bytes with AL across [di_lo, di_hi).
             let al = (al_or_ax & 0xFF) as u8;
-            bulk_fill(state, dst_linear, n as usize, al);
+            bulk_fill(state, dst_lo_linear, (di_hi - di_lo) as usize, al);
         }
         0xAB => {
+            // STOSW: write (lo,hi) at each of the n word slots. Direction
+            // doesn't change which addresses get which byte — slot k writes
+            // lo at DI±k*2 and hi at DI±k*2+1. Just enumerate the slots.
             let lo = (al_or_ax & 0xFF) as u8;
             let hi = ((al_or_ax >> 8) & 0xFF) as u8;
-            let mut off = 0i64;
-            for _ in 0..n {
-                bulk_store_byte(state, dst_linear + off, lo);
-                bulk_store_byte(state, dst_linear + off + 1, hi);
-                off += 2;
+            for k in 0..(n as i64) {
+                let off = if df { -k * 2 } else { k * 2 };
+                let base = es_base + di as i64 + off;
+                bulk_store_byte(state, base, lo);
+                bulk_store_byte(state, base + 1, hi);
             }
         }
-        0xA4 | 0xA5 => {
-            let src_linear = (ds as i64) * 16 + si_end_opt.unwrap().0 as i64;
-            bulk_copy(state, src_linear, dst_linear, (n as usize) * step as usize);
+        0xA4 => {
+            // MOVSB: per-byte read+write in iteration order. read_mem
+            // handles BIOS-ROM via state.extended and packed cells.
+            let si = si_opt.unwrap();
+            let src_seg = (ds as i64) * 16;
+            for k in 0..(n as i64) {
+                let off = if df { -k } else { k };
+                let s = src_seg + si as i64 + off;
+                let d = es_base + di as i64 + off;
+                let b = (state.read_mem(s as i32) & 0xFF) as u8;
+                bulk_store_byte(state, d, b);
+            }
+        }
+        0xA5 => {
+            // MOVSW: per-iter, copy (lo, hi) from [src..src+1] to [dst..dst+1].
+            // Order within the word is fixed (low byte first); only the
+            // iteration step direction varies.
+            let si = si_opt.unwrap();
+            let src_seg = (ds as i64) * 16;
+            for k in 0..(n as i64) {
+                let off = if df { -k * 2 } else { k * 2 };
+                let s = src_seg + si as i64 + off;
+                let d = es_base + di as i64 + off;
+                let lo = (state.read_mem(s as i32) & 0xFF) as u8;
+                let hi = (state.read_mem((s + 1) as i32) & 0xFF) as u8;
+                bulk_store_byte(state, d, lo);
+                bulk_store_byte(state, d + 1, hi);
+            }
         }
         _ => unreachable!(),
     }
 
-    state.set_var("DI", di + n * step);
-    if let Some((si, _)) = si_end_opt {
-        state.set_var("SI", si + n * step);
+    // 16-bit wrap on DI/SI commit.
+    state.set_var("DI", (di + n * signed_step) & 0xFFFF);
+    if let Some(si) = si_opt {
+        state.set_var("SI", (si + n * signed_step) & 0xFFFF);
     }
     state.set_var("CX", 0);
     // IP bookkeeping. The kiln emits repIP() as
@@ -5087,6 +5444,7 @@ fn rep_fast_forward_cmps_scas(
     let mut last_dst: i32 = 0;
     let mut last_src: i32 = 0;
     let mut iters = 0i32;
+    let mut exit_reason: &'static str = "cx-exhausted";
     // 16-bit wrap on DI/SI is the actual hardware behavior. Iterate at
     // most cx_in times.
     while cx > 0 {
@@ -5137,8 +5495,8 @@ fn rep_fast_forward_cmps_scas(
         // Check REP termination based on the comparison just made.
         // ZF set iff equal.
         let zf = if is_cmps { src_v == dst_v } else { scas_acc == dst_v };
-        if rep_type == 1 && !zf { break; }   // REPE: stop on inequality
-        if rep_type == 2 && zf { break; }    // REPNE: stop on equality
+        if rep_type == 1 && !zf { exit_reason = "repe-not-equal"; break; }   // REPE: stop on inequality
+        if rep_type == 2 && zf { exit_reason = "repne-equal"; break; }       // REPNE: stop on equality
     }
 
     // Compute flags from the LAST comparison: subFlags(last_cmp_dst, last_cmp_src)
@@ -5169,6 +5527,7 @@ fn rep_fast_forward_cmps_scas(
         state.set_var("cycleCount", cc.wrapping_add(iters.wrapping_mul(per_iter)));
     }
     rep_diag_fire(opcode, iters);
+    rep_trace_cmps_scas(opcode, rep_type, cx_in, iters, di_start, di, exit_reason);
 }
 
 /// Compute the 8086 flag word produced by SUB(dst, src), preserving the
@@ -5213,12 +5572,21 @@ mod rep_diag {
     use std::sync::Mutex;
     use std::sync::OnceLock;
     use std::collections::HashMap;
+    #[derive(Default, Clone, Copy)]
+    pub(super) struct Fires {
+        pub stosb: u64, pub stosw: u64, pub movsb: u64, pub movsw: u64,
+        pub cmpsb: u64, pub cmpsw: u64, pub scasb: u64, pub scasw: u64,
+        pub total_iters: i64,
+    }
     pub(super) static COUNTS: OnceLock<Mutex<HashMap<&'static str, u64>>> = OnceLock::new();
-    // (stosb, movsb, stosw, movsw, total_iters)
-    pub(super) static FIRES: OnceLock<Mutex<(u64, u64, u64, u64, i64)>> = OnceLock::new();
+    pub(super) static FIRES: OnceLock<Mutex<Fires>> = OnceLock::new();
     pub(super) static ENABLED: OnceLock<bool> = OnceLock::new();
+    pub(super) static TRACE: OnceLock<bool> = OnceLock::new();
     pub(super) fn enabled() -> bool {
         *ENABLED.get_or_init(|| std::env::var("CALCITE_REP_DIAG").is_ok())
+    }
+    pub(super) fn trace_cmps_scas() -> bool {
+        *TRACE.get_or_init(|| std::env::var("CALCITE_REP_TRACE_CMPS_SCAS").is_ok())
     }
 }
 
@@ -5231,30 +5599,81 @@ fn rep_diag_bail(reason: &'static str) {
 #[cfg(target_arch = "wasm32")]
 fn rep_diag_bail(_reason: &'static str) {}
 
+/// Panic with the offending REP state. Called when a fast-forward bail
+/// would otherwise drop into per-byte CSS execution. There is no slow
+/// path: per-byte CSS for a long REP is so slow that conformance can't
+/// progress and DOOM never reaches its menu within a sensible budget.
+/// When this fires, the fix is to extend rep_fast_forward to handle the
+/// new variant — never to make the bail silent.
+fn rep_fast_forward_panic(
+    reason: &'static str,
+    opcode: i32,
+    rep_type: i32,
+    cx: i32,
+    flags: i32,
+    cs: i32,
+    ip: i32,
+    advice: &str,
+) -> ! {
+    let opname = match opcode {
+        0xA4 => "MOVSB", 0xA5 => "MOVSW",
+        0xA6 => "CMPSB", 0xA7 => "CMPSW",
+        0xAA => "STOSB", 0xAB => "STOSW",
+        0xAE => "SCASB", 0xAF => "SCASW",
+        _ => "?",
+    };
+    let prefix = match rep_type {
+        1 => "REPE/REP",
+        2 => "REPNE",
+        _ => "no-prefix",
+    };
+    panic!(
+        "rep_fast_forward: {reason} — {prefix} {opname} (op={opcode:#04x}) at CS:IP={cs:#06x}:{ip:#06x} CX={cx} flags={flags:#x}\n  {advice}\n  No slow path: extend rep_fast_forward to handle this variant.",
+    );
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn rep_diag_fire(opcode: i32, n: i32) {
     if !rep_diag::enabled() { return; }
-    let m = rep_diag::FIRES.get_or_init(|| std::sync::Mutex::new((0, 0, 0, 0, 0)));
+    let m = rep_diag::FIRES.get_or_init(|| std::sync::Mutex::new(rep_diag::Fires::default()));
     let mut m = m.lock().unwrap();
     match opcode {
-        0xAA => m.0 += 1,
-        0xAB => m.2 += 1,
-        0xA4 => m.1 += 1,
-        0xA5 => m.3 += 1,
+        0xAA => m.stosb += 1,
+        0xAB => m.stosw += 1,
+        0xA4 => m.movsb += 1,
+        0xA5 => m.movsw += 1,
+        0xA6 => m.cmpsb += 1,
+        0xA7 => m.cmpsw += 1,
+        0xAE => m.scasb += 1,
+        0xAF => m.scasw += 1,
         _ => {}
     }
-    m.4 += n as i64;
+    m.total_iters += n as i64;
 }
 #[cfg(target_arch = "wasm32")]
 fn rep_diag_fire(_opcode: i32, _n: i32) {}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn rep_trace_cmps_scas(opcode: i32, rep_type: i32, cx_in: i32, iters: i32, di_start: i32, di_end: i32, exit_reason: &'static str) {
+    if !rep_diag::trace_cmps_scas() { return; }
+    let name = match opcode {
+        0xA6 => "CMPSB", 0xA7 => "CMPSW", 0xAE => "SCASB", 0xAF => "SCASW",
+        _ => "?",
+    };
+    let prefix = if rep_type == 1 { "REPE" } else if rep_type == 2 { "REPNE" } else { "REP?" };
+    eprintln!("[rep_cmps_scas] {} {} cx_in={} iters={} di {:#06x}->{:#06x} exit={}",
+        prefix, name, cx_in, iters, di_start & 0xFFFF, di_end & 0xFFFF, exit_reason);
+}
+#[cfg(target_arch = "wasm32")]
+fn rep_trace_cmps_scas(_opcode: i32, _rep_type: i32, _cx_in: i32, _iters: i32, _di_start: i32, _di_end: i32, _exit_reason: &'static str) {}
 
 pub fn rep_diag_reset() {
     #[cfg(not(target_arch = "wasm32"))]
     {
         rep_diag::COUNTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
             .lock().unwrap().clear();
-        *rep_diag::FIRES.get_or_init(|| std::sync::Mutex::new((0, 0, 0, 0, 0)))
-            .lock().unwrap() = (0, 0, 0, 0, 0);
+        *rep_diag::FIRES.get_or_init(|| std::sync::Mutex::new(rep_diag::Fires::default()))
+            .lock().unwrap() = rep_diag::Fires::default();
     }
 }
 
@@ -5263,11 +5682,13 @@ pub fn rep_diag_report() -> String {
     {
         let bails = rep_diag::COUNTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
             .lock().unwrap().clone();
-        let fires = *rep_diag::FIRES.get_or_init(|| std::sync::Mutex::new((0, 0, 0, 0, 0)))
+        let fires = *rep_diag::FIRES.get_or_init(|| std::sync::Mutex::new(rep_diag::Fires::default()))
             .lock().unwrap();
         let mut s = String::new();
-        s.push_str(&format!("rep_fast_forward fires: STOSB={} STOSW={} MOVSB={} MOVSW={} total_iters={}\n",
-            fires.0, fires.2, fires.1, fires.3, fires.4));
+        s.push_str(&format!(
+            "rep_fast_forward fires: STOSB={} STOSW={} MOVSB={} MOVSW={} CMPSB={} CMPSW={} SCASB={} SCASW={} total_iters={}\n",
+            fires.stosb, fires.stosw, fires.movsb, fires.movsw,
+            fires.cmpsb, fires.cmpsw, fires.scasb, fires.scasw, fires.total_iters));
         s.push_str("rep_fast_forward bails:\n");
         let mut items: Vec<_> = bails.iter().collect();
         items.sort_by(|a, b| b.1.cmp(a.1));

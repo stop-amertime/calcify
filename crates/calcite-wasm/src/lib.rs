@@ -87,6 +87,13 @@ impl CalciteEngine {
         // available (read-side `packed_cell_tables[0]`, or the merged
         // write-port tables as a fallback).
         evaluator.wire_state_for_packed_memory(&mut state);
+        // Install the rom-disk window descriptor so reads in
+        // [0xD0000..0xD0200) collapse to one state-var read + one
+        // flat-array index instead of walking the inline-exception chain
+        // and re-evaluating `--readDiskByte` on every byte. Disk bytes
+        // come from the cabinet's compiled `--readDiskByte` flat array —
+        // no separate sidecar load is required.
+        evaluator.wire_state_for_disk_window(&mut state);
 
         let initial_properties = parsed.properties;
         Ok(CalciteEngine { state, evaluator, initial_properties })
@@ -104,6 +111,7 @@ impl CalciteEngine {
             self.state.populate_memory_from_readmem(table);
         }
         self.evaluator.wire_state_for_packed_memory(&mut self.state);
+        self.evaluator.wire_state_for_disk_window(&mut self.state);
     }
 
     /// Run a batch of ticks and return the property changes as a JSON string.
@@ -119,6 +127,43 @@ impl CalciteEngine {
             .map(|(name, value)| format!("[\"{name}\",\"{value}\"]"))
             .collect();
         Ok(format!("[{}]", json_parts.join(",")))
+    }
+
+    /// Run a batch of ticks WITHOUT computing the per-batch state-var diff.
+    ///
+    /// `tick_batch` returns the changed state vars as a JSON string for
+    /// callers (debug-server, conformance harness) that consume them.
+    /// The web bridge ignores the returned JSON — it observes state via
+    /// `get_state_var` / `read_framebuffer_rgba` after each batch instead.
+    /// On large cabinets the diff is non-trivial (doom8088: ~10K state
+    /// vars, full O(N) sweep each batch), and the JSON formatting on top
+    /// of that adds another ~5-10% per batch.
+    ///
+    /// This entry point skips both. Same correctness contract as
+    /// `tick_batch` for state advancement; just doesn't synthesize the
+    /// JSON return.
+    pub fn run_batch_silent(&mut self, count: u32) {
+        self.evaluator.run_batch_silent(&mut self.state, count);
+    }
+
+    /// Serialise the runtime-mutable state (state_vars + memory + extended
+    /// + string_properties + frame_counter) to a byte blob. Pair with
+    /// [`restore`](Self::restore) on the same cabinet to resume execution
+    /// from this exact tick — useful for benchmarking a level-load window
+    /// without re-running boot/title/menu first.
+    ///
+    /// The blob is portable across calcite-cli and calcite-wasm and across
+    /// runs of the same cabinet, but NOT across cabinets (slot ordering is
+    /// per-parse).
+    pub fn snapshot(&self) -> Vec<u8> {
+        self.state.snapshot()
+    }
+
+    /// Restore a snapshot blob produced by [`snapshot`](Self::snapshot)
+    /// against the same cabinet. Returns an error if the blob is malformed
+    /// or the cabinet's state shape doesn't match the snapshot.
+    pub fn restore(&mut self, blob: &[u8]) -> Result<(), JsError> {
+        self.state.restore(blob).map_err(JsError::new)
     }
 
     /// Inject a keypress into the BDA ring buffer.
@@ -148,24 +193,6 @@ impl CalciteEngine {
         self.state.set_var("keyboard", key & 0xFFFF);
     }
 
-    /// Load a disk image so REP MOVS from `DS=0xD000` (the rom-disk window
-    /// at linear `[0xD0000, 0xD0200)`) can fast-forward in O(1) instead of
-    /// bailing to per-byte CSS evaluation.
-    ///
-    /// Without a disk image, calcite-core's `rep_fast_forward` bails on the
-    /// rom-disk source range (the bail relies on the CSS path to invoke
-    /// `--readDiskByte` for the right bytes). With one, `state.read_mem`
-    /// services those addresses directly from the byte slice, mirroring the
-    /// cabinet's `--readDiskByte` dispatch but in O(1).
-    ///
-    /// The disk image should be the FAT12 floppy bytes that would be the
-    /// `<cabinet>.disk.bin` sidecar in calcite-cli usage. The browser
-    /// cabinet builder has these bytes in scope (`buildFloppyInBrowser`
-    /// returns them) and should pass them in here right after `compile`.
-    pub fn set_disk_image(&mut self, bytes: &[u8]) {
-        self.state.disk_image = Some(bytes.to_vec());
-    }
-
     /// Get the current value of a register (for debugging).
     pub fn get_register(&self, index: usize) -> i32 {
         if index < self.state.state_vars.len() {
@@ -179,6 +206,14 @@ impl CalciteEngine {
     /// Returns 0 if the variable doesn't exist.
     pub fn get_state_var(&self, name: &str) -> i32 {
         self.state.get_var(name).unwrap_or(0)
+    }
+
+    /// Number of ticks evaluated since reset. Equivalent to the
+    /// `tick` count `calcite-cli` prints. Used by bench harnesses that
+    /// want a stable "calcite work units done" metric independent of
+    /// guest CPU frequency.
+    pub fn get_tick(&self) -> u32 {
+        self.state.frame_counter
     }
 
     /// Read text-mode video memory (character bytes only).

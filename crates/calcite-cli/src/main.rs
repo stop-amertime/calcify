@@ -189,6 +189,93 @@ struct Cli {
     /// Lines starting with `#` and blank lines are ignored.
     #[arg(long = "script-file", value_name = "PATH")]
     script_file: Option<PathBuf>,
+
+    /// Restore a snapshot blob (produced by `--snapshot-out`) into the
+    /// engine **before** the run begins. The cabinet must be the same one
+    /// that produced the snapshot — slot ordering is parse-dependent.
+    /// Pairs naturally with `--ticks N` to measure a precise window.
+    #[arg(long = "restore", value_name = "PATH")]
+    restore_path: Option<PathBuf>,
+
+    /// Write a snapshot blob (state_vars + memory + extended +
+    /// string_properties + frame_counter) to PATH **after** the run
+    /// completes. Combine with `--script-event` and `--ticks N` to land on
+    /// a specific moment (e.g. just-reached-in-game) and freeze it for
+    /// later restore. The blob is independent of `--dump-mem-range` —
+    /// snapshots are for resuming execution; mem-range dumps are for
+    /// rendering.
+    #[arg(long = "snapshot-out", value_name = "PATH")]
+    snapshot_out: Option<PathBuf>,
+
+    /// Run the engine in chunks of N ticks instead of one unbounded batch.
+    ///
+    /// Required for `--cond` to fire — conditions are evaluated only at
+    /// chunk boundaries. Default 0 = disabled (one big run_batch). At
+    /// 4.77 MHz, 50_000 ticks ≈ 10.5 ms of guest time, comparable to the
+    /// web bench's 250 ms wall poll once you account for native being
+    /// ~25× faster than the bridge.
+    #[arg(long = "poll-stride", value_name = "N", default_value = "0")]
+    poll_stride: u32,
+
+    /// Sample CS:IP at fixed and bursty intervals for offline analysis.
+    ///
+    /// Format: `STRIDE,BURST,EVERY,PATH`. STRIDE/BURST/EVERY may be decimal
+    /// or 0xHEX.
+    ///   STRIDE — single-tick samples are taken every STRIDE ticks (the
+    ///            wide axis: an unbiased CS:IP heatmap).
+    ///   BURST  — every EVERY-th sample is replaced by BURST consecutive
+    ///            single-tick samples (the local-shape axis: lets you
+    ///            reconstruct loop bodies, REP bails, call depth).
+    ///   EVERY  — bursts fire on sample 0, EVERY, 2*EVERY, … (set EVERY=0
+    ///            to disable bursts entirely).
+    ///   PATH   — output CSV: tick,cs,ip,sp,burst_id  (burst_id=-1 for
+    ///            singles). Header line written first.
+    ///
+    /// Designed for offline hot-spot analysis of long-running workloads
+    /// (Doom8088 level-load, etc). Pairs with `--restore` to skip boot
+    /// and only sample a window of interest.
+    ///
+    /// Example: `--sample-cs-ip=600,1000,100,samples.csv` (≈50K wide
+    /// samples + 50 bursts of 1000 over a 30M-tick window).
+    #[arg(long = "sample-cs-ip", value_name = "STRIDE,BURST,EVERY,PATH")]
+    sample_cs_ip: Option<String>,
+
+    /// Stage condition. Repeatable.
+    ///
+    /// Format: `NAME:ADDR=VAL[,ADDR=VAL...][:then=ACTION]`. ADDR/VAL may
+    /// be decimal or 0xHEX. ADDR is a linear guest-memory byte address;
+    /// VAL is the byte value to match. `ADDR!=VAL` matches when the byte
+    /// differs. Multiple comma-separated tests must all hold.
+    ///
+    /// Special address tokens:
+    ///   `vram_text:NEEDLE`    — true if the ASCII string NEEDLE appears
+    ///                          in 80x25 text VRAM (B8000..B8FA0). NEEDLE
+    ///                          may not contain `,` `:` or `=`.
+    ///
+    /// At every `--poll-stride` boundary, all unfired stages are checked
+    /// in declaration order. On first match, the stage prints one line:
+    ///   `stage=NAME t_ms=W tick=T cycles=C`
+    /// and runs ACTION (if present), then is removed from polling. Each
+    /// stage fires at most once.
+    ///
+    /// ACTION = one of:
+    ///   `tap:VALUE[:HOLD]`     — single press+release of (scan<<8)|ascii.
+    ///   `spam:VALUE:every=K`   — start tapping every K ticks. Continues
+    ///                            until a stage with `then=spam-stop`
+    ///                            fires or run ends.
+    ///   `spam-stop`            — stop any running spam.
+    ///   `halt`                 — stop the run.
+    ///
+    /// Example (Doom8088 stage_menu):
+    ///   --cond=menu:0x3ac62=1:then=spam:0x1c0d:every=250000
+    ///
+    /// Example (text-mode banner):
+    ///   --cond=text_drdos:0x449=0x03,vram_text:DR-DOS
+    ///
+    /// Stage output goes to stdout as one line per stage. Polling is
+    /// silent unless a stage fires.
+    #[arg(long = "cond", value_name = "NAME:CONDS[:then=ACTION]")]
+    conds: Vec<String>,
 }
 
 
@@ -435,6 +522,147 @@ fn load_script_events(specs: &[String], file: Option<&std::path::Path>) -> Resul
     Ok(out)
 }
 
+/// One condition test inside a `--cond` stage.
+///
+/// `ByteEq` / `ByteNe` test a single byte at the linear address. `VramText`
+/// scans 80x25 text VRAM (B8000..B8FA0) for the ASCII needle, reading even
+/// bytes only (text VRAM is char,attr,char,attr,…).
+#[derive(Debug, Clone)]
+enum CondTest {
+    ByteEq { addr: i32, val: u8 },
+    ByteNe { addr: i32, val: u8 },
+    VramText { needle: String },
+}
+
+/// Action to run when a stage's conditions first match.
+#[derive(Debug, Clone)]
+enum CondAction {
+    None,
+    Tap { value: i32, hold: u32 },
+    Spam { value: i32, every: u32 },
+    SpamStop,
+    Halt,
+}
+
+#[derive(Debug, Clone)]
+struct StageDef {
+    name: String,
+    tests: Vec<CondTest>,
+    action: CondAction,
+}
+
+/// Parse a single --cond NAME:ADDR=VAL[,ADDR=VAL...][:then=ACTION] into a StageDef.
+fn parse_cond(spec: &str) -> Result<StageDef, String> {
+    // Split off NAME first.
+    let (name, rest) = spec.split_once(':')
+        .ok_or_else(|| format!("--cond missing ':': {spec:?}"))?;
+    if name.is_empty() {
+        return Err(format!("--cond stage name is empty: {spec:?}"));
+    }
+    // Optional ":then=ACTION" trailing segment. Split on ":then=".
+    let (conds_part, action_part) = match rest.find(":then=") {
+        Some(i) => (&rest[..i], Some(&rest[i + ":then=".len()..])),
+        None => (rest, None),
+    };
+    if conds_part.is_empty() {
+        return Err(format!("--cond {name:?} has no condition tests"));
+    }
+    let mut tests: Vec<CondTest> = Vec::new();
+    for tok in conds_part.split(',') {
+        let tok = tok.trim();
+        if tok.is_empty() { continue; }
+        if let Some(needle) = tok.strip_prefix("vram_text:") {
+            tests.push(CondTest::VramText { needle: needle.to_string() });
+        } else if let Some(idx) = tok.find("!=") {
+            let (a, v) = tok.split_at(idx);
+            let v = &v[2..];
+            let addr = parse_int_flexible(a, "ADDR")? as i32;
+            let val = parse_int_flexible(v, "VAL")? as u8;
+            tests.push(CondTest::ByteNe { addr, val });
+        } else if let Some(idx) = tok.find('=') {
+            let (a, v) = tok.split_at(idx);
+            let v = &v[1..];
+            let addr = parse_int_flexible(a, "ADDR")? as i32;
+            let val = parse_int_flexible(v, "VAL")? as u8;
+            tests.push(CondTest::ByteEq { addr, val });
+        } else {
+            return Err(format!("--cond test {tok:?} not ADDR=VAL / ADDR!=VAL / vram_text:NEEDLE"));
+        }
+    }
+    if tests.is_empty() {
+        return Err(format!("--cond {name:?} parsed to zero tests"));
+    }
+    let action = match action_part {
+        None => CondAction::None,
+        Some(a) => parse_cond_action(a)
+            .map_err(|e| format!("--cond {name:?} action: {e}"))?,
+    };
+    Ok(StageDef { name: name.to_string(), tests, action })
+}
+
+fn parse_cond_action(spec: &str) -> Result<CondAction, String> {
+    let (kind, args) = match spec.split_once(':') {
+        Some((k, a)) => (k, a),
+        None => (spec, ""),
+    };
+    match kind {
+        "halt" => Ok(CondAction::Halt),
+        "spam-stop" => Ok(CondAction::SpamStop),
+        "tap" => {
+            let parts: Vec<&str> = args.splitn(2, ':').collect();
+            if parts.is_empty() || parts[0].is_empty() {
+                return Err(format!("tap missing VALUE in {spec:?}"));
+            }
+            let value = parse_int_flexible(parts[0], "VALUE")? as i32;
+            let hold = if parts.len() == 2 {
+                parse_int_flexible(parts[1], "HOLD")? as u32
+            } else { 5000 };
+            Ok(CondAction::Tap { value, hold })
+        }
+        "spam" => {
+            // spam:VALUE:every=K
+            let parts: Vec<&str> = args.splitn(2, ':').collect();
+            if parts.len() != 2 {
+                return Err(format!("spam expects VALUE:every=K, got {args:?}"));
+            }
+            let value = parse_int_flexible(parts[0], "VALUE")? as i32;
+            let every_s = parts[1].strip_prefix("every=")
+                .ok_or_else(|| format!("spam expects every=K, got {:?}", parts[1]))?;
+            let every = parse_int_flexible(every_s, "every")? as u32;
+            if every == 0 {
+                return Err("spam every=0 would tap every tick — refusing".to_string());
+            }
+            Ok(CondAction::Spam { value, every })
+        }
+        _ => Err(format!("unknown action kind {kind:?}")),
+    }
+}
+
+/// Evaluate a single condition test against current state.
+fn cond_test_holds(t: &CondTest, state: &calcite_core::State) -> bool {
+    match t {
+        CondTest::ByteEq { addr, val } => (state.read_mem(*addr) & 0xFF) as u8 == *val,
+        CondTest::ByteNe { addr, val } => (state.read_mem(*addr) & 0xFF) as u8 != *val,
+        CondTest::VramText { needle } => {
+            // Text VRAM is char,attr,char,attr,… — match needle against even
+            // bytes only. 80*25 = 2000 chars = 4000 bytes.
+            let bytes = needle.as_bytes();
+            if bytes.is_empty() { return true; }
+            let n = bytes.len();
+            // 2000 char positions; we need n consecutive matches starting at i.
+            for start in 0..(2000 - n) {
+                let mut ok = true;
+                for j in 0..n {
+                    let b = (state.read_mem(0xB8000 + ((start + j) as i32) * 2) & 0xFF) as u8;
+                    if b != bytes[j] { ok = false; break; }
+                }
+                if ok { return true; }
+            }
+            false
+        }
+    }
+}
+
 fn execute_script_action(action: &ScriptAction, state: &mut calcite_core::State, current_tick: u32) -> bool {
     // Returns true if execution should halt after this action.
     match action {
@@ -553,24 +781,6 @@ fn main() {
             let mut state = calcite_core::State::default();
             state.load_properties(&parsed.properties);
 
-            // Load the cabinet's disk sidecar so REP MOVSW from the rom-disk
-            // window can fast-forward in bulk. Without this, every BIOS
-            // sector load (Doom8088 hits hundreds during init) costs 256
-            // ticks for the per-byte CSS dispatch instead of 1 in bulk —
-            // calcite never reaches the demo loop within feasible tick budgets.
-            // Sidecar is `<cabinet>.disk.bin` next to the .css.
-            {
-                let mut disk_path = input_path.clone();
-                let stem = disk_path.file_stem().map(|s| s.to_string_lossy().to_string());
-                if let Some(stem) = stem {
-                    disk_path.set_file_name(format!("{}.disk.bin", stem));
-                    if let Ok(bytes) = std::fs::read(&disk_path) {
-                        eprintln!("loaded disk sidecar: {} ({} bytes)", disk_path.display(), bytes.len());
-                        state.disk_image = Some(bytes);
-                    }
-                }
-            }
-
             let t1 = std::time::Instant::now();
             let mut evaluator = calcite_core::Evaluator::from_parsed(&parsed);
             let compile_time = t1.elapsed();
@@ -580,6 +790,36 @@ fn main() {
             // every positive-address read returns 0 even though the CPU
             // wrote the value — see Evaluator::wire_state_for_packed_memory.
             evaluator.wire_state_for_packed_memory(&mut state);
+            // The cabinet's rom-disk dispatch is recognised at compile time
+            // and the descriptor is installed on State here. No sidecar load:
+            // the disk bytes already live in the cabinet's compiled
+            // `--readDiskByte` flat-array dispatch — see
+            // Evaluator::wire_state_for_disk_window.
+            evaluator.wire_state_for_disk_window(&mut state);
+
+            // --restore: replay a previously-captured execution state into
+            // the freshly-wired engine. This must run AFTER load_properties
+            // and the wire_state_for_* calls so the slot count is finalised
+            // (the snapshot's state_vars length must match self.state_vars).
+            if let Some(path) = &cli.restore_path {
+                match std::fs::read(path) {
+                    Ok(bytes) => match state.restore(&bytes) {
+                        Ok(()) => eprintln!(
+                            "restored snapshot from {} ({} bytes)",
+                            path.display(),
+                            bytes.len()
+                        ),
+                        Err(e) => {
+                            eprintln!("--restore={}: {}", path.display(), e);
+                            std::process::exit(2);
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("--restore={}: {}", path.display(), e);
+                        std::process::exit(2);
+                    }
+                }
+            }
 
             // Interactive iff --ticks is omitted; in that case run unlimited.
             let interactive = cli.ticks.is_none();
@@ -642,6 +882,24 @@ fn main() {
             if !script_events.is_empty() {
                 eprintln!("loaded {} script event(s)", script_events.len());
             }
+
+            // Parse --cond stage definitions.
+            let mut stages: Vec<StageDef> = Vec::new();
+            for s in &cli.conds {
+                match parse_cond(s) {
+                    Ok(sd) => stages.push(sd),
+                    Err(e) => { eprintln!("--cond {s:?}: {e}"); std::process::exit(1); }
+                }
+            }
+            // --cond requires --poll-stride to fire (silent otherwise).
+            if !stages.is_empty() && cli.poll_stride == 0 {
+                eprintln!("--cond requires --poll-stride=N (default 0 means stages never poll)");
+                std::process::exit(1);
+            }
+            if !stages.is_empty() {
+                eprintln!("loaded {} stage condition(s), poll-stride={}", stages.len(), cli.poll_stride);
+            }
+            let poll_stride: u32 = cli.poll_stride;
 
             let t2 = std::time::Instant::now();
 
@@ -865,6 +1123,109 @@ fn main() {
                 return;
             }
 
+            // --sample-cs-ip: hybrid wide+bursty CS:IP sampler for offline
+            // hot-spot analysis. Writes a CSV to disk; prints nothing to
+            // stdout except summary stats at end.
+            if let Some(spec) = cli.sample_cs_ip.as_ref() {
+                let parts: Vec<&str> = spec.splitn(4, ',').collect();
+                if parts.len() != 4 {
+                    eprintln!("--sample-cs-ip: expected STRIDE,BURST,EVERY,PATH; got {:?}", spec);
+                    std::process::exit(2);
+                }
+                let parse_u = |s: &str, name: &str| -> u32 {
+                    let s = s.trim();
+                    let r = if let Some(h) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+                        u32::from_str_radix(h, 16)
+                    } else { s.parse::<u32>() };
+                    r.unwrap_or_else(|_| {
+                        eprintln!("--sample-cs-ip: bad {}: {:?}", name, s);
+                        std::process::exit(2);
+                    })
+                };
+                let stride = parse_u(parts[0], "STRIDE").max(1);
+                let burst = parse_u(parts[1], "BURST");
+                let every = parse_u(parts[2], "EVERY"); // 0 disables bursts
+                let path = parts[3].to_string();
+
+                let out_file = std::fs::File::create(&path).unwrap_or_else(|e| {
+                    eprintln!("--sample-cs-ip: cannot create {}: {}", path, e);
+                    std::process::exit(2);
+                });
+                let mut out = std::io::BufWriter::new(out_file);
+                use std::io::Write;
+                writeln!(out, "tick,cs,ip,sp,burst_id").ok();
+
+                let cs_slot = state.state_var_names.iter().position(|n| n == "CS");
+                let ip_slot = state.state_var_names.iter().position(|n| n == "IP");
+                let sp_slot = state.state_var_names.iter().position(|n| n == "SP");
+                let read = |state: &calcite_core::State, slot: Option<usize>| -> i32 {
+                    slot.map(|i| state.state_vars[i]).unwrap_or(0)
+                };
+
+                let mut tick: u32 = 0;
+                let mut sample_count: u32 = 0;
+                let mut burst_count: u32 = 0;
+                let mut singles: u32 = 0;
+                let t_start = std::time::Instant::now();
+
+                while tick < ticks_limit {
+                    // Decide: is this a burst sample, or a wide single?
+                    let is_burst = every > 0 && burst > 0
+                        && (sample_count % every == 0);
+
+                    if is_burst {
+                        // Tick-by-tick for BURST consecutive ticks. Cap at
+                        // remaining budget so we don't overshoot ticks_limit.
+                        let n = burst.min(ticks_limit - tick);
+                        let bid = burst_count as i32;
+                        for _ in 0..n {
+                            evaluator.tick(&mut state);
+                            tick += 1;
+                            let cs = read(&state, cs_slot);
+                            let ip = read(&state, ip_slot);
+                            let sp = read(&state, sp_slot);
+                            writeln!(out, "{},{},{},{},{}", tick, cs, ip, sp, bid).ok();
+                        }
+                        burst_count += 1;
+                    } else {
+                        // Wide pass: run STRIDE-1 ticks via run_batch (fast),
+                        // then one tick to sample on. This gives us "the IP
+                        // value at exactly tick T" rather than "somewhere
+                        // inside the batch".
+                        let advance = stride.min(ticks_limit - tick);
+                        if advance > 1 {
+                            evaluator.run_batch(&mut state, advance - 1);
+                        }
+                        if advance >= 1 {
+                            evaluator.tick(&mut state);
+                        }
+                        tick += advance;
+                        let cs = read(&state, cs_slot);
+                        let ip = read(&state, ip_slot);
+                        let sp = read(&state, sp_slot);
+                        writeln!(out, "{},{},{},{},{}", tick, cs, ip, sp, -1).ok();
+                        singles += 1;
+                    }
+                    sample_count += 1;
+
+                    if let Some(addr) = halt_addr {
+                        if state.read_mem(addr) != 0 {
+                            eprintln!("Halt: memory 0x{:X} set at tick {}", addr, tick);
+                            break;
+                        }
+                    }
+                }
+                out.flush().ok();
+                drop(out);
+                let elapsed = t_start.elapsed().as_secs_f64();
+                let tps = if elapsed > 0.0 { tick as f64 / elapsed } else { 0.0 };
+                eprintln!(
+                    "sample-cs-ip: {} ticks in {:.1}s ({:.0} ticks/s); {} singles + {} bursts ({} samples) -> {}",
+                    tick, elapsed, tps, singles, burst_count, singles + burst_count * burst, path,
+                );
+                return;
+            }
+
             // --watch-cell: tick-by-tick monitor, print only transitions.
             if !cli.watch_cell.is_empty() {
                 // Resolve each watched cell-idx to its state-var slot index up front.
@@ -1078,6 +1439,15 @@ fn main() {
 
                 let mut quit = false;
                 let mut tick = verbose_skip;
+                // Interactive keyboard: write to --keyboard so the press
+                // edge fires IRQ 1, then schedule a release a few thousand
+                // ticks later so the break code reaches programs that read
+                // port 0x60 directly (DOOM hooks INT 9, reads `inp(0x60)`,
+                // and tracks held keys via the high bit of the scancode —
+                // it never looks at the BDA ring buffer). bda_push_key is
+                // not enough on its own.
+                const KBD_HOLD_TICKS: u32 = 5000;
+                let mut pending_release_tick: Option<u32> = None;
                 while tick < ticks_limit {
                     if interactive {
                         // Poll keyboard non-blocking.
@@ -1092,12 +1462,29 @@ fn main() {
                                     }
                                     let dos_key = key_to_dos(&key_event);
                                     if dos_key != 0 {
+                                        // Press: drive --keyboard. The CSS
+                                        // edge detector fires IRQ 1, the ISR
+                                        // (corduroy or DOOM-installed) reads
+                                        // port 0x60 and processes the scan
+                                        // code. Also push into the BDA ring
+                                        // for INT 16h-based programs.
+                                        state.set_var("keyboard", dos_key);
                                         state.bda_push_key(dos_key);
+                                        pending_release_tick = Some(tick.saturating_add(KBD_HOLD_TICKS));
                                     }
                                 }
                             }
                         }
                         if quit { break; }
+                        // Fire scheduled release: --keyboard back to 0 so
+                        // --_kbdRelease edge fires, port 0x60 returns the
+                        // break code (scan|0x80) on the resulting IRQ 1.
+                        if let Some(rt) = pending_release_tick {
+                            if tick >= rt {
+                                state.set_var("keyboard", 0);
+                                pending_release_tick = None;
+                            }
+                        }
                     }
 
                     // Determine this batch's size: capped by remaining ticks and
@@ -1107,6 +1494,14 @@ fn main() {
                         if ev_tick >= tick && ev_tick < tick + batch {
                             batch = ev_tick - tick;
                             if batch == 0 { batch = 1; break; } // fire this tick immediately
+                        }
+                    }
+                    // Cap on the pending interactive release tick too, so the
+                    // release fires at the right time rather than after a
+                    // 50K-tick batch races past it.
+                    if let Some(rt) = pending_release_tick {
+                        if rt >= tick && rt < tick + batch {
+                            batch = (rt - tick).max(1);
                         }
                     }
                     if batch == 0 { batch = 1; }
@@ -1166,26 +1561,137 @@ fn main() {
                         }
                     }
                 }
-            } else if !script_events.is_empty() {
-                // Run in chunks bounded by script-event ticks. Between events
-                // use run_batch for full speed.
+            } else if !script_events.is_empty() || !stages.is_empty() {
+                // Unified scripted-run path. Each iteration advances the
+                // engine to the next "interesting" tick — the soonest of:
+                //   - next scripted script-event tick
+                //   - next poll-stride boundary (if stages exist)
+                //   - next pending spam tap
+                //   - ticks_limit
+                // and then evaluates whichever of those fired.
+                //
+                // run_batch is the only call that drives ticks; it's never
+                // invoked for batch < 1, and the stride is whatever the
+                // user configured. Per-tick overhead is zero when nothing
+                // fires this stride.
                 let mut cursor: u32 = 0;
                 let mut halted = false;
-                for ev in &script_events {
-                    if ev.tick > ticks_limit { break; }
-                    if ev.tick > cursor {
-                        let batch = ev.tick - cursor;
+                let mut script_idx: usize = 0;
+
+                // Active spam state: which stage started it, the value, the
+                // cadence. None when no spam is active.
+                struct SpamState { value: i32, every: u32, next_tick: u32 }
+                let mut spam: Option<SpamState> = None;
+
+                // Pending release for any in-flight tap (spam taps too).
+                let mut pending_release_tick: Option<u32> = None;
+
+                // Map name -> stage index, plus a fired flag per stage.
+                let mut stage_fired: Vec<bool> = vec![false; stages.len()];
+
+                while cursor < ticks_limit && !halted {
+                    // Determine the next firing tick.
+                    let mut next_tick = ticks_limit;
+                    if poll_stride > 0 {
+                        // Next stride boundary > cursor.
+                        let n = (cursor / poll_stride + 1) * poll_stride;
+                        if n < next_tick { next_tick = n; }
+                    }
+                    while script_idx < script_events.len()
+                        && script_events[script_idx].tick <= cursor {
+                        // Edge case: an event at tick==0 should fire at cursor==0.
+                        if script_events[script_idx].tick == cursor {
+                            if execute_script_action(&script_events[script_idx].action, &mut state, cursor) {
+                                halted = true;
+                            }
+                            script_idx += 1;
+                            if halted { break; }
+                        } else {
+                            // Past-due (shouldn't happen in practice given sort).
+                            script_idx += 1;
+                        }
+                    }
+                    if halted { break; }
+                    if script_idx < script_events.len() {
+                        let t = script_events[script_idx].tick;
+                        if t < next_tick { next_tick = t; }
+                    }
+                    if let Some(s) = &spam {
+                        if s.next_tick < next_tick { next_tick = s.next_tick; }
+                    }
+                    if let Some(rt) = pending_release_tick {
+                        if rt < next_tick { next_tick = rt; }
+                    }
+
+                    let batch = next_tick.saturating_sub(cursor);
+                    if batch > 0 {
                         evaluator.run_batch(&mut state, batch);
-                        cursor = ev.tick;
+                        cursor = next_tick;
                     }
-                    if execute_script_action(&ev.action, &mut state, cursor) {
-                        halted = true;
-                        break;
+
+                    // Fire scripted events at exactly this tick.
+                    while script_idx < script_events.len()
+                        && script_events[script_idx].tick == cursor {
+                        if execute_script_action(&script_events[script_idx].action, &mut state, cursor) {
+                            halted = true;
+                        }
+                        script_idx += 1;
+                        if halted { break; }
                     }
-                }
-                if !halted && cursor < ticks_limit {
-                    evaluator.run_batch(&mut state, ticks_limit - cursor);
-                    cursor = ticks_limit;
+                    if halted { break; }
+
+                    // Spam tap: fire if due.
+                    if let Some(s) = spam.as_mut() {
+                        if s.next_tick <= cursor {
+                            state.set_var("keyboard", s.value);
+                            pending_release_tick = Some(cursor.saturating_add(5000));
+                            s.next_tick = cursor.saturating_add(s.every);
+                        }
+                    }
+
+                    // Release any in-flight tap.
+                    if let Some(rt) = pending_release_tick {
+                        if cursor >= rt {
+                            state.set_var("keyboard", 0);
+                            pending_release_tick = None;
+                        }
+                    }
+
+                    // Stage polling: only at stride boundaries (or terminal tick).
+                    let at_stride_boundary =
+                        poll_stride > 0 && cursor % poll_stride == 0;
+                    if at_stride_boundary {
+                        let cycles = state.get_var("cycleCount").unwrap_or(0);
+                        let elapsed_ms = t2.elapsed().as_millis() as u64;
+                        for (i, sd) in stages.iter().enumerate() {
+                            if stage_fired[i] { continue; }
+                            if sd.tests.iter().all(|t| cond_test_holds(t, &state)) {
+                                stage_fired[i] = true;
+                                println!(
+                                    "stage={} t_ms={} tick={} cycles={}",
+                                    sd.name, elapsed_ms, cursor, cycles
+                                );
+                                match &sd.action {
+                                    CondAction::None => {}
+                                    CondAction::Halt => { halted = true; }
+                                    CondAction::Tap { value, hold } => {
+                                        state.set_var("keyboard", *value);
+                                        pending_release_tick =
+                                            Some(cursor.saturating_add(*hold));
+                                    }
+                                    CondAction::Spam { value, every } => {
+                                        spam = Some(SpamState {
+                                            value: *value,
+                                            every: *every,
+                                            next_tick: cursor,
+                                        });
+                                    }
+                                    CondAction::SpamStop => { spam = None; }
+                                }
+                                if halted { break; }
+                            }
+                        }
+                    }
                 }
                 ticks_run = cursor;
             } else {
@@ -1274,6 +1780,25 @@ fn main() {
                 if let Err(e) = dump_mem_range(spec, &state) {
                     eprintln!("--dump-mem-range={spec}: {e}");
                     std::process::exit(1);
+                }
+            }
+
+            // --snapshot-out: freeze the runtime-mutable state to disk so a
+            // later --restore can resume at this exact tick. Pair with
+            // --ticks N or a `:halt` script-event to land on a precise
+            // moment (e.g. just-reached-in-game) before snapshotting.
+            if let Some(path) = &cli.snapshot_out {
+                let blob = state.snapshot();
+                match std::fs::write(path, &blob) {
+                    Ok(()) => eprintln!(
+                        "snapshot: wrote {} bytes to {}",
+                        blob.len(),
+                        path.display()
+                    ),
+                    Err(e) => {
+                        eprintln!("--snapshot-out={}: {}", path.display(), e);
+                        std::process::exit(1);
+                    }
                 }
             }
         }

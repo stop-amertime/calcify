@@ -30,6 +30,7 @@ fn empty_program() -> CompiledProgram {
         flat_dispatch_arrays: Vec::new(),
         property_slots: std::collections::HashMap::new(),
         functions: Vec::new(),
+        disk_window: None,
     }
 }
 

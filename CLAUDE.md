@@ -12,6 +12,24 @@ Similarly, if a CSS-DOS agent needs calcite changes, they should read this file
 first. The repos are independent (no code dependency) but tightly coupled in
 practice: CSS-DOS generates CSS, calcite runs it.
 
+## Web is the only delivery method
+
+calcite-wasm in the browser is the product. calcite-cli is a test harness.
+
+A consequence of that: **anything that works in calcite-cli but not in
+calcite-wasm is broken**, and any code path that exists in calcite-cli but
+not in calcite-wasm (loading sidecar files, native-only state setup,
+filesystem reads at startup, etc.) is a bug to be removed, not a feature to
+preserve. If you find a CLI-only mechanism, your first instinct should be
+to delete it and route the same logic through compile-time data on
+`CompiledProgram` (which both targets share). Don't add CLI-only
+optimisations or workarounds — fix it for the web or don't fix it.
+
+If you are tempted to write `#[cfg(not(target_arch = "wasm32"))]` for
+anything beyond what's already documented in the wasm-safety section
+below (timing, threads, fs/net), stop and find a different design. The
+two targets must produce identical results from the same cabinet.
+
 
 # calc(ite)
 
