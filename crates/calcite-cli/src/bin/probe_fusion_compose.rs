@@ -21,8 +21,10 @@ use std::path::PathBuf;
 use calcite_core::Evaluator;
 use calcite_core::compile::{Op, Slot};
 use calcite_core::pattern::fusion_sim::{
-    simulate_ops_with, Assumptions, BailReason, SlotEnv, SymExpr,
+    simulate_ops_full, Assumptions, BailReason, SlotEnv, SymExpr,
 };
+#[allow(unused_imports)]
+use std::io::Write;
 use clap::Parser;
 
 #[derive(Parser, Debug)]
@@ -119,7 +121,7 @@ fn main() {
             let key = b as i64;
             if let Some((ops, result_slot)) = table.entries.get(&key) {
                 result_slot_seen = Some(*result_slot);
-                match simulate_ops_with(&mut env, ops, &assumptions) {
+                match simulate_ops_full(&mut env, ops, &assumptions, &program.flat_dispatch_arrays) {
                     Ok(()) => {
                         bytes_processed += 1;
                     }

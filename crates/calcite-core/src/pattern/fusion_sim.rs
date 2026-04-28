@@ -44,7 +44,7 @@
 
 use std::collections::HashMap;
 
-use crate::compile::{Op, Slot};
+use crate::compile::{FlatDispatchArray, Op, Slot};
 
 /// A symbolic expression. Trees of these represent composed values.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -371,13 +371,25 @@ pub fn simulate_ops(env: &mut SlotEnv, ops: &[Op]) -> Result<(), BailReason> {
     simulate_ops_with(env, ops, &assumptions)
 }
 
-/// Simulate one Op sequence with control-flow + assumptions support.
-/// Branches whose condition slot has a `Const` value are resolved
-/// statically; unresolvable branches bail.
+/// Simulate with assumptions, no flat-array support. Equivalent to
+/// `simulate_ops_full` with empty arrays.
 pub fn simulate_ops_with(
     env: &mut SlotEnv,
     ops: &[Op],
     assumptions: &Assumptions,
+) -> Result<(), BailReason> {
+    simulate_ops_full(env, ops, assumptions, &[])
+}
+
+/// Full simulation: control flow + assumptions + flat-array dispatch.
+/// `flat_arrays` is the cabinet's `program.flat_dispatch_arrays`. When a
+/// `DispatchFlatArray` op fires with a Const key, the simulator reads the
+/// array value and stores it as a Const in the destination slot.
+pub fn simulate_ops_full(
+    env: &mut SlotEnv,
+    ops: &[Op],
+    assumptions: &Assumptions,
+    flat_arrays: &[FlatDispatchArray],
 ) -> Result<(), BailReason> {
     let mut pc: usize = 0;
     let mut steps: usize = 0;
@@ -388,7 +400,7 @@ pub fn simulate_ops_with(
         }
         steps += 1;
         let op = &ops[pc];
-        match simulate_op_with_cfg(env, op, assumptions)? {
+        match simulate_op_with_cfg(env, op, assumptions, flat_arrays)? {
             StepOutcome::Next => pc += 1,
             StepOutcome::Jump(t) => pc = t,
             StepOutcome::Halt => break,
@@ -412,7 +424,7 @@ fn read_slot(env: &SlotEnv, s: Slot) -> SymExpr {
 
 fn simulate_op(env: &mut SlotEnv, op: &Op) -> Result<(), BailReason> {
     let assumptions = Assumptions::default();
-    match simulate_op_with_cfg(env, op, &assumptions)? {
+    match simulate_op_with_cfg(env, op, &assumptions, &[])? {
         StepOutcome::Next => Ok(()),
         StepOutcome::Jump(_) | StepOutcome::Halt => Err(BailReason::Branch("branch")),
     }
@@ -422,6 +434,7 @@ fn simulate_op_with_cfg(
     env: &mut SlotEnv,
     op: &Op,
     assumptions: &Assumptions,
+    flat_arrays: &[FlatDispatchArray],
 ) -> Result<StepOutcome, BailReason> {
     use Op::*;
     match op {
@@ -610,7 +623,23 @@ fn simulate_op_with_cfg(
         LoadMem { .. } | LoadMem16 { .. } | LoadPackedByte { .. } => {
             return Err(BailReason::SideEffect("LoadMem*"));
         }
-        Dispatch { .. } | DispatchFlatArray { .. } | DispatchChain { .. } => {
+        DispatchFlatArray { dst, key, array_id, base_key, default } => {
+            let key_expr = read_slot(env, *key);
+            if let SymExpr::Const(k) = key_expr {
+                let arr = flat_arrays.get(*array_id as usize)
+                    .ok_or(BailReason::Unsupported("DispatchFlatArray (array_id out of range)"))?;
+                let idx = (k as i64) - (*base_key as i64);
+                let val = if idx >= 0 && (idx as usize) < arr.values.len() {
+                    arr.values[idx as usize] as i64
+                } else {
+                    *default as i64
+                };
+                env.insert(*dst, SymExpr::Const(val));
+            } else {
+                return Err(BailReason::Unsupported("DispatchFlatArray (non-const key)"));
+            }
+        }
+        Dispatch { .. } | DispatchChain { .. } => {
             return Err(BailReason::Unsupported("dispatch*"));
         }
         Call { .. } => return Err(BailReason::Unsupported("Call")),
