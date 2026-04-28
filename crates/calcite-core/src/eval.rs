@@ -1731,7 +1731,12 @@ impl Evaluator {
                 if divisor == 0.0 {
                     0.0
                 } else {
-                    self.eval_expr(a, state).as_number() % divisor
+                    // CSS mod() takes the sign of the divisor (matches f64::rem_euclid
+                    // when both signs match, but more precisely: mod(a,b) = a - floor(a/b)*b).
+                    // Rust's `%` operator takes the sign of the dividend, so e.g.
+                    // (-7) % 3 == -1 in Rust but Chrome's mod(-7, 3) == 2.
+                    let a_v = self.eval_expr(a, state).as_number();
+                    a_v - (a_v / divisor).floor() * divisor
                 }
             }
             CalcOp::Min(args) => args

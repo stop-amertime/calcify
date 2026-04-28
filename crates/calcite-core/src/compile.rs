@@ -1428,7 +1428,11 @@ fn fold_calc(op: &CalcOp) -> Expr {
             let fa = const_fold(a);
             let fb = const_fold(b);
             match (&fa, &fb) {
-                (Expr::Literal(x), Expr::Literal(y)) if *y != 0.0 => Expr::Literal(x % y),
+                // CSS mod() is euclidean (sign of divisor), not Rust's `%`
+                // (sign of dividend). a - floor(a/b)*b is the spec definition.
+                (Expr::Literal(x), Expr::Literal(y)) if *y != 0.0 => {
+                    Expr::Literal(x - (x / y).floor() * y)
+                }
                 _ => Expr::Calc(CalcOp::Mod(Box::new(fa), Box::new(fb))),
             }
         }
@@ -5938,7 +5942,15 @@ fn exec_ops(
             }
             Op::Mod { dst, a, b } => {
                 let divisor = sload!(*b);
-                let v = if divisor == 0 { 0 } else { sload!(*a) % divisor };
+                // CSS mod() takes the sign of the divisor (Knuth/floor mod),
+                // not the sign of the dividend like Rust's `%`.
+                let v = if divisor == 0 {
+                    0
+                } else {
+                    let dividend = sload!(*a);
+                    let r = dividend % divisor;
+                    if (r != 0) && ((r < 0) != (divisor < 0)) { r + divisor } else { r }
+                };
                 sstore!(*dst, v);
             }
             Op::Neg { dst, src } => {
@@ -6022,7 +6034,15 @@ fn exec_ops(
             }
             Op::ModLit { dst, a, val } => {
                 let divisor = *val;
-                sstore!(*dst, if divisor == 0 { 0 } else { sload!(*a) % divisor });
+                // Same Knuth/floor-mod fix as Op::Mod above.
+                let v = if divisor == 0 {
+                    0
+                } else {
+                    let dividend = sload!(*a);
+                    let r = dividend % divisor;
+                    if (r != 0) && ((r < 0) != (divisor < 0)) { r + divisor } else { r }
+                };
+                sstore!(*dst, v);
             }
             Op::Bit { dst, val, idx } => {
                 let v = sload!(*val);
