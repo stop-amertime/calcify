@@ -1,0 +1,11 @@
+{
+  "description": "calc(50 - 8) — subtraction",
+  "ticks": 1,
+  "read": [
+    {
+      "property": "--r",
+      "type": "integer",
+      "expected_str": "42"
+    }
+  ]
+}

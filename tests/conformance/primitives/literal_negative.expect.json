@@ -1,0 +1,11 @@
+{
+  "description": "literal negative integer assignment",
+  "ticks": 1,
+  "read": [
+    {
+      "property": "--x",
+      "type": "integer",
+      "expected_str": "-17"
+    }
+  ]
+}

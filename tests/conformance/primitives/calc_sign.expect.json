@@ -1,0 +1,11 @@
+{
+  "description": "sign(-7) — expect -1",
+  "ticks": 1,
+  "read": [
+    {
+      "property": "--r",
+      "type": "integer",
+      "expected_str": "-1"
+    }
+  ]
+}

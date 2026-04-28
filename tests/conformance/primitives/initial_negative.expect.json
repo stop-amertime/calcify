@@ -1,0 +1,11 @@
+{
+  "description": "@property initial-value: -42 — negative integer",
+  "ticks": 1,
+  "read": [
+    {
+      "property": "--x",
+      "type": "integer",
+      "expected_str": "-42"
+    }
+  ]
+}

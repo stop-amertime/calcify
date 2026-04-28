@@ -1,0 +1,11 @@
+{
+  "description": "var(--undef, 99) when --undef is undeclared reads the fallback",
+  "ticks": 1,
+  "read": [
+    {
+      "property": "--dst",
+      "type": "integer",
+      "expected_str": "99"
+    }
+  ]
+}

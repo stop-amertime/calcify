@@ -1,0 +1,11 @@
+{
+  "description": "var(--src, 99) when --src is defined reads --src not the fallback",
+  "ticks": 1,
+  "read": [
+    {
+      "property": "--dst",
+      "type": "integer",
+      "expected_str": "5"
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "description": "var(--undef) with no fallback — Chrome falls back to initial-value",
+  "ticks": 1,
+  "read": [
+    {
+      "property": "--dst",
+      "type": "integer",
+      "expected_str": "7"
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "description": "calc(6 * 7) — multiplication",
+  "ticks": 1,
+  "read": [
+    {
+      "property": "--r",
+      "type": "integer",
+      "expected_str": "42"
+    }
+  ]
+}

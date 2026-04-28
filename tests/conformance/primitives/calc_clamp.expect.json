@@ -1,0 +1,11 @@
+{
+  "description": "clamp(0, 12, 10) — value above max, expect 10",
+  "ticks": 1,
+  "read": [
+    {
+      "property": "--r",
+      "type": "integer",
+      "expected_str": "10"
+    }
+  ]
+}

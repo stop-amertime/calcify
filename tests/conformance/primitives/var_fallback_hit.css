@@ -1,0 +1,14 @@
+@property --src {
+  syntax: "<integer>";
+  inherits: false;
+  initial-value: 5;
+}
+@property --dst {
+  syntax: "<integer>";
+  inherits: false;
+  initial-value: 0;
+}
+
+:root {
+  --dst: var(--src, 99);
+}

@@ -1,0 +1,9 @@
+@property --r {
+  syntax: "<integer>";
+  inherits: false;
+  initial-value: 0;
+}
+
+:root {
+  --r: sign(-7);
+}

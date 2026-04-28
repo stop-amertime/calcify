@@ -1,0 +1,16 @@
+{
+  "description": "var(--name) of defined property reads its value",
+  "ticks": 1,
+  "read": [
+    {
+      "property": "--src",
+      "type": "integer",
+      "expected_str": "7"
+    },
+    {
+      "property": "--dst",
+      "type": "integer",
+      "expected_str": "7"
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "description": "calc(84 / 2) — division",
+  "ticks": 1,
+  "read": [
+    {
+      "property": "--r",
+      "type": "integer",
+      "expected_str": "42"
+    }
+  ]
+}

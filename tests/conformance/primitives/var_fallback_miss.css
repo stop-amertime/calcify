@@ -1,0 +1,10 @@
+@property --dst {
+  syntax: "<integer>";
+  inherits: false;
+  initial-value: 0;
+}
+
+:root {
+  /* --undef is never declared; fallback should win */
+  --dst: var(--undef, 99);
+}

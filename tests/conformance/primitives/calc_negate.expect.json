@@ -1,0 +1,11 @@
+{
+  "description": "calc(0 - var(--x)) — emits CalcOp::Sub but functionally negation",
+  "ticks": 1,
+  "read": [
+    {
+      "property": "--r",
+      "type": "integer",
+      "expected_str": "-13"
+    }
+  ]
+}

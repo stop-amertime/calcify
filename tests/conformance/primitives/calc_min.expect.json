@@ -1,0 +1,11 @@
+{
+  "description": "min(7, 3, 9) — multi-arg min",
+  "ticks": 1,
+  "read": [
+    {
+      "property": "--r",
+      "type": "integer",
+      "expected_str": "3"
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+@property --x {
+  syntax: "<integer>";
+  inherits: false;
+  initial-value: 123;
+}
+
+:root {
+  /* No assignment — should read initial-value. */
+}
