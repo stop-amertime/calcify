@@ -4939,6 +4939,52 @@ fn packed_splice_byte(
     }
 }
 
+/// Splice an even-aligned 16-bit word through a packed-broadcast port.
+/// Caller guarantees `byte_addr & 1 == 0` so both bytes land in the same
+/// cell and the whole cell can be replaced in one read-modify-write.
+///
+/// `val` is a 16-bit value pre-masked to 0..=65535 by the caller. The
+/// affine projectors expect *byte-level* write_log entries even for word
+/// writes (so a STOSW loop's per-byte stride is visible), so we still
+/// emit two write_log entries — but the cell update itself is one op.
+#[inline]
+fn packed_splice_word_aligned(
+    port: &CompiledPackedBroadcastWrite,
+    state: &mut State,
+    byte_addr: i32,
+    val: i32,
+) {
+    debug_assert!(byte_addr >= 0 && byte_addr & 1 == 0);
+    let pack = port.pack as i32;
+    let cell_idx = (byte_addr / pack) as usize;
+    if cell_idx >= port.cell_table.len() {
+        return;
+    }
+    let cell_state_addr = port.cell_table[cell_idx];
+    if cell_state_addr == 0 {
+        return;
+    }
+    let prev = state.read_mem(cell_state_addr);
+    if val != prev {
+        let sidx = (-cell_state_addr - 1) as usize;
+        if sidx < state.state_vars.len() {
+            state.state_vars[sidx] = val;
+        }
+        let addr_u = byte_addr as usize;
+        if addr_u + 1 < state.memory.len() {
+            state.memory[addr_u]     = (val & 0xFF) as u8;
+            state.memory[addr_u + 1] = ((val >> 8) & 0xFF) as u8;
+        }
+        // Affine projectors lock on byte-stride patterns, so log byte
+        // writes (matching what byte-mode would produce) rather than
+        // logging a single (addr, word) entry.
+        if let Some(ref mut log) = state.write_log {
+            log.push((byte_addr, val & 0xFF));
+            log.push((byte_addr + 1, (val >> 8) & 0xFF));
+        }
+    }
+}
+
 /// Execute a compiled program for one tick.
 pub fn execute(program: &CompiledProgram, state: &mut State, slots: &mut Vec<i32>) {
     // Size slots appropriately; keep stale values between ticks. The compiler
@@ -4998,8 +5044,14 @@ pub fn execute(program: &CompiledProgram, state: &mut State, slots: &mut Vec<i32
     //
     // Width: each port reads a per-tick width slot (1 or 2). Width=1 splices
     // a single byte at byte_addr. Width=2 writes a 16-bit word; when
-    // byte_addr is even the lo and hi halves both land in cell `byte_addr/2`,
-    // when odd they straddle (lo into b1 of cell N, hi into b0 of cell N+1).
+    // byte_addr is even the lo and hi halves both land in cell
+    // `byte_addr/2` (single read-modify-write of the whole cell), when odd
+    // they straddle (lo into b1 of cell N, hi into b0 of cell N+1).
+    //
+    // The aligned-width=2 path is hot — every PUSH/CALL/INT/IRQ frame and
+    // every word `MOV [m], r16` to even-aligned memory hits it. Inlining
+    // the splice and specialising the aligned case lets us avoid the
+    // double read-modify-write the naive two-byte-splice version would do.
     for port in program.packed_broadcast_writes.iter().rev() {
         if slots[port.gate_slot as usize] != 1 {
             continue;
@@ -5011,9 +5063,17 @@ pub fn execute(program: &CompiledProgram, state: &mut State, slots: &mut Vec<i32
         let val = slots[port.val_slot as usize];
         let width = slots[port.width_slot as usize];
         if width == 2 {
-            // Word splice — lo at byte_addr, hi at byte_addr+1.
-            packed_splice_byte(port, state, byte_addr, val & 0xFF);
-            packed_splice_byte(port, state, byte_addr + 1, (val >> 8) & 0xFF);
+            if byte_addr & 1 == 0 {
+                // Aligned word: single cell, single read-modify-write.
+                // The whole cell becomes the 16-bit word value (masked to
+                // u16 so a sign-extended val doesn't bleed into bit 16+).
+                packed_splice_word_aligned(port, state, byte_addr, val & 0xFFFF);
+            } else {
+                // Straddle: lo half goes to cell N's high byte; hi half
+                // goes to cell N+1's low byte. Two cells, two splices.
+                packed_splice_byte(port, state, byte_addr, val & 0xFF);
+                packed_splice_byte(port, state, byte_addr + 1, (val >> 8) & 0xFF);
+            }
         } else {
             // Byte splice (width=1, the default).
             packed_splice_byte(port, state, byte_addr, val & 0xFF);
@@ -6271,8 +6331,12 @@ pub fn execute_profiled(
         let val = slots[port.val_slot as usize];
         let width = slots[port.width_slot as usize];
         if width == 2 {
-            packed_splice_byte(port, state, byte_addr, val & 0xFF);
-            packed_splice_byte(port, state, byte_addr + 1, (val >> 8) & 0xFF);
+            if byte_addr & 1 == 0 {
+                packed_splice_word_aligned(port, state, byte_addr, val & 0xFFFF);
+            } else {
+                packed_splice_byte(port, state, byte_addr, val & 0xFF);
+                packed_splice_byte(port, state, byte_addr + 1, (val >> 8) & 0xFF);
+            }
         } else {
             packed_splice_byte(port, state, byte_addr, val & 0xFF);
         }
