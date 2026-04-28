@@ -1,0 +1,11 @@
+{
+  "description": "Concat: var(--first) \"_\" var(--second)",
+  "ticks": 1,
+  "read": [
+    {
+      "property": "--r",
+      "type": "string",
+      "expected_str": "\"a\" \"_\" \"b\""
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+@property --in {
+  syntax: "<integer>";
+  inherits: false;
+  initial-value: 4;
+}
+@property --r {
+  syntax: "<integer>";
+  inherits: false;
+  initial-value: 0;
+}
+
+@function --quadPlusOne(--x <integer>) returns <integer> {
+  --sq: calc(var(--x) * var(--x));
+  --quad: calc(var(--sq) * 4);
+  result: calc(var(--quad) + 1);
+}
+
+:root {
+  --r: --quadPlusOne(var(--in));
+}

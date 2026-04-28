@@ -1,0 +1,11 @@
+{
+  "description": "composed @functions — triple(inc(3)) = 12",
+  "ticks": 1,
+  "read": [
+    {
+      "property": "--r",
+      "type": "integer",
+      "expected_str": "12"
+    }
+  ]
+}

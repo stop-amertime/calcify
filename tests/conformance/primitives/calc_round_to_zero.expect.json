@@ -1,0 +1,11 @@
+{
+  "description": "round(to-zero, -9, 5) — truncate toward zero, expect -5",
+  "ticks": 1,
+  "read": [
+    {
+      "property": "--r",
+      "type": "integer",
+      "expected_str": "-5"
+    }
+  ]
+}

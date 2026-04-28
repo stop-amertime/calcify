@@ -1,0 +1,11 @@
+@property --r {
+  syntax: "<integer>";
+  inherits: false;
+  initial-value: 0;
+}
+
+:root {
+  /* Negative dividend. CSS mod() spec says result has the sign of the
+     divisor (so mod(-7, 3) == 2). Pinning Chrome to confirm. */
+  --r: mod(-7, 3);
+}

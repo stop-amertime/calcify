@@ -1,0 +1,11 @@
+{
+  "description": "two-arg @function — combine(10, 20) -> 1020",
+  "ticks": 1,
+  "read": [
+    {
+      "property": "--r",
+      "type": "integer",
+      "expected_str": "1020"
+    }
+  ]
+}

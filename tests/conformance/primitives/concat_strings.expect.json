@@ -1,0 +1,11 @@
+{
+  "description": "Concat: var(--greeting) \" world\"",
+  "ticks": 1,
+  "read": [
+    {
+      "property": "--r",
+      "type": "string",
+      "expected_str": "\"hello\" \" world\""
+    }
+  ]
+}

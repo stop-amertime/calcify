@@ -1,0 +1,23 @@
+@property --a {
+  syntax: "<integer>";
+  inherits: false;
+  initial-value: 5;
+}
+@property --b {
+  syntax: "<integer>";
+  inherits: false;
+  initial-value: 0;
+}
+@property --c {
+  syntax: "<integer>";
+  inherits: false;
+  initial-value: 0;
+}
+
+:root {
+  /* Dependent assignments. --b reads --a, --c reads --b. Chrome's
+     computed-style resolution and calcite's tick should both reach
+     fully-resolved values in one pass via topological sort. */
+  --b: calc(var(--a) * 10);
+  --c: calc(var(--b) + 1);
+}

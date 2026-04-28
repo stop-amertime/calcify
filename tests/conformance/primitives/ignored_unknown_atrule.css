@@ -1,0 +1,18 @@
+@property --r {
+  syntax: "<integer>";
+  inherits: false;
+  initial-value: 0;
+}
+
+@keyframes wiggle {
+  0% { opacity: 0; }
+  100% { opacity: 1; }
+}
+
+@media (min-width: 1px) {
+  body { color: red; }
+}
+
+:root {
+  --r: 99;
+}

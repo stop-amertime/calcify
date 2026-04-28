@@ -1,0 +1,12 @@
+{
+  "description": "custom prop set on :hover/::before doesn't affect documentElement",
+  "ticks": 1,
+  "xfail_v1": "calcite parses all qualified-rule blocks as flat declaration lists regardless of selector — :hover and ::before declarations are aggregated alongside :root, so the later :hover write to --r wins. Computational CSS only authors to :root/.cpu so this isn't a hot-path bug, but the divergence is real. Phase 1+ should track selector specificity at lowering time.",
+  "read": [
+    {
+      "property": "--r",
+      "type": "integer",
+      "expected_str": "7"
+    }
+  ]
+}

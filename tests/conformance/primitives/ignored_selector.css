@@ -1,0 +1,16 @@
+@property --r {
+  syntax: "<integer>";
+  inherits: false;
+  initial-value: 0;
+}
+
+/* Custom property declared inside an unrelated selector. Per CSS
+   cascade, --r is set on the html element when written under :root,
+   but :hover/::before don't apply to a static document, so those
+   declarations never affect getComputedStyle on documentElement.
+   Calcite reads :root only via flat aggregation. The :hover write
+   below should NOT win — getComputedStyle on documentElement should
+   see 7 (from :root), not 99. */
+:root { --r: 7; }
+:hover { --r: 99; }
+::before { --r: 99; }

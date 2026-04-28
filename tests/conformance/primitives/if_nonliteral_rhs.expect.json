@@ -1,0 +1,11 @@
+{
+  "description": "style(--a: calc(...)) with non-literal rhs",
+  "ticks": 1,
+  "read": [
+    {
+      "property": "--r",
+      "type": "integer",
+      "expected_str": "11"
+    }
+  ]
+}

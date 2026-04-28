@@ -1,0 +1,23 @@
+@property --a {
+  syntax: "<integer>";
+  inherits: false;
+  initial-value: 10;
+}
+@property --b {
+  syntax: "<integer>";
+  inherits: false;
+  initial-value: 20;
+}
+@property --r {
+  syntax: "<integer>";
+  inherits: false;
+  initial-value: 0;
+}
+
+@function --combine(--x <integer>, --y <integer>) returns <integer> {
+  result: calc(var(--x) * 100 + var(--y));
+}
+
+:root {
+  --r: --combine(var(--a), var(--b));
+}

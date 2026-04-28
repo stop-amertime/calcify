@@ -1,0 +1,11 @@
+{
+  "description": "clamp(5, 2, 10) — value below min, expect 5",
+  "ticks": 1,
+  "read": [
+    {
+      "property": "--r",
+      "type": "integer",
+      "expected_str": "5"
+    }
+  ]
+}

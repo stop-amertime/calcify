@@ -1,0 +1,12 @@
+@property --r {
+  syntax: "<integer>";
+  inherits: false;
+  initial-value: 0;
+}
+
+:root {
+  /* Two declarations of the same property in cascade order. CSS spec:
+     last-wins. */
+  --r: 1;
+  --r: 2;
+}

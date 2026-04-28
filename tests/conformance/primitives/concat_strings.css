@@ -1,0 +1,14 @@
+@property --greeting {
+  syntax: "*";
+  inherits: false;
+  initial-value: "hello";
+}
+@property --r {
+  syntax: "*";
+  inherits: false;
+  initial-value: "";
+}
+
+:root {
+  --r: var(--greeting) " world";
+}

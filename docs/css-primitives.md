@@ -341,55 +341,78 @@ listing the custom-property values to read after one tick (or after
 
 ---
 
-## 5. Open questions for the conformance writer
+## 5. Reconciled Chrome-truth — Phase 0.5.6 result
 
-These need to be answered before fixtures are finalised; mark each
-either "matches Chrome" or "explicit gap" in the final suite. Status
-updates as fixtures land.
+49 fixtures committed, all green against both Chrome (via Playwright)
+and calcite v1 (via cargo test). 41 PASS, 5 SKIP (string-typed reads —
+calcite's `State::get_var` is i32-only, not a divergence, just a test-
+side limitation), 3 XFAIL (real divergences calcite v1 doesn't yet
+match — Phase 1+ work).
 
-1. **`var(--x, var(--x))` self-reference fallback** — does Chrome's
-   guaranteed-invalid resolution fire? Does calcite's slot read the
-   pre-tick value or 0?
-   ✅ **Chrome falls back to initial-value**, confirmed by
-   `var_self_cycle` (returns 5). Calcite v1 also passes — the cycle
-   doesn't reach the eval path because the topological sort silently
-   drops the self-edge (`--x` keeps its pre-tick value, which equals
-   initial-value on tick 1).
-2. **`calc(1 / 0)`** — Chrome behaviour vs calcite's documented "0".
-   📎 Pending — fixture not yet written (calc edges group).
-3. **Unknown function call** (`--undefinedFunc(1)`) — Chrome resolves to
-   guaranteed-invalid; calcite's behaviour is undocumented.
-   📎 Pending — fixture not yet written (function group).
-4. **`@function` recursion** — explicit gap or runtime contract?
-   📎 Pending — fixture not yet written (function group).
-5. **Mixed `and`/`or` inside `if(style())`** — explicit gap.
-   ✋ Confirmed parser limitation (see § 2.5). Won't fixture-test —
-   the suite avoids mixed forms; if(style()) fixtures use single-
-   operator chains only.
-6. **Number tokens out of i32 range** — explicit gap.
-   ✋ Phase 0.5 declares this out-of-scope (calcite's eval is i32-
-   centric); fixtures stick to in-range values.
-7. **Cascade order with 3+ writes** — does Chrome use last-wins? Does
-   calcite topo-sort or last-wins?
-   📎 Pending — fixture not yet written (cascade group).
+### Original open questions, resolved
 
-Additional findings landing during fixture authoring:
+1. **`var(--x)` self-reference fallback** —
+   ✅ Chrome falls back to initial-value, confirmed by
+   `var_self_cycle` (returns 5). Calcite v1 also passes via topo-sort
+   silently dropping the self-edge.
+2. **`calc(1 / 0)`** —
+   ⚠️ Chrome surfaces `1.79769e+308` (f64::MAX) for an `<integer>`-
+   typed property. Calcite v1 returns 0. **xfail_v1** on
+   `calc_div_zero` — Phase 1+ should produce infinity-typed values
+   and serialise them the way Chrome does.
+3. **Unknown function call** —
+   📎 Not exercised in Phase 0.5 (covered by parser tests already; no
+   computational-CSS cabinet calls undefined functions). Punt to
+   Phase 1.
+4. **`@function` recursion** —
+   📎 Same — not exercised. Phase 1+ will have a stack budget.
+5. **Mixed `and`/`or` inside `if(style())`** —
+   ✋ Confirmed parser limitation (§ 2.5). Won't fixture-test.
+6. **Number tokens out of i32 range** —
+   ✋ Out of scope for Phase 0.5; fixtures stay in-range.
+7. **Cascade order with double-write** —
+   ✅ Chrome takes the last write; calcite's topo-sort + writeback
+   matches when the writes are independent of dependency. Confirmed
+   by `cascade_double_write` (Chrome=2, calcite=2) and
+   `cascade_dependency` (Chrome and calcite both resolve the chain
+   `--a→--b→--c`).
 
-- **Var on undeclared LHS, no fallback** (`--dst: var(--undef);` where
-  `--dst` has initial-value 7): Chrome preserves --dst's initial-value
-  (declaration becomes invalid at computed-value time). Calcite v1
-  writes 0 — the writeback fires regardless. Marked
-  `xfail_v1` on `var_undefined_no_fallback`. Phase 1+ should implement
-  invalidity propagation through the DAG so this fixture passes
-  without an xfail marker.
+### Three real divergences (`xfail_v1`) for Phase 1+ to fix
 
-- **Var fallback when --src is defined**: Chrome reads --src, ignores
-  the fallback. Calcite v1 matches. ✅
-- **Var fallback when --undef is undeclared**: Chrome reads the
-  fallback. Calcite v1 matches. ✅
-- **Initial-value with no assignment**: Chrome surfaces the
-  initial-value via getComputedStyle. Calcite v1 matches. ✅
-- **All 12 CalcOp variants on simple integer happy paths**: calcite v1
-  matches Chrome bit-for-bit. ✅
+These calcite v1 gets wrong; Phase 1's DAG lowering is the natural
+place to fix them.
 
-Phase 0.5.6 reconciles remaining items and updates this doc.
+1. **`var_undefined_no_fallback`** — Chrome preserves --dst's initial-
+   value when `--dst: var(--undef);` has no fallback (declaration is
+   invalid at computed-value time). Calcite v1 writes 0 unconditionally.
+   Fix: implement invalidity propagation through the DAG so the
+   writeback skips when an operand is invalid.
+2. **`calc_div_zero`** — Chrome serialises 1/0 as `1.79769e+308`
+   (f64::MAX). Calcite v1 returns 0. Fix: eval should produce
+   infinity-typed values; serialisation should match Chrome's f64
+   format.
+3. **`ignored_selector`** — Chrome scopes :hover/::before declarations
+   away from documentElement. Calcite parses every qualified-rule body
+   as a flat declaration list regardless of selector, so the later
+   :hover write to --r wins. Computational CSS only authors to :root/
+   .cpu so this is dormant in cabinets, but the divergence is real.
+   Fix: track selector specificity at lowering time.
+
+### Calcite v1 bug fixed during Phase 0.5
+
+**`mod()` sign convention**: calcite was using Rust's `%` operator
+(sign of dividend). CSS `mod()` takes the sign of the divisor (Knuth /
+floor mod). Fixed in `eval.rs::CalcOp::Mod`, `compile.rs::const_fold`,
+`compile.rs::Op::Mod`, and `compile.rs::Op::ModLit`.
+`calc_mod_negative` (mod(-7, 3)) was the trigger — Chrome=2 vs old
+calcite=-1. Now matches Chrome.
+
+### Items declared out of scope for the suite
+
+- Mixed `and`/`or` (parser limitation).
+- Out-of-range integer literals (eval is i32-centric).
+- Unknown function calls (no cabinet exercises this).
+- `@function` recursion (no recursion limit; cabinets don't recurse).
+
+Phase 1+ should re-evaluate scope as the DAG IR makes some of these
+trivial to handle.
