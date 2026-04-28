@@ -204,6 +204,55 @@ let (result, profile) = evaluator.tick_profiled(&mut state);
 // profile.op_counts    — HashMap<&str, u64> of per-op-type counts
 ```
 
+## Snapshot / restore — measure a window without re-running boot
+
+`calcite-cli --snapshot-out=PATH` writes the runtime-mutable engine state
+(state_vars, memory, extended properties, string properties, frame
+counter) to disk after the run completes. `calcite-cli --restore=PATH`
+loads it back, replacing the freshly-initialised state right after
+`load_properties` and the `wire_state_for_*` setup but before the tick
+loop starts. The result is a deterministic resume from the snapshotted
+tick.
+
+This was built to measure a specific execution window (e.g. doom8088
+level-load) without re-running boot/title/menu every iteration. The
+pattern:
+
+```sh
+# 1. Drive the engine to the moment you want to measure. --script-event
+#    handles keypresses + a halt point so you don't have to know the
+#    exact tick.
+calcite-cli -i doom8088.css \
+  --script-event=2000000:tap:0x1c0d \
+  --script-event=20000000:tap:0x1c0d \
+  --script-event=40000000:tap:0x1c0d \
+  --ticks=60000000 \
+  --snapshot-out=just-in-game.snap
+
+# 2. Iterate on perf. Restore + run a known window. Wall-time of the
+#    second invocation is just-the-window cost, no boot tax.
+time calcite-cli -i doom8088.css \
+  --restore=just-in-game.snap --ticks=10000000
+```
+
+A snapshot is portable across runs of the same cabinet (calcite-cli ↔
+calcite-wasm) but NOT across cabinets — slot ordering depends on parse
+order, and `restore` rejects any blob whose state-vars or memory length
+doesn't match the loaded cabinet's shape.
+
+Format: 4-byte `CSNP` magic + u32 version + length-prefixed
+state_vars / memory / extended / string_properties + u32 frame_counter,
+all little-endian. Tiny: hello-text snaps to 14 KB; doom8088 mid-load
+is on the order of single-digit MB (memory dominates).
+
+The wasm bindings expose the same calls: `engine.snapshot()` returns a
+`Uint8Array`; `engine.restore(bytes)` throws on mismatch. Web-side
+bench code can capture an in-game state once and then iterate just
+the level-load window across reload cycles.
+
+Verified (2026-04-28) on hello-text: snapshot at tick 100k + 50k more
+ticks produces a byte-identical snapshot to a fresh 150k-tick run.
+
 ## Baseline numbers (2026-04-14, post BranchIfNotEqLit fusion)
 
 | Program | Ticks/s | % of 8086 | us/tick |

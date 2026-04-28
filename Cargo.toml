@@ -22,3 +22,5 @@ thiserror = "2"
 # Enable debug symbols in release builds for profiling (flamegraphs, perf, etc.)
 [profile.release]
 debug = true
+lto = "fat"
+codegen-units = 1

@@ -81,6 +81,49 @@ pub struct State {
     pub packed_cell_table: Vec<i32>,
     /// Bytes per packed cell (2 in current CSS-DOS). 0 means "no packed layout".
     pub packed_cell_size: u8,
+    /// Optional pattern-recognised "windowed byte array" descriptor — when
+    /// present, `read_mem` services addresses inside `window_base..window_end`
+    /// by reading a key from a state-var cell, multiplying by `stride`,
+    /// adding the in-window offset, and indexing `byte_array`. This is the
+    /// shape the CSS-DOS rom-disk dispatch happens to take, but the descriptor
+    /// is named in calcite's own vocabulary (window, key cell, byte array)
+    /// not x86's (LBA, sector, disk) so calcite stays free of x86 knowledge.
+    /// All fields are filled in at compile time by
+    /// `Evaluator::wire_state_for_disk_window` from data the recogniser
+    /// extracts out of the cabinet's `--readMem` dispatch entries — there is
+    /// no CLI-only loading path; calcite-cli and calcite-wasm both use this
+    /// path identically.
+    pub disk_window: Option<DiskWindow>,
+}
+
+/// A "window of bytes addressed by an in-memory key" — the shape calcite
+/// recognises in the CSS-DOS rom-disk dispatch. Lives on `State` so the read
+/// fast path can resolve in-window addresses without going back through the
+/// compiled CSS expression for every byte.
+///
+/// All fields are derived at compile time from the cabinet's own dispatch
+/// entries; nothing here reflects x86 disk semantics — calcite sees a window,
+/// a key cell, and a byte array.
+#[derive(Debug, Clone)]
+pub struct DiskWindow {
+    /// First linear address inside the window (inclusive).
+    pub window_base: i32,
+    /// One past the last linear address inside the window.
+    pub window_end: i32,
+    /// State-var slot index holding the lookup key (a u16 cell — low byte
+    /// and high byte combined). Resolved from the property name extracted
+    /// from the dispatch entry by `wire_state_for_disk_window`.
+    pub key_cell_slot: usize,
+    /// Multiplier applied to the cell value before adding in-window offset.
+    pub stride: i32,
+    /// First key represented by `byte_array[0]`. Subtract this from the
+    /// computed key before indexing. (The cabinet's `--readDiskByte` flat
+    /// array is base-keyed at the first non-zero entry, not at zero.)
+    pub byte_array_base_key: i32,
+    /// The flat byte array `--readDiskByte`'s dispatch compiles to. Shared
+    /// with `CompiledProgram::flat_dispatch_arrays` so we don't duplicate
+    /// the (potentially multi-MB) byte data.
+    pub byte_array: std::sync::Arc<Vec<i32>>,
 }
 
 impl State {
@@ -98,6 +141,7 @@ impl State {
             write_log: None,
             packed_cell_table: Vec::new(),
             packed_cell_size: 0,
+            disk_window: None,
         }
     }
 
@@ -218,7 +262,10 @@ impl State {
             // cells cover conventional RAM (0..0xA0000) on most cabinets
             // and also out-of-range regions like the VGA DAC at 0x100000
             // that live above 1 MB; those cells are emitted by kiln for
-            // both, so a single lookup covers both cases.
+            // both, so a single lookup covers both cases. The hot path
+            // (~96% of bytecode ops are LoadStateAndBranchIfNotEqLit on
+            // normal RAM) returns from inside this block; everything below
+            // is for misses (BIOS, disk window, MMIO).
             if !self.packed_cell_table.is_empty() && self.packed_cell_size > 0 {
                 let pack = self.packed_cell_size as usize;
                 let cell_idx = addr_u / pack;
@@ -236,6 +283,45 @@ impl State {
                 // Cell table exists but no entry for this address — fall
                 // through to the legacy paths below (extended HashMap for
                 // out-of-1MB regions; flat shadow for BIOS ROM literals).
+            }
+            // Pattern-recognised "windowed byte array" — CSS-DOS uses this
+            // shape for the rom-disk window, but the descriptor is in
+            // calcite's own vocabulary (window/key cell/byte array).
+            // Resolves the window read in O(1): one state-var read for the
+            // key, one flat-array index. Same byte the compiled CSS path
+            // would compute via the inline-exception chain → `--readDiskByte`
+            // flat-array dispatch.
+            //
+            // Placed AFTER the packed-cell check because the disk window's
+            // addresses (e.g. 0xD0000-0xD01FF) sit well above the packed
+            // cell table's range, so packed reads never fall in here. Each
+            // byte of conventional RAM (the 96% hot path) would otherwise
+            // pay for a disk-window check on every read_mem call — measured
+            // as a ~30% web slowdown when the check came first.
+            if let Some(ref dw) = self.disk_window {
+                if addr >= dw.window_base && addr < dw.window_end {
+                    let key = self.state_vars
+                        .get(dw.key_cell_slot)
+                        .copied()
+                        .unwrap_or(0);
+                    let computed_key = key.wrapping_mul(dw.stride)
+                        .wrapping_add(addr - dw.window_base);
+                    let idx = computed_key.wrapping_sub(dw.byte_array_base_key);
+                    if idx >= 0 {
+                        if let Some(&v) = dw.byte_array.get(idx as usize) {
+                            if let Ok(mut borrow) = self.read_log.try_borrow_mut() {
+                                if let Some(ref mut log) = *borrow { log.push((addr, v)); }
+                            }
+                            return v;
+                        }
+                    }
+                    // Out of array → byte was 0 in the cabinet (the flat
+                    // array's `default`).
+                    if let Ok(mut borrow) = self.read_log.try_borrow_mut() {
+                        if let Some(ref mut log) = *borrow { log.push((addr, 0)); }
+                    }
+                    return 0;
+                }
             }
             if addr_u >= 0xF0000 {
                 self.extended.get(&addr).copied().unwrap_or(0)
@@ -358,20 +444,30 @@ impl State {
         }
     }
 
-    /// Copy a byte range through the packed-aware write path. Handles
-    /// `src`/`dst` regions that may overlap in either direction.
+    /// Copy a byte range through the packed-aware write path, matching the
+    /// per-byte read-then-write semantics of REP MOVSB on x86 (forward
+    /// direction — the only direction this is called from, since
+    /// `rep_fast_forward` bails on DF=1).
+    ///
+    /// **Overlap matters here.** If `dst > src` and the ranges overlap,
+    /// later iterations read bytes that were *just written* by earlier
+    /// iterations. That is exactly the LZ77 self-reference UPX (and any
+    /// LZ-style decompressor) relies on: `MOV SI,dst-N; MOV CX,len;
+    /// REP MOVSB` to repeat the last N bytes. A `memmove`-style snapshot
+    /// would break that — the copy would pull stale source bytes and
+    /// produce garbage. Symptom: UPX-packed COMMAND.COM exits via INT 20h
+    /// because its decompression output is corrupt, kernel reads it as
+    /// "shell exited cleanly" and prints "Bad or missing command interpreter".
+    ///
+    /// Forward-overlap with `src > dst` is fine either way (writes don't
+    /// touch unread source bytes); backward-overlap (REP MOVSB with DF=1)
+    /// would be wrong with this implementation, but the fast-forward bails
+    /// before getting here in that case.
     pub fn bulk_copy_bytes(&mut self, src: usize, dst: usize, count: usize) {
         if count == 0 { return; }
-        // Snapshot source bytes first so overlapping src/dst regions
-        // behave like a left-to-right copy from a stable read view.
-        let mut buf = vec![0u8; count];
         for i in 0..count {
-            let sa = (src + i) as i32;
-            buf[i] = (self.read_mem(sa) & 0xFF) as u8;
-        }
-        // Now write them out through the packed-aware path.
-        for i in 0..count {
-            self.write_byte_packed_aware(dst + i, buf[i]);
+            let byte = (self.read_mem((src + i) as i32) & 0xFF) as u8;
+            self.write_byte_packed_aware(dst + i, byte);
         }
     }
 
@@ -780,6 +876,137 @@ impl State {
             }
         }
     }
+
+    /// Serialise the runtime-mutable parts of the state to a byte blob.
+    ///
+    /// What goes in: `state_vars`, `memory`, `extended`, `string_properties`,
+    /// `frame_counter` — everything the tick loop touches.
+    ///
+    /// What stays out: `state_var_names`/`state_var_index` (set by
+    /// `load_properties` from the parsed cabinet), `packed_cell_table` /
+    /// `packed_cell_size` / `disk_window` (wired at compile time from
+    /// `CompiledProgram`). A snapshot is therefore portable across runs of
+    /// the **same cabinet**: load the cabinet, restore the snapshot, the
+    /// machine resumes mid-execution. It is NOT portable across cabinets;
+    /// slot ordering depends on parse order.
+    ///
+    /// Format (little-endian throughout):
+    ///   "CSNP"                     4 bytes — magic
+    ///   u32 version = 1
+    ///   u32 state_vars_len, then n × i32     state_vars
+    ///   u32 memory_len,    then n × u8       memory
+    ///   u32 extended_count, then n × (i32 addr, i32 val)
+    ///   u32 string_count, then n × (u32 name_len, name_bytes,
+    ///                               u32 val_len,  val_bytes)
+    ///   u32 frame_counter
+    pub fn snapshot(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(
+            16 + self.state_vars.len() * 4 + self.memory.len() + self.extended.len() * 8,
+        );
+        out.extend_from_slice(b"CSNP");
+        out.extend_from_slice(&1u32.to_le_bytes());
+
+        out.extend_from_slice(&(self.state_vars.len() as u32).to_le_bytes());
+        for &v in &self.state_vars {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+
+        out.extend_from_slice(&(self.memory.len() as u32).to_le_bytes());
+        out.extend_from_slice(&self.memory);
+
+        out.extend_from_slice(&(self.extended.len() as u32).to_le_bytes());
+        for (&addr, &val) in &self.extended {
+            out.extend_from_slice(&addr.to_le_bytes());
+            out.extend_from_slice(&val.to_le_bytes());
+        }
+
+        out.extend_from_slice(&(self.string_properties.len() as u32).to_le_bytes());
+        for (name, val) in &self.string_properties {
+            let nb = name.as_bytes();
+            let vb = val.as_bytes();
+            out.extend_from_slice(&(nb.len() as u32).to_le_bytes());
+            out.extend_from_slice(nb);
+            out.extend_from_slice(&(vb.len() as u32).to_le_bytes());
+            out.extend_from_slice(vb);
+        }
+
+        out.extend_from_slice(&self.frame_counter.to_le_bytes());
+        out
+    }
+
+    /// Inverse of [`snapshot`](Self::snapshot). Replaces the runtime-mutable
+    /// fields in `self`. The compile-time fields (state_var_names, packed
+    /// cell table, disk window) are left alone — caller must be operating
+    /// against the same cabinet that produced the snapshot.
+    ///
+    /// Returns `Err(&str)` on bad magic, unsupported version, truncation,
+    /// invalid utf-8, or a state-vars/memory length mismatch with `self`.
+    pub fn restore(&mut self, blob: &[u8]) -> Result<(), &'static str> {
+        let mut p = 0usize;
+        fn take<'a>(blob: &'a [u8], p: &mut usize, n: usize) -> Result<&'a [u8], &'static str> {
+            if *p + n > blob.len() {
+                return Err("snapshot truncated");
+            }
+            let s = &blob[*p..*p + n];
+            *p += n;
+            Ok(s)
+        }
+        fn read_u32(blob: &[u8], p: &mut usize) -> Result<u32, &'static str> {
+            let s = take(blob, p, 4)?;
+            Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+        }
+        fn read_i32(blob: &[u8], p: &mut usize) -> Result<i32, &'static str> {
+            let s = take(blob, p, 4)?;
+            Ok(i32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+        }
+
+        let magic = take(blob, &mut p, 4)?;
+        if magic != b"CSNP" {
+            return Err("snapshot: bad magic (expected CSNP)");
+        }
+        let version = read_u32(blob, &mut p)?;
+        if version != 1 {
+            return Err("snapshot: unsupported version");
+        }
+
+        let svlen = read_u32(blob, &mut p)? as usize;
+        if svlen != self.state_vars.len() {
+            return Err("snapshot: state_vars length mismatch (different cabinet?)");
+        }
+        for slot in 0..svlen {
+            self.state_vars[slot] = read_i32(blob, &mut p)?;
+        }
+
+        let mlen = read_u32(blob, &mut p)? as usize;
+        if mlen != self.memory.len() {
+            return Err("snapshot: memory length mismatch (different cabinet?)");
+        }
+        let mbytes = take(blob, &mut p, mlen)?;
+        self.memory.copy_from_slice(mbytes);
+
+        let ext_count = read_u32(blob, &mut p)? as usize;
+        self.extended.clear();
+        for _ in 0..ext_count {
+            let addr = read_i32(blob, &mut p)?;
+            let val = read_i32(blob, &mut p)?;
+            self.extended.insert(addr, val);
+        }
+
+        let str_count = read_u32(blob, &mut p)? as usize;
+        self.string_properties.clear();
+        for _ in 0..str_count {
+            let nlen = read_u32(blob, &mut p)? as usize;
+            let nb = take(blob, &mut p, nlen)?.to_vec();
+            let vlen = read_u32(blob, &mut p)? as usize;
+            let vb = take(blob, &mut p, vlen)?.to_vec();
+            let name = String::from_utf8(nb).map_err(|_| "snapshot: bad utf-8 in name")?;
+            let val = String::from_utf8(vb).map_err(|_| "snapshot: bad utf-8 in value")?;
+            self.string_properties.insert(name, val);
+        }
+
+        self.frame_counter = read_u32(blob, &mut p)?;
+        Ok(())
+    }
 }
 
 impl Default for State {
@@ -931,5 +1158,47 @@ mod tests {
 
         state.write_mem(-2, -2);
         assert_eq!(state.state_vars[1], -2);
+    }
+
+    /// REP MOVSB with forward-overlap is the LZ77 self-reference pattern
+    /// that UPX (and any LZ-style decompressor) depends on. Each iteration
+    /// reads then writes one byte, so when SI catches up to the bytes DI
+    /// just wrote, those new bytes get re-copied — repeating the run.
+    /// `bulk_copy_bytes` must mirror this; a `memmove`-style snapshot
+    /// would silently break LZ77 and any UPX-packed program would produce
+    /// garbage on decompression. Concrete consequence we hit in the wild:
+    /// UPX-packed COMMAND.COM exiting via INT 20h instead of running its
+    /// shell loop, kernel reporting "Bad or missing command interpreter".
+    #[test]
+    fn bulk_copy_bytes_lz77_repeat() {
+        let mut state = State::default();
+        state.write_mem(0x100, b'A' as i32);
+        state.write_mem(0x101, b'B' as i32);
+        state.write_mem(0x102, b'C' as i32);
+        // Copy 6 bytes from 0x100 to 0x103 — LZ-style "repeat last 3".
+        // Per-iteration semantics: write A→0x103, B→0x104, C→0x105,
+        // then read 0x103 (now 'A') → write 0x106, etc.
+        state.bulk_copy_bytes(0x100, 0x103, 6);
+        assert_eq!(state.read_mem(0x103), b'A' as i32);
+        assert_eq!(state.read_mem(0x104), b'B' as i32);
+        assert_eq!(state.read_mem(0x105), b'C' as i32);
+        assert_eq!(state.read_mem(0x106), b'A' as i32);
+        assert_eq!(state.read_mem(0x107), b'B' as i32);
+        assert_eq!(state.read_mem(0x108), b'C' as i32);
+    }
+
+    /// Sister case: non-overlapping copy must still work — and copying
+    /// with `src > dst` (no overlap into source) must not be perturbed
+    /// by the per-byte loop.
+    #[test]
+    fn bulk_copy_bytes_disjoint() {
+        let mut state = State::default();
+        for i in 0..4 { state.write_mem(0x200 + i, (i + 1) as i32); }
+        state.bulk_copy_bytes(0x200, 0x300, 4);
+        for i in 0..4 {
+            assert_eq!(state.read_mem(0x300 + i), (i + 1) as i32);
+            // Source unchanged.
+            assert_eq!(state.read_mem(0x200 + i), (i + 1) as i32);
+        }
     }
 }

@@ -56,6 +56,13 @@ struct Args {
     /// Batch size for run_batch (0 = single-tick loop for profiling).
     #[arg(long, default_value = "0")]
     batch: u32,
+
+    /// Restore a snapshot blob (produced by `calcite-cli --snapshot-out`)
+    /// into the engine **before** the benchmark window. Use this to skip
+    /// boot/menu/loading and only measure a specific stage. Cabinet must
+    /// match the one used to produce the snapshot.
+    #[arg(long, value_name = "PATH")]
+    restore: Option<PathBuf>,
 }
 
 const REAL_8086_HZ: f64 = 4_772_727.0;
@@ -463,6 +470,16 @@ fn main() {
     state.load_properties(&parsed.properties);
     let mut evaluator = calcite_core::Evaluator::from_parsed(&parsed);
     evaluator.wire_state_for_packed_memory(&mut state);
+    evaluator.wire_state_for_disk_window(&mut state);
+    if let Some(path) = &args.restore {
+        match std::fs::read(path) {
+            Ok(bytes) => match state.restore(&bytes) {
+                Ok(()) => eprintln!("restored snapshot from {} ({} bytes)", path.display(), bytes.len()),
+                Err(e) => { eprintln!("--restore={}: {}", path.display(), e); std::process::exit(2); }
+            },
+            Err(e) => { eprintln!("--restore={}: {}", path.display(), e); std::process::exit(2); }
+        }
+    }
     let compile_time = t_compile_start.elapsed().as_secs_f64();
 
     let halt_addr: Option<i32> = args.halt.as_ref().map(|s| {
@@ -488,10 +505,17 @@ fn main() {
     }
 
     // --- Warmup ---
+    // Use run_batch (no per-tick state-vars clone). The slow tick() path
+    // is ~100x slower than run_batch on dense cabinets like doom8088, so
+    // a 5M warmup that should take ~13s would otherwise take ~22 minutes.
     if args.warmup > 0 {
         let t_warmup = Instant::now();
-        for _ in 0..args.warmup {
-            evaluator.tick(&mut state);
+        let warmup_batch = args.batch.max(1);
+        let mut remaining = args.warmup;
+        while remaining > 0 {
+            let n = remaining.min(warmup_batch);
+            evaluator.run_batch(&mut state, n);
+            remaining -= n;
         }
         let warmup_time = t_warmup.elapsed().as_secs_f64();
         if args.phase_breakdown {
@@ -513,9 +537,19 @@ fn main() {
             state.load_properties(&parsed.properties);
             evaluator = calcite_core::Evaluator::from_parsed(&parsed);
             evaluator.wire_state_for_packed_memory(&mut state);
+            evaluator.wire_state_for_disk_window(&mut state);
+            if let Some(path) = &args.restore {
+                if let Ok(bytes) = std::fs::read(path) {
+                    state.restore(&bytes).ok();
+                }
+            }
             if args.warmup > 0 {
-                for _ in 0..args.warmup {
-                    evaluator.tick(&mut state);
+                let warmup_batch = args.batch.max(1);
+                let mut remaining = args.warmup;
+                while remaining > 0 {
+                    let n = remaining.min(warmup_batch);
+                    evaluator.run_batch(&mut state, n);
+                    remaining -= n;
                 }
             }
         }

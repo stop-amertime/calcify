@@ -87,6 +87,13 @@ impl CalciteEngine {
         // available (read-side `packed_cell_tables[0]`, or the merged
         // write-port tables as a fallback).
         evaluator.wire_state_for_packed_memory(&mut state);
+        // Install the rom-disk window descriptor so reads in
+        // [0xD0000..0xD0200) collapse to one state-var read + one
+        // flat-array index instead of walking the inline-exception chain
+        // and re-evaluating `--readDiskByte` on every byte. Disk bytes
+        // come from the cabinet's compiled `--readDiskByte` flat array —
+        // no separate sidecar load is required.
+        evaluator.wire_state_for_disk_window(&mut state);
 
         let initial_properties = parsed.properties;
         Ok(CalciteEngine { state, evaluator, initial_properties })
@@ -104,6 +111,7 @@ impl CalciteEngine {
             self.state.populate_memory_from_readmem(table);
         }
         self.evaluator.wire_state_for_packed_memory(&mut self.state);
+        self.evaluator.wire_state_for_disk_window(&mut self.state);
     }
 
     /// Run a batch of ticks and return the property changes as a JSON string.
@@ -121,11 +129,68 @@ impl CalciteEngine {
         Ok(format!("[{}]", json_parts.join(",")))
     }
 
+    /// Run a batch of ticks WITHOUT computing the per-batch state-var diff.
+    ///
+    /// `tick_batch` returns the changed state vars as a JSON string for
+    /// callers (debug-server, conformance harness) that consume them.
+    /// The web bridge ignores the returned JSON — it observes state via
+    /// `get_state_var` / `read_framebuffer_rgba` after each batch instead.
+    /// On large cabinets the diff is non-trivial (doom8088: ~10K state
+    /// vars, full O(N) sweep each batch), and the JSON formatting on top
+    /// of that adds another ~5-10% per batch.
+    ///
+    /// This entry point skips both. Same correctness contract as
+    /// `tick_batch` for state advancement; just doesn't synthesize the
+    /// JSON return.
+    pub fn run_batch_silent(&mut self, count: u32) {
+        self.evaluator.run_batch_silent(&mut self.state, count);
+    }
+
+    /// Serialise the runtime-mutable state (state_vars + memory + extended
+    /// + string_properties + frame_counter) to a byte blob. Pair with
+    /// [`restore`](Self::restore) on the same cabinet to resume execution
+    /// from this exact tick — useful for benchmarking a level-load window
+    /// without re-running boot/title/menu first.
+    ///
+    /// The blob is portable across calcite-cli and calcite-wasm and across
+    /// runs of the same cabinet, but NOT across cabinets (slot ordering is
+    /// per-parse).
+    pub fn snapshot(&self) -> Vec<u8> {
+        self.state.snapshot()
+    }
+
+    /// Restore a snapshot blob produced by [`snapshot`](Self::snapshot)
+    /// against the same cabinet. Returns an error if the blob is malformed
+    /// or the cabinet's state shape doesn't match the snapshot.
+    pub fn restore(&mut self, blob: &[u8]) -> Result<(), JsError> {
+        self.state.restore(blob).map_err(JsError::new)
+    }
+
     /// Inject a keypress into the BDA ring buffer.
     /// Pass (scancode << 8 | ascii), matching the standard PC keyboard convention.
-    /// The BIOS INT 16h handler will pop it when the program next reads keyboard input.
+    /// Two delivery paths are populated:
+    ///   1. The BDA keyboard buffer at 0x41E (for INT 16h consumers).
+    ///   2. The `--keyboard` shadow at linear 0x500 (for INT 9h / port 0x60
+    ///      consumers — programs that hook IRQ 1 directly).
+    ///
+    /// In pure-CSS the player drives `--keyboard` from button :active state,
+    /// and CSS edge-detects make/break in `--_kbdPress` / `--_kbdRelease`.
+    /// Calcite implements `var(--keyboard)` as `read_mem(0x500)`, so writing
+    /// here is the equivalent. To produce a make/break pair the caller posts
+    /// (key=N, then key=0) on consecutive `set_keyboard` calls.
+    ///
+    /// DOOM8088 reads scancodes via `IN AL, 0x60` from its own INT 9h handler;
+    /// without this 0x500 write IRQ 1 never fires and the title-screen demo
+    /// loop never advances.
     pub fn set_keyboard(&mut self, key: i32) {
         self.state.bda_push_key(key);
+        // Drive the `--keyboard` state-var that calcite watches for IRQ 1
+        // edges. (CSS-DOS pure-CSS sets --keyboard via `:has(:active)` button
+        // rules; in calcite that mapping is replaced by a state-var slot of
+        // the same name. Without this write, --keyboard stays 0 forever and
+        // _kbdEdge never fires.) Smoke / SDK tests don't depend on this so
+        // it's a free addition.
+        self.state.set_var("keyboard", key & 0xFFFF);
     }
 
     /// Get the current value of a register (for debugging).
@@ -141,6 +206,14 @@ impl CalciteEngine {
     /// Returns 0 if the variable doesn't exist.
     pub fn get_state_var(&self, name: &str) -> i32 {
         self.state.get_var(name).unwrap_or(0)
+    }
+
+    /// Number of ticks evaluated since reset. Equivalent to the
+    /// `tick` count `calcite-cli` prints. Used by bench harnesses that
+    /// want a stable "calcite work units done" metric independent of
+    /// guest CPU frequency.
+    pub fn get_tick(&self) -> u32 {
+        self.state.frame_counter
     }
 
     /// Read text-mode video memory (character bytes only).
@@ -300,14 +373,28 @@ impl CalciteEngine {
         }
         // Build a mini State view whose `memory` covers just the framebuffer
         // at base_addr, then call the existing palette resolver. DAC entries
-        // live in `extended` which we share by clone — cheap since DAC is 768
-        // bytes and only populated when the guest program touches OUT 0x3C9.
+        // are materialised into `scratch.extended` via the unified read path:
+        // on packed cabinets the OUT 0x3C9 writes are routed through the
+        // packed broadcast-write port directly into `state_vars` — they do
+        // NOT go through `write_mem` and so never land in `self.extended`.
+        // Just cloning `self.extended` here misses every DAC byte and the
+        // palette-resolver falls back to CGA, producing the magenta/cyan
+        // garbage we saw on Doom8088 / Prince of Persia in the web player.
         let mut scratch = calcite_core::State::default();
         if scratch.memory.len() < base_addr + pixels {
             scratch.memory.resize(base_addr + pixels, 0);
         }
         scratch.memory[base_addr..base_addr + pixels].copy_from_slice(&vram);
         scratch.extended = self.state.extended.clone();
+        // Populate DAC palette via the unified path so packed cabinets work.
+        // 768 bytes = 256 entries x RGB (matches CSS-DOS kiln/memory.mjs DAC_BYTES).
+        for i in 0..768i32 {
+            let addr = calcite_core::state::VGA_DAC_LINEAR + i;
+            let v = self.read_byte_unified(addr) as i32;
+            if v != 0 {
+                scratch.extended.insert(addr, v);
+            }
+        }
         scratch.read_framebuffer_rgba(base_addr, width, height)
     }
 

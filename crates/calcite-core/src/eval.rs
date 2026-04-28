@@ -228,6 +228,51 @@ impl Evaluator {
         }
     }
 
+    /// Install the compile-time-recognised "windowed byte array" descriptor
+    /// on `State` so reads inside the window collapse to one state-var read +
+    /// one flat-array index (instead of walking the inline-exception CmpEq
+    /// chain in `--readMem` and re-evaluating the inner `--readDiskByte`
+    /// dispatch on every byte).
+    ///
+    /// Mirrors the contract of `wire_state_for_packed_memory`: must be
+    /// called after `state.load_properties` and before any ticks. Safe to
+    /// call when the cabinet has no rom-disk shape — descriptor is `None`
+    /// and `State::read_mem` skips the short-circuit.
+    pub fn wire_state_for_disk_window(&self, state: &mut crate::State) {
+        let Some(ref cw) = self.compiled.disk_window else { return };
+        // The compiler tracks the cell by NAME (e.g. "--__1mc632"), since
+        // state-var slot indices aren't assigned until State::load_properties.
+        // Resolve to the state var here. CSS-DOS double-buffers cells through
+        // intermediate names `--__1mcN` / `--__2mcN` whose default sources the
+        // canonical `--mcN` property; the canonical name is what
+        // `load_properties` registers as a state var (with the `--` stripped).
+        let bare = cw.key_cell_property.trim_start_matches("--");
+        let canonical = bare
+            .strip_prefix("__1")
+            .or_else(|| bare.strip_prefix("__2"))
+            .unwrap_or(bare);
+        let Some(slot) = state.var_slot(canonical) else {
+            log::warn!(
+                "[disk-window] cabinet has rom-disk dispatch but key cell `{}` (canonical `{}`) is not a state var; falling back to per-byte CSS",
+                cw.key_cell_property, canonical
+            );
+            return;
+        };
+        state.disk_window = Some(crate::state::DiskWindow {
+            window_base: cw.window_base,
+            window_end: cw.window_end,
+            key_cell_slot: slot,
+            stride: cw.stride,
+            byte_array_base_key: cw.byte_array_base_key,
+            byte_array: cw.byte_array.clone(),
+        });
+        log::info!(
+            "[disk-window] installed: window=[0x{:X},0x{:X}) stride={} key_cell={} byte_array_len={}",
+            cw.window_base, cw.window_end, cw.stride, cw.key_cell_property,
+            cw.byte_array.len()
+        );
+    }
+
     /// Build an evaluator from a `ParsedProgram`.
     pub fn from_parsed(program: &ParsedProgram) -> Self {
         let _t = Instant::now();
@@ -989,6 +1034,18 @@ impl Evaluator {
         TickResult {
             changes,
             ticks_executed: count,
+        }
+    }
+
+    /// Run a batch of ticks without computing the state-var diff.
+    ///
+    /// Use this when the caller doesn't consume the diff (the web bridge
+    /// observes state via direct property reads after each batch). On
+    /// dense cabinets — doom8088 has ~10K state vars — the snapshot+sweep
+    /// is a real per-batch cost we shouldn't pay if no one's reading it.
+    pub fn run_batch_silent(&mut self, state: &mut State, count: u32) {
+        for _ in 0..count {
+            self.tick_no_diff(state);
         }
     }
 
