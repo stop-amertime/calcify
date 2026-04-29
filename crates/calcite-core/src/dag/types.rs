@@ -46,8 +46,13 @@ pub enum CalcKind {
 /// `DagNode` because it never produces a value, only gates one.
 #[derive(Debug, Clone)]
 pub enum StyleCondNode {
-    /// `style(--prop: value)` — slot is the resolved property slot.
-    Single { slot: SlotId, value: NodeId },
+    /// `style(--prop: value)` — desugars to `lhs == value`. The LHS is
+    /// stored as a `NodeId` (not a `SlotId`) so that function inlining
+    /// can substitute params correctly: when `--prop` is a function
+    /// parameter inside an inlined body, the LHS is the call-site arg's
+    /// NodeId rather than a (non-existent) tick-global slot. For
+    /// top-level `style(--AX: 0)`, the LHS lowers to a `LoadVar` node.
+    Single { lhs: NodeId, value: NodeId },
     /// `cond1 and cond2 and …` — short-circuits left-to-right.
     And(Vec<StyleCondNode>),
     /// `cond1 or cond2 or …` — short-circuits left-to-right.

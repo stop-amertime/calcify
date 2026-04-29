@@ -1987,13 +1987,12 @@ impl Evaluator {
         transient_cache: &[Option<i32>],
         state: &State,
     ) -> bool {
-        use crate::dag::types::TickPosition;
         use crate::dag::StyleCondNode;
         match cond {
-            StyleCondNode::Single { slot, value } => {
-                let lhs = self.dag_read_slot(
-                    *slot,
-                    TickPosition::Current,
+            StyleCondNode::Single { lhs, value } => {
+                let lhs_v = self.dag_eval_node(
+                    dag,
+                    *lhs,
                     state_var_cache,
                     memory_cache,
                     transient_cache,
@@ -2007,7 +2006,7 @@ impl Evaluator {
                     transient_cache,
                     state,
                 );
-                lhs == rhs
+                lhs_v == rhs
             }
             StyleCondNode::And(parts) => parts.iter().all(|p| {
                 self.dag_eval_style_cond(

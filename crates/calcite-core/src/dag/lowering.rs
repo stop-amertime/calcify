@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use super::types::{CalcKind, Dag, DagNode, NodeId, SlotId, StyleCondNode, TickPosition};
 use crate::types::{
-    Assignment, CalcOp, Expr, ParsedProgram, StyleBranch, StyleTest,
+    Assignment, CalcOp, Expr, FunctionDef, ParsedProgram, StyleBranch, StyleTest,
 };
 
 /// Strip `--`, then optional `__0`/`__1`/`__2` prefix. Returns the bare
@@ -45,7 +45,7 @@ fn committed_slot_of(name: &str) -> Option<SlotId> {
 
 /// Lowering context: a fresh DAG plus a transient-slot allocator for
 /// property names that don't resolve to committed state.
-struct LowerCtx {
+struct LowerCtx<'a> {
     dag: Dag,
     /// Bare-name → SlotId for transient (per-tick scratch) properties.
     /// Allocated lazily as references and assignments reach unknown
@@ -57,15 +57,46 @@ struct LowerCtx {
     /// (→ allocate transient, ignore var() fallback) from "name is
     /// genuinely unresolved" (→ use var() fallback per CSS spec).
     assigned_names: std::collections::HashSet<String>,
+    /// Function definitions, keyed by `--name`. Borrowed from the
+    /// program for the duration of lowering so call sites can resolve
+    /// callees and inline their bodies.
+    functions: HashMap<String, &'a FunctionDef>,
+    /// Active inlining stack: each entry is a frame mapping
+    /// param/local name → NodeId. Innermost frame is last. A `var(--p)`
+    /// reference scans frames innermost-first; if found, it resolves to
+    /// the bound NodeId (the call-site arg or local's lowered body).
+    /// Mirrors v1's `self.properties` shadow-and-restore in
+    /// `eval_function_call`.
+    inline_frames: Vec<HashMap<String, NodeId>>,
+    /// Currently-inlining function names. If a call site tries to
+    /// inline a function already on this stack, we fall back to a
+    /// FuncCall node (delegated to v1) — CSS @function doesn't support
+    /// recursion, so this is defensive.
+    inlining_stack: Vec<String>,
 }
 
-impl LowerCtx {
+impl<'a> LowerCtx<'a> {
     fn new() -> Self {
         Self {
             dag: Dag::default(),
             transient_slots: HashMap::new(),
             assigned_names: std::collections::HashSet::new(),
+            functions: HashMap::new(),
+            inline_frames: Vec::new(),
+            inlining_stack: Vec::new(),
         }
+    }
+
+    /// Look up a name in the active inline frames (innermost first).
+    /// Used by `Expr::Var` lowering to short-circuit param/local
+    /// references during function-body inlining.
+    fn lookup_inline(&self, bare: &str) -> Option<NodeId> {
+        for frame in self.inline_frames.iter().rev() {
+            if let Some(&id) = frame.get(bare) {
+                return Some(id);
+            }
+        }
+        None
     }
 
     fn intern_function(&mut self, name: &str) -> u32 {
@@ -111,10 +142,23 @@ impl LowerCtx {
 
             Expr::Var { name, fallback } => {
                 let (bare, kind) = strip_var_name(name);
-                // CSS spec: `var(--x, fb)` evaluates fb only when --x
-                // is unresolved. "Unresolved" means: --x has neither
-                // a registered @property declaration nor any
-                // assignment that produces it. v2 distinguishes:
+                // 1. Inline frame check (param/local of the function
+                //    we're currently inlining). This must come before
+                //    the global-slot resolution: param names like
+                //    `--at` aren't tick-global, they're call-bound.
+                //    Triple-buffer prefixes (`--__1at`) on a param read
+                //    don't make sense (params are always current-call),
+                //    so we only consult the inline frame for current
+                //    reads.
+                if matches!(kind, TickPosition::Current) {
+                    if let Some(id) = self.lookup_inline(bare) {
+                        return id;
+                    }
+                }
+                // 2. CSS spec: `var(--x, fb)` evaluates fb only when
+                //    --x is unresolved. "Unresolved" means: --x has
+                //    neither a registered @property declaration nor
+                //    any assignment that produces it. v2 distinguishes:
                 //   - committed_slot_of(bare).is_some() → state var
                 //     or memory address → resolved.
                 //   - assigned_names.contains(bare) → an assignment
@@ -166,9 +210,13 @@ impl LowerCtx {
             }
 
             Expr::FunctionCall { name, args } => {
-                let fn_id = self.intern_function(name);
-                let lowered: Vec<NodeId> = args.iter().map(|e| self.lower_expr(e)).collect();
-                self.dag.push(DagNode::FuncCall { fn_id, args: lowered })
+                // Lower args in caller scope first. The same NodeId is
+                // referenced by every param substitution site, so the
+                // arg expression evaluates exactly once per call —
+                // matching v1's `eval_function_call` (which evaluates
+                // each arg once at bind time).
+                let arg_ids: Vec<NodeId> = args.iter().map(|e| self.lower_expr(e)).collect();
+                self.lower_call(name, arg_ids)
             }
 
             Expr::StyleCondition { branches, fallback } => {
@@ -194,18 +242,106 @@ impl LowerCtx {
         }
     }
 
+    /// Lower a function call: inline the body if possible, fall back
+    /// to a `FuncCall` delegation node otherwise.
+    ///
+    /// Inlining model: push a frame mapping each param name to the
+    /// corresponding caller-evaluated arg `NodeId`, then lower the
+    /// callee's `result` expression. Locals are lowered sequentially,
+    /// each adding to the same frame so subsequent locals (and the
+    /// result) can reference them.
+    ///
+    /// Recursion: `inlining_stack` tracks function names currently
+    /// being inlined. CSS `@function` doesn't allow recursion (Chrome
+    /// rejects it), so encountering a recursive call falls back to a
+    /// `FuncCall` delegation node — defensive, not expected.
+    ///
+    /// Unknown callees: if the program declares no function with this
+    /// name, emit a `FuncCall` to mirror v1's behaviour
+    /// (`eval_function_call` returns 0 for undefined functions); the
+    /// walker will hit the same not-found path. The `fn_id` is interned
+    /// so the call site has a stable handle.
+    fn lower_call(&mut self, name: &str, arg_ids: Vec<NodeId>) -> NodeId {
+        let func = match self.functions.get(name) {
+            Some(f) => *f,
+            None => {
+                let fn_id = self.intern_function(name);
+                return self.dag.push(DagNode::FuncCall { fn_id, args: arg_ids });
+            }
+        };
+        if self.inlining_stack.iter().any(|n| n == name) {
+            let fn_id = self.intern_function(name);
+            return self.dag.push(DagNode::FuncCall { fn_id, args: arg_ids });
+        }
+
+        // Build the param/local frame. Missing args (caller passed
+        // fewer than declared) bind to a literal 0, matching v1
+        // (`unwrap_or(Value::Number(0.0))`).
+        let mut frame: HashMap<String, NodeId> = HashMap::new();
+        for (i, param) in func.parameters.iter().enumerate() {
+            let bare = param.name.strip_prefix("--").unwrap_or(&param.name).to_string();
+            let id = arg_ids.get(i).copied().unwrap_or_else(|| self.dag.push(DagNode::Lit(0.0)));
+            frame.insert(bare, id);
+        }
+
+        self.inlining_stack.push(name.to_string());
+        self.inline_frames.push(frame);
+
+        // Lower locals sequentially. Each local's body sees previously-
+        // bound params and earlier locals (frame is on the stack), and
+        // its lowered NodeId becomes the binding for its own name.
+        for local in &func.locals {
+            let value_id = self.lower_expr(&local.value);
+            let bare = local.name.strip_prefix("--").unwrap_or(&local.name).to_string();
+            self.inline_frames
+                .last_mut()
+                .expect("inline frame just pushed")
+                .insert(bare, value_id);
+        }
+
+        let result_id = self.lower_expr(&func.result);
+
+        self.inline_frames.pop();
+        self.inlining_stack.pop();
+
+        result_id
+    }
+
     fn lower_style_test(&mut self, test: &StyleTest) -> StyleCondNode {
         match test {
             StyleTest::Single { property, value } => {
-                let (bare, _kind) = strip_var_name(property);
-                // The slot of a `style(--P: V)` test is P's current-
-                // tick slot. May be transient if --P is computed but
-                // not @property-declared (e.g. --opcode in CSS-DOS
-                // cabinets). The walker handles transient slots in
-                // both reads (LoadVar) and StyleCondNode lookups.
-                let slot = self.slot_for(bare);
+                let (bare, kind) = strip_var_name(property);
+                // The LHS of a `style(--P: V)` test is whatever a
+                // `var(--P)` would evaluate to in the same scope.
+                // During function-body inlining, that may be the
+                // substituted call-site arg (param/local frame),
+                // otherwise it's a tick-global slot read. Reuse the
+                // same lookup logic as Expr::Var lowering — we just
+                // construct a synthetic Var node and lower it.
+                //
+                // (We can't take a shortcut here because `--P` could
+                // be a function parameter whose substituted value is
+                // anything from a literal to a complex sub-expression.)
+                let lhs = if matches!(kind, TickPosition::Current) {
+                    if let Some(id) = self.lookup_inline(bare) {
+                        id
+                    } else if committed_slot_of(bare).is_some()
+                        || self.assigned_names.contains(bare)
+                    {
+                        let slot = self.slot_for(bare);
+                        self.dag.push(DagNode::LoadVar { slot, kind })
+                    } else {
+                        // Unresolved property in a style() test reads
+                        // as 0 (the registered initial-value default
+                        // for unregistered numeric properties).
+                        self.dag.push(DagNode::Lit(0.0))
+                    }
+                } else {
+                    let slot = self.slot_for(bare);
+                    self.dag.push(DagNode::LoadVar { slot, kind })
+                };
                 let value_id = self.lower_expr(value);
-                StyleCondNode::Single { slot, value: value_id }
+                StyleCondNode::Single { lhs, value: value_id }
             }
             StyleTest::And(parts) => {
                 StyleCondNode::And(parts.iter().map(|p| self.lower_style_test(p)).collect())
@@ -295,11 +431,13 @@ pub fn lower_parsed_program(program: &ParsedProgram) -> Dag {
     absorbed.extend(packed_result.absorbed_properties);
     absorbed.extend(program.fast_path_absorbed.iter().cloned());
 
-    // Intern function names so call sites can reference them by id.
-    // Phase 1 does NOT lower function bodies — see lower_function
-    // above for the rationale. The walker delegates entire calls to
-    // v1's eval_function_call, which handles parameter binding.
+    // Index function definitions by name so `lower_call` can resolve
+    // callees and inline their bodies. Also intern each name so that
+    // any call we can't inline (currently: recursive callees only —
+    // CSS rejects them but the guard is defensive) still has a stable
+    // `fn_id` for the FuncCall fallback delegated to v1.
     for f in &program.functions {
+        ctx.functions.insert(f.name.clone(), f);
         ctx.intern_function(&f.name);
     }
 
@@ -486,10 +624,12 @@ fn collect_style_cond_reads(
     out: &mut Vec<usize>,
 ) {
     match cond {
-        StyleCondNode::Single { slot, value } => {
-            if let Some(&idx) = slot_to_term.get(slot) {
-                out.push(idx);
-            }
+        StyleCondNode::Single { lhs, value } => {
+            // The LHS is now a NodeId (an arbitrary expression — a
+            // LoadVar at top level, or a substituted param node when
+            // inlined). Recurse into it so any LoadVar Current reads
+            // contribute to the topo edges, just like the value side.
+            collect_current_reads(dag, *lhs, slot_to_term, out);
             collect_current_reads(dag, *value, slot_to_term, out);
         }
         StyleCondNode::And(parts) | StyleCondNode::Or(parts) => {
@@ -581,7 +721,11 @@ mod tests {
     }
 
     #[test]
-    fn lowers_function_call() {
+    fn lowers_function_call_by_inlining() {
+        // `--double(21)` should inline to `calc(21 * 2)` — i.e. a Calc
+        // node whose first arg is the lit 21 (param substitution) and
+        // second is the lit 2. No FuncCall node should remain because
+        // there's no recursion and the callee is known.
         let css = r#"
             @property --AX { syntax: "<integer>"; inherits: true; initial-value: 0; }
             @function --double(--x <integer>) returns <integer> {
@@ -590,18 +734,57 @@ mod tests {
             .cpu { --AX: --double(21); }
         "#;
         let dag = build(css);
-        // The function should be interned and have a root.
-        assert_eq!(dag.function_names.len(), 1);
-        let id = dag.function_names["--double"];
-        assert!(dag.function_roots[id as usize] != NodeId::MAX);
-        // The terminal's value should be a FuncCall referencing it.
-        let terminal_id = dag.terminals[0];
-        match &dag.nodes[terminal_id as usize] {
-            DagNode::WriteVar { value, .. } => match &dag.nodes[*value as usize] {
-                DagNode::FuncCall { fn_id, .. } => assert_eq!(*fn_id, id),
-                other => panic!("expected FuncCall, got {other:?}"),
-            },
-            other => panic!("expected WriteVar, got {other:?}"),
+        assert_eq!(dag.terminals.len(), 1);
+
+        // No FuncCall in the DAG.
+        for n in &dag.nodes {
+            if matches!(n, DagNode::FuncCall { .. }) {
+                panic!("expected no FuncCall after inlining; DAG: {:?}", dag.nodes);
+            }
         }
+
+        // Terminal's value is a Mul node.
+        let terminal_id = dag.terminals[0];
+        let value_id = match &dag.nodes[terminal_id as usize] {
+            DagNode::WriteVar { value, .. } => *value,
+            other => panic!("expected WriteVar, got {other:?}"),
+        };
+        match &dag.nodes[value_id as usize] {
+            DagNode::Calc { op: CalcKind::Mul, args } => {
+                assert_eq!(args.len(), 2);
+                // Param substitution: arg[0] should resolve to Lit(21).
+                match &dag.nodes[args[0] as usize] {
+                    DagNode::Lit(v) => assert_eq!(*v, 21.0),
+                    other => panic!("expected Lit(21) for substituted --x, got {other:?}"),
+                }
+                match &dag.nodes[args[1] as usize] {
+                    DagNode::Lit(v) => assert_eq!(*v, 2.0),
+                    other => panic!("expected Lit(2), got {other:?}"),
+                }
+            }
+            other => panic!("expected Calc(Mul), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inlining_preserves_locals() {
+        // A function with a local that depends on a param. The local's
+        // value-NodeId should be referenced by the result's body.
+        let css = r#"
+            @property --AX { syntax: "<integer>"; inherits: true; initial-value: 0; }
+            @function --plus3(--x <integer>) returns <integer> {
+                --tmp: calc(var(--x) + 1);
+                result: calc(var(--tmp) + 2);
+            }
+            .cpu { --AX: --plus3(10); }
+        "#;
+        let dag = build(css);
+        // No FuncCall remains.
+        for n in &dag.nodes {
+            if matches!(n, DagNode::FuncCall { .. }) {
+                panic!("expected no FuncCall after inlining");
+            }
+        }
+        assert_eq!(dag.terminals.len(), 1);
     }
 }
