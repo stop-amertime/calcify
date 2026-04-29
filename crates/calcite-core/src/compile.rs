@@ -5555,33 +5555,32 @@ fn column_drawer_fast_forward(program: &CompiledProgram, state: &mut State, slot
         state.get_var(bare)
     }
 
-    // Guards: must have --opcode (post-tick), no REP, no segment override.
-    let opcode = match read_prop(program, state, slots, "--opcode") {
-        Some(v) => v,
-        None => return 0,
-    };
-    // Body's first byte is 0x88. Only fire when we just executed it (or at
-    // the start of a body). If post-tick opcode is not the body's last byte
-    // (0x01 ADD r/m16,r16 from byte 19) we can still fire if next-IP lands
-    // at a body. Simpler condition: detection by ROM bytes at IP.
-    let _ = opcode;
-
-    let has_rep = read_prop(program, state, slots, "--hasREP").unwrap_or(0);
-    if has_rep != 0 { return 0; }
-    let has_seg_ov = read_prop(program, state, slots, "--hasSegOverride").unwrap_or(0);
-    if has_seg_ov != 0 { return 0; }
-
-    // Read CS:IP, compute linear IP.
+    // Cheap fast-out: the column-drawer body STARTS with 0x88 (mov r/m8,r8).
+    // Read the byte at current linear-IP first; if it's not 0x88 we can't
+    // be at body entry. This costs one read_mem per tick rather than the
+    // 21-byte rom_match. Almost every tick lands here.
     let cs = match state.get_var("CS") { Some(v) => v, None => return 0 };
     let ip = match state.get_var("IP") { Some(v) => v, None => return 0 };
     let cs_base = (cs as i64) * 16;
     let ip_lin = cs_base + (ip as i64);
     if ip_lin < 0 { return 0; }
+    if (state.read_mem(ip_lin as i32) & 0xFF) as u8 != COLUMN_DRAWER_BODY[0] {
+        return 0;
+    }
 
-    // Detect the column-drawer body at current IP. If we just executed
-    // byte 20 of body N, the post-tick IP points at byte 0 of body N+1
-    // (or the next instruction if this was the last body). So we match
-    // the body starting at the CURRENT post-tick IP.
+    // Cheap byte-1 fast-out: body[1] = 0xF0 (modrm of mov al,dh).
+    if (state.read_mem((ip_lin + 1) as i32) & 0xFF) as u8 != COLUMN_DRAWER_BODY[1] {
+        return 0;
+    }
+
+    // Now we've passed the cheap pre-filter (byte 0 + byte 1 match). Do the
+    // expensive guards: no REP, no segment override, full body match.
+    let has_rep = read_prop(program, state, slots, "--hasREP").unwrap_or(0);
+    if has_rep != 0 { return 0; }
+    let has_seg_ov = read_prop(program, state, slots, "--hasSegOverride").unwrap_or(0);
+    if has_seg_ov != 0 { return 0; }
+
+    // Full 21-byte body match starting at current post-tick IP.
     if !rom_match(state, ip_lin as i32, COLUMN_DRAWER_BODY) {
         return 0;
     }
