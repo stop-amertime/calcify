@@ -168,5 +168,6 @@ fn op_name(op: &Op) -> &'static str {
         Op::MemoryFill { .. } => "MemoryFill",
         Op::MemoryCopy { .. } => "MemoryCopy",
         Op::Call { .. } => "Call",
+        Op::ReplicatedBody { .. } => "ReplicatedBody",
     }
 }

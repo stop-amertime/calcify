@@ -14,5 +14,8 @@
 //! - **`@function` inlining.** (Optional, future)
 
 pub mod broadcast_write;
+pub mod byte_period;
 pub mod dispatch_table;
+pub mod fusion_sim;
 pub mod packed_broadcast_write;
+pub mod replicated_body;

@@ -426,6 +426,28 @@ pub enum Op {
         count_slot: Slot,
         exit_target: u32,
     },
+
+    /// Replicated body: executes a periodic op sequence detected by the
+    /// `replicated_body` recogniser. At runtime, for each rep `k` in
+    /// `0..reps`, the body's ops are evaluated with operand fields adjusted
+    /// by `k * stride` for any operand classified as Linear by the
+    /// classifier. Constant operands keep their template value.
+    ///
+    /// `body` holds the rep-0 ops verbatim (template form). `strides` is a
+    /// parallel array — one entry per body op — listing
+    /// `(operand_index, stride)` for each Linear operand. Operand indices
+    /// are the canonical extraction order from
+    /// `pattern::replicated_body::extract_op_fields`.
+    ///
+    /// Body ops must be straight-line (no branch/jump/dispatch/bulk-mem
+    /// variants) and must not contain variable-arity Vec fields
+    /// (Min/Max/Call) — the recogniser bails on those before constructing
+    /// this op.
+    ReplicatedBody {
+        body: Box<[Op]>,
+        strides: Box<[Box<[(u8, i32)]>]>,
+        reps: u32,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -606,14 +628,20 @@ pub struct CompiledSpillover {
 /// One CompiledPackedBroadcastWrite covers all packed cells through one slot.
 /// Slot 0 is applied last so it wins same-cell collisions (matching the CSS
 /// `--applySlot` chain's outermost-wins semantics).
+///
+/// Width semantics: `width_slot` reads 1 (byte splice at `addr_slot`) or 2
+/// (word splice with lo at `addr_slot` and hi at `addr_slot+1` — may straddle
+/// two adjacent cells when the address is odd-aligned).
 #[derive(Debug)]
 pub struct CompiledPackedBroadcastWrite {
     /// Slot holding the per-tick gate (`--_slotKLive`). Skip the port when 0.
     pub gate_slot: Slot,
     /// Slot holding the byte address (`--memAddrK`).
     pub addr_slot: Slot,
-    /// Slot holding the byte value (`--memValK`).
+    /// Slot holding the byte (width=1) or 16-bit word (width=2) value (`--memValK`).
     pub val_slot: Slot,
+    /// Slot holding the per-tick width gate (`--_slotKWidth`). 1 or 2.
+    pub width_slot: Slot,
     /// Pack size — bytes per cell (currently always 2).
     pub pack: u8,
     /// Dense cell-index → cell-state-address lookup. Index by `byte_addr / pack`.
@@ -3216,14 +3244,15 @@ pub fn compile(
         // Resolve slots. If any is missing, skip the port — better to fall
         // back to the non-absorbed `--mc{N}` evaluation than to silently
         // splice from slot 0.
-        let (Some(&gate_slot), Some(&addr_slot), Some(&val_slot)) = (
+        let (Some(&gate_slot), Some(&addr_slot), Some(&val_slot), Some(&width_slot)) = (
             compiler.property_slots.get(&port.gate_property),
             compiler.property_slots.get(&port.addr_property),
             compiler.property_slots.get(&port.val_property),
+            compiler.property_slots.get(&port.width_property),
         ) else {
             log::warn!(
-                "Packed broadcast port {} {} {}: missing slot binding, skipping",
-                port.gate_property, port.addr_property, port.val_property
+                "Packed broadcast port {} {} {} {}: missing slot binding, skipping",
+                port.gate_property, port.addr_property, port.val_property, port.width_property
             );
             continue;
         };
@@ -3246,6 +3275,7 @@ pub fn compile(
             gate_slot,
             addr_slot,
             val_slot,
+            width_slot,
             pack: port.pack,
             cell_table,
         });
@@ -3303,6 +3333,15 @@ pub fn compile(
     let _ct = web_time::Instant::now();
     compact_slots(&mut program);
     log::info!("[compile detail] slot compaction: {:.2}s", _ct.elapsed().as_secs_f64());
+
+    // Replicated-body recognition: fold long unrolled straight-line regions
+    // (e.g. emitter-unrolled column drawers) into a single Op::ReplicatedBody.
+    // Must run AFTER all peephole passes and slot compaction so the slot-
+    // walking utility functions never encounter the new variant.
+    let _ct = web_time::Instant::now();
+    let folded = recognise_replicated_bodies(&mut program);
+    log::info!("[compile detail] replicated_body: {} regions folded, {:.2}s",
+        folded, _ct.elapsed().as_secs_f64());
 
     profile_compile_dump();
     program
@@ -3877,6 +3916,354 @@ fn fuse_ls_ops(ops: &mut Vec<Op>, chain_tables: &mut [DispatchChainTable]) -> us
 }
 
 // ---------------------------------------------------------------------------
+// Replicated-body recognition — collapse unrolled straight-line regions
+// ---------------------------------------------------------------------------
+
+/// Walks every op array in the program, finds maximal straight-line regions
+/// (no incoming branch targets in the middle, no branch/jump/dispatch/bulk-
+/// memory/Vec-bearing variants), and where such a region is K-periodic with
+/// K >= MIN_REPS, replaces the region with one `Op::ReplicatedBody`.
+///
+/// Returns the number of regions folded.
+///
+/// Must run after `compact_slots` — folding alters op-array length and
+/// branch targets, and the slot-walking utility functions
+/// (`op_slots_read`, `op_dst`, `map_op_slots`, `seed_from_parent`) panic on
+/// `ReplicatedBody` because they have no sensible answer for it.
+fn recognise_replicated_bodies(program: &mut CompiledProgram) -> usize {
+    let mut total = 0;
+    total += recognise_replicated_in(&mut program.ops, &mut program.chain_tables);
+    for table in &mut program.dispatch_tables {
+        for (_k, (entry_ops, _s)) in &mut table.entries {
+            total += recognise_replicated_in(entry_ops, &mut program.chain_tables);
+        }
+        total += recognise_replicated_in(&mut table.fallback_ops, &mut program.chain_tables);
+    }
+    for bw in &mut program.broadcast_writes {
+        total += recognise_replicated_in(&mut bw.value_ops, &mut program.chain_tables);
+        if let Some(ref mut sp) = bw.spillover {
+            for (_k, (spill_ops, _s)) in &mut sp.entries {
+                total += recognise_replicated_in(spill_ops, &mut program.chain_tables);
+            }
+        }
+    }
+    total
+}
+
+/// Per-ops-array recogniser. See `recognise_replicated_bodies` for context.
+fn recognise_replicated_in(
+    ops: &mut Vec<Op>,
+    chain_tables: &mut [DispatchChainTable],
+) -> usize {
+    use crate::pattern::replicated_body::{
+        classify_body, detect_period, BailReason, OperandClass, MIN_PERIOD, MIN_REPS,
+    };
+
+    // Diagnostic: count straight-line region lengths so we can tell whether
+    // the issue is "no straight-line regions long enough" or "regions exist
+    // but aren't periodic". Disabled by default; flip CALCITE_DBG_REPL=1 to
+    // enable. The histogram is printed at end of recogniser.
+    let dbg_enabled = std::env::var_os("CALCITE_DBG_REPL").is_some();
+    let mut dbg_region_lens: Vec<usize> = Vec::new();
+    let mut dbg_classify_attempts: usize = 0;
+    let mut dbg_classify_bails: Vec<&'static str> = Vec::new();
+
+    if ops.len() < MIN_PERIOD * MIN_REPS {
+        return 0;
+    }
+
+    // Build is_target: every op index that is a branch destination, a chain-
+    // table body PC pointing into this array, or a flat-table chain target.
+    // We may not fold a region that contains an internal jump target (the
+    // jumper would land in the middle of the body and skip earlier ops).
+    let referenced_chain_ids: Vec<u32> = {
+        let mut v: Vec<u32> = ops.iter().filter_map(|op| {
+            if let Op::DispatchChain { chain_id, .. } = op { Some(*chain_id) } else { None }
+        }).collect();
+        v.sort();
+        v.dedup();
+        v
+    };
+
+    let mut is_target = vec![false; ops.len() + 1];
+    for op in ops.iter() {
+        match op {
+            Op::BranchIfZero { target, .. }
+            | Op::BranchIfNotEqLit { target, .. }
+            | Op::LoadStateAndBranchIfNotEqLit { target, .. }
+            | Op::Jump { target } => mark_target(&mut is_target, *target),
+            Op::DispatchChain { miss_target, .. } => mark_target(&mut is_target, *miss_target),
+            Op::Dispatch { fallback_target, .. } => mark_target(&mut is_target, *fallback_target),
+            Op::MemoryFill { exit_target, .. } | Op::MemoryCopy { exit_target, .. } => {
+                mark_target(&mut is_target, *exit_target);
+            }
+            _ => {}
+        }
+    }
+    for &cid in &referenced_chain_ids {
+        for (_v, body_pc) in &chain_tables[cid as usize].entries {
+            mark_target(&mut is_target, *body_pc);
+        }
+        if let Some(ref flat) = chain_tables[cid as usize].flat_table {
+            for &t in &flat.targets {
+                if t != u32::MAX {
+                    mark_target(&mut is_target, t);
+                }
+            }
+        }
+    }
+
+    // is_eligible: an op may live inside a body iff it has no branch field,
+    // no Vec-bearing field, and no exit_target. Equivalent to "extract_op_fields
+    // returns is_branch=false and the variant is not Min/Max/Call".
+    let eligible = |op: &Op| -> bool {
+        match op {
+            Op::Min { .. } | Op::Max { .. } | Op::Call { .. } => false,
+            Op::BranchIfZero { .. }
+            | Op::BranchIfNotEqLit { .. }
+            | Op::LoadStateAndBranchIfNotEqLit { .. }
+            | Op::Jump { .. }
+            | Op::DispatchChain { .. }
+            | Op::Dispatch { .. }
+            | Op::MemoryFill { .. }
+            | Op::MemoryCopy { .. }
+            | Op::ReplicatedBody { .. } => false,
+            _ => true,
+        }
+    };
+
+    // Scan: for each potential region start, find the maximal eligible run
+    // (no internal target, all ops eligible). Try to fold; if it folds, jump
+    // past it and continue. If it doesn't, advance one op and retry.
+    let mut folded_regions: Vec<(usize, usize, Op)> = Vec::new(); // (start, end_exclusive, replacement)
+    let mut i = 0;
+    while i < ops.len() {
+        if !eligible(&ops[i]) {
+            i += 1;
+            continue;
+        }
+        // Find region end: stop at first ineligible op or first internal
+        // target (a target at i is allowed — it's the region head).
+        let region_start = i;
+        let mut end = i + 1;
+        while end < ops.len() && eligible(&ops[end]) && !is_target[end] {
+            end += 1;
+        }
+        let region_len = end - region_start;
+        if dbg_enabled {
+            dbg_region_lens.push(region_len);
+        }
+        if region_len < MIN_PERIOD * MIN_REPS {
+            i = end;
+            continue;
+        }
+        let region = &ops[region_start..end];
+
+        // Try every period that divides the region and yields >= MIN_REPS.
+        // detect_period takes the full slice and finds the smallest period
+        // where the *whole* slice is periodic. If the region's length isn't
+        // periodic, try truncating the tail to find a periodic prefix.
+        if let Some(p) = detect_period(region) {
+            // Periodic for the full region. Try to classify.
+            dbg_classify_attempts += 1;
+            match classify_body(region, p.period, p.reps) {
+                Ok(bt) => {
+                    let folded = build_replicated_body_op(&bt, region);
+                    folded_regions.push((region_start, end, folded));
+                    i = end;
+                    continue;
+                }
+                Err(bail) => {
+                    if dbg_enabled {
+                        dbg_classify_bails.push(match bail {
+                            BailReason::BranchInBody { .. } => "BranchInBody",
+                            BailReason::StructuralMismatch { .. } => "StructuralMismatch",
+                            BailReason::NonAffineOperand { .. } => "NonAffineOperand",
+                            BailReason::ArityMismatch { .. } => "ArityMismatch",
+                        });
+                    }
+                }
+            }
+        } else {
+            // The region wasn't fully periodic. Try the largest periodic
+            // prefix at every candidate period >= MIN_PERIOD up to
+            // region_len / MIN_REPS. This catches "16 reps + a couple of
+            // trailing odd ops".
+            let max_period = region_len / MIN_REPS;
+            'periods: for period in MIN_PERIOD..=max_period {
+                let reps_max = region_len / period;
+                if reps_max < MIN_REPS {
+                    break;
+                }
+                let prefix_reps = crate::pattern::replicated_body::longest_periodic_prefix(
+                    region, 0, period,
+                );
+                if prefix_reps < MIN_REPS {
+                    continue;
+                }
+                let prefix_len = period * prefix_reps;
+                let prefix = &region[..prefix_len];
+                if let Ok(bt) = classify_body(prefix, period, prefix_reps) {
+                    let folded = build_replicated_body_op(&bt, prefix);
+                    folded_regions.push((region_start, region_start + prefix_len, folded));
+                    i = region_start + prefix_len;
+                    break 'periods;
+                }
+            }
+            // If no period worked, advance past the region (it's not foldable).
+            if folded_regions.last().map(|(_s, e, _)| *e) != Some(end)
+                && folded_regions.last().map(|(s, _e, _)| *s) != Some(region_start)
+            {
+                i = end;
+                continue;
+            }
+            // If we did fold something here, `i` was already updated above.
+            continue;
+        }
+        i = end;
+    }
+
+    let _ = OperandClass::Constant(0); // keep import alive
+
+    if dbg_enabled {
+        // Per-array histogram: how big are the straight-line regions, and
+        // how many classify attempts bailed and why?
+        if !dbg_region_lens.is_empty() {
+            let max = *dbg_region_lens.iter().max().unwrap_or(&0);
+            let n_long: usize = dbg_region_lens.iter().filter(|&&l| l >= MIN_PERIOD * MIN_REPS).count();
+            let n_total = dbg_region_lens.len();
+            eprintln!(
+                "[repl-dbg] ops_len={} regions={} long(>={})={} max_region={} classify_attempts={} bails={:?}",
+                ops.len(),
+                n_total,
+                MIN_PERIOD * MIN_REPS,
+                n_long,
+                max,
+                dbg_classify_attempts,
+                dbg_classify_bails,
+            );
+        }
+    }
+
+    if folded_regions.is_empty() {
+        return 0;
+    }
+
+    let n_folded = folded_regions.len();
+
+    // Build a new ops array with folded regions replaced. Track the index
+    // remapping so we can fix branch targets.
+    let mut new_ops: Vec<Op> = Vec::with_capacity(ops.len());
+    let mut new_indices = vec![0u32; ops.len() + 1];
+    let mut region_iter = folded_regions.into_iter().peekable();
+    let mut old = 0;
+    while old < ops.len() {
+        new_indices[old] = new_ops.len() as u32;
+        if let Some((rstart, _rend, _)) = region_iter.peek() {
+            if *rstart == old {
+                let (_, rend, replacement) = region_iter.next().unwrap();
+                new_ops.push(replacement);
+                // All old indices inside [rstart, rend) collapse onto the
+                // single inserted op. We don't expect any branch targets to
+                // land inside (we built `is_target` to prevent that), but if
+                // one does (from a chain body PC we missed), point it at the
+                // ReplicatedBody op.
+                for inside in (old + 1)..rend {
+                    new_indices[inside] = new_ops.len() as u32 - 1;
+                }
+                old = rend;
+                continue;
+            }
+        }
+        new_ops.push(std::mem::replace(&mut ops[old], Op::LoadLit { dst: 0, val: 0 }));
+        old += 1;
+    }
+    new_indices[ops.len()] = new_ops.len() as u32;
+    let new_end = new_ops.len() as u32;
+
+    // Remap all branch/jump/dispatch targets in the rewritten array.
+    for op in new_ops.iter_mut() {
+        match op {
+            Op::BranchIfZero { target, .. }
+            | Op::BranchIfNotEqLit { target, .. }
+            | Op::LoadStateAndBranchIfNotEqLit { target, .. }
+            | Op::Jump { target } => {
+                let o = *target as usize;
+                *target = if o < new_indices.len() { new_indices[o] } else { new_end };
+            }
+            Op::DispatchChain { miss_target, .. } => {
+                let o = *miss_target as usize;
+                *miss_target = if o < new_indices.len() { new_indices[o] } else { new_end };
+            }
+            Op::Dispatch { fallback_target, .. } => {
+                let o = *fallback_target as usize;
+                *fallback_target = if o < new_indices.len() { new_indices[o] } else { new_end };
+            }
+            Op::MemoryFill { exit_target, .. } | Op::MemoryCopy { exit_target, .. } => {
+                let o = *exit_target as usize;
+                *exit_target = if o < new_indices.len() { new_indices[o] } else { new_end };
+            }
+            _ => {}
+        }
+    }
+
+    // Remap chain-table body PCs and flat-table targets that point into this
+    // array.
+    for &cid in &referenced_chain_ids {
+        for (_v, body_pc) in chain_tables[cid as usize].entries.iter_mut() {
+            let o = *body_pc as usize;
+            *body_pc = if o < new_indices.len() { new_indices[o] } else { new_end };
+        }
+        if let Some(ref mut flat) = chain_tables[cid as usize].flat_table {
+            for t in flat.targets.iter_mut() {
+                if *t == u32::MAX { continue; }
+                let o = *t as usize;
+                *t = if o < new_indices.len() { new_indices[o] } else { new_end };
+            }
+        }
+    }
+
+    *ops = new_ops;
+    n_folded
+}
+
+fn mark_target(is_target: &mut [bool], target: u32) {
+    let t = target as usize;
+    if t < is_target.len() {
+        is_target[t] = true;
+    }
+}
+
+/// Translate a classified BodyTemplate into the runtime Op::ReplicatedBody.
+/// `region` is the original op slice the template was classified from; we
+/// take the first `period` ops as the body templates.
+fn build_replicated_body_op(
+    bt: &crate::pattern::replicated_body::BodyTemplate,
+    region: &[Op],
+) -> Op {
+    use crate::pattern::replicated_body::OperandClass;
+    let body: Vec<Op> = region[..bt.period].to_vec();
+
+    // For each body op, build the strides list — operand_index, stride for
+    // every Linear-classified operand. Constant operands are dropped.
+    let strides: Vec<Box<[(u8, i32)]>> = bt.ops.iter().map(|op_t| {
+        let v: Vec<(u8, i32)> = op_t.operands.iter().enumerate().filter_map(|(i, c)| {
+            match c {
+                OperandClass::Constant(_) => None,
+                OperandClass::Linear { stride, .. } => Some((i as u8, *stride as i32)),
+            }
+        }).collect();
+        v.into_boxed_slice()
+    }).collect();
+
+    Op::ReplicatedBody {
+        body: body.into_boxed_slice(),
+        strides: strides.into_boxed_slice(),
+        reps: bt.reps as u32,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Dispatch-chain recognition — collapse runs of same-slot BranchIfNotEqLit
 // ---------------------------------------------------------------------------
 
@@ -4424,6 +4811,7 @@ fn compact_slots(program: &mut CompiledProgram) {
         port.gate_slot = slot_map.get(&port.gate_slot).copied().unwrap_or(port.gate_slot);
         port.addr_slot = slot_map.get(&port.addr_slot).copied().unwrap_or(port.addr_slot);
         port.val_slot = slot_map.get(&port.val_slot).copied().unwrap_or(port.val_slot);
+        port.width_slot = slot_map.get(&port.width_slot).copied().unwrap_or(port.width_slot);
     }
 
     program.slot_count = alloc.high_water;
@@ -4474,6 +4862,7 @@ fn collect_main_pinned(program: &CompiledProgram) -> Vec<Slot> {
         pinned.push(port.gate_slot);
         pinned.push(port.addr_slot);
         pinned.push(port.val_slot);
+        pinned.push(port.width_slot);
     }
     pinned.sort_unstable();
     pinned.dedup();
@@ -4799,6 +5188,11 @@ fn op_slots_read(op: &Op) -> Vec<Slot> {
         Op::Call { arg_slots, .. } => arg_slots.clone(),
         Op::MemoryFill { dst_slot, val_slot, count_slot, .. } => vec![*dst_slot, *val_slot, *count_slot],
         Op::MemoryCopy { src_slot, dst_slot, count_slot, .. } => vec![*src_slot, *dst_slot, *count_slot],
+        // ReplicatedBody is inserted by the recogniser AFTER slot compaction
+        // and peephole passes; this utility should never see it.
+        Op::ReplicatedBody { .. } => unreachable!(
+            "op_slots_read called on ReplicatedBody — recogniser ran before slot compaction"
+        ),
     }
 }
 
@@ -4844,6 +5238,9 @@ fn op_dst(op: &Op) -> Option<Slot> {
         Op::BranchIfZero { .. } | Op::BranchIfNotEqLit { .. } | Op::Jump { .. } | Op::DispatchChain { .. } | Op::StoreState { .. } | Op::StoreMem { .. } | Op::MemoryFill { .. } | Op::MemoryCopy { .. } => {
             None
         }
+        Op::ReplicatedBody { .. } => unreachable!(
+            "op_dst called on ReplicatedBody — recogniser ran before slot compaction"
+        ),
     }
 }
 
@@ -4984,6 +5381,9 @@ fn map_op_slots(op: &mut Op, slot_map: &mut HashMap<Slot, Slot>, alloc: &mut Slo
             *dst_slot = alloc.get_or_alloc(*dst_slot, slot_map);
             *count_slot = alloc.get_or_alloc(*count_slot, slot_map);
         }
+        Op::ReplicatedBody { .. } => unreachable!(
+            "map_op_slots called on ReplicatedBody — recogniser ran before slot compaction"
+        ),
     }
 }
 
@@ -5041,6 +5441,9 @@ fn seed_from_parent(
         Op::Call { arg_slots, .. } => { for s in arg_slots { seed(*s); } }
         Op::MemoryFill { dst_slot, val_slot, count_slot, .. } => { seed(*dst_slot); seed(*val_slot); seed(*count_slot); }
         Op::MemoryCopy { src_slot, dst_slot, count_slot, .. } => { seed(*src_slot); seed(*dst_slot); seed(*count_slot); }
+        Op::ReplicatedBody { .. } => unreachable!(
+            "seed_from_parent called on ReplicatedBody — recogniser ran before slot compaction"
+        ),
     }
 }
 
@@ -5117,6 +5520,108 @@ fn compile_broadcast_write(bw: &BroadcastWrite, compiler: &mut Compiler) -> Comp
 // Executor — runs a CompiledProgram against State
 // ---------------------------------------------------------------------------
 
+/// Splice one byte through a packed-broadcast port at a guest byte address.
+/// Reads the cell containing `byte_addr`, replaces the byte at `byte_addr`,
+/// writes back, keeps the flat shadow + write log in sync.
+///
+/// `val` is masked to 0xFF by the caller (or is implicitly within range).
+/// `byte_addr` is in guest memory — the cell index is `byte_addr / pack`.
+/// If the cell isn't in the port's table the splice is silently dropped
+/// (matches the v1 behaviour: ports cover every writable cell).
+#[inline]
+fn packed_splice_byte(
+    port: &CompiledPackedBroadcastWrite,
+    state: &mut State,
+    byte_addr: i32,
+    val: i32,
+) {
+    if byte_addr < 0 {
+        return;
+    }
+    let pack = port.pack as i32;
+    let cell_idx = (byte_addr / pack) as usize;
+    let off = byte_addr % pack;
+    if cell_idx >= port.cell_table.len() {
+        return;
+    }
+    let cell_state_addr = port.cell_table[cell_idx];
+    if cell_state_addr == 0 {
+        return;
+    }
+    let prev = state.read_mem(cell_state_addr);
+    let new_cell = if off == 0 {
+        (prev & !0xFF) | val
+    } else {
+        // off == 1: replace high byte (bits 8..15)
+        (prev & 0xFF) | (val << 8)
+    };
+    if new_cell != prev {
+        // Write directly to state_vars — the writeback logic for
+        // pack=2 cabinets logs single-byte guest writes (not whole-cell
+        // i32 writes) so the affine projectors can detect byte-fill loops.
+        // See the long comment in execute()'s previous version of this
+        // splice for why this matters for pack=2 perf.
+        let sidx = (-cell_state_addr - 1) as usize;
+        if sidx < state.state_vars.len() {
+            state.state_vars[sidx] = new_cell;
+        }
+        // Keep the flat shadow in step.
+        let addr_u = byte_addr as usize;
+        if addr_u < state.memory.len() {
+            state.memory[addr_u] = val as u8;
+        }
+        if let Some(ref mut log) = state.write_log {
+            log.push((byte_addr, val));
+        }
+    }
+}
+
+/// Splice an even-aligned 16-bit word through a packed-broadcast port.
+/// Caller guarantees `byte_addr & 1 == 0` so both bytes land in the same
+/// cell and the whole cell can be replaced in one read-modify-write.
+///
+/// `val` is a 16-bit value pre-masked to 0..=65535 by the caller. The
+/// affine projectors expect *byte-level* write_log entries even for word
+/// writes (so a STOSW loop's per-byte stride is visible), so we still
+/// emit two write_log entries — but the cell update itself is one op.
+#[inline]
+fn packed_splice_word_aligned(
+    port: &CompiledPackedBroadcastWrite,
+    state: &mut State,
+    byte_addr: i32,
+    val: i32,
+) {
+    debug_assert!(byte_addr >= 0 && byte_addr & 1 == 0);
+    let pack = port.pack as i32;
+    let cell_idx = (byte_addr / pack) as usize;
+    if cell_idx >= port.cell_table.len() {
+        return;
+    }
+    let cell_state_addr = port.cell_table[cell_idx];
+    if cell_state_addr == 0 {
+        return;
+    }
+    let prev = state.read_mem(cell_state_addr);
+    if val != prev {
+        let sidx = (-cell_state_addr - 1) as usize;
+        if sidx < state.state_vars.len() {
+            state.state_vars[sidx] = val;
+        }
+        let addr_u = byte_addr as usize;
+        if addr_u + 1 < state.memory.len() {
+            state.memory[addr_u]     = (val & 0xFF) as u8;
+            state.memory[addr_u + 1] = ((val >> 8) & 0xFF) as u8;
+        }
+        // Affine projectors lock on byte-stride patterns, so log byte
+        // writes (matching what byte-mode would produce) rather than
+        // logging a single (addr, word) entry.
+        if let Some(ref mut log) = state.write_log {
+            log.push((byte_addr, val & 0xFF));
+            log.push((byte_addr + 1, (val >> 8) & 0xFF));
+        }
+    }
+}
+
 /// Execute a compiled program for one tick.
 pub fn execute(program: &CompiledProgram, state: &mut State, slots: &mut Vec<i32>) {
     // Size slots appropriately; keep stale values between ticks. The compiler
@@ -5184,7 +5689,18 @@ pub(crate) fn execute_post_main_phases(
     // the absorbed `--mc{N}: --applySlot(...)` chain. We iterate ports in
     // REVERSE order so slot 0 fires LAST — matching the CSS semantics where
     // slot 0 is the outermost --applySlot wrapper and wins same-cell
-    // collisions over slots 1..5.
+    // collisions over later slots.
+    //
+    // Width: each port reads a per-tick width slot (1 or 2). Width=1 splices
+    // a single byte at byte_addr. Width=2 writes a 16-bit word; when
+    // byte_addr is even the lo and hi halves both land in cell
+    // `byte_addr/2` (single read-modify-write of the whole cell), when odd
+    // they straddle (lo into b1 of cell N, hi into b0 of cell N+1).
+    //
+    // The aligned-width=2 path is hot — every PUSH/CALL/INT/IRQ frame and
+    // every word `MOV [m], r16` to even-aligned memory hits it. Inlining
+    // the splice and specialising the aligned case lets us avoid the
+    // double read-modify-write the naive two-byte-splice version would do.
     for port in program.packed_broadcast_writes.iter().rev() {
         if slots[port.gate_slot as usize] != 1 {
             continue;
@@ -5193,55 +5709,23 @@ pub(crate) fn execute_post_main_phases(
         if byte_addr < 0 {
             continue;
         }
-        let pack = port.pack as i32;
-        let cell_idx = (byte_addr / pack) as usize;
-        let off = byte_addr % pack;
-        if cell_idx >= port.cell_table.len() {
-            continue;
-        }
-        let cell_state_addr = port.cell_table[cell_idx];
-        if cell_state_addr == 0 {
-            continue;
-        }
-        let val = slots[port.val_slot as usize] & 0xFF;
-        let prev = state.read_mem(cell_state_addr);
-        let new_cell = if off == 0 {
-            (prev & !0xFF) | val
+        let val = slots[port.val_slot as usize];
+        let width = slots[port.width_slot as usize];
+        if width == 2 {
+            if byte_addr & 1 == 0 {
+                // Aligned word: single cell, single read-modify-write.
+                // The whole cell becomes the 16-bit word value (masked to
+                // u16 so a sign-extended val doesn't bleed into bit 16+).
+                packed_splice_word_aligned(port, state, byte_addr, val & 0xFFFF);
+            } else {
+                // Straddle: lo half goes to cell N's high byte; hi half
+                // goes to cell N+1's low byte. Two cells, two splices.
+                packed_splice_byte(port, state, byte_addr, val & 0xFF);
+                packed_splice_byte(port, state, byte_addr + 1, (val >> 8) & 0xFF);
+            }
         } else {
-            // off == 1: replace high byte (bits 8..15)
-            (prev & 0xFF) | (val << 8)
-        };
-        if new_cell != prev {
-            // Write directly to state_vars — this path writes a whole cell
-            // value (two bytes packed into an i32). Using `write_mem` on
-            // the negative state-var address would log `(negative_addr,
-            // cell_i32)` to the write_log, which the affine projectors
-            // (tick_period.rs, cycle_tracker.rs) filter out as state-var
-            // noise. We want the projectors to see this as a single-byte
-            // guest memory write at `byte_addr`, which is how pack=1's
-            // broadcast_writes log it. Without that, the projectors never
-            // lock on byte-fill loops in packed cabinets and the CPU runs
-            // at the un-projected per-tick rate — which was the cause of
-            // pack=2 being ~10x slower per guest-cycle than pack=1 on
-            // splash/fill workloads.
-            let sidx = (-cell_state_addr - 1) as usize;
-            if sidx < state.state_vars.len() {
-                state.state_vars[sidx] = new_cell;
-            }
-            // Keep the flat shadow in step so code paths that read via
-            // `self.memory[..]` (renderer staging, debugger tools) see
-            // the same byte. `new_cell` contains the updated byte in
-            // `val` at position `off`; the other half is unchanged.
-            let addr_u = byte_addr as usize;
-            if addr_u < state.memory.len() {
-                state.memory[addr_u] = val as u8;
-            }
-            // Log as a single-byte guest write at the positive linear
-            // address, matching pack=1's log shape. Projectors can then
-            // detect affine stride evolution across ticks.
-            if let Some(ref mut log) = state.write_log {
-                log.push((byte_addr, val));
-            }
+            // Byte splice (width=1, the default).
+            packed_splice_byte(port, state, byte_addr, val & 0xFF);
         }
     }
 
@@ -5255,6 +5739,204 @@ pub(crate) fn execute_post_main_phases(
     if program.has_rep_machinery && rep_fastfwd_enabled() {
         rep_fast_forward(program, state, slots);
     }
+
+    // Fusion fast-forward: detect the doom column-drawer body in ROM at
+    // current CS:IP, bulk-apply its net effect. See column_drawer_fast_forward.
+    if fusion_fastfwd_enabled() {
+        let n = column_drawer_fast_forward(program, state, slots);
+        #[cfg(not(target_arch = "wasm32"))]
+        if n > 0 {
+            FUSION_FIRES.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        }
+        let _ = n;
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+static FUSION_FIRES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn fusion_fire_count() -> usize {
+    FUSION_FIRES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn fusion_fastfwd_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        // OFF by default. Bench-doom-gameplay shows fusion as a net
+        // loss (~3% slower with fast-out, much worse without). Cause
+        // unknown — see CSS-DOS logbook entry "2026-04-29 — fusion
+        // disabled by default". Set CALCITE_FUSION_FASTFWD=1 to
+        // re-enable for investigation.
+        match std::env::var("CALCITE_FUSION_FASTFWD").as_deref() {
+            Ok("1") | Ok("true") | Ok("on") => true,
+            _ => false,
+        }
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+fn fusion_fastfwd_enabled() -> bool { false }
+
+/// The 21-byte column-drawer body pattern. Detected periodically in the
+/// doom8088 ROM by byte_period (offset 86306, 16 reps). Pattern matching
+/// against this byte sequence at current CS:IP triggers the fused body
+/// emit. Cabinet-agnostic — any cabinet whose ROM happens to contain this
+/// sequence at the current IP and whose register state matches the body's
+/// preconditions (no REP, no segment override, etc.) fires the fast-forward.
+const COLUMN_DRAWER_BODY: &[u8] = &[
+    0x88, 0xF0, 0xD0, 0xE8, 0x89, 0xF3, 0xD7, 0x89, 0xCB, 0x36, 0xD7,
+    0x88, 0xC4, 0xAB, 0xAB, 0x81, 0xC7, 0xEC, 0x00, 0x01, 0xEA,
+];
+
+/// Bulk-apply N iterations of the column-drawer body. Each body iteration:
+///   mov al, dh           ; al = dh
+///   shr al, 1            ; al = dh >> 1
+///   mov bx, si           ; bx = si (transient)
+///   xlat                 ; al = mem[ds*16 + si + al]
+///   mov bx, cx           ; bx = cx
+///   ss: xlat             ; al = mem[ss*16 + cx + al]  (with SS: prefix)
+///   mov ah, al           ; ax = (al << 8) | al
+///   stosw                ; mem[es*16 + di] = ax; di += 2
+///   stosw                ; mem[es*16 + di] = ax; di += 2
+///   add di, 0xEC         ; di += 0xEC
+///   add dx, bp           ; dx += bp
+///
+/// Net per-iteration: two memory reads (palette, colormap) → one byte →
+/// broadcast to AX → two memory writes → DI advances 4 + 0xEC = 0xF0,
+/// DX advances by BP, AL/AH = colormap byte, BX = CX (final).
+///
+/// Returns the number of iterations applied (0 if no match).
+fn column_drawer_fast_forward(program: &CompiledProgram, state: &mut State, slots: &[i32]) -> usize {
+    fn read_prop(program: &CompiledProgram, state: &State, slots: &[i32], name: &str) -> Option<i32> {
+        if let Some(&s) = program.property_slots.get(name) {
+            return Some(slots[s as usize]);
+        }
+        let bare = name.strip_prefix("--").unwrap_or(name);
+        state.get_var(bare)
+    }
+
+    // Cheap fast-out: the column-drawer body STARTS with 0x88 (mov r/m8,r8).
+    // Read the byte at current linear-IP first; if it's not 0x88 we can't
+    // be at body entry. This costs one read_mem per tick rather than the
+    // 21-byte rom_match. Almost every tick lands here.
+    let cs = match state.get_var("CS") { Some(v) => v, None => return 0 };
+    let ip = match state.get_var("IP") { Some(v) => v, None => return 0 };
+    let cs_base = (cs as i64) * 16;
+    let ip_lin = cs_base + (ip as i64);
+    if ip_lin < 0 { return 0; }
+    if (state.read_mem(ip_lin as i32) & 0xFF) as u8 != COLUMN_DRAWER_BODY[0] {
+        return 0;
+    }
+
+    // Cheap byte-1 fast-out: body[1] = 0xF0 (modrm of mov al,dh).
+    if (state.read_mem((ip_lin + 1) as i32) & 0xFF) as u8 != COLUMN_DRAWER_BODY[1] {
+        return 0;
+    }
+
+    // Now we've passed the cheap pre-filter (byte 0 + byte 1 match). Do the
+    // expensive guards: no REP, no segment override, full body match.
+    let has_rep = read_prop(program, state, slots, "--hasREP").unwrap_or(0);
+    if has_rep != 0 { return 0; }
+    let has_seg_ov = read_prop(program, state, slots, "--hasSegOverride").unwrap_or(0);
+    if has_seg_ov != 0 { return 0; }
+
+    // Full 21-byte body match starting at current post-tick IP.
+    if !rom_match(state, ip_lin as i32, COLUMN_DRAWER_BODY) {
+        return 0;
+    }
+
+    // Detect how many bodies are stacked (max 16 unrolled).
+    let mut reps = 0;
+    while reps < 16 {
+        let off = (reps as i64) * (COLUMN_DRAWER_BODY.len() as i64);
+        if !rom_match(state, (ip_lin + off) as i32, COLUMN_DRAWER_BODY) {
+            break;
+        }
+        reps += 1;
+    }
+    if reps == 0 { return 0; }
+
+    // Read entry-state registers.
+    let dx = state.get_var("DX").unwrap_or(0) as i32;
+    let bp = state.get_var("BP").unwrap_or(0) as i32;
+    let cx = state.get_var("CX").unwrap_or(0) as i32;
+    let si = state.get_var("SI").unwrap_or(0) as i32;
+    let mut di = state.get_var("DI").unwrap_or(0) as i32;
+    let ds = state.get_var("DS").unwrap_or(0) as i32;
+    let ss = state.get_var("SS").unwrap_or(0) as i32;
+    let es = state.get_var("ES").unwrap_or(0) as i32;
+    let ax_init = state.get_var("AX").unwrap_or(0) as i32;
+
+    // Run N body iterations. Each iteration mutates dx, di; ax/bx are
+    // overwritten per body, only their final values matter.
+    let mut dx_cur = dx;
+    let mut last_byte: i32 = 0;
+    for _ in 0..reps {
+        // dh = high byte of dx (pre-iteration; the body reads dh BEFORE
+        // updating dx. Update happens at the very end via 'add dx,bp'.)
+        let dh = (dx_cur >> 8) & 0xFF;
+        let al0 = dh >> 1;                              // shr al,1
+        // First xlat: ds*16 + si + al0
+        let p0_addr = ((ds as i64) * 16 + (si as i64) + (al0 as i64)) as i32;
+        let p0 = state.read_mem(p0_addr) & 0xFF;
+        // Second xlat (with SS:): ss*16 + cx + p0
+        let p1_addr = ((ss as i64) * 16 + (cx as i64) + (p0 as i64)) as i32;
+        let p1 = state.read_mem(p1_addr) & 0xFF;
+        last_byte = p1;
+        // ax = (p1 << 8) | p1
+        let ax = (p1 << 8) | p1;
+        let ax_lo = (ax & 0xFF) as u8;
+        let ax_hi = ((ax >> 8) & 0xFF) as u8;
+        // stosw at es:di, di += 2
+        let d0 = ((es as i64) * 16 + (di as i64)) as i32;
+        bulk_store_byte(state, d0 as i64, ax_lo);
+        bulk_store_byte(state, (d0 + 1) as i64, ax_hi);
+        di = (di + 2) & 0xFFFF;
+        // stosw at es:di, di += 2
+        let d1 = ((es as i64) * 16 + (di as i64)) as i32;
+        bulk_store_byte(state, d1 as i64, ax_lo);
+        bulk_store_byte(state, (d1 + 1) as i64, ax_hi);
+        di = (di + 2) & 0xFFFF;
+        // add di, 0xEC
+        di = (di + 0xEC) & 0xFFFF;
+        // add dx, bp (16-bit wrap)
+        dx_cur = (dx_cur + bp) & 0xFFFF;
+    }
+
+    // Commit: AX = (last_byte << 8) | last_byte, BX = CX (final body wrote it),
+    // DX = dx_cur, DI = di, IP advanced by reps * 21.
+    let ax_final = (last_byte << 8) | last_byte;
+    state.set_var("AX", ax_final & 0xFFFF);
+    state.set_var("BX", cx & 0xFFFF);
+    state.set_var("DX", dx_cur & 0xFFFF);
+    state.set_var("DI", di & 0xFFFF);
+    let ip_new = ((ip as i64) + (reps as i64) * (COLUMN_DRAWER_BODY.len() as i64)) & 0xFFFF;
+    state.set_var("IP", ip_new as i32);
+    // Charge cycles. Per body: ~50 cycles (rough estimate based on opcodes).
+    if let Some(cc) = state.get_var("cycleCount") {
+        let total = (reps as i32).wrapping_mul(50);
+        state.set_var("cycleCount", cc.wrapping_add(total));
+    }
+    // We initially only accounted for the post-tick state of the *first*
+    // body byte (0x88 mov al,dh) since that's what the CSS would have just
+    // executed. Skip that — we instead detected at the START of a body
+    // (post-tick IP at byte 0 of the unfired body). So we apply ALL reps
+    // here, no need to subtract.
+    let _ = ax_init;
+    reps
+}
+
+fn rom_match(state: &State, addr: i32, pattern: &[u8]) -> bool {
+    for (i, &b) in pattern.iter().enumerate() {
+        let a = addr.wrapping_add(i as i32);
+        if (state.read_mem(a) & 0xFF) as u8 != b {
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -6425,8 +7107,62 @@ pub(crate) fn exec_ops(
                 pc = *exit_target as usize;
                 continue;
             }
+            Op::ReplicatedBody { body, strides, reps } => {
+                exec_replicated_body(
+                    body, strides, *reps,
+                    dispatch_tables, chain_tables, flat_dispatch_arrays,
+                    functions, packed_cell_tables, packed_exception_tables,
+                    state, slots,
+                );
+            }
         }
         pc += 1;
+    }
+}
+
+/// Execute a replicated-body op: for each rep `k` in `0..reps`, apply the
+/// per-op strides to materialise the rep's ops, then run them.
+///
+/// The body never contains branches/dispatches/bulk-mem ops (recogniser
+/// rejects those), so we can reuse `exec_ops` straight — its loop runs
+/// linearly through the body, exits when pc == body.len(), and we repeat.
+///
+/// Allocates a small scratch `Vec<Op>` of length `body.len()` once and
+/// reuses it across reps.
+#[allow(clippy::too_many_arguments)]
+fn exec_replicated_body(
+    body: &[Op],
+    strides: &[Box<[(u8, i32)]>],
+    reps: u32,
+    dispatch_tables: &[CompiledDispatchTable],
+    chain_tables: &[DispatchChainTable],
+    flat_dispatch_arrays: &[FlatDispatchArray],
+    functions: &[CompiledFunction],
+    packed_cell_tables: &[Vec<i32>],
+    packed_exception_tables: &[PackedExceptionTable],
+    state: &mut State,
+    slots: &mut [i32],
+) {
+    use crate::pattern::replicated_body::apply_strides;
+    debug_assert_eq!(body.len(), strides.len());
+
+    // Scratch buffer: one materialised Op per body position.
+    // Allocated fresh each call — bodies are small (typically <= 16 ops),
+    // so the cost is dwarfed by the rep loop. If profiling shows this
+    // matters, hoist into a reusable Vec on the call frame.
+    let mut scratch: Vec<Op> = Vec::with_capacity(body.len());
+
+    for k in 0..reps {
+        scratch.clear();
+        for (template, op_strides) in body.iter().zip(strides.iter()) {
+            scratch.push(apply_strides(template, k, op_strides));
+        }
+        exec_ops(
+            &scratch,
+            dispatch_tables, chain_tables, flat_dispatch_arrays,
+            functions, packed_cell_tables, packed_exception_tables,
+            state, slots,
+        );
     }
 }
 
@@ -6511,25 +7247,17 @@ pub fn execute_profiled(
         if byte_addr < 0 {
             continue;
         }
-        let pack = port.pack as i32;
-        let cell_idx = (byte_addr / pack) as usize;
-        let off = byte_addr % pack;
-        if cell_idx >= port.cell_table.len() {
-            continue;
-        }
-        let cell_state_addr = port.cell_table[cell_idx];
-        if cell_state_addr == 0 {
-            continue;
-        }
-        let val = slots[port.val_slot as usize] & 0xFF;
-        let prev = state.read_mem(cell_state_addr);
-        let new_cell = if off == 0 {
-            (prev & !0xFF) | val
+        let val = slots[port.val_slot as usize];
+        let width = slots[port.width_slot as usize];
+        if width == 2 {
+            if byte_addr & 1 == 0 {
+                packed_splice_word_aligned(port, state, byte_addr, val & 0xFFFF);
+            } else {
+                packed_splice_byte(port, state, byte_addr, val & 0xFF);
+                packed_splice_byte(port, state, byte_addr + 1, (val >> 8) & 0xFF);
+            }
         } else {
-            (prev & 0xFF) | (val << 8)
-        };
-        if new_cell != prev {
-            state.write_mem(cell_state_addr, new_cell);
+            packed_splice_byte(port, state, byte_addr, val & 0xFF);
         }
     }
     let t4 = Instant::now();
@@ -6940,6 +7668,20 @@ fn exec_ops_profiled(
                 slots[*count_slot as usize] = 0;
                 pc = *exit_target as usize;
                 continue;
+            }
+            Op::ReplicatedBody { body, strides, reps } => {
+                count_op!(profile, "ReplicatedBody");
+                // Profiled path delegates to the production runner — accuracy
+                // of inner-op counts is sacrificed in favour of code size.
+                // The outer loop still increments main_ops_count once per
+                // ReplicatedBody dispatch, which is the meaningful thing to
+                // measure (we collapsed N inner-loop iterations into 1).
+                exec_replicated_body(
+                    body, strides, *reps,
+                    dispatch_tables, chain_tables, flat_dispatch_arrays,
+                    functions, packed_cell_tables, packed_exception_tables,
+                    state, slots,
+                );
             }
         }
         pc += 1;
@@ -7514,6 +8256,25 @@ pub fn exec_ops_traced(
                 pc = *exit_target as usize;
                 continue;
             }
+            Op::ReplicatedBody { body, strides, reps } => {
+                if should_trace {
+                    trace.push(TraceEntry {
+                        pc,
+                        op: format!("ReplicatedBody body_len={} reps={}", body.len(), reps),
+                        dst_slot: None,
+                        dst_value: None,
+                        inputs: vec![],
+                        branch_taken: None,
+                        depth,
+                    });
+                }
+                exec_replicated_body(
+                    body, strides, *reps,
+                    dispatch_tables, chain_tables, flat_dispatch_arrays,
+                    functions, packed_cell_tables, packed_exception_tables,
+                    state, slots,
+                );
+            }
         }
         pc += 1;
     }
@@ -8076,5 +8837,116 @@ mod tests {
             &mut slots2,
         );
         assert_eq!(slots2[slot2 as usize], -1);
+    }
+
+    #[test]
+    fn replicated_body_matches_unrolled_execution() {
+        // Build an unrolled body of K=8 reps × period=3:
+        //   LoadLit  { dst: 100 + k*3,     val: 7 }       ; constant val
+        //   AddLit   { dst: 100 + k*3,     a: 100 + k*3, val: k }   ; mix const+linear
+        //   LoadSlot { dst: 200,           src: 100 + k*3 }         ; reads strided slot
+        // After execution, slot 200 == 7 + (K-1) ; slots 100..(100+K*3) hold 7+k.
+
+        let _ = setup();
+        let period = 3usize;
+        let reps = 8u32;
+
+        let mut original_ops = Vec::new();
+        for k in 0..reps {
+            let s = 100 + k * 3;
+            original_ops.push(Op::LoadLit { dst: s, val: 7 });
+            original_ops.push(Op::AddLit { dst: s, a: s, val: k as i32 });
+            original_ops.push(Op::LoadSlot { dst: 200, src: s });
+        }
+
+        // Run the unrolled version.
+        let mut state_a = State::default();
+        let mut slots_a = vec![0i32; 256];
+        exec_ops_for_test(&original_ops, &mut state_a, &mut slots_a);
+
+        // Build the ReplicatedBody form. Body = first rep verbatim.
+        let body: Vec<Op> = original_ops[..period].to_vec();
+        // Strides per body op:
+        //   op0 LoadLit  { dst, val }       : dst stride 3, val const
+        //     => [(0, 3)]
+        //   op1 AddLit   { dst, a, val }    : dst stride 3, a stride 3, val stride 1
+        //     => [(0, 3), (1, 3), (2, 1)]
+        //   op2 LoadSlot { dst, src }       : dst const, src stride 3
+        //     => [(1, 3)]
+        let strides_per_op: Vec<Box<[(u8, i32)]>> = vec![
+            Box::from([(0u8, 3i32)] as [(u8, i32); 1]),
+            Box::from([(0u8, 3i32), (1u8, 3i32), (2u8, 1i32)] as [(u8, i32); 3]),
+            Box::from([(1u8, 3i32)] as [(u8, i32); 1]),
+        ];
+        let folded_op = Op::ReplicatedBody {
+            body: body.into_boxed_slice(),
+            strides: strides_per_op.into_boxed_slice(),
+            reps,
+        };
+
+        let mut state_b = State::default();
+        let mut slots_b = vec![0i32; 256];
+        exec_ops_for_test(&[folded_op], &mut state_b, &mut slots_b);
+
+        // Slots used by the body (100..100+reps*3, plus 200) must match.
+        for k in 0..reps {
+            let s = (100 + k * 3) as usize;
+            assert_eq!(
+                slots_a[s], slots_b[s],
+                "slot {} (rep {}) differs: a={} b={}",
+                s, k, slots_a[s], slots_b[s]
+            );
+        }
+        assert_eq!(slots_a[200], slots_b[200], "slot 200 (last LoadSlot) differs");
+        // And specifically, slot 200 should equal 7 + (reps-1) = 14.
+        assert_eq!(slots_a[200], 7 + (reps as i32 - 1));
+    }
+
+    #[test]
+    fn replicated_body_with_state_writes() {
+        // Body that touches state memory: StoreState { addr, src } with addr
+        // striding by 4. After execution, state[0x100], state[0x104], ... hold
+        // the values from slot 50 (constant per rep but easier to seed).
+
+        let _ = setup();
+        let mut state_a = State::default();
+        let mut slots_a = vec![0i32; 256];
+        slots_a[50] = 0xCAFE;
+
+        let reps = 8u32;
+        let mut original_ops = Vec::new();
+        for k in 0..reps {
+            let addr = 0x100 + (k as i32) * 4;
+            original_ops.push(Op::StoreState { addr, src: 50 });
+        }
+        exec_ops_for_test(&original_ops, &mut state_a, &mut slots_a);
+
+        // Folded: body = first StoreState; addr (operand 0) strides by 4.
+        let body = vec![Op::StoreState { addr: 0x100, src: 50 }];
+        let strides_per_op: Vec<Box<[(u8, i32)]>> =
+            vec![Box::from([(0u8, 4i32)] as [(u8, i32); 1])];
+        let folded = Op::ReplicatedBody {
+            body: body.into_boxed_slice(),
+            strides: strides_per_op.into_boxed_slice(),
+            reps,
+        };
+        let mut state_b = State::default();
+        let mut slots_b = vec![0i32; 256];
+        slots_b[50] = 0xCAFE;
+        exec_ops_for_test(&[folded], &mut state_b, &mut slots_b);
+
+        // Both runs must produce identical state at every written address.
+        // (We don't assert what the value *is* — `state.read_mem` may truncate,
+        // sign-extend, or mask depending on address class. The conformance
+        // claim is that ReplicatedBody and unrolled execution agree.)
+        for k in 0..reps {
+            let addr = 0x100 + (k as i32) * 4;
+            assert_eq!(
+                state_a.read_mem(addr),
+                state_b.read_mem(addr),
+                "state[{:#x}] differs",
+                addr
+            );
+        }
     }
 }
