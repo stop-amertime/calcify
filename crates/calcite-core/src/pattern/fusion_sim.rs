@@ -613,6 +613,19 @@ pub fn simulate_with_effects(
     assumptions: &Assumptions,
     flat_arrays: &[FlatDispatchArray],
 ) -> Result<(), BailReason> {
+    simulate_with_effects_ext(result, ops, assumptions, flat_arrays, &[], &[])
+}
+
+/// As `simulate_with_effects`, but also threads `chain_tables` and
+/// `dispatch_tables` so DispatchChain/Dispatch can be statically resolved.
+pub fn simulate_with_effects_ext(
+    result: &mut SimResult,
+    ops: &[Op],
+    assumptions: &Assumptions,
+    flat_arrays: &[FlatDispatchArray],
+    chain_tables: &[DispatchChainTable],
+    dispatch_tables: &[CompiledDispatchTable],
+) -> Result<(), BailReason> {
     let mut pc: usize = 0;
     let mut steps: usize = 0;
     let max_steps = ops.len() * 16;
@@ -622,7 +635,7 @@ pub fn simulate_with_effects(
         }
         steps += 1;
         let op = &ops[pc];
-        match simulate_op_effects(result, op, assumptions, flat_arrays)? {
+        match simulate_op_effects_ext(result, op, assumptions, flat_arrays, chain_tables, dispatch_tables)? {
             StepOutcome::Next => pc += 1,
             StepOutcome::Jump(t) => pc = t,
             StepOutcome::Halt => break,
@@ -631,11 +644,13 @@ pub fn simulate_with_effects(
     Ok(())
 }
 
-fn simulate_op_effects(
+fn simulate_op_effects_ext(
     result: &mut SimResult,
     op: &Op,
     assumptions: &Assumptions,
     flat_arrays: &[FlatDispatchArray],
+    chain_tables: &[DispatchChainTable],
+    dispatch_tables: &[CompiledDispatchTable],
 ) -> Result<StepOutcome, BailReason> {
     use Op::*;
     match op {
@@ -650,7 +665,7 @@ fn simulate_op_effects(
             result.state_writes.push((*addr, val));
             Ok(StepOutcome::Next)
         }
-        _ => simulate_op_with_cfg(&mut result.env, op, assumptions, flat_arrays),
+        _ => simulate_op_ext(&mut result.env, op, assumptions, flat_arrays, chain_tables, dispatch_tables),
     }
 }
 
