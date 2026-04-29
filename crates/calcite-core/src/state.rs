@@ -89,30 +89,32 @@ pub struct State {
     /// is named in calcite's own vocabulary (window, key cell, byte array)
     /// not x86's (LBA, sector, disk) so calcite stays free of x86 knowledge.
     /// All fields are filled in at compile time by
-    /// `Evaluator::wire_state_for_disk_window` from data the recogniser
+    /// `Evaluator::wire_state_for_windowed_byte_array` from data the recogniser
     /// extracts out of the cabinet's `--readMem` dispatch entries — there is
     /// no CLI-only loading path; calcite-cli and calcite-wasm both use this
     /// path identically.
-    pub disk_window: Option<DiskWindow>,
+    pub windowed_byte_array: Option<WindowedByteArray>,
 }
 
-/// A "window of bytes addressed by an in-memory key" — the shape calcite
-/// recognises in the CSS-DOS rom-disk dispatch. Lives on `State` so the read
-/// fast path can resolve in-window addresses without going back through the
-/// compiled CSS expression for every byte.
+/// A "window of bytes addressed by an in-memory key" — a CSS shape where a
+/// contiguous address window is serviced by reading a key from a state-var
+/// cell, multiplying by a stride, adding the in-window offset, and indexing a
+/// flat byte array. Lives on `State` so the read fast path can resolve
+/// in-window addresses without going back through the compiled CSS expression
+/// for every byte.
 ///
 /// All fields are derived at compile time from the cabinet's own dispatch
-/// entries; nothing here reflects x86 disk semantics — calcite sees a window,
-/// a key cell, and a byte array.
+/// entries; nothing here reflects any upstream concept — calcite sees a
+/// window, a key cell, and a byte array.
 #[derive(Debug, Clone)]
-pub struct DiskWindow {
+pub struct WindowedByteArray {
     /// First linear address inside the window (inclusive).
     pub window_base: i32,
     /// One past the last linear address inside the window.
     pub window_end: i32,
     /// State-var slot index holding the lookup key (a u16 cell — low byte
     /// and high byte combined). Resolved from the property name extracted
-    /// from the dispatch entry by `wire_state_for_disk_window`.
+    /// from the dispatch entry by `wire_state_for_windowed_byte_array`.
     pub key_cell_slot: usize,
     /// Multiplier applied to the cell value before adding in-window offset.
     pub stride: i32,
@@ -141,7 +143,7 @@ impl State {
             write_log: None,
             packed_cell_table: Vec::new(),
             packed_cell_size: 0,
-            disk_window: None,
+            windowed_byte_array: None,
         }
     }
 
@@ -292,13 +294,13 @@ impl State {
             // would compute via the inline-exception chain → `--readDiskByte`
             // flat-array dispatch.
             //
-            // Placed AFTER the packed-cell check because the disk window's
-            // addresses (e.g. 0xD0000-0xD01FF) sit well above the packed
-            // cell table's range, so packed reads never fall in here. Each
-            // byte of conventional RAM (the 96% hot path) would otherwise
-            // pay for a disk-window check on every read_mem call — measured
-            // as a ~30% web slowdown when the check came first.
-            if let Some(ref dw) = self.disk_window {
+            // Placed AFTER the packed-cell check because the windowed byte
+            // array's addresses (e.g. 0xD0000-0xD01FF) sit well above the
+            // packed cell table's range, so packed reads never fall in here.
+            // Each byte of conventional RAM (the 96% hot path) would otherwise
+            // pay for a windowed-byte-array check on every read_mem call —
+            // measured as a ~30% web slowdown when the check came first.
+            if let Some(ref dw) = self.windowed_byte_array {
                 if addr >= dw.window_base && addr < dw.window_end {
                     let key = self.state_vars
                         .get(dw.key_cell_slot)
@@ -884,7 +886,7 @@ impl State {
     ///
     /// What stays out: `state_var_names`/`state_var_index` (set by
     /// `load_properties` from the parsed cabinet), `packed_cell_table` /
-    /// `packed_cell_size` / `disk_window` (wired at compile time from
+    /// `packed_cell_size` / `windowed_byte_array` (wired at compile time from
     /// `CompiledProgram`). A snapshot is therefore portable across runs of
     /// the **same cabinet**: load the cabinet, restore the snapshot, the
     /// machine resumes mid-execution. It is NOT portable across cabinets;

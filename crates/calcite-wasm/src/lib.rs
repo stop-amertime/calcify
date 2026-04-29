@@ -87,13 +87,13 @@ impl CalciteEngine {
         // available (read-side `packed_cell_tables[0]`, or the merged
         // write-port tables as a fallback).
         evaluator.wire_state_for_packed_memory(&mut state);
-        // Install the rom-disk window descriptor so reads in
-        // [0xD0000..0xD0200) collapse to one state-var read + one
-        // flat-array index instead of walking the inline-exception chain
-        // and re-evaluating `--readDiskByte` on every byte. Disk bytes
-        // come from the cabinet's compiled `--readDiskByte` flat array —
-        // no separate sidecar load is required.
-        evaluator.wire_state_for_disk_window(&mut state);
+        // Install the windowed-byte-array descriptor so reads inside the
+        // window collapse to one state-var read + one flat-array index
+        // instead of walking the inline-exception chain and re-evaluating
+        // the inner flat-array function on every byte. The byte data comes
+        // from the cabinet's compiled flat-array dispatch — no separate
+        // sidecar load is required.
+        evaluator.wire_state_for_windowed_byte_array(&mut state);
 
         let initial_properties = parsed.properties;
         Ok(CalciteEngine { state, evaluator, initial_properties })
@@ -128,7 +128,7 @@ impl CalciteEngine {
             self.state.populate_memory_from_readmem(table);
         }
         self.evaluator.wire_state_for_packed_memory(&mut self.state);
-        self.evaluator.wire_state_for_disk_window(&mut self.state);
+        self.evaluator.wire_state_for_windowed_byte_array(&mut self.state);
     }
 
     /// Run a batch of ticks and return the property changes as a JSON string.

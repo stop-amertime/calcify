@@ -87,10 +87,10 @@ fn main() {
     let evaluator = Evaluator::from_parsed(&parsed);
     let program = evaluator.compiled();
 
-    let dw = match &program.disk_window {
+    let dw = match &program.windowed_byte_array {
         Some(dw) => dw,
         None => {
-            eprintln!("ERROR: no disk_window recognised in cabinet — nothing to scan.");
+            eprintln!("ERROR: no windowed_byte_array recognised in cabinet — nothing to scan.");
             std::process::exit(1);
         }
     };
@@ -101,7 +101,7 @@ fn main() {
         .map(|&v| (v & 0xFF) as u8)
         .collect();
     eprintln!(
-        "  disk_window: window=[{:#x}..{:#x}), stride={}, base_key={:#x}, byte_array.len={}",
+        "  windowed_byte_array: window=[{:#x}..{:#x}), stride={}, base_key={:#x}, byte_array.len={}",
         dw.window_base,
         dw.window_end,
         dw.stride,

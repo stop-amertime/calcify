@@ -496,22 +496,22 @@ pub struct CompiledProgram {
     /// Optional descriptor for a "windowed byte array" read pattern detected
     /// in `--readMem`'s exception entries — i.e. a contiguous range of
     /// addresses whose dispatch entries all redirect to a single
-    /// `--readDiskByte`-style flat-array dispatch with the same shape
+    /// flat-array dispatch with the same shape
     /// `--funcname((cell_value) * stride + literal_offset)`. The
     /// `key_cell_property` name is resolved to a state-var slot by
-    /// `Evaluator::wire_state_for_disk_window`, which builds the runtime
-    /// `state::DiskWindow` and installs it on `State` so reads inside the
-    /// window collapse to one state-var read + one array index, instead of
-    /// walking the inline-exception CmpEq chain on every byte.
-    pub disk_window: Option<CompiledDiskWindow>,
+    /// `Evaluator::wire_state_for_windowed_byte_array`, which builds the
+    /// runtime `state::WindowedByteArray` and installs it on `State` so reads
+    /// inside the window collapse to one state-var read + one array index,
+    /// instead of walking the inline-exception CmpEq chain on every byte.
+    pub windowed_byte_array: Option<CompiledWindowedByteArray>,
 }
 
-/// Compile-time half of the rom-disk fast path. The compiler can't resolve
-/// state-var slots (they're assigned by `State::load_properties`), so the
-/// descriptor carries the property NAME; the wiring step looks the slot up
-/// and builds the runtime `state::DiskWindow`.
+/// Compile-time half of the windowed-byte-array fast path. The compiler can't
+/// resolve state-var slots (they're assigned by `State::load_properties`), so
+/// the descriptor carries the property NAME; the wiring step looks the slot up
+/// and builds the runtime `state::WindowedByteArray`.
 #[derive(Debug, Clone)]
-pub struct CompiledDiskWindow {
+pub struct CompiledWindowedByteArray {
     pub window_base: i32,
     pub window_end: i32,
     pub key_cell_property: String,
@@ -650,7 +650,7 @@ pub struct FlatDispatchArray {
     /// Values indexed by (key - base_key). Out-of-range indices yield the
     /// default value baked into the op.
     /// Stored behind an `Arc` so other parts of the runtime (e.g. the
-    /// `State::disk_window` short-circuit) can share the backing buffer
+    /// `State::windowed_byte_array` short-circuit) can share the backing buffer
     /// without cloning multi-MB byte payloads.
     pub values: std::sync::Arc<Vec<i32>>,
 }
@@ -1234,12 +1234,12 @@ fn decode_disk_entry(expr: &Expr) -> Option<DiskEntryShape> {
 /// Returns `None` if no qualifying group is found. A real but small group
 /// (e.g. <16 entries) is treated as unrecognised — the perf win isn't worth
 /// the runtime check; classify-and-bail keeps the code path predictable.
-fn recognise_disk_window(
+fn recognise_windowed_byte_array(
     table: &DispatchTable,
     inline_exception_keys: &[i64],
     flat_dispatch_cache: &HashMap<String, (u32, i32, i32)>,
     compiled_flat_arrays: &[FlatDispatchArray],
-) -> Option<CompiledDiskWindow> {
+) -> Option<CompiledWindowedByteArray> {
     use std::collections::BTreeMap;
     // Decode each inline-exception entry. Skip ones that aren't disk-shape.
     let mut decoded: BTreeMap<i64, DiskEntryShape> = BTreeMap::new();
@@ -1316,7 +1316,7 @@ fn recognise_disk_window(
         shape.func_name, array_id, base_key, arr.values.len()
     );
 
-    Some(CompiledDiskWindow {
+    Some(CompiledWindowedByteArray {
         window_base: window_base as i32,
         window_end: (window_last + 1) as i32,
         key_cell_property: shape.key_property,
@@ -1600,10 +1600,10 @@ struct Compiler<'a> {
     /// Cache: function name → fn_id in `compiled_functions`.
     function_cache: HashMap<String, u32>,
     /// "Windowed byte-array" descriptor extracted from the cabinet's
-    /// `--readMem` exception entries (see [`recognise_disk_window`]).
+    /// `--readMem` exception entries (see [`recognise_windowed_byte_array`]).
     /// `None` until pattern recognition runs; consumed by `CompiledProgram`
     /// at end-of-compile.
-    recognised_disk_window: Option<CompiledDiskWindow>,
+    recognised_windowed_byte_array: Option<CompiledWindowedByteArray>,
 }
 
 impl<'a> Compiler<'a> {
@@ -1628,7 +1628,7 @@ impl<'a> Compiler<'a> {
             packed_exception_tables: Vec::new(),
             compiled_functions: Vec::new(),
             function_cache: HashMap::new(),
-            recognised_disk_window: None,
+            recognised_windowed_byte_array: None,
         }
     }
 
@@ -2679,8 +2679,8 @@ impl<'a> Compiler<'a> {
             // branches are emitted regardless — the runtime State short-circuit
             // catches reads first, but the inline path is the correct fallback
             // for any cabinet/future shape that doesn't fit the recogniser.
-            if self.recognised_disk_window.is_none() && name == "--readMem" {
-                self.recognised_disk_window = recognise_disk_window(
+            if self.recognised_windowed_byte_array.is_none() && name == "--readMem" {
+                self.recognised_windowed_byte_array = recognise_windowed_byte_array(
                     &table,
                     &inline_exceptions,
                     &self.flat_dispatch_cache,
@@ -3287,7 +3287,7 @@ pub fn compile(
         packed_cell_tables: compiler.packed_cell_tables,
         packed_exception_tables: compiler.packed_exception_tables,
         packed_broadcast_writes: compiled_packed_bw,
-        disk_window: compiler.recognised_disk_window.take(),
+        windowed_byte_array: compiler.recognised_windowed_byte_array.take(),
     };
 
     // Expand all Op::Call sites inline. Op::Call was a compile-time device to
@@ -5485,21 +5485,75 @@ pub fn execute(program: &CompiledProgram, state: &mut State, slots: &mut Vec<i32
     // Fusion fast-forward: detect the doom column-drawer body in ROM at
     // current CS:IP, bulk-apply its net effect. See column_drawer_fast_forward.
     if fusion_fastfwd_enabled() {
-        let n = column_drawer_fast_forward(program, state, slots);
-        #[cfg(not(target_arch = "wasm32"))]
-        if n > 0 {
-            FUSION_FIRES.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        let _ = column_drawer_fast_forward(program, state, slots);
+    }
+}
+
+/// Diagnostic funnel counters for `column_drawer_fast_forward`. Single-
+/// threaded by construction (calcite-core runs on one thread per State),
+/// stored in a `thread_local!` cell so the hot path can use plain `usize`
+/// increments — no atomics, no parameter threading.
+///
+/// Production cost when disabled: one `thread_local!` access + branch on
+/// `enabled` per tick. When enabled: the same plus a few non-atomic
+/// integer increments. Compare to the prior `AtomicUsize::fetch_add`
+/// implementation which was a `lock xadd` per stage per tick — at 10M
+/// ticks/sec that's the cost the diag was supposed to be measuring,
+/// not adding to.
+#[derive(Default, Clone, Debug)]
+pub struct FusionDiag {
+    pub enabled: bool,
+    pub ticks: usize,
+    pub pass_b0: usize,
+    pub pass_b1: usize,
+    pub pass_flags: usize,
+    pub pass_rom: usize,
+    pub body_iters_applied: usize,
+}
+
+impl FusionDiag {
+    pub fn report(&self) -> String {
+        if !self.enabled {
+            return String::from("fusion-diag: disabled (call fusion_diag_enable() before the run)\n");
         }
-        let _ = n;
+        if self.ticks == 0 {
+            return String::from("fusion-diag: no ticks recorded\n");
+        }
+        let pct = |n: usize| (n as f64) * 100.0 / (self.ticks as f64);
+        format!(
+            "fusion-diag: ticks={} pass_b0={} ({:.3}%) pass_b1={} ({:.4}%) pass_flags={} ({:.4}%) pass_rom={} ({:.4}%) body_iters_applied={}\n",
+            self.ticks,
+            self.pass_b0, pct(self.pass_b0),
+            self.pass_b1, pct(self.pass_b1),
+            self.pass_flags, pct(self.pass_flags),
+            self.pass_rom, pct(self.pass_rom),
+            self.body_iters_applied,
+        )
     }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-static FUSION_FIRES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    static FUSION_DIAG: std::cell::RefCell<FusionDiag> = std::cell::RefCell::new(FusionDiag::default());
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn fusion_diag_enable() {
+    FUSION_DIAG.with(|d| {
+        let mut d = d.borrow_mut();
+        *d = FusionDiag::default();
+        d.enabled = true;
+    });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn fusion_diag_snapshot() -> FusionDiag {
+    FUSION_DIAG.with(|d| d.borrow().clone())
+}
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn fusion_fire_count() -> usize {
-    FUSION_FIRES.load(std::sync::atomic::Ordering::Relaxed)
+    FUSION_DIAG.with(|d| d.borrow().body_iters_applied)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -5560,10 +5614,23 @@ fn column_drawer_fast_forward(program: &CompiledProgram, state: &mut State, slot
         state.get_var(bare)
     }
 
+    // Diag funnel. The thread-local access is cheap (one TLS load + one
+    // RefCell borrow), but we still want to short-circuit when disabled
+    // so the production hot path costs nothing. Read enabled-flag once
+    // and pass through `&mut FusionDiag` only on the diag path.
+    #[cfg(not(target_arch = "wasm32"))]
+    let diag_enabled = FUSION_DIAG.with(|d| d.borrow().enabled);
+    #[cfg(target_arch = "wasm32")]
+    let diag_enabled = false;
+
     // Cheap fast-out: the column-drawer body STARTS with 0x88 (mov r/m8,r8).
     // Read the byte at current linear-IP first; if it's not 0x88 we can't
     // be at body entry. This costs one read_mem per tick rather than the
     // 21-byte rom_match. Almost every tick lands here.
+    #[cfg(not(target_arch = "wasm32"))]
+    if diag_enabled {
+        FUSION_DIAG.with(|d| d.borrow_mut().ticks += 1);
+    }
     let cs = match state.get_var("CS") { Some(v) => v, None => return 0 };
     let ip = match state.get_var("IP") { Some(v) => v, None => return 0 };
     let cs_base = (cs as i64) * 16;
@@ -5572,10 +5639,18 @@ fn column_drawer_fast_forward(program: &CompiledProgram, state: &mut State, slot
     if (state.read_mem(ip_lin as i32) & 0xFF) as u8 != COLUMN_DRAWER_BODY[0] {
         return 0;
     }
+    #[cfg(not(target_arch = "wasm32"))]
+    if diag_enabled {
+        FUSION_DIAG.with(|d| d.borrow_mut().pass_b0 += 1);
+    }
 
     // Cheap byte-1 fast-out: body[1] = 0xF0 (modrm of mov al,dh).
     if (state.read_mem((ip_lin + 1) as i32) & 0xFF) as u8 != COLUMN_DRAWER_BODY[1] {
         return 0;
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    if diag_enabled {
+        FUSION_DIAG.with(|d| d.borrow_mut().pass_b1 += 1);
     }
 
     // Now we've passed the cheap pre-filter (byte 0 + byte 1 match). Do the
@@ -5584,10 +5659,18 @@ fn column_drawer_fast_forward(program: &CompiledProgram, state: &mut State, slot
     if has_rep != 0 { return 0; }
     let has_seg_ov = read_prop(program, state, slots, "--hasSegOverride").unwrap_or(0);
     if has_seg_ov != 0 { return 0; }
+    #[cfg(not(target_arch = "wasm32"))]
+    if diag_enabled {
+        FUSION_DIAG.with(|d| d.borrow_mut().pass_flags += 1);
+    }
 
     // Full 21-byte body match starting at current post-tick IP.
     if !rom_match(state, ip_lin as i32, COLUMN_DRAWER_BODY) {
         return 0;
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    if diag_enabled {
+        FUSION_DIAG.with(|d| d.borrow_mut().pass_rom += 1);
     }
 
     // Detect how many bodies are stacked (max 16 unrolled).
@@ -5668,6 +5751,10 @@ fn column_drawer_fast_forward(program: &CompiledProgram, state: &mut State, slot
     // (post-tick IP at byte 0 of the unfired body). So we apply ALL reps
     // here, no need to subtract.
     let _ = ax_init;
+    #[cfg(not(target_arch = "wasm32"))]
+    if diag_enabled {
+        FUSION_DIAG.with(|d| d.borrow_mut().body_iters_applied += reps);
+    }
     reps
 }
 
@@ -5966,14 +6053,14 @@ fn rep_fast_forward(program: &CompiledProgram, state: &mut State, slots: &[i32])
     // a cabinet has a rom-disk dispatch in CSS but the recogniser failed
     // to extract a descriptor, `read_mem` for the disk window would
     // silently return 0 — panic so the caller knows to fix the recogniser.
-    if (opcode == 0xA4 || opcode == 0xA5) && state.disk_window.is_none() {
+    if (opcode == 0xA4 || opcode == 0xA5) && state.windowed_byte_array.is_none() {
         let src_lo_linear = (ds as i64) * 16 + si_opt.unwrap() as i64
             - if df { (n as i64 - 1) * step_bytes as i64 } else { 0 };
         if src_lo_linear < 0xD_0200 && (src_lo_linear + n_bytes) > 0xD_0000 {
             rep_fast_forward_panic(
                 "src-rom-disk-no-descriptor",
                 opcode, rep_type, cx, flags, cs_for_diag, ip_for_diag,
-                "REP MOVS source overlaps disk window but cabinet has no disk_window descriptor — recogniser failed",
+                "REP MOVS source overlaps windowed-byte-array window but cabinet has no windowed_byte_array descriptor — recogniser failed",
             );
         }
     }

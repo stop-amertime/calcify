@@ -30,7 +30,7 @@ fn empty_program() -> CompiledProgram {
         flat_dispatch_arrays: Vec::new(),
         property_slots: std::collections::HashMap::new(),
         functions: Vec::new(),
-        disk_window: None,
+        windowed_byte_array: None,
     }
 }
 
@@ -282,7 +282,7 @@ fn no_fast_forward_on_unrelated_opcode() {
 }
 
 #[test]
-fn no_fast_forward_when_movs_source_overlaps_romdisk_window() {
+fn no_fast_forward_when_movs_source_overlaps_windowed_byte_array() {
     // The ROM-disk window at linear 0xD0000..0xD01FF is populated *per byte
     // read* by the CSS `--readDiskByte` function, not by state.memory. A bulk
     // copy_within from there would read zeros. This is exactly how CSS-DOS's

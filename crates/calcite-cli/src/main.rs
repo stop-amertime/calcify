@@ -785,17 +785,26 @@ fn main() {
             let mut evaluator = calcite_core::Evaluator::from_parsed(&parsed);
             let compile_time = t1.elapsed();
 
+            // Fusion FFD diag: enable thread-local funnel counters before
+            // the run starts so column_drawer_fast_forward records every
+            // tick. Cheap (one TLS load + branch per tick when disabled;
+            // a few non-atomic increments when enabled). End-of-run prints
+            // via fusion_diag_snapshot().report().
+            if std::env::var("CALCITE_FUSION_DIAG").is_ok() {
+                calcite_core::compile::fusion_diag_enable();
+            }
+
             // Packed-cell cabinets (PACK_SIZE > 1) keep guest memory in
             // `mcN` state vars, not in `state.memory[]`. Without this call
             // every positive-address read returns 0 even though the CPU
             // wrote the value — see Evaluator::wire_state_for_packed_memory.
             evaluator.wire_state_for_packed_memory(&mut state);
-            // The cabinet's rom-disk dispatch is recognised at compile time
-            // and the descriptor is installed on State here. No sidecar load:
-            // the disk bytes already live in the cabinet's compiled
-            // `--readDiskByte` flat-array dispatch — see
-            // Evaluator::wire_state_for_disk_window.
-            evaluator.wire_state_for_disk_window(&mut state);
+            // The cabinet's windowed-byte-array dispatch is recognised at
+            // compile time and the descriptor is installed on State here. No
+            // sidecar load: the bytes already live in the cabinet's compiled
+            // flat-array dispatch — see
+            // Evaluator::wire_state_for_windowed_byte_array.
+            evaluator.wire_state_for_windowed_byte_array(&mut state);
 
             // --restore: replay a previously-captured execution state into
             // the freshly-wired engine. This must run AFTER load_properties
@@ -1736,6 +1745,9 @@ fn main() {
             let fusion_fires = calcite_core::compile::fusion_fire_count();
             if fusion_fires > 0 {
                 eprintln!("Fusion fast-forward: {} body iterations applied", fusion_fires);
+            }
+            if std::env::var("CALCITE_FUSION_DIAG").is_ok() {
+                eprint!("{}", calcite_core::compile::fusion_diag_snapshot().report());
             }
 
             // Display string property output (e.g., --textBuffer)
