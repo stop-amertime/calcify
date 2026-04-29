@@ -335,6 +335,126 @@ impl SymExpr {
             FlatArrayLookup { .. } => None, // Needs cabinet array data; emit-side handles it.
         }
     }
+
+    /// Lower a symbolic expression into a Vec<Op> that, when evaluated against
+    /// the original entry-state slot environment, computes this expression's
+    /// value into `dst`.
+    ///
+    /// `alloc_slot` is called to allocate a fresh scratch slot for each
+    /// intermediate sub-expression. The caller is responsible for ensuring
+    /// allocated slots don't collide with anything else. Free `Slot(s)` leaves
+    /// in the expression refer to entry-state slots from the original program
+    /// — they're emitted as `LoadSlot { src: s }` with no remapping.
+    ///
+    /// Returns `Err(())` if the expression contains a `State(_)` or
+    /// `FlatArrayLookup` node — those need fusion-emit-side handling
+    /// (state-var read or array-data plumbing) and aren't pure slot ops.
+    pub fn lower_to_ops(
+        &self,
+        dst: Slot,
+        alloc_slot: &mut dyn FnMut() -> Slot,
+        out: &mut Vec<Op>,
+    ) -> Result<(), &'static str> {
+        use SymExpr::*;
+        match self {
+            Const(v) => {
+                out.push(Op::LoadLit { dst, val: *v as i32 });
+            }
+            Slot(s) => {
+                out.push(Op::LoadSlot { dst, src: *s });
+            }
+            State(_) => return Err("State (needs LoadState emit)"),
+            Add(a, b) => match (b.as_ref(), a.as_ref()) {
+                (Const(v), _) => { let sa = alloc_slot(); a.lower_to_ops(sa, alloc_slot, out)?; out.push(Op::AddLit { dst, a: sa, val: *v as i32 }); }
+                (_, Const(v)) => { let sb = alloc_slot(); b.lower_to_ops(sb, alloc_slot, out)?; out.push(Op::AddLit { dst, a: sb, val: *v as i32 }); }
+                _ => bin_to_ops(a, b, dst, alloc_slot, out, |d, x, y| Op::Add { dst: d, a: x, b: y })?,
+            },
+            Sub(a, b) => match b.as_ref() {
+                Const(v) => { let sa = alloc_slot(); a.lower_to_ops(sa, alloc_slot, out)?; out.push(Op::SubLit { dst, a: sa, val: *v as i32 }); }
+                _ => bin_to_ops(a, b, dst, alloc_slot, out, |d, x, y| Op::Sub { dst: d, a: x, b: y })?,
+            },
+            Mul(a, b) => match (b.as_ref(), a.as_ref()) {
+                (Const(v), _) => { let sa = alloc_slot(); a.lower_to_ops(sa, alloc_slot, out)?; out.push(Op::MulLit { dst, a: sa, val: *v as i32 }); }
+                (_, Const(v)) => { let sb = alloc_slot(); b.lower_to_ops(sb, alloc_slot, out)?; out.push(Op::MulLit { dst, a: sb, val: *v as i32 }); }
+                _ => bin_to_ops(a, b, dst, alloc_slot, out, |d, x, y| Op::Mul { dst: d, a: x, b: y })?,
+            },
+            Shl(a, b) => match b.as_ref() {
+                Const(v) => { let sa = alloc_slot(); a.lower_to_ops(sa, alloc_slot, out)?; out.push(Op::ShlLit { dst, a: sa, val: *v as i32 }); }
+                _ => bin_to_ops(a, b, dst, alloc_slot, out, |d, x, y| Op::Shl { dst: d, a: x, b: y })?,
+            },
+            Shr(a, b) => match b.as_ref() {
+                Const(v) => { let sa = alloc_slot(); a.lower_to_ops(sa, alloc_slot, out)?; out.push(Op::ShrLit { dst, a: sa, val: *v as i32 }); }
+                _ => bin_to_ops(a, b, dst, alloc_slot, out, |d, x, y| Op::Shr { dst: d, a: x, b: y })?,
+            },
+            LowerBytes(a, b) => match b.as_ref() {
+                Const(v) => { let sa = alloc_slot(); a.lower_to_ops(sa, alloc_slot, out)?; out.push(Op::AndLit { dst, a: sa, val: *v as i32 }); }
+                _ => bin_to_ops(a, b, dst, alloc_slot, out, |d, x, y| Op::And { dst: d, a: x, b: y })?,
+            },
+            Mod(a, b) => match b.as_ref() {
+                Const(v) => { let sa = alloc_slot(); a.lower_to_ops(sa, alloc_slot, out)?; out.push(Op::ModLit { dst, a: sa, val: *v as i32 }); }
+                _ => bin_to_ops(a, b, dst, alloc_slot, out, |d, x, y| Op::Mod { dst: d, a: x, b: y })?,
+            },
+            Div(a, b) => bin_to_ops(a, b, dst, alloc_slot, out, |d, x, y| Op::Div { dst: d, a: x, b: y })?,
+            Neg(a) => un_to_ops(a, dst, alloc_slot, out, |d, x| Op::Neg { dst: d, src: x })?,
+            Floor(a) => un_to_ops(a, dst, alloc_slot, out, |d, x| Op::Floor { dst: d, src: x })?,
+            Abs(a) => un_to_ops(a, dst, alloc_slot, out, |d, x| Op::Abs { dst: d, src: x })?,
+            Sign(a) => un_to_ops(a, dst, alloc_slot, out, |d, x| Op::Sign { dst: d, src: x })?,
+            BitExtract(v, i) => bin_to_ops(v, i, dst, alloc_slot, out, |d, x, y| Op::Bit { dst: d, val: x, idx: y })?,
+            BitAnd16(a, b) => bin_to_ops(a, b, dst, alloc_slot, out, |d, x, y| Op::BitAnd16 { dst: d, a: x, b: y })?,
+            BitOr16(a, b) => bin_to_ops(a, b, dst, alloc_slot, out, |d, x, y| Op::BitOr16 { dst: d, a: x, b: y })?,
+            BitXor16(a, b) => bin_to_ops(a, b, dst, alloc_slot, out, |d, x, y| Op::BitXor16 { dst: d, a: x, b: y })?,
+            BitNot16(a) => un_to_ops(a, dst, alloc_slot, out, |d, x| Op::BitNot16 { dst: d, a: x })?,
+            Min(args) => {
+                let mut arg_slots = Vec::with_capacity(args.len());
+                for arg in args {
+                    let s = alloc_slot();
+                    arg.lower_to_ops(s, alloc_slot, out)?;
+                    arg_slots.push(s);
+                }
+                out.push(Op::Min { dst, args: arg_slots });
+            }
+            Max(args) => {
+                let mut arg_slots = Vec::with_capacity(args.len());
+                for arg in args {
+                    let s = alloc_slot();
+                    arg.lower_to_ops(s, alloc_slot, out)?;
+                    arg_slots.push(s);
+                }
+                out.push(Op::Max { dst, args: arg_slots });
+            }
+            FlatArrayLookup { .. } => return Err("FlatArrayLookup (needs runtime array plumbing)"),
+        }
+        Ok(())
+    }
+}
+
+fn un_to_ops(
+    a: &SymExpr,
+    dst: Slot,
+    alloc_slot: &mut dyn FnMut() -> Slot,
+    out: &mut Vec<Op>,
+    build: impl FnOnce(Slot, Slot) -> Op,
+) -> Result<(), &'static str> {
+    let sa = alloc_slot();
+    a.lower_to_ops(sa, alloc_slot, out)?;
+    out.push(build(dst, sa));
+    Ok(())
+}
+
+fn bin_to_ops(
+    a: &SymExpr,
+    b: &SymExpr,
+    dst: Slot,
+    alloc_slot: &mut dyn FnMut() -> Slot,
+    out: &mut Vec<Op>,
+    build: impl FnOnce(Slot, Slot, Slot) -> Op,
+) -> Result<(), &'static str> {
+    let sa = alloc_slot();
+    a.lower_to_ops(sa, alloc_slot, out)?;
+    let sb = alloc_slot();
+    b.lower_to_ops(sb, alloc_slot, out)?;
+    out.push(build(dst, sa, sb));
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1123,5 +1243,81 @@ mod tests {
         simulate_ops(&mut env, &ops).unwrap();
         // Const-folded path: should equal Const(0x2345 & 0xFFFF) = 0x2345.
         assert_eq!(env[&2], SymExpr::Const(0x2345));
+    }
+
+    /// Round-trip: simulate ops → SymExpr → lower → simulate lowered ops →
+    /// expect bit-identical SymExpr in the destination slot.
+    #[test]
+    fn lower_to_ops_roundtrips_arithmetic() {
+        // Body: r2 = (r0 + 5) * 2 - 1
+        let mut env1: SlotEnv = HashMap::new();
+        let original = vec![
+            Op::AddLit { dst: 1, a: 0, val: 5 },
+            Op::MulLit { dst: 1, a: 1, val: 2 },
+            Op::SubLit { dst: 2, a: 1, val: 1 },
+        ];
+        simulate_ops(&mut env1, &original).unwrap();
+        let expr = env1.get(&2).unwrap().clone();
+
+        // Lower the SymExpr back to ops, targeting a fresh slot 100.
+        let mut next_slot: Slot = 200;
+        let mut alloc_slot = || { let s = next_slot; next_slot += 1; s };
+        let mut lowered = Vec::new();
+        expr.lower_to_ops(100, &mut alloc_slot, &mut lowered).unwrap();
+
+        // Simulate the lowered ops against a fresh env and check the result.
+        let mut env2: SlotEnv = HashMap::new();
+        simulate_ops(&mut env2, &lowered).unwrap();
+        let expr2 = env2.get(&100).unwrap().clone();
+
+        // Concretise both against r0=7 → expect (7+5)*2-1 = 23.
+        let mut concrete: HashMap<Slot, i64> = HashMap::new();
+        concrete.insert(0, 7);
+        assert_eq!(expr.eval_concrete(&concrete), Some(23));
+        assert_eq!(expr2.eval_concrete(&concrete), Some(23));
+    }
+
+    /// Round-trip with bitwise ops including LowerBytes/AndLit fast path.
+    #[test]
+    fn lower_to_ops_roundtrips_bitwise() {
+        // Body: r2 = lowerBytes((r0 << 4) | r1, 8)  →  ((r0<<4) | r1) & 0xFF
+        let mut env1: SlotEnv = HashMap::new();
+        let original = vec![
+            Op::ShlLit { dst: 2, a: 0, val: 4 },
+            Op::BitOr16 { dst: 2, a: 2, b: 1 },
+            Op::AndLit { dst: 2, a: 2, val: 8 },
+        ];
+        simulate_ops(&mut env1, &original).unwrap();
+        let expr = env1.get(&2).unwrap().clone();
+
+        let mut next_slot: Slot = 200;
+        let mut alloc_slot = || { let s = next_slot; next_slot += 1; s };
+        let mut lowered = Vec::new();
+        expr.lower_to_ops(100, &mut alloc_slot, &mut lowered).unwrap();
+
+        let mut env2: SlotEnv = HashMap::new();
+        simulate_ops(&mut env2, &lowered).unwrap();
+
+        let mut concrete: HashMap<Slot, i64> = HashMap::new();
+        concrete.insert(0, 0xCD);
+        concrete.insert(1, 0x05);
+        // (0xCD << 4) | 0x05 = 0xCD5; & 0xFF = 0xD5
+        assert_eq!(expr.eval_concrete(&concrete), Some(0xD5));
+        assert_eq!(env2.get(&100).unwrap().eval_concrete(&concrete), Some(0xD5));
+    }
+
+    #[test]
+    fn lower_to_ops_rejects_flat_array_lookup() {
+        let expr = SymExpr::FlatArrayLookup {
+            array_id: 0,
+            key: Box::new(SymExpr::Slot(0)),
+            base_key: 0,
+            default: 0,
+        };
+        let mut next_slot: Slot = 200;
+        let mut alloc_slot = || { let s = next_slot; next_slot += 1; s };
+        let mut out = Vec::new();
+        let r = expr.lower_to_ops(100, &mut alloc_slot, &mut out);
+        assert!(r.is_err());
     }
 }

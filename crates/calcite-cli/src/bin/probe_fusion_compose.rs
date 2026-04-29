@@ -461,6 +461,117 @@ fn main() {
         100.0 * (tables_full_compose as f64) / (total_tables.max(1) as f64));
     println!("  partial:        {}", tables_partial);
     println!("  bail at start:  {}", tables_bail);
+
+    // === Lower FULL-compose tables to fused Op sequences ===
+    // For each table that fully composed, emit the fused Op sequence and
+    // compare its op count against the sum of the original per-byte entry ops.
+    println!();
+    println!("== Fused-emit (per FULL table) ==");
+    println!("    {:>4}  {:>10}  {:>10}  {:>8}  {}",
+        "tbl", "orig_ops", "fused_ops", "shrink", "result_expr_kind");
+
+    let mut total_orig_ops = 0usize;
+    let mut total_fused_ops = 0usize;
+    let mut emit_failures = 0usize;
+    // Use a high slot range for scratch to avoid colliding with real slots.
+    let mut next_scratch: Slot = 1_000_000;
+
+    for (tbl_id, table) in program.dispatch_tables.iter().enumerate() {
+        let has_any = body.iter().any(|&b| table.entries.contains_key(&(b as i64)));
+        if !has_any { continue; }
+
+        // Re-simulate the body on this table to get the final SymExpr for
+        // the result slot. (Quick second pass — symbolic only.)
+        let mut env: SlotEnv = HashMap::new();
+        let mut result_slot_seen: Option<Slot> = None;
+        let mut bailed = false;
+        for (i, &b) in body.iter().enumerate() {
+            if let Some(pin) = pins.get(i) {
+                if !pin.fires { continue; }
+            }
+            // Re-pin invariants and decoder state.
+            for (name, val) in &body_invariant {
+                if let Some(s) = slot_of(name) {
+                    env.insert(s, SymExpr::Const(*val));
+                }
+            }
+            if let Some(pin) = pins.get(i) {
+                apply_pin(&mut env, pin, &slot_of);
+            }
+            if let Some((ops, result_slot)) = table.entries.get(&(b as i64)) {
+                result_slot_seen = Some(*result_slot);
+                if simulate_ops_full_ext(&mut env, ops, &assumptions, &program.flat_dispatch_arrays, &program.chain_tables, &program.dispatch_tables).is_err() {
+                    bailed = true;
+                    break;
+                }
+            }
+        }
+        if bailed { continue; }
+        let Some(rs) = result_slot_seen else { continue; };
+        let Some(expr) = env.get(&rs).cloned() else { continue; };
+
+        // Original op count: sum of ops across firing entries for this body.
+        let orig_op_count: usize = body.iter().enumerate()
+            .filter_map(|(i, &b)| {
+                if pins.get(i).map(|p| !p.fires).unwrap_or(false) { return None; }
+                table.entries.get(&(b as i64)).map(|(ops, _)| ops.len())
+            })
+            .sum();
+
+        // Lower the SymExpr to a fused Op sequence writing into the
+        // result_slot directly.
+        let mut fused_ops = Vec::new();
+        let mut alloc = || { let s = next_scratch; next_scratch += 1; s };
+        match expr.lower_to_ops(rs, &mut alloc, &mut fused_ops) {
+            Ok(()) => {
+                let kind = match &expr {
+                    SymExpr::Const(_) => "Const",
+                    SymExpr::Slot(_) => "Slot (pure passthrough)",
+                    SymExpr::Add(_, _) => "Add",
+                    SymExpr::Sub(_, _) => "Sub",
+                    SymExpr::Mul(_, _) => "Mul",
+                    SymExpr::Shl(_, _) => "Shl",
+                    SymExpr::Shr(_, _) => "Shr",
+                    SymExpr::LowerBytes(_, _) => "LowerBytes",
+                    SymExpr::Mod(_, _) => "Mod",
+                    SymExpr::Div(_, _) => "Div",
+                    SymExpr::BitAnd16(_, _) => "BitAnd16",
+                    SymExpr::BitOr16(_, _) => "BitOr16",
+                    SymExpr::BitXor16(_, _) => "BitXor16",
+                    SymExpr::BitNot16(_) => "BitNot16",
+                    SymExpr::Neg(_) | SymExpr::Floor(_) | SymExpr::Abs(_) | SymExpr::Sign(_) => "Unary",
+                    SymExpr::BitExtract(_, _) => "BitExtract",
+                    SymExpr::Min(_) => "Min",
+                    SymExpr::Max(_) => "Max",
+                    _ => "Other",
+                };
+                let shrink = if orig_op_count > 0 {
+                    100.0 * (1.0 - (fused_ops.len() as f64) / (orig_op_count as f64))
+                } else { 0.0 };
+                println!("    {:>4}  {:>10}  {:>10}  {:>7.1}%  {}",
+                    tbl_id, orig_op_count, fused_ops.len(), shrink, kind);
+                total_orig_ops += orig_op_count;
+                total_fused_ops += fused_ops.len();
+            }
+            Err(why) => {
+                emit_failures += 1;
+                println!("    {:>4}  {:>10}  {:>10}  --       lower-fail: {}",
+                    tbl_id, orig_op_count, "?", why);
+            }
+        }
+    }
+
+    println!();
+    println!("== Fused-emit summary ==");
+    println!("  total original ops: {}", total_orig_ops);
+    println!("  total fused ops:    {}", total_fused_ops);
+    if total_orig_ops > 0 {
+        println!("  shrink:             {:.1}%",
+            100.0 * (1.0 - (total_fused_ops as f64) / (total_orig_ops as f64)));
+    }
+    if emit_failures > 0 {
+        println!("  emit failures:      {} (non-pure SymExpr)", emit_failures);
+    }
     if !bail_reasons.is_empty() {
         println!();
         println!("== Bail-reason histogram ==");
