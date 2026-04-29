@@ -17,5 +17,6 @@ pub mod broadcast_write;
 pub mod byte_period;
 pub mod dispatch_table;
 pub mod fusion_sim;
+pub mod op_profile;
 pub mod packed_broadcast_write;
 pub mod replicated_body;

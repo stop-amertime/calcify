@@ -240,6 +240,14 @@ struct Cli {
     #[arg(long = "sample-cs-ip", value_name = "STRIDE,BURST,EVERY,PATH")]
     sample_cs_ip: Option<String>,
 
+    /// Op-adjacency profile. Records (prev_kind, curr_kind) counts for
+    /// every op dispatched (including inside dispatch entries, function
+    /// bodies, broadcast-write value_ops). Pair with --restore and --ticks
+    /// to profile a specific window. Writes a CSV at PATH and prints a
+    /// summary to stderr at end-of-run. ~10ns/op overhead when enabled.
+    #[arg(long = "op-profile", value_name = "PATH")]
+    op_profile_path: Option<PathBuf>,
+
     /// Stage condition. Repeatable.
     ///
     /// Format: `NAME:ADDR=VAL[,ADDR=VAL...][:then=ACTION]`. ADDR/VAL may
@@ -792,6 +800,12 @@ fn main() {
             // via fusion_diag_snapshot().report().
             if std::env::var("CALCITE_FUSION_DIAG").is_ok() {
                 calcite_core::compile::fusion_diag_enable();
+            }
+
+            // --op-profile: enable adjacency tracking before the run starts.
+            // The CSV + summary print happens at end-of-run.
+            if cli.op_profile_path.is_some() {
+                calcite_core::pattern::op_profile::op_profile_enable();
             }
 
             // Packed-cell cabinets (PACK_SIZE > 1) keep guest memory in
@@ -1748,6 +1762,18 @@ fn main() {
             }
             if std::env::var("CALCITE_FUSION_DIAG").is_ok() {
                 eprint!("{}", calcite_core::compile::fusion_diag_snapshot().report());
+            }
+
+            // --op-profile: dump matrix CSV + print summary to stderr.
+            if let Some(path) = &cli.op_profile_path {
+                let snap = calcite_core::pattern::op_profile::op_profile_snapshot();
+                if let Err(e) = snap.write_csv(path) {
+                    eprintln!("--op-profile write {}: {}", path.display(), e);
+                } else {
+                    eprintln!("op-profile CSV written to {}", path.display());
+                }
+                eprint!("{}", snap.report_summary());
+                calcite_core::pattern::op_profile::op_profile_disable();
             }
 
             // Display string property output (e.g., --textBuffer)

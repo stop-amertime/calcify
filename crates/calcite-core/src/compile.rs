@@ -6609,9 +6609,15 @@ fn exec_ops(
         }};
     }
 
+    let op_profile_enabled = crate::pattern::op_profile::op_profile_is_enabled();
+
     while pc < len {
         // Safety: pc < len checked by loop condition.
         let op = unsafe { ops.get_unchecked(pc) };
+        if op_profile_enabled {
+            let kind = crate::pattern::op_profile::op_kind_index(op);
+            crate::pattern::op_profile::op_profile_tick(kind);
+        }
         match op {
             // Hot path: 96%+ of ops in CSS-DOS programs are this one variant.
             // Keep it first so the compiler can (hopefully) lay out the jump table
