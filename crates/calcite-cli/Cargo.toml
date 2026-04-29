@@ -65,3 +65,15 @@ path = "src/bin/probe_cell_template.rs"
 [[bin]]
 name = "probe-pack-diff"
 path = "src/bin/probe_pack_diff.rs"
+
+[[bin]]
+name = "probe-loadslot-coalesce"
+path = "src/bin/probe_loadslot_coalesce.rs"
+
+[[bin]]
+name = "probe-jump-audit"
+path = "src/bin/probe_jump_audit.rs"
+
+[[bin]]
+name = "probe-branch-chains"
+path = "src/bin/probe_branch_chains.rs"

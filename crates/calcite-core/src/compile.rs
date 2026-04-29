@@ -3297,6 +3297,10 @@ pub fn compile(
     log::info!("[compile detail] fuse_loadstate_branch: {} fused, {:.2}s", lsfused, _ct.elapsed().as_secs_f64());
 
     let _ct = web_time::Instant::now();
+    let shortened = shorten_jumps(&mut program);
+    log::info!("[compile detail] shorten_jumps: {} branch fields rewritten, {:.2}s", shortened, _ct.elapsed().as_secs_f64());
+
+    let _ct = web_time::Instant::now();
     compact_slots(&mut program);
     log::info!("[compile detail] slot compaction: {:.2}s", _ct.elapsed().as_secs_f64());
 
@@ -3907,9 +3911,17 @@ fn build_dispatch_chains(program: &mut CompiledProgram) -> usize {
     total
 }
 
-/// Minimum chain length to convert. Below this, linear BranchIfNotEqLit
-/// is probably faster than a HashMap lookup (which costs ~30ns vs ~5ns/op).
-const MIN_CHAIN_LEN: usize = 6;
+/// Minimum chain length to convert via the HashMap-only path. Below this,
+/// linear BranchIfNotEqLit is probably faster than a HashMap lookup (which
+/// costs ~30ns vs ~5ns/op).
+const MIN_CHAIN_LEN_HASHMAP: usize = 6;
+
+/// Minimum chain length to convert when the flat-array fast path will be
+/// available — i.e. when keys are dense enough to fit in `Vec<u32>` indexed
+/// by `key - base`. Flat-array lookups are O(1) and ~5ns, comparable to a
+/// single linear branch but eliminating the per-branch dispatch overhead
+/// for length-≥2 runs. S1.3: lowered from 6 to 2.
+const MIN_CHAIN_LEN_FLAT: usize = 2;
 
 fn chains_in_ops(ops: &mut [Op], chain_tables: &mut Vec<DispatchChainTable>) -> usize {
     let mut built = 0;
@@ -3942,45 +3954,263 @@ fn chains_in_ops(ops: &mut [Op], chain_tables: &mut Vec<DispatchChainTable>) -> 
             }
         }
 
-        if entries.len() >= MIN_CHAIN_LEN {
-            // Build the table.
-            let mut table = DispatchChainTable::default();
-            for (v, pc) in &entries {
-                // If there are duplicate keys (shouldn't normally happen), first wins.
-                table.entries.entry(*v).or_insert(*pc);
-            }
-            // Build a dense-array fast path when the key range is small enough.
-            // Density threshold: range / count <= 2 (i.e., at least half the
-            // indices are real entries, rest are misses).
-            if !table.entries.is_empty() {
-                let mut min_k = i32::MAX;
-                let mut max_k = i32::MIN;
-                for &k in table.entries.keys() {
-                    if k < min_k { min_k = k; }
-                    if k > max_k { max_k = k; }
-                }
-                let range = (max_k as i64) - (min_k as i64) + 1;
-                let count = table.entries.len() as i64;
-                // Cap absolute range to avoid huge sparse tables for outlier keys.
-                if range <= 256 && range <= count * 3 {
-                    let mut targets = vec![u32::MAX; range as usize];
-                    for (&k, &pc) in &table.entries {
-                        targets[(k - min_k) as usize] = pc;
-                    }
-                    table.flat_table = Some(FlatChainTable { base: min_k, targets });
-                }
-            }
-            let chain_id = chain_tables.len() as u32;
-            chain_tables.push(table);
-            ops[i] = Op::DispatchChain { a: key_slot, chain_id, miss_target: miss };
-            built += 1;
-            // Advance past the whole chain so we don't nest chains.
-            i = last_branch_pc + 1;
-        } else {
+        // Decide whether to convert. We allow short runs (length >= 2) only
+        // when the flat-array fast path will be built — flat lookups are
+        // O(1) and competitive with linear branches even at length 2.
+        if entries.len() < MIN_CHAIN_LEN_FLAT {
             i += 1;
+            continue;
         }
+
+        // Build the table (key map + optional flat fast path).
+        let mut table = DispatchChainTable::default();
+        for (v, pc) in &entries {
+            // If there are duplicate keys (shouldn't normally happen), first wins.
+            table.entries.entry(*v).or_insert(*pc);
+        }
+        // Try to build the dense-array fast path. Density threshold: range
+        // ≤ count*3 (at least ~1/3 of the indices are real entries).
+        let mut has_flat = false;
+        if !table.entries.is_empty() {
+            let mut min_k = i32::MAX;
+            let mut max_k = i32::MIN;
+            for &k in table.entries.keys() {
+                if k < min_k { min_k = k; }
+                if k > max_k { max_k = k; }
+            }
+            let range = (max_k as i64) - (min_k as i64) + 1;
+            let count = table.entries.len() as i64;
+            if range <= 256 && range <= count * 3 {
+                let mut targets = vec![u32::MAX; range as usize];
+                for (&k, &pc) in &table.entries {
+                    targets[(k - min_k) as usize] = pc;
+                }
+                table.flat_table = Some(FlatChainTable { base: min_k, targets });
+                has_flat = true;
+            }
+        }
+
+        // Gate: short runs (< MIN_CHAIN_LEN_HASHMAP) must have the flat
+        // fast path or we leave them as linear branches.
+        if entries.len() < MIN_CHAIN_LEN_HASHMAP && !has_flat {
+            i += 1;
+            continue;
+        }
+
+        let chain_id = chain_tables.len() as u32;
+        chain_tables.push(table);
+        ops[i] = Op::DispatchChain { a: key_slot, chain_id, miss_target: miss };
+        built += 1;
+        // Advance past the whole chain so we don't nest chains.
+        i = last_branch_pc + 1;
     }
     built
+}
+
+// ---------------------------------------------------------------------------
+// Jump-to-jump shortening (S1.2)
+// ---------------------------------------------------------------------------
+
+/// Shorten every chain `A: Jump → B: Jump → C: …` into a direct `A → C`.
+///
+/// Within one ops slice, computes `chase[pc]` for every PC that lands on
+/// an `Op::Jump`, then rewrites every branch-like target field in the
+/// slice (and every chain-table body PC for chains that live in this
+/// slice) to point at the chased target.
+///
+/// Cycles (a sequence of Jump ops that loops back to itself) are left
+/// alone — chasing stops at the first repeated PC. The original
+/// program would loop forever there too; we don't change that behaviour.
+///
+/// Returns the number of branch-like target fields whose value changed.
+fn shorten_jumps(program: &mut CompiledProgram) -> usize {
+    let mut total = 0;
+
+    // Main ops + main-stream chain tables.
+    let main_chain_ids = collect_chain_ids(&program.ops);
+    total += shorten_jumps_in_slice(
+        &mut program.ops,
+        &main_chain_ids,
+        &mut program.chain_tables,
+    );
+
+    // Dispatch table entry ops have their own PC scope. Chain tables
+    // referenced by them are still in the shared `program.chain_tables`
+    // arena, but with body PCs into the entry's own slice.
+    for table in &mut program.dispatch_tables {
+        for (_k, (entry_ops, _s)) in &mut table.entries {
+            let ids = collect_chain_ids(entry_ops);
+            total += shorten_jumps_in_slice(entry_ops, &ids, &mut program.chain_tables);
+        }
+        let ids = collect_chain_ids(&table.fallback_ops);
+        total += shorten_jumps_in_slice(&mut table.fallback_ops, &ids, &mut program.chain_tables);
+    }
+
+    // Broadcast value/spillover ops have their own PC scope too.
+    for bw in &mut program.broadcast_writes {
+        let ids = collect_chain_ids(&bw.value_ops);
+        total += shorten_jumps_in_slice(&mut bw.value_ops, &ids, &mut program.chain_tables);
+        if let Some(ref mut sp) = bw.spillover {
+            for (_k, (spill_ops, _s)) in &mut sp.entries {
+                let ids = collect_chain_ids(spill_ops);
+                total += shorten_jumps_in_slice(spill_ops, &ids, &mut program.chain_tables);
+            }
+        }
+    }
+
+    // Compiled function bodies have their own PC scope and don't share
+    // chain tables with the main stream (build_dispatch_chains runs
+    // chain construction per-slice, and Op::Call is inlined before
+    // chain construction, so functions still in `program.functions`
+    // are leftover skeletons — but rewrite anyway in case any survive
+    // and run via the interpreter fallback).
+    for func in &mut program.functions {
+        let ids = collect_chain_ids(&func.body_ops);
+        total += shorten_jumps_in_slice(&mut func.body_ops, &ids, &mut program.chain_tables);
+    }
+
+    total
+}
+
+/// Collect the set of chain_ids referenced by `Op::DispatchChain` in this
+/// ops slice. Returned as a sorted Vec for fast membership-by-binary-search
+/// (the slice owns the chain table for the duration of jump shortening).
+fn collect_chain_ids(ops: &[Op]) -> Vec<u32> {
+    let mut ids = Vec::new();
+    for op in ops {
+        if let Op::DispatchChain { chain_id, .. } = op {
+            ids.push(*chain_id);
+        }
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+/// Shorten jumps in a single ops slice. Returns the number of target
+/// fields whose value changed. `chain_ids` lists chain tables whose
+/// body PCs are PCs into this slice.
+fn shorten_jumps_in_slice(
+    ops: &mut [Op],
+    chain_ids: &[u32],
+    chain_tables: &mut [DispatchChainTable],
+) -> usize {
+    let n = ops.len();
+    if n == 0 {
+        return 0;
+    }
+
+    // Single pass over ops, mutating in place. Each op's chase reads
+    // only `Op::Jump.target` fields of OTHER ops; we never mutate Jump
+    // ops to anything other than the terminal target of their own
+    // chain, so re-reading a previously-rewritten Jump just returns
+    // the same value (idempotent).
+    //
+    // To work around the borrow checker (chase needs `&[Op]`, mutate
+    // needs `&mut Op`), index by PC and use `&ops[..]` for the chase
+    // call inside an `unsafe`-free split: read the target out, chase,
+    // then re-borrow mutably to write.
+    let mut changed = 0;
+    for i in 0..ops.len() {
+        let new_t_opt: Option<u32> = match &ops[i] {
+            Op::Jump { target }
+            | Op::BranchIfZero { target, .. }
+            | Op::BranchIfNotEqLit { target, .. }
+            | Op::LoadStateAndBranchIfNotEqLit { target, .. } => {
+                let t = *target;
+                let new_t = chase_jump(ops, t);
+                if new_t != t { Some(new_t) } else { None }
+            }
+            Op::DispatchChain { miss_target, .. } => {
+                let t = *miss_target;
+                let new_t = chase_jump(ops, t);
+                if new_t != t { Some(new_t) } else { None }
+            }
+            Op::MemoryFill { exit_target, .. } | Op::MemoryCopy { exit_target, .. } => {
+                let t = *exit_target;
+                let new_t = chase_jump(ops, t);
+                if new_t != t { Some(new_t) } else { None }
+            }
+            Op::Dispatch { fallback_target, .. } => {
+                let t = *fallback_target;
+                let new_t = chase_jump(ops, t);
+                if new_t != t { Some(new_t) } else { None }
+            }
+            _ => None,
+        };
+        if let Some(new_t) = new_t_opt {
+            match &mut ops[i] {
+                Op::Jump { target }
+                | Op::BranchIfZero { target, .. }
+                | Op::BranchIfNotEqLit { target, .. }
+                | Op::LoadStateAndBranchIfNotEqLit { target, .. } => *target = new_t,
+                Op::DispatchChain { miss_target, .. } => *miss_target = new_t,
+                Op::MemoryFill { exit_target, .. } | Op::MemoryCopy { exit_target, .. } => {
+                    *exit_target = new_t
+                }
+                Op::Dispatch { fallback_target, .. } => *fallback_target = new_t,
+                _ => unreachable!(),
+            }
+            changed += 1;
+        }
+    }
+
+    // Chain tables associated with this slice: rewrite body PCs.
+    // ops is now immutable again so we can call chase_jump freely.
+    for &id in chain_ids {
+        let table = &mut chain_tables[id as usize];
+        for (_k, body_pc) in table.entries.iter_mut() {
+            let new_t = chase_jump(ops, *body_pc);
+            if new_t != *body_pc {
+                *body_pc = new_t;
+                changed += 1;
+            }
+        }
+        if let Some(flat) = &mut table.flat_table {
+            for t in flat.targets.iter_mut() {
+                if *t == u32::MAX {
+                    continue; // sentinel — no entry
+                }
+                let new_t = chase_jump(ops, *t);
+                if new_t != *t {
+                    *t = new_t;
+                    changed += 1;
+                }
+            }
+        }
+    }
+
+    changed
+}
+
+/// Follow `Op::Jump.target` from `start` until reaching a non-Jump op,
+/// running off the slice (PC ≥ ops.len()), or hitting MAX_HOPS. Returns
+/// the terminal PC. On hop-budget exhaustion or self-loop, returns
+/// `start` unchanged so cycle semantics are preserved.
+///
+/// `MAX_HOPS = 64` is plenty in practice — real CSS-DOS jump chains are
+/// short — and bounds the per-target cost so the whole pass is O(ops·k)
+/// with a small k.
+fn chase_jump(ops: &[Op], start: u32) -> u32 {
+    const MAX_HOPS: u32 = 64;
+    let n = ops.len();
+    let mut cur = start;
+    for _ in 0..MAX_HOPS {
+        let pc = cur as usize;
+        if pc >= n {
+            return cur;
+        }
+        match &ops[pc] {
+            Op::Jump { target } => {
+                if *target == cur {
+                    return start; // self-loop — leave alone
+                }
+                cur = *target;
+            }
+            _ => return cur,
+        }
+    }
+    start
 }
 
 // ---------------------------------------------------------------------------

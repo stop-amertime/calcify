@@ -21,6 +21,27 @@ fn worktree_root() -> PathBuf {
     p
 }
 
+fn pick_cabinet() -> Option<PathBuf> {
+    if let Ok(env_path) = std::env::var("CALCITE_DOOM_CSS") {
+        let p = PathBuf::from(env_path);
+        if p.is_file() { return Some(p); }
+    }
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    for ancestor in manifest.ancestors() {
+        for sibling in ["CSS-DOS"] {
+            let c = ancestor.join(sibling).join("doom8088.css");
+            if c.is_file() { return Some(c); }
+            if let Some(parent) = ancestor.parent() {
+                let c2 = parent.join(sibling).join("doom8088.css");
+                if c2.is_file() { return Some(c2); }
+            }
+        }
+    }
+    let demo = worktree_root().join("web").join("demo.css");
+    if demo.is_file() { return Some(demo); }
+    None
+}
+
 fn time_ticks(css: &str, backend: Backend) -> f64 {
     let parsed = parse_css(css).expect("parse cabinet css");
     let mut state = State::default();
@@ -36,11 +57,14 @@ fn time_ticks(css: &str, backend: Backend) -> f64 {
 
 #[test]
 fn phase3_closure_smoke_timings() {
-    let cabinet = worktree_root().join("web").join("demo.css");
-    if !cabinet.is_file() {
-        eprintln!("phase3_closure_smoke: skipping — no cabinet at {}", cabinet.display());
-        return;
-    }
+    let cabinet = match pick_cabinet() {
+        Some(p) => p,
+        None => {
+            eprintln!("phase3_closure_smoke: skipping — no cabinet found");
+            return;
+        }
+    };
+    eprintln!("phase3_closure_smoke: cabinet = {}", cabinet.display());
     let css = std::fs::read_to_string(&cabinet).expect("read cabinet");
     let bytecode_s = time_ticks(&css, Backend::Bytecode);
     let dag_s = time_ticks(&css, Backend::Dag);
