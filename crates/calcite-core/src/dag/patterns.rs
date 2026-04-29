@@ -447,7 +447,8 @@ fn op_writes_slot(op: &Op) -> Option<u32> {
         | Op::StoreState { .. }
         | Op::StoreMem { .. }
         | Op::MemoryFill { .. }
-        | Op::MemoryCopy { .. } => None,
+        | Op::MemoryCopy { .. }
+        | Op::ReplicatedBody { .. } => None,
     }
 }
 
