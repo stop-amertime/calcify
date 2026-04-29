@@ -1733,6 +1733,10 @@ fn main() {
                 ticks_run,
                 ticks_run as f64 / tick_time.as_secs_f64(),
             );
+            let fusion_fires = calcite_core::compile::fusion_fire_count();
+            if fusion_fires > 0 {
+                eprintln!("Fusion fast-forward: {} body iterations applied", fusion_fires);
+            }
 
             // Display string property output (e.g., --textBuffer)
             for (name, value) in &state.string_properties {

@@ -5481,6 +5481,200 @@ pub fn execute(program: &CompiledProgram, state: &mut State, slots: &mut Vec<i32
     if rep_fastfwd_enabled() {
         rep_fast_forward(program, state, slots);
     }
+
+    // Fusion fast-forward: detect the doom column-drawer body in ROM at
+    // current CS:IP, bulk-apply its net effect. See column_drawer_fast_forward.
+    if fusion_fastfwd_enabled() {
+        let n = column_drawer_fast_forward(program, state, slots);
+        #[cfg(not(target_arch = "wasm32"))]
+        if n > 0 {
+            FUSION_FIRES.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        }
+        let _ = n;
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+static FUSION_FIRES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn fusion_fire_count() -> usize {
+    FUSION_FIRES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn fusion_fastfwd_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        match std::env::var("CALCITE_FUSION_FASTFWD").as_deref() {
+            Ok("0") | Ok("false") | Ok("off") => false,
+            _ => true,
+        }
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+fn fusion_fastfwd_enabled() -> bool { true }
+
+/// The 21-byte column-drawer body pattern. Detected periodically in the
+/// doom8088 ROM by byte_period (offset 86306, 16 reps). Pattern matching
+/// against this byte sequence at current CS:IP triggers the fused body
+/// emit. Cabinet-agnostic — any cabinet whose ROM happens to contain this
+/// sequence at the current IP and whose register state matches the body's
+/// preconditions (no REP, no segment override, etc.) fires the fast-forward.
+const COLUMN_DRAWER_BODY: &[u8] = &[
+    0x88, 0xF0, 0xD0, 0xE8, 0x89, 0xF3, 0xD7, 0x89, 0xCB, 0x36, 0xD7,
+    0x88, 0xC4, 0xAB, 0xAB, 0x81, 0xC7, 0xEC, 0x00, 0x01, 0xEA,
+];
+
+/// Bulk-apply N iterations of the column-drawer body. Each body iteration:
+///   mov al, dh           ; al = dh
+///   shr al, 1            ; al = dh >> 1
+///   mov bx, si           ; bx = si (transient)
+///   xlat                 ; al = mem[ds*16 + si + al]
+///   mov bx, cx           ; bx = cx
+///   ss: xlat             ; al = mem[ss*16 + cx + al]  (with SS: prefix)
+///   mov ah, al           ; ax = (al << 8) | al
+///   stosw                ; mem[es*16 + di] = ax; di += 2
+///   stosw                ; mem[es*16 + di] = ax; di += 2
+///   add di, 0xEC         ; di += 0xEC
+///   add dx, bp           ; dx += bp
+///
+/// Net per-iteration: two memory reads (palette, colormap) → one byte →
+/// broadcast to AX → two memory writes → DI advances 4 + 0xEC = 0xF0,
+/// DX advances by BP, AL/AH = colormap byte, BX = CX (final).
+///
+/// Returns the number of iterations applied (0 if no match).
+fn column_drawer_fast_forward(program: &CompiledProgram, state: &mut State, slots: &[i32]) -> usize {
+    fn read_prop(program: &CompiledProgram, state: &State, slots: &[i32], name: &str) -> Option<i32> {
+        if let Some(&s) = program.property_slots.get(name) {
+            return Some(slots[s as usize]);
+        }
+        let bare = name.strip_prefix("--").unwrap_or(name);
+        state.get_var(bare)
+    }
+
+    // Guards: must have --opcode (post-tick), no REP, no segment override.
+    let opcode = match read_prop(program, state, slots, "--opcode") {
+        Some(v) => v,
+        None => return 0,
+    };
+    // Body's first byte is 0x88. Only fire when we just executed it (or at
+    // the start of a body). If post-tick opcode is not the body's last byte
+    // (0x01 ADD r/m16,r16 from byte 19) we can still fire if next-IP lands
+    // at a body. Simpler condition: detection by ROM bytes at IP.
+    let _ = opcode;
+
+    let has_rep = read_prop(program, state, slots, "--hasREP").unwrap_or(0);
+    if has_rep != 0 { return 0; }
+    let has_seg_ov = read_prop(program, state, slots, "--hasSegOverride").unwrap_or(0);
+    if has_seg_ov != 0 { return 0; }
+
+    // Read CS:IP, compute linear IP.
+    let cs = match state.get_var("CS") { Some(v) => v, None => return 0 };
+    let ip = match state.get_var("IP") { Some(v) => v, None => return 0 };
+    let cs_base = (cs as i64) * 16;
+    let ip_lin = cs_base + (ip as i64);
+    if ip_lin < 0 { return 0; }
+
+    // Detect the column-drawer body at current IP. If we just executed
+    // byte 20 of body N, the post-tick IP points at byte 0 of body N+1
+    // (or the next instruction if this was the last body). So we match
+    // the body starting at the CURRENT post-tick IP.
+    if !rom_match(state, ip_lin as i32, COLUMN_DRAWER_BODY) {
+        return 0;
+    }
+
+    // Detect how many bodies are stacked (max 16 unrolled).
+    let mut reps = 0;
+    while reps < 16 {
+        let off = (reps as i64) * (COLUMN_DRAWER_BODY.len() as i64);
+        if !rom_match(state, (ip_lin + off) as i32, COLUMN_DRAWER_BODY) {
+            break;
+        }
+        reps += 1;
+    }
+    if reps == 0 { return 0; }
+
+    // Read entry-state registers.
+    let dx = state.get_var("DX").unwrap_or(0) as i32;
+    let bp = state.get_var("BP").unwrap_or(0) as i32;
+    let cx = state.get_var("CX").unwrap_or(0) as i32;
+    let si = state.get_var("SI").unwrap_or(0) as i32;
+    let mut di = state.get_var("DI").unwrap_or(0) as i32;
+    let ds = state.get_var("DS").unwrap_or(0) as i32;
+    let ss = state.get_var("SS").unwrap_or(0) as i32;
+    let es = state.get_var("ES").unwrap_or(0) as i32;
+    let ax_init = state.get_var("AX").unwrap_or(0) as i32;
+
+    // Run N body iterations. Each iteration mutates dx, di; ax/bx are
+    // overwritten per body, only their final values matter.
+    let mut dx_cur = dx;
+    let mut last_byte: i32 = 0;
+    for _ in 0..reps {
+        // dh = high byte of dx (pre-iteration; the body reads dh BEFORE
+        // updating dx. Update happens at the very end via 'add dx,bp'.)
+        let dh = (dx_cur >> 8) & 0xFF;
+        let al0 = dh >> 1;                              // shr al,1
+        // First xlat: ds*16 + si + al0
+        let p0_addr = ((ds as i64) * 16 + (si as i64) + (al0 as i64)) as i32;
+        let p0 = state.read_mem(p0_addr) & 0xFF;
+        // Second xlat (with SS:): ss*16 + cx + p0
+        let p1_addr = ((ss as i64) * 16 + (cx as i64) + (p0 as i64)) as i32;
+        let p1 = state.read_mem(p1_addr) & 0xFF;
+        last_byte = p1;
+        // ax = (p1 << 8) | p1
+        let ax = (p1 << 8) | p1;
+        let ax_lo = (ax & 0xFF) as u8;
+        let ax_hi = ((ax >> 8) & 0xFF) as u8;
+        // stosw at es:di, di += 2
+        let d0 = ((es as i64) * 16 + (di as i64)) as i32;
+        bulk_store_byte(state, d0 as i64, ax_lo);
+        bulk_store_byte(state, (d0 + 1) as i64, ax_hi);
+        di = (di + 2) & 0xFFFF;
+        // stosw at es:di, di += 2
+        let d1 = ((es as i64) * 16 + (di as i64)) as i32;
+        bulk_store_byte(state, d1 as i64, ax_lo);
+        bulk_store_byte(state, (d1 + 1) as i64, ax_hi);
+        di = (di + 2) & 0xFFFF;
+        // add di, 0xEC
+        di = (di + 0xEC) & 0xFFFF;
+        // add dx, bp (16-bit wrap)
+        dx_cur = (dx_cur + bp) & 0xFFFF;
+    }
+
+    // Commit: AX = (last_byte << 8) | last_byte, BX = CX (final body wrote it),
+    // DX = dx_cur, DI = di, IP advanced by reps * 21.
+    let ax_final = (last_byte << 8) | last_byte;
+    state.set_var("AX", ax_final & 0xFFFF);
+    state.set_var("BX", cx & 0xFFFF);
+    state.set_var("DX", dx_cur & 0xFFFF);
+    state.set_var("DI", di & 0xFFFF);
+    let ip_new = ((ip as i64) + (reps as i64) * (COLUMN_DRAWER_BODY.len() as i64)) & 0xFFFF;
+    state.set_var("IP", ip_new as i32);
+    // Charge cycles. Per body: ~50 cycles (rough estimate based on opcodes).
+    if let Some(cc) = state.get_var("cycleCount") {
+        let total = (reps as i32).wrapping_mul(50);
+        state.set_var("cycleCount", cc.wrapping_add(total));
+    }
+    // We initially only accounted for the post-tick state of the *first*
+    // body byte (0x88 mov al,dh) since that's what the CSS would have just
+    // executed. Skip that — we instead detected at the START of a body
+    // (post-tick IP at byte 0 of the unfired body). So we apply ALL reps
+    // here, no need to subtract.
+    let _ = ax_init;
+    reps
+}
+
+fn rom_match(state: &State, addr: i32, pattern: &[u8]) -> bool {
+    for (i, &b) in pattern.iter().enumerate() {
+        let a = addr.wrapping_add(i as i32);
+        if (state.read_mem(a) & 0xFF) as u8 != b {
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg(not(target_arch = "wasm32"))]
