@@ -44,7 +44,7 @@
 
 use std::collections::HashMap;
 
-use crate::compile::{FlatDispatchArray, Op, Slot};
+use crate::compile::{CompiledDispatchTable, DispatchChainTable, FlatDispatchArray, Op, Slot};
 
 /// A symbolic expression. Trees of these represent composed values.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,6 +81,19 @@ pub enum SymExpr {
     BitOr16(Box<SymExpr>, Box<SymExpr>),
     BitXor16(Box<SymExpr>, Box<SymExpr>),
     BitNot16(Box<SymExpr>),
+    /// Runtime flat-array lookup. `array_id` references the cabinet's
+    /// `program.flat_dispatch_arrays[array_id]`; `key_expr` is a symbolic
+    /// expression for the lookup key, evaluated at fused-tick time.
+    /// `base_key` and `default` mirror `Op::DispatchFlatArray`.
+    /// Used when the key isn't statically Const but the lookup is otherwise
+    /// well-defined — we keep the symbolic node so emit can either inline
+    /// the array values or call back into the runtime dispatcher.
+    FlatArrayLookup {
+        array_id: u32,
+        key: Box<SymExpr>,
+        base_key: i32,
+        default: i32,
+    },
 }
 
 impl SymExpr {
@@ -319,6 +332,7 @@ impl SymExpr {
             }
             Abs(a) => Some(a.eval_concrete(slot_env)?.wrapping_abs()),
             Sign(a) => Some(a.eval_concrete(slot_env)?.signum()),
+            FlatArrayLookup { .. } => None, // Needs cabinet array data; emit-side handles it.
         }
     }
 }
@@ -335,6 +349,24 @@ pub enum BailReason {
 
 /// Symbolic environment: slot index → current expression for that slot.
 pub type SlotEnv = HashMap<Slot, SymExpr>;
+
+/// A pending memory write recorded during simulation. Address and value
+/// are SymExprs so they thread through 16-rep replication.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingWrite {
+    pub addr: SymExpr,
+    pub val: SymExpr,
+}
+
+/// Combined simulation result: slot env + ordered list of memory writes
+/// the body performs. Returned by `simulate_with_effects`.
+#[derive(Debug, Clone, Default)]
+pub struct SimResult {
+    pub env: SlotEnv,
+    pub writes: Vec<PendingWrite>,
+    /// Compile-time-known state-var writes (StoreState ops).
+    pub state_writes: Vec<(i32, SymExpr)>,
+}
 
 /// Compile-time assumptions about state-var values at fusion entry.
 /// Maps `state.read_mem(addr)` results to a known constant. Used to
@@ -353,12 +385,28 @@ pub type SlotEnv = HashMap<Slot, SymExpr>;
 #[derive(Debug, Clone, Default)]
 pub struct Assumptions {
     pub state_vars: HashMap<i32, i32>,
+    /// Compile-time-known guest memory bytes, keyed by linear address.
+    /// Used to const-fold LoadMem / LoadMem16 / LoadPackedByte when the
+    /// address slot resolves to a `Const`. The fusion site supplies these
+    /// for the body bytes it's composing — those are the ROM bytes the
+    /// per-instruction dispatch reads via `--rawN` → `--readMem(--linearIP+N)`.
+    pub mem_bytes: HashMap<i32, u8>,
 }
 
 impl Assumptions {
     pub fn new() -> Self { Self::default() }
     pub fn with(mut self, addr: i32, val: i32) -> Self {
         self.state_vars.insert(addr, val);
+        self
+    }
+    pub fn with_mem(mut self, addr: i32, byte: u8) -> Self {
+        self.mem_bytes.insert(addr, byte);
+        self
+    }
+    pub fn with_mem_range(mut self, base_addr: i32, bytes: &[u8]) -> Self {
+        for (i, &b) in bytes.iter().enumerate() {
+            self.mem_bytes.insert(base_addr + i as i32, b);
+        }
         self
     }
 }
@@ -391,6 +439,32 @@ pub fn simulate_ops_full(
     assumptions: &Assumptions,
     flat_arrays: &[FlatDispatchArray],
 ) -> Result<(), BailReason> {
+    simulate_ops_full_with_chains(env, ops, assumptions, flat_arrays, &[])
+}
+
+/// As `simulate_ops_full`, but also resolves `DispatchChain` ops when the
+/// keying slot resolves to a `Const`. Pass `program.chain_tables`.
+pub fn simulate_ops_full_with_chains(
+    env: &mut SlotEnv,
+    ops: &[Op],
+    assumptions: &Assumptions,
+    flat_arrays: &[FlatDispatchArray],
+    chain_tables: &[DispatchChainTable],
+) -> Result<(), BailReason> {
+    simulate_ops_full_ext(env, ops, assumptions, flat_arrays, chain_tables, &[])
+}
+
+/// As `simulate_ops_full_with_chains`, but also resolves `Dispatch` (HashMap)
+/// ops when the keying slot is `Const`: recursively simulate the entry's ops
+/// and write the entry's result slot value into `dst`.
+pub fn simulate_ops_full_ext(
+    env: &mut SlotEnv,
+    ops: &[Op],
+    assumptions: &Assumptions,
+    flat_arrays: &[FlatDispatchArray],
+    chain_tables: &[DispatchChainTable],
+    dispatch_tables: &[CompiledDispatchTable],
+) -> Result<(), BailReason> {
     let mut pc: usize = 0;
     let mut steps: usize = 0;
     let max_steps = ops.len() * 16; // bound runaway simulation
@@ -400,13 +474,64 @@ pub fn simulate_ops_full(
         }
         steps += 1;
         let op = &ops[pc];
-        match simulate_op_with_cfg(env, op, assumptions, flat_arrays)? {
+        match simulate_op_ext(env, op, assumptions, flat_arrays, chain_tables, dispatch_tables)? {
             StepOutcome::Next => pc += 1,
             StepOutcome::Jump(t) => pc = t,
             StepOutcome::Halt => break,
         }
     }
     Ok(())
+}
+
+/// Side-effect-recording simulation. Runs like `simulate_ops_full` but
+/// accumulates `StoreMem` and `StoreState` into the result instead of
+/// bailing. Used by the fusion-emit path that needs to know what memory
+/// effects the body has so it can replay them at fused-tick time.
+pub fn simulate_with_effects(
+    result: &mut SimResult,
+    ops: &[Op],
+    assumptions: &Assumptions,
+    flat_arrays: &[FlatDispatchArray],
+) -> Result<(), BailReason> {
+    let mut pc: usize = 0;
+    let mut steps: usize = 0;
+    let max_steps = ops.len() * 16;
+    while pc < ops.len() {
+        if steps > max_steps {
+            return Err(BailReason::Branch("loop-or-runaway"));
+        }
+        steps += 1;
+        let op = &ops[pc];
+        match simulate_op_effects(result, op, assumptions, flat_arrays)? {
+            StepOutcome::Next => pc += 1,
+            StepOutcome::Jump(t) => pc = t,
+            StepOutcome::Halt => break,
+        }
+    }
+    Ok(())
+}
+
+fn simulate_op_effects(
+    result: &mut SimResult,
+    op: &Op,
+    assumptions: &Assumptions,
+    flat_arrays: &[FlatDispatchArray],
+) -> Result<StepOutcome, BailReason> {
+    use Op::*;
+    match op {
+        StoreMem { addr_slot, src } => {
+            let addr = read_slot(&result.env, *addr_slot);
+            let val = read_slot(&result.env, *src);
+            result.writes.push(PendingWrite { addr, val });
+            Ok(StepOutcome::Next)
+        }
+        StoreState { addr, src } => {
+            let val = read_slot(&result.env, *src);
+            result.state_writes.push((*addr, val));
+            Ok(StepOutcome::Next)
+        }
+        _ => simulate_op_with_cfg(&mut result.env, op, assumptions, flat_arrays),
+    }
 }
 
 enum StepOutcome {
@@ -435,6 +560,27 @@ fn simulate_op_with_cfg(
     op: &Op,
     assumptions: &Assumptions,
     flat_arrays: &[FlatDispatchArray],
+) -> Result<StepOutcome, BailReason> {
+    simulate_op_with_cfg_chains(env, op, assumptions, flat_arrays, &[])
+}
+
+fn simulate_op_with_cfg_chains(
+    env: &mut SlotEnv,
+    op: &Op,
+    assumptions: &Assumptions,
+    flat_arrays: &[FlatDispatchArray],
+    chain_tables: &[DispatchChainTable],
+) -> Result<StepOutcome, BailReason> {
+    simulate_op_ext(env, op, assumptions, flat_arrays, chain_tables, &[])
+}
+
+fn simulate_op_ext(
+    env: &mut SlotEnv,
+    op: &Op,
+    assumptions: &Assumptions,
+    flat_arrays: &[FlatDispatchArray],
+    chain_tables: &[DispatchChainTable],
+    dispatch_tables: &[CompiledDispatchTable],
 ) -> Result<StepOutcome, BailReason> {
     use Op::*;
     match op {
@@ -620,8 +766,40 @@ fn simulate_op_with_cfg(
 
         // ---- Out of scope ----
         StoreState { .. } | StoreMem { .. } => return Err(BailReason::SideEffect("StoreState/StoreMem")),
-        LoadMem { .. } | LoadMem16 { .. } | LoadPackedByte { .. } => {
-            return Err(BailReason::SideEffect("LoadMem*"));
+        LoadMem { dst, addr_slot } => {
+            // Resolve to Const if the address slot is Const AND we have a
+            // compile-time-known byte at that linear address. Otherwise bail.
+            let addr_expr = read_slot(env, *addr_slot);
+            if let SymExpr::Const(addr) = addr_expr {
+                if let Some(&b) = assumptions.mem_bytes.get(&(addr as i32)) {
+                    env.insert(*dst, SymExpr::Const(b as i64));
+                } else {
+                    return Err(BailReason::SideEffect("LoadMem (no mem assumption)"));
+                }
+            } else {
+                return Err(BailReason::SideEffect("LoadMem (non-const addr)"));
+            }
+        }
+        LoadMem16 { dst, addr_slot } => {
+            let addr_expr = read_slot(env, *addr_slot);
+            if let SymExpr::Const(addr) = addr_expr {
+                let lo = assumptions.mem_bytes.get(&(addr as i32));
+                let hi = assumptions.mem_bytes.get(&((addr + 1) as i32));
+                match (lo, hi) {
+                    (Some(&l), Some(&h)) => {
+                        let v = (l as i64) | ((h as i64) << 8);
+                        env.insert(*dst, SymExpr::Const(v));
+                    }
+                    _ => return Err(BailReason::SideEffect("LoadMem16 (no mem assumption)")),
+                }
+            } else {
+                return Err(BailReason::SideEffect("LoadMem16 (non-const addr)"));
+            }
+        }
+        LoadPackedByte { .. } => {
+            // Packed-byte resolution would need access to packed_cell_tables
+            // and the pack mode — skip for now; falls through to bail.
+            return Err(BailReason::SideEffect("LoadPackedByte"));
         }
         DispatchFlatArray { dst, key, array_id, base_key, default } => {
             let key_expr = read_slot(env, *key);
@@ -636,11 +814,70 @@ fn simulate_op_with_cfg(
                 };
                 env.insert(*dst, SymExpr::Const(val));
             } else {
-                return Err(BailReason::Unsupported("DispatchFlatArray (non-const key)"));
+                // Non-const key: keep as symbolic FlatArrayLookup. At
+                // fused-emit time, this becomes a runtime indexed read
+                // against the cabinet's flat-dispatch array.
+                env.insert(*dst, SymExpr::FlatArrayLookup {
+                    array_id: *array_id,
+                    key: Box::new(key_expr),
+                    base_key: *base_key,
+                    default: *default,
+                });
             }
         }
-        Dispatch { .. } | DispatchChain { .. } => {
-            return Err(BailReason::Unsupported("dispatch*"));
+        DispatchChain { a, chain_id, miss_target } => {
+            // Const-keyed chain dispatch: look up slot[a] in the chain
+            // table and Jump to the target body PC, else jump to miss_target.
+            let key_expr = read_slot(env, *a);
+            if let SymExpr::Const(k) = key_expr {
+                if let Some(table) = chain_tables.get(*chain_id as usize) {
+                    let key32 = k as i32;
+                    // Prefer flat_table fast path when present.
+                    if let Some(flat) = &table.flat_table {
+                        let idx = (key32 as i64) - (flat.base as i64);
+                        if idx >= 0 && (idx as usize) < flat.targets.len() {
+                            let t = flat.targets[idx as usize];
+                            if t != u32::MAX {
+                                return Ok(StepOutcome::Jump(t as usize));
+                            }
+                        }
+                        // Fall through to miss.
+                        return Ok(StepOutcome::Jump(*miss_target as usize));
+                    }
+                    if let Some(&t) = table.entries.get(&key32) {
+                        return Ok(StepOutcome::Jump(t as usize));
+                    } else {
+                        return Ok(StepOutcome::Jump(*miss_target as usize));
+                    }
+                }
+                return Err(BailReason::Unsupported("DispatchChain (chain_id out of range)"));
+            }
+            return Err(BailReason::Unsupported("DispatchChain (non-const key)"));
+        }
+        Dispatch { dst, key, table_id, fallback_target: _ } => {
+            // Const-keyed HashMap dispatch: look up table.entries[key] and
+            // recursively simulate the entry's ops, then write result_slot
+            // into dst. fallback_target only matters when key isn't found.
+            let key_expr = read_slot(env, *key);
+            if let SymExpr::Const(k) = key_expr {
+                let table = dispatch_tables.get(*table_id as usize)
+                    .ok_or(BailReason::Unsupported("Dispatch (table_id out of range)"))?;
+                if let Some((entry_ops, result_slot)) = table.entries.get(&k) {
+                    // Recursively simulate the entry's ops on the same env.
+                    simulate_ops_full_ext(
+                        env, entry_ops, assumptions, flat_arrays,
+                        chain_tables, dispatch_tables,
+                    )?;
+                    let v = read_slot(env, *result_slot);
+                    env.insert(*dst, v);
+                } else {
+                    // Key not in table — would jump to fallback_target. We
+                    // don't have the parent op stream here, so bail.
+                    return Err(BailReason::Branch("Dispatch (miss → fallback)"));
+                }
+            } else {
+                return Err(BailReason::Unsupported("Dispatch (non-const key)"));
+            }
         }
         Call { .. } => return Err(BailReason::Unsupported("Call")),
         MemoryFill { .. } | MemoryCopy { .. } => {
