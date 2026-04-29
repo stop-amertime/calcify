@@ -123,10 +123,6 @@ pub struct Dag {
     pub function_roots: Vec<NodeId>,
     /// Function name → `fn_id`, for resolving `Expr::FunctionCall`.
     pub function_names: std::collections::HashMap<String, u32>,
-    /// Slot map: bare property name (no `--`, no `__0/__1/__2`
-    /// prefix) → `SlotId`. Built from `State::load_properties` and
-    /// `--readMem`-style address tables.
-    pub slot_map: std::collections::HashMap<String, SlotId>,
 }
 
 impl Dag {

@@ -10,7 +10,6 @@ use super::types::{CalcKind, Dag, DagNode, NodeId, SlotId, StyleCondNode, TickPo
 use crate::types::{
     Assignment, CalcOp, Expr, FunctionDef, ParsedProgram, StyleBranch, StyleTest,
 };
-use crate::State;
 
 /// Strip `--`, then optional `__0`/`__1`/`__2` prefix. Returns the bare
 /// property name plus a `TickPosition` flag indicating whether the read
@@ -34,37 +33,6 @@ fn strip_var_name(name: &str) -> (&str, TickPosition) {
 /// (`eval.rs:1351`). Buffer copies are skipped in lowering.
 fn is_buffer_copy(name: &str) -> bool {
     name.starts_with("--__0") || name.starts_with("--__1") || name.starts_with("--__2")
-}
-
-/// Build a slot map from `State` after `load_properties` has run.
-///
-/// State vars get their negative slot indices; memory bytes get their
-/// non-negative addresses. The map is keyed by *bare* name (no `--`,
-/// no triple-buffer prefix).
-fn build_slot_map(state: &State) -> HashMap<String, SlotId> {
-    let mut map: HashMap<String, SlotId> = HashMap::new();
-    // State vars: index i → slot -(i+1).
-    for (i, name) in state_var_names(state).iter().enumerate() {
-        map.insert(name.clone(), -(i as SlotId + 1));
-    }
-    // Memory bytes: every property `mN` → slot N. We can't enumerate
-    // them from `State` directly (memory is just a flat Vec), but
-    // `crate::eval::property_to_address` is the canonical resolver
-    // and covers state vars + mN + dispatch-table-derived addresses.
-    // We delegate to it lazily during `slot_of` rather than pre-
-    // populating the map, which would miss late-bound entries.
-    map
-}
-
-/// Get state var names from State.
-///
-/// Phase 1 stub: empty. `slot_of` uses `eval::property_to_address` as
-/// the authoritative resolver (the same global address map v1 uses),
-/// so we don't need to pre-build a slot map by name. Phase 2 may
-/// switch to a per-DAG slot map for cache locality, at which point
-/// this becomes the right place to enumerate.
-fn state_var_names(_state: &State) -> Vec<String> {
-    Vec::new()
 }
 
 /// Resolve a bare property name to its slot.
@@ -221,9 +189,8 @@ impl LowerCtx {
 }
 
 /// Lower a `ParsedProgram` to a `Dag`.
-pub fn lower_parsed_program(program: &ParsedProgram, state: &State) -> Dag {
+pub fn lower_parsed_program(program: &ParsedProgram) -> Dag {
     let mut ctx = LowerCtx::new();
-    ctx.dag.slot_map = build_slot_map(state);
 
     // Lower each `@function`: intern the name, lower the body, record
     // the root. Sub-DAG is shared with the main DAG (one Vec<DagNode>).
@@ -269,7 +236,164 @@ pub fn lower_parsed_program(program: &ParsedProgram, state: &State) -> Dag {
         ctx.dag.terminals.push(id);
     }
 
+    sort_terminals(&mut ctx.dag);
     ctx.dag
+}
+
+/// Topologically sort `dag.terminals` so that for each `WriteVar(slot=S)`,
+/// every `WriteVar` whose value the current node reads via
+/// `LoadVar { kind: Current, slot=S }` comes before it.
+///
+/// CSS spec: cascade resolves with substitution semantics. Topo sort is
+/// the standard implementation. `LoadVar { kind: Prev }` reads don't
+/// create edges (they read prior-cascade committed state, not this-pass
+/// values).
+///
+/// On cycle, fall back to declaration order — CSS spec says cyclic
+/// `var()` references make the declaration invalid at computed-value
+/// time, but the registered initial value still applies. v1 produces
+/// the same fallback (`eval.rs:1167`).
+fn sort_terminals(dag: &mut Dag) {
+    let n = dag.terminals.len();
+    if n <= 1 {
+        return;
+    }
+
+    // Map from slot → terminal index (only WriteVar terminals have
+    // a defined slot; IndirectStore goes to many slots and is treated
+    // as a sink — it can't be depended on).
+    let mut slot_to_term: HashMap<SlotId, usize> = HashMap::new();
+    for (i, &term_id) in dag.terminals.iter().enumerate() {
+        if let DagNode::WriteVar { slot, .. } = dag.nodes[term_id as usize] {
+            slot_to_term.insert(slot, i);
+        }
+    }
+
+    // For each terminal, collect indices of terminals whose slots it
+    // reads via LoadVar Current. Skip self-edges (CSS-spec cycle is
+    // non-fatal; v1 retains them too).
+    let mut deps: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (i, &term_id) in dag.terminals.iter().enumerate() {
+        let mut reads: Vec<usize> = Vec::new();
+        let value_root = match &dag.nodes[term_id as usize] {
+            DagNode::WriteVar { value, .. } => Some(*value),
+            _ => None,
+        };
+        if let Some(root) = value_root {
+            collect_current_reads(dag, root, &slot_to_term, &mut reads);
+        }
+        reads.sort_unstable();
+        reads.dedup();
+        reads.retain(|&dep| dep != i);
+        deps[i] = reads;
+    }
+
+    // Kahn's algorithm with min-heap on original index for stable order.
+    let mut in_degree = vec![0usize; n];
+    let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (i, dep_list) in deps.iter().enumerate() {
+        for &dep in dep_list {
+            in_degree[i] += 1;
+            dependents[dep].push(i);
+        }
+    }
+    let mut ready: std::collections::BinaryHeap<std::cmp::Reverse<usize>> =
+        std::collections::BinaryHeap::new();
+    for (i, &deg) in in_degree.iter().enumerate() {
+        if deg == 0 {
+            ready.push(std::cmp::Reverse(i));
+        }
+    }
+    let mut order: Vec<usize> = Vec::with_capacity(n);
+    while let Some(std::cmp::Reverse(idx)) = ready.pop() {
+        order.push(idx);
+        for &d in &dependents[idx] {
+            in_degree[d] -= 1;
+            if in_degree[d] == 0 {
+                ready.push(std::cmp::Reverse(d));
+            }
+        }
+    }
+    if order.len() != n {
+        // Cycle. Keep declaration order; CSS spec says cyclic refs are
+        // invalid-at-computed-value, but the registered initial value
+        // still applies. The walker will compute *something* here; the
+        // primitive_conformance var_self_cycle fixture pins what.
+        log::debug!("v2 lowering: dependency cycle in terminals, keeping declaration order");
+        return;
+    }
+    let new_terminals: Vec<NodeId> = order.iter().map(|&i| dag.terminals[i]).collect();
+    dag.terminals = new_terminals;
+}
+
+/// Walk a node's sub-expression tree, pushing onto `out` the index of
+/// any terminal whose slot is read via `LoadVar { kind: Current }`.
+fn collect_current_reads(
+    dag: &Dag,
+    node_id: NodeId,
+    slot_to_term: &HashMap<SlotId, usize>,
+    out: &mut Vec<usize>,
+) {
+    match &dag.nodes[node_id as usize] {
+        DagNode::Lit(_) | DagNode::LitStr(_) => {}
+        DagNode::LoadVar { slot, kind } => {
+            if matches!(kind, TickPosition::Current) {
+                if let Some(&idx) = slot_to_term.get(slot) {
+                    out.push(idx);
+                }
+            }
+        }
+        DagNode::Calc { args, .. } => {
+            for &a in args {
+                collect_current_reads(dag, a, slot_to_term, out);
+            }
+        }
+        DagNode::FuncCall { args, .. } => {
+            // Conservatively include arg-side reads. The function
+            // body's own reads aren't traced here (the body evaluates
+            // arguments, not the call site's other slots) — Phase 2
+            // inlining will tighten this.
+            for &a in args {
+                collect_current_reads(dag, a, slot_to_term, out);
+            }
+        }
+        DagNode::If { branches, fallback } => {
+            for (cond, then_id) in branches {
+                collect_style_cond_reads(dag, cond, slot_to_term, out);
+                collect_current_reads(dag, *then_id, slot_to_term, out);
+            }
+            collect_current_reads(dag, *fallback, slot_to_term, out);
+        }
+        DagNode::Concat(parts) => {
+            for &p in parts {
+                collect_current_reads(dag, p, slot_to_term, out);
+            }
+        }
+        DagNode::WriteVar { .. } | DagNode::IndirectStore { .. } => {
+            // Not reached on well-formed sub-expressions.
+        }
+    }
+}
+
+fn collect_style_cond_reads(
+    dag: &Dag,
+    cond: &StyleCondNode,
+    slot_to_term: &HashMap<SlotId, usize>,
+    out: &mut Vec<usize>,
+) {
+    match cond {
+        StyleCondNode::Single { slot, value } => {
+            if let Some(&idx) = slot_to_term.get(slot) {
+                out.push(idx);
+            }
+            collect_current_reads(dag, *value, slot_to_term, out);
+        }
+        StyleCondNode::And(parts) | StyleCondNode::Or(parts) => {
+            for p in parts {
+                collect_style_cond_reads(dag, p, slot_to_term, out);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -279,9 +403,11 @@ mod tests {
 
     fn build(css: &str) -> Dag {
         let parsed = parse_css(css).expect("parse");
-        let mut state = State::default();
+        // load_properties populates the global address map that
+        // lower_parsed_program reads via slot_of.
+        let mut state = crate::State::default();
         state.load_properties(&parsed.properties);
-        lower_parsed_program(&parsed, &state)
+        lower_parsed_program(&parsed)
     }
 
     #[test]

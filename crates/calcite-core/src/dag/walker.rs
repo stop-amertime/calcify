@@ -1,21 +1,11 @@
-//! DAG walker — evaluates a `Dag` against `State` for one tick.
+//! v2 DAG walker.
 //!
-//! See `docs/v2-rewrite-design.md` § State model for the semantics this
-//! walker must reproduce. Phase 1 is a working evaluator that produces
-//! bit-identical results to v1's bytecode interpreter on the corner
-//! cases pinned in `tests/v2_tick_semantics.rs`.
+//! The walker logic lives on `Evaluator::dag_v2_tick` in `eval.rs`, not
+//! in this module. The reason is that walking a `FuncCall` requires
+//! reaching back into v1's `eval_function_call` for parameter binding
+//! (Phase 1 stub — see `docs/v2-rewrite-design.md` § State model).
+//! Phase 2 will inline function bodies natively into the DAG and the
+//! walker can move back into a free function in this module then.
 //!
-//! Phase 1 implementation status: stub. Walker logic lands in the
-//! follow-on commit alongside the `Backend::DagV2` wiring.
-
-use super::types::Dag;
-use crate::State;
-
-/// Walk a DAG once, mutating `State` to commit this tick's writes.
-///
-/// **Stub.** Returns immediately without evaluating. The first
-/// real implementation will land alongside `Backend::DagV2` wiring
-/// in `eval.rs` — at that point this stub is replaced.
-pub fn walk(_dag: &Dag, _state: &mut State) {
-    // Phase 1 stub. Real walker arrives in the next commit.
-}
+//! This file kept as a placeholder so the module path
+//! `calcite_core::dag::walker` exists for future code to land into.

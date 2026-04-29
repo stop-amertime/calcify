@@ -241,33 +241,51 @@ it's the cheaper alternative to re-parsing 30 MB of memory cells.)
 
 ### The CSS contract
 
-Chrome is the spec. CSS evaluates all custom-property assignments on a
-single element *simultaneously* against the values they had on the
-prior style computation. There is no "before" or "after" within a
-tick — every `var(--foo)` reference resolves against the same
-prior-tick value pool, and every `--foo: <expr>` assignment commits
-into the next-tick value pool. There is no read-write ordering
-question because there are no sequenced reads or writes.
+Chrome is the spec. CSS resolves a cascade of custom-property
+assignments via *substitution*: each `var(--foo)` in a declaration's
+RHS is substituted with `--foo`'s computed value as resolved during
+the same cascade pass. When `--b: calc(var(--a) * 10)` and
+`--a` resolves first to `5`, then `--b: calc(5 * 10) = 50`. When
+`--c: calc(var(--b) + 1)` resolves later in the same cascade pass,
+`var(--b)` substitutes the just-computed `50`, so `--c = 51`.
 
-The cabinet uses a *triple-buffer* convention to make multi-tick state
-visible:
+This is *not* simultaneous evaluation against a prior pool — it's
+sequential substitution within one cascade pass, ordered such that
+each `var()` reference sees the most-recently-resolved value of its
+referent.
 
-- `--mN` — the new value computed this tick.
-- `--__1mN` — the previous tick's `--mN` value.
-- `--__2mN` — two ticks ago.
+For the cabinet, this gives single-pass full resolution per cascade.
+What the cabinet wants — multi-tick state — comes from a triple-
+buffer convention layered on top:
 
-Three structural CSS shapes implement the buffer pipeline:
+- `--mN` — the new value being computed this cascade pass (this tick).
+- `--__1mN` — the value `--mN` had at the end of the previous tick.
+- `--__2mN` — the value `--mN` had two ticks ago.
 
-1. `--mN: if(<this-tick write rules>; else: var(--__1mN))` — compute
-   the new value, falling back to last tick's value (hold).
-2. `--__1mN: var(--__2mN, init)` — copy the second-tick-back to the
-   one-tick-back slot.
-3. `--__2mN` carries forward by Chrome's normal cascade.
+The buffer-copy assignments (`--__1mN: var(--__2mN, init)`) shift the
+history one position each tick. Because they're regular cascade
+assignments, Chrome resolves them in the same single-pass
+substitution model.
 
-When all three assignments evaluate simultaneously against the prior
-tick's pool, the end-of-tick state has each `--mN` updated and each
-`--__1mN` / `--__2mN` shifted back one position. Open the cabinet in
-Chrome and this is what happens.
+The pure-CSS-in-Chrome execution of a cabinet, then, is one cascade
+pass per Chrome paint frame, where each pass:
+
+1. Reads the prior frame's committed values from registered
+   `@property` storage (the property's prior computed value).
+2. Resolves the cascade with substitution.
+3. Commits the new computed values for the next frame.
+
+In CSS spec terms, the prior frame's committed values are exactly
+what `var(--mN)` would read if there were no `--mN` assignment in
+this cascade. With the `--mN` assignment present, substitution
+replaces it.
+
+The `--__1` / `--__2` prefixes are *separate properties* in CSS —
+not "the prior tick's `--mN`," but their own properties whose values
+happened to be set to `--mN`'s prior value by the buffer-copy
+assignments last tick. Reading `var(--__1mN)` resolves against the
+`--__1mN` property's current cascade-pass value — which, for the
+cabinet shape, is what `--mN` was last tick.
 
 ### What v2 has to produce
 
@@ -276,29 +294,40 @@ CSS. Nothing else.
 
 ### How v2 produces it
 
-The walker's contract is *observable end-of-tick state matches what
-Chrome would produce on the same CSS*. The mechanism is implementation
-choice — Phase 1 picks one and gates against Chrome.
+The walker reproduces single-pass substitution via a per-tick value
+cache plus topological ordering of the assignment graph:
 
-Two viable mechanisms, both correct:
+1. **Compile-time topological sort.** Build a dependency graph from
+   `WriteVar` terminals: an edge from `WriteVar(B)` to `WriteVar(A)`
+   means A's RHS contains a `var(--B)` reference (current-tick read).
+   Sort the terminals so each writer comes before any of its readers.
+   `var(--__1foo)` reads do *not* create edges — they reference a
+   different property (the `--__1foo` slot), not a temporal offset
+   on `--foo`.
 
-**(a) Two-pool snapshot.** Prior pool (read-only, populated at tick
-start) and next pool (write-only, populated by `WriteVar`). Every
-`var(...)` reads from prior; every assignment writes to next; pools
-swap at tick end. This is the literal simultaneous-evaluation
-semantics. Cost: one slot-array clone per tick.
+2. **Per-tick evaluation.**
+   - At tick start, clear a per-tick value cache (one entry per slot).
+   - Walk the topologically-sorted terminal list. For each
+     `WriteVar { slot, value }`:
+     - Recursively evaluate `value` against the DAG. `LoadVar` checks
+       the cache first; on miss, falls back to committed state.
+     - Write the computed value into the cache.
+   - At tick end, flush the cache to committed `State`. (Or commit
+     each `WriteVar` eagerly — implementation choice.)
 
-**(b) Cache-plus-topological-sort.** Maintain a per-tick cache that
-each `WriteVar` populates and each `LoadVar` reads with fall-through
-to committed state. Sort assignments so writers come before readers
-on every current-tick edge. `--__1*` reads bypass the cache and read
-committed state directly. Cost: one topo sort at compile time, one
-cache reset per tick.
+3. **Cycles.** A genuine `--a: var(--a)` self-reference (no `--__1`)
+   has an edge to itself; topo sort would refuse. CSS spec: such a
+   declaration is invalid at computed-value time and the property
+   keeps its registered initial value. The compile-time sort detects
+   the cycle and emits an `Invalid` marker for that terminal; the
+   walker honours it by reading the slot's initial value into the
+   cache without calling `WriteVar`.
 
-Both produce CSS-consistent observable state on every cabinet shape
-the kiln emits. Choice depends on perf and walker complexity. Phase 1
-sub-task: prototype both, gate against Chrome (Phase 0.5 conformance
-suite), pick the simpler one if perf is comparable.
+This is the same mechanism v1 uses (see `eval.rs`'s
+`topological_sort_assignments` and `self.properties` cache). The
+reason it's correct isn't "v1 does this" — it's that the CSS cascade
+is single-pass substitution, and topo sort + cache is the textbook
+implementation. v1 happens to have arrived at the right model.
 
 ### Slot map
 
@@ -310,25 +339,30 @@ slot allocation.
 
 ### What `LoadVar { kind }` means in the IR
 
-`kind` is a *lowering hint*, not a runtime mode:
+`kind` distinguishes *which property* the load reads, not which tick
+position. CSS-wise, `--foo` and `--__1foo` are different properties.
+The cabinet's triple-buffer convention happens to make their values
+look like the same slot at different temporal positions, but at the
+CSS level they're independent.
 
-- `Current` is lowered from a bare `--foo` reference. In CSS terms
-  this is "read `--foo`'s value as the simultaneous-evaluation pool
-  has it." In a two-pool walker, that's the prior pool. In a
-  cache-plus-sort walker, that's the cache (post-sort, the cache
-  holds this-tick's value because the writer fired first).
-- `Prev` is lowered from `--__0` / `--__1` / `--__2` prefixed
-  references. The triple-buffer convention means these resolve to the
-  same slot but at a different temporal position. The walker's job is
-  to return whatever value Chrome would return — which, given the
-  buffer-copy mechanism Chrome uses, is the slot's value as of N
-  ticks ago for the `--__N` prefix.
+v2 collapses `--foo` and its prefixed siblings to one slot in the
+underlying state (matching v1's `strip_prop_prefixes`) because that's
+how `State` is structured. `kind` records whether the read should
+participate in current-tick topo-sort dependency edges:
 
-Phase 1 sub-task: confirm against Chrome (Phase 0.5 suite) what
-`var(--__1mN)` returns when an assignment to `--mN` exists earlier in
-the same `.cpu` block. CSS spec says the read sees the prior tick's
-`--mN`. Pin that as the v2 contract. The walker's mechanism (two-pool,
-cache-plus-sort, or otherwise) just has to deliver it.
+- `Current` (from bare `--foo`): the read creates a dep edge. If
+  `--foo` is also assigned this cascade, the read sees the
+  this-cascade value via the cache.
+- `Prev` (from `--__0` / `--__1` / `--__2` prefixed): the read does
+  *not* create a dep edge. It reads the underlying slot's committed
+  state, which is the value `--foo` had at the end of the previous
+  cascade pass — i.e. last tick's `--foo`.
+
+This mapping reproduces what Chrome does on the cabinet in CSS terms:
+`var(--__1mN)` resolves against `--__1mN`'s computed value, which by
+the buffer-copy convention equals last tick's `--mN`. The walker
+takes a shortcut and reads it from the same slot directly, but the
+result is identical.
 
 ## Phase 1 acceptance gates
 

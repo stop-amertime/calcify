@@ -14,13 +14,14 @@ pub mod walker;
 pub use types::{Dag, DagNode, NodeId, SlotId, StyleCondNode, TickPosition};
 
 use crate::types::ParsedProgram;
-use crate::State;
 
 /// Build a DAG from a parsed program.
 ///
-/// `state` must already be populated via `State::load_properties` so the
-/// slot map can resolve property names to negative state-var slots and
-/// non-negative memory addresses.
-pub fn build_dag(program: &ParsedProgram, state: &State) -> Dag {
-    lowering::lower_parsed_program(program, state)
+/// Slot resolution defers to `eval::property_to_address`, which reads
+/// the global address map populated by `State::load_properties`. The
+/// caller must therefore call `State::load_properties` before
+/// `build_dag` — the same ordering v1's `Evaluator::from_parsed`
+/// already requires.
+pub fn build_dag(program: &ParsedProgram) -> Dag {
+    lowering::lower_parsed_program(program)
 }

@@ -18,6 +18,23 @@ use crate::pattern::dispatch_table::{self, DispatchTable};
 use crate::state::State;
 use crate::types::*;
 
+/// Which evaluator backend an `Evaluator` instance uses for `tick()`.
+///
+/// `Bytecode` is v1's compiled-bytecode evaluator (the default; what
+/// every existing caller gets).  `DagV2` is the in-progress
+/// clean-rewrite walker — see `dag/` and `docs/v2-rewrite-design.md`.
+///
+/// Selection is per-Evaluator and one-way for now: set once after
+/// construction, then call `tick()` as normal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Backend {
+    /// v1: flat bytecode + interpreter loop (`compile::execute`).
+    #[default]
+    Bytecode,
+    /// v2: walk the per-tick DAG.
+    DagV2,
+}
+
 /// A value produced by expression evaluation — either numeric or string.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
@@ -106,6 +123,12 @@ pub struct Evaluator {
     pub(crate) compiled: CompiledProgram,
     /// Slot array reused across ticks (avoids per-tick allocation).
     slots: Vec<i32>,
+    /// Which backend `tick()` dispatches to. Default `Bytecode`.
+    backend: Backend,
+    /// v2 DAG, lowered from `ParsedProgram` during `from_parsed`.
+    /// Populated even when `backend == Bytecode` so `set_backend(DagV2)`
+    /// is a cheap toggle. Phase 1 only.
+    dag_v2: crate::dag::Dag,
 }
 
 /// Granular timing breakdown from [`Evaluator::tick_profiled`].
@@ -493,6 +516,7 @@ impl Evaluator {
 
         let slot_count = compiled.slot_count as usize;
         let properties_capacity = assignments.len();
+        let dag_v2 = crate::dag::build_dag(program);
         Evaluator {
             functions,
             assignments,
@@ -507,6 +531,8 @@ impl Evaluator {
             string_property_names,
             compiled,
             slots: Vec::with_capacity(slot_count),
+            backend: Backend::default(),
+            dag_v2,
         }
     }
 
@@ -519,6 +545,17 @@ impl Evaluator {
         self.pre_tick_hooks.push(hook);
     }
 
+    /// Select which backend `tick()` will dispatch to. Default is
+    /// `Backend::Bytecode` (v1). See `Backend` for details.
+    pub fn set_backend(&mut self, backend: Backend) {
+        self.backend = backend;
+    }
+
+    /// Current backend. Mostly for tests.
+    pub fn backend(&self) -> Backend {
+        self.backend
+    }
+
     /// Run a single tick: evaluate all assignments against the state.
     pub fn tick(&mut self, state: &mut State) -> TickResult {
         // Run pre-tick hooks (e.g., external function dispatch).
@@ -529,8 +566,15 @@ impl Evaluator {
         // Snapshot state vars for change detection
         let prev_vars = state.state_vars.clone();
 
-        // Execute numeric assignments via compiled bytecode
-        compile::execute(&self.compiled, state, &mut self.slots);
+        // Execute numeric assignments via the selected backend.
+        match self.backend {
+            Backend::Bytecode => {
+                compile::execute(&self.compiled, state, &mut self.slots);
+            }
+            Backend::DagV2 => {
+                self.dag_v2_tick(state);
+            }
+        }
 
 
         // Evaluate string assignments via interpreter (after compiled pass,
@@ -1654,6 +1698,251 @@ const MAX_CALL_DEPTH: usize = 64;
 // during evaluation.
 
 impl Evaluator {
+    /// Walk the v2 DAG once, mutating `state` to commit this tick's
+    /// writes. See `docs/v2-rewrite-design.md` § State model.
+    ///
+    /// Phase 1 implementation: pure expression nodes are walked
+    /// directly; `FuncCall` delegates to v1's `eval_function_call`
+    /// (Phase 2 inlines); `IndirectStore` is a stub (Phase 2 promotes
+    /// to a self-contained DAG super-node).
+    fn dag_v2_tick(&mut self, state: &mut State) {
+        // Take ownership of the DAG temporarily so we can mutate self
+        // (eval_function_call needs &mut self) while walking. Cheap —
+        // Vec swaps are pointer-copies, no allocation.
+        let dag = std::mem::take(&mut self.dag_v2);
+        let n_state_vars = state.state_var_count();
+        let mut state_var_cache: Vec<Option<i32>> = vec![None; n_state_vars];
+        let mut memory_cache: HashMap<i32, i32> = HashMap::new();
+
+        for &term_id in &dag.terminals {
+            match &dag.nodes[term_id as usize] {
+                crate::dag::DagNode::WriteVar { slot, value } => {
+                    let slot = *slot;
+                    let value_id = *value;
+                    let v = self.dag_eval_node(
+                        &dag,
+                        value_id,
+                        &state_var_cache,
+                        &memory_cache,
+                        state,
+                    );
+                    if slot < 0 {
+                        let idx = (-slot - 1) as usize;
+                        if idx < state_var_cache.len() {
+                            state_var_cache[idx] = Some(v);
+                        }
+                    } else {
+                        memory_cache.insert(slot, v);
+                    }
+                    state.write_mem(slot, v);
+                }
+                crate::dag::DagNode::IndirectStore { port_id, packed } => {
+                    log::debug!(
+                        "v2 walker: IndirectStore port={port_id} packed={packed} not yet implemented",
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        // Restore the DAG.
+        self.dag_v2 = dag;
+    }
+
+    /// Evaluate a single DAG node to an i32. Reads cache first, falls
+    /// back to committed state. Recursive on Calc/If/Concat/FuncCall.
+    fn dag_eval_node(
+        &mut self,
+        dag: &crate::dag::Dag,
+        node_id: crate::dag::NodeId,
+        state_var_cache: &[Option<i32>],
+        memory_cache: &HashMap<i32, i32>,
+        state: &State,
+    ) -> i32 {
+        use crate::dag::types::CalcKind;
+        use crate::dag::DagNode;
+        match &dag.nodes[node_id as usize] {
+            DagNode::Lit(v) => *v as i32,
+            DagNode::LitStr(_) => 0,
+            DagNode::LoadVar { slot, kind } => {
+                self.dag_read_slot(*slot, *kind, state_var_cache, memory_cache, state)
+            }
+            DagNode::Calc { op, args } => {
+                let af = |this: &mut Self, idx: usize| {
+                    this.dag_eval_node(dag, args[idx], state_var_cache, memory_cache, state) as f64
+                };
+                let result: f64 = match op {
+                    CalcKind::Add => af(self, 0) + af(self, 1),
+                    CalcKind::Sub => af(self, 0) - af(self, 1),
+                    CalcKind::Mul => af(self, 0) * af(self, 1),
+                    CalcKind::Div => {
+                        let b = af(self, 1);
+                        if b == 0.0 { 0.0 } else { af(self, 0) / b }
+                    }
+                    CalcKind::Mod => {
+                        let b = af(self, 1);
+                        if b == 0.0 {
+                            0.0
+                        } else {
+                            let av = af(self, 0);
+                            av - (av / b).floor() * b
+                        }
+                    }
+                    CalcKind::Pow => af(self, 0).powf(af(self, 1)),
+                    CalcKind::Min => args
+                        .iter()
+                        .map(|&n| {
+                            self.dag_eval_node(dag, n, state_var_cache, memory_cache, state) as f64
+                        })
+                        .fold(f64::INFINITY, f64::min),
+                    CalcKind::Max => args
+                        .iter()
+                        .map(|&n| {
+                            self.dag_eval_node(dag, n, state_var_cache, memory_cache, state) as f64
+                        })
+                        .fold(f64::NEG_INFINITY, f64::max),
+                    CalcKind::Clamp => {
+                        let lo = af(self, 0);
+                        let v = af(self, 1);
+                        let hi = af(self, 2);
+                        v.clamp(lo, hi)
+                    }
+                    CalcKind::Round(strategy) => {
+                        let v = af(self, 0);
+                        let interval = af(self, 1);
+                        if interval == 0.0 {
+                            v
+                        } else {
+                            let q = v / interval;
+                            let rounded = match strategy {
+                                RoundStrategy::Nearest => {
+                                    let f = q.floor();
+                                    let frac = q - f;
+                                    if frac < 0.5 {
+                                        f
+                                    } else if frac > 0.5 {
+                                        f + 1.0
+                                    } else if (f as i64) % 2 == 0 {
+                                        f
+                                    } else {
+                                        f + 1.0
+                                    }
+                                }
+                                RoundStrategy::Up => q.ceil(),
+                                RoundStrategy::Down => q.floor(),
+                                RoundStrategy::ToZero => q.trunc(),
+                            };
+                            rounded * interval
+                        }
+                    }
+                    CalcKind::Sign => {
+                        let v = af(self, 0);
+                        if v > 0.0 { 1.0 } else if v < 0.0 { -1.0 } else { 0.0 }
+                    }
+                    CalcKind::Abs => af(self, 0).abs(),
+                    CalcKind::Neg => -af(self, 0),
+                };
+                result as i32
+            }
+            DagNode::FuncCall { fn_id, args } => {
+                // Delegate to v1's eval_function_call. We rebuild Expr
+                // arguments as Literals from the DAG-evaluated values —
+                // the function body itself is then walked through v1's
+                // interpreter, which handles parameter binding via
+                // self.properties. Phase 2 will inline directly.
+                let name = dag
+                    .function_names
+                    .iter()
+                    .find(|(_, &id)| id == *fn_id)
+                    .map(|(n, _)| n.clone());
+                let Some(name) = name else {
+                    log::warn!("v2 walker: FuncCall fn_id={fn_id} has no name");
+                    return 0;
+                };
+                let args_owned = args.clone();
+                let evaluated_args: Vec<Expr> = args_owned
+                    .iter()
+                    .map(|&a| {
+                        let v = self.dag_eval_node(dag, a, state_var_cache, memory_cache, state);
+                        Expr::Literal(v as f64)
+                    })
+                    .collect();
+                self.eval_function_call(&name, &evaluated_args, state).as_number() as i32
+            }
+            DagNode::If { branches, fallback } => {
+                let branches = branches.clone();
+                let fallback = *fallback;
+                for (cond, then_id) in &branches {
+                    if self.dag_eval_style_cond(
+                        dag, cond, state_var_cache, memory_cache, state,
+                    ) {
+                        return self.dag_eval_node(
+                            dag, *then_id, state_var_cache, memory_cache, state,
+                        );
+                    }
+                }
+                self.dag_eval_node(dag, fallback, state_var_cache, memory_cache, state)
+            }
+            DagNode::Concat(_) => 0,
+            DagNode::WriteVar { .. } | DagNode::IndirectStore { .. } => 0,
+        }
+    }
+
+    fn dag_eval_style_cond(
+        &mut self,
+        dag: &crate::dag::Dag,
+        cond: &crate::dag::StyleCondNode,
+        state_var_cache: &[Option<i32>],
+        memory_cache: &HashMap<i32, i32>,
+        state: &State,
+    ) -> bool {
+        use crate::dag::types::TickPosition;
+        use crate::dag::StyleCondNode;
+        match cond {
+            StyleCondNode::Single { slot, value } => {
+                let lhs = self.dag_read_slot(
+                    *slot,
+                    TickPosition::Current,
+                    state_var_cache,
+                    memory_cache,
+                    state,
+                );
+                let rhs =
+                    self.dag_eval_node(dag, *value, state_var_cache, memory_cache, state);
+                lhs == rhs
+            }
+            StyleCondNode::And(parts) => parts.iter().all(|p| {
+                self.dag_eval_style_cond(dag, p, state_var_cache, memory_cache, state)
+            }),
+            StyleCondNode::Or(parts) => parts.iter().any(|p| {
+                self.dag_eval_style_cond(dag, p, state_var_cache, memory_cache, state)
+            }),
+        }
+    }
+
+    fn dag_read_slot(
+        &self,
+        slot: i32,
+        kind: crate::dag::TickPosition,
+        state_var_cache: &[Option<i32>],
+        memory_cache: &HashMap<i32, i32>,
+        state: &State,
+    ) -> i32 {
+        use crate::dag::types::TickPosition;
+        if matches!(kind, TickPosition::Prev) {
+            return state.read_mem(slot);
+        }
+        if slot < 0 {
+            let idx = (-slot - 1) as usize;
+            if let Some(Some(v)) = state_var_cache.get(idx) {
+                return *v;
+            }
+        } else if let Some(&v) = memory_cache.get(&slot) {
+            return v;
+        }
+        state.read_mem(slot)
+    }
+
     /// Evaluate an expression to a `Value` (number or string).
     fn eval_expr(&mut self, expr: &Expr, state: &State) -> Value {
         match expr {
@@ -2112,6 +2401,8 @@ mod tests {
             string_property_names: HashSet::new(),
             compiled,
             slots: Vec::new(),
+            backend: Backend::default(),
+            dag_v2: crate::dag::Dag::default(),
         };
         (evaluator, state)
     }
