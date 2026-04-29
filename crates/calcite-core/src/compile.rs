@@ -5507,15 +5507,20 @@ fn fusion_fastfwd_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
+        // OFF by default. Bench-doom-gameplay shows fusion as a net
+        // loss (~3% slower with fast-out, much worse without). Cause
+        // unknown — see CSS-DOS logbook entry "2026-04-29 — fusion
+        // disabled by default". Set CALCITE_FUSION_FASTFWD=1 to
+        // re-enable for investigation.
         match std::env::var("CALCITE_FUSION_FASTFWD").as_deref() {
-            Ok("0") | Ok("false") | Ok("off") => false,
-            _ => true,
+            Ok("1") | Ok("true") | Ok("on") => true,
+            _ => false,
         }
     })
 }
 
 #[cfg(target_arch = "wasm32")]
-fn fusion_fastfwd_enabled() -> bool { true }
+fn fusion_fastfwd_enabled() -> bool { false }
 
 /// The 21-byte column-drawer body pattern. Detected periodically in the
 /// doom8088 ROM by byte_period (offset 86306, 16 reps). Pattern matching
