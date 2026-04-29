@@ -220,6 +220,14 @@ impl<'a> LowerCtx<'a> {
             }
 
             Expr::StyleCondition { branches, fallback } => {
+                // Idiom: dispatch table. If every branch tests
+                // `style(--P: <integer-literal>)` against the same
+                // property `--P`, lower to a Switch keyed on `--P`'s
+                // current value. O(1) lookup vs O(N) scan; matches
+                // the speedup v1 gets via `dispatch_tables`.
+                if let Some(switch_id) = self.try_lower_dispatch(branches, fallback) {
+                    return switch_id;
+                }
                 let lowered_branches: Vec<(StyleCondNode, NodeId)> = branches
                     .iter()
                     .map(|StyleBranch { condition, then }| {
@@ -305,6 +313,85 @@ impl<'a> LowerCtx<'a> {
         self.inlining_stack.pop();
 
         result_id
+    }
+
+    /// Try lowering a `StyleCondition` to a `Switch` (dispatch table).
+    /// Returns `Some(node_id)` when every branch is
+    /// `style(--key: <integer-literal>): <expr>` against the same key
+    /// and there are at least 4 branches (the same threshold v1 uses
+    /// in `pattern::dispatch_table::recognise_dispatch`). Returns
+    /// `None` otherwise; caller falls back to lowering as `If`.
+    ///
+    /// Why 4: smaller chains aren't worth the HashMap overhead. v1
+    /// landed on this empirically.
+    fn try_lower_dispatch(
+        &mut self,
+        branches: &[StyleBranch],
+        fallback: &Expr,
+    ) -> Option<NodeId> {
+        if branches.len() < 4 {
+            return None;
+        }
+        // First branch's property is the key. All subsequent branches
+        // must use the same property and test it against an integer
+        // literal. Compound conditions (And/Or) disqualify the chain.
+        let key_property = match &branches[0].condition {
+            StyleTest::Single { property, .. } => property.clone(),
+            _ => return None,
+        };
+        let mut entries: Vec<(i64, &Expr)> = Vec::with_capacity(branches.len());
+        for b in branches {
+            match &b.condition {
+                StyleTest::Single { property, value } => {
+                    if property != &key_property {
+                        return None;
+                    }
+                    match value {
+                        Expr::Literal(v) => entries.push((*v as i64, &b.then)),
+                        _ => return None,
+                    }
+                }
+                _ => return None,
+            }
+        }
+        // Dispatch matches; lower the key and the branch bodies.
+        let key_id = self.lower_var_in_scope(&key_property);
+        let mut table: std::collections::HashMap<i64, NodeId> =
+            std::collections::HashMap::with_capacity(entries.len());
+        for (k, expr) in entries {
+            // First write wins on duplicate keys, mirroring v1's
+            // HashMap::insert from `recognise_dispatch`. Duplicate
+            // keys in v1 silently keep the last; we keep the first
+            // because it matches the natural CSS semantics ("first
+            // matching branch wins"). v1's "last wins" is a quirk of
+            // its HashMap insertion order, not a Chrome contract.
+            table.entry(k).or_insert_with(|| self.lower_expr(expr));
+        }
+        let fallback_id = self.lower_expr(fallback);
+        Some(self.dag.push(DagNode::Switch {
+            key: key_id,
+            table,
+            fallback: fallback_id,
+        }))
+    }
+
+    /// Lower `var(--name)` in the current lowering scope. Same logic as
+    /// `Expr::Var` arm of `lower_expr` but takes a bare property name
+    /// (with or without leading `--`). Used by dispatch lowering for
+    /// the key property.
+    fn lower_var_in_scope(&mut self, name: &str) -> NodeId {
+        let (bare, kind) = strip_var_name(name);
+        if matches!(kind, TickPosition::Current) {
+            if let Some(id) = self.lookup_inline(bare) {
+                return id;
+            }
+        }
+        if committed_slot_of(bare).is_some() || self.assigned_names.contains(bare) {
+            let slot = self.slot_for(bare);
+            self.dag.push(DagNode::LoadVar { slot, kind })
+        } else {
+            self.dag.push(DagNode::Lit(0.0))
+        }
     }
 
     fn lower_style_test(&mut self, test: &StyleTest) -> StyleCondNode {
@@ -606,6 +693,13 @@ fn collect_current_reads(
             }
             collect_current_reads(dag, *fallback, slot_to_term, out);
         }
+        DagNode::Switch { key, table, fallback } => {
+            collect_current_reads(dag, *key, slot_to_term, out);
+            for branch_id in table.values() {
+                collect_current_reads(dag, *branch_id, slot_to_term, out);
+            }
+            collect_current_reads(dag, *fallback, slot_to_term, out);
+        }
         DagNode::Concat(parts) => {
             for &p in parts {
                 collect_current_reads(dag, p, slot_to_term, out);
@@ -764,6 +858,91 @@ mod tests {
             }
             other => panic!("expected Calc(Mul), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn lowers_dispatch_chain_to_switch() {
+        // Six-branch dispatch on `--opcode` should lower to a Switch
+        // node, not a chain of If branches.
+        let css = r#"
+            @property --opcode { syntax: "<integer>"; inherits: true; initial-value: 0; }
+            @property --AX { syntax: "<integer>"; inherits: true; initial-value: 0; }
+            :root {
+                --AX: if(
+                    style(--opcode: 1): 11;
+                    style(--opcode: 2): 22;
+                    style(--opcode: 3): 33;
+                    style(--opcode: 4): 44;
+                    style(--opcode: 5): 55;
+                    style(--opcode: 6): 66;
+                    else: 0
+                );
+            }
+        "#;
+        let dag = build(css);
+        let mut found_switch = false;
+        for n in &dag.nodes {
+            if let DagNode::Switch { table, .. } = n {
+                assert_eq!(table.len(), 6);
+                found_switch = true;
+            }
+        }
+        assert!(found_switch, "expected dispatch chain to lower to Switch");
+    }
+
+    #[test]
+    fn small_chain_stays_as_if() {
+        // Three-branch chain is below the dispatch threshold (4); it
+        // should stay as an If, not become a Switch.
+        let css = r#"
+            @property --opcode { syntax: "<integer>"; inherits: true; initial-value: 0; }
+            @property --AX { syntax: "<integer>"; inherits: true; initial-value: 0; }
+            :root {
+                --AX: if(
+                    style(--opcode: 1): 11;
+                    style(--opcode: 2): 22;
+                    style(--opcode: 3): 33;
+                    else: 0
+                );
+            }
+        "#;
+        let dag = build(css);
+        for n in &dag.nodes {
+            if matches!(n, DagNode::Switch { .. }) {
+                panic!("3-branch chain should not lower to Switch");
+            }
+        }
+    }
+
+    #[test]
+    fn inlined_function_body_can_become_switch() {
+        // A function whose body is a dispatch chain on a parameter:
+        // when inlined, the param substitution becomes the Switch key.
+        let css = r#"
+            @property --opcode { syntax: "<integer>"; inherits: true; initial-value: 3; }
+            @property --AX { syntax: "<integer>"; inherits: true; initial-value: 0; }
+            @function --pick(--k <integer>) returns <integer> {
+                result: if(
+                    style(--k: 1): 100;
+                    style(--k: 2): 200;
+                    style(--k: 3): 300;
+                    style(--k: 4): 400;
+                    else: -1
+                );
+            }
+            :root {
+                --AX: --pick(var(--opcode));
+            }
+        "#;
+        let dag = build(css);
+        let mut found = false;
+        for n in &dag.nodes {
+            if let DagNode::Switch { table, .. } = n {
+                assert_eq!(table.len(), 4);
+                found = true;
+            }
+        }
+        assert!(found, "inlined dispatch on substituted param should become Switch");
     }
 
     #[test]

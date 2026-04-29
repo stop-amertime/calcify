@@ -96,6 +96,19 @@ pub enum DagNode {
         fallback: NodeId,
     },
 
+    /// Dispatch-table specialisation of `If`: every branch tests
+    /// `style(<same key>: <integer-literal>)` so the chain compiles
+    /// to an O(1) keyed lookup instead of an O(N) scan. Lowered when
+    /// the StyleCondition shape passes `dispatch_table::recognise_dispatch`.
+    ///
+    /// At eval time: read `key` (one node, evaluated once), look up
+    /// in `table`, evaluate the matched branch — or `fallback` on miss.
+    Switch {
+        key: NodeId,
+        table: std::collections::HashMap<i64, NodeId>,
+        fallback: NodeId,
+    },
+
     /// Space-separated string concatenation.
     Concat(Vec<NodeId>),
 

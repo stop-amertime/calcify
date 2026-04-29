@@ -1973,6 +1973,34 @@ impl Evaluator {
                     state,
                 )
             }
+            DagNode::Switch { key, table, fallback } => {
+                // Read the key once, look up, evaluate matched branch
+                // or fallback. The clone of `table` mirrors the
+                // borrow-release pattern used for `If` (we hand `dag`
+                // back to recursive eval below).
+                let key_val = self.dag_eval_node(
+                    dag,
+                    *key,
+                    state_var_cache,
+                    memory_cache,
+                    transient_cache,
+                    state,
+                );
+                let table = table.clone();
+                let fallback = *fallback;
+                let target = table
+                    .get(&(key_val as i64))
+                    .copied()
+                    .unwrap_or(fallback);
+                self.dag_eval_node(
+                    dag,
+                    target,
+                    state_var_cache,
+                    memory_cache,
+                    transient_cache,
+                    state,
+                )
+            }
             DagNode::Concat(_) => 0,
             DagNode::WriteVar { .. } | DagNode::IndirectStore { .. } => 0,
         }
