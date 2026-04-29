@@ -123,7 +123,44 @@ pub struct Dag {
     pub function_roots: Vec<NodeId>,
     /// Function name → `fn_id`, for resolving `Expr::FunctionCall`.
     pub function_names: std::collections::HashMap<String, u32>,
+    /// Broadcast-write ports (recognised + prebuilt-from-parser-fast-path),
+    /// indexed by `IndirectStore::port_id` when `packed = false`.
+    pub broadcast_writes: Vec<crate::pattern::broadcast_write::BroadcastWrite>,
+    /// Packed-cell broadcast ports, indexed by `IndirectStore::port_id`
+    /// when `packed = true`.
+    pub packed_broadcast_ports: Vec<crate::pattern::packed_broadcast_write::PackedSlotPort>,
+    /// Property names absorbed into the broadcast lists. The lowering
+    /// loop filters assignments against this set so absorbed cells are
+    /// not double-evaluated as both `WriteVar` and `IndirectStore`.
+    pub absorbed_properties: std::collections::HashSet<String>,
+    /// Transient slot count: the number of properties that appear in
+    /// assignments but aren't `@property`-declared (don't have a real
+    /// state-var slot or memory address). v1's compiler allocates
+    /// transient slots for these — they hold per-tick computed values
+    /// that other assignments can read but that don't commit to State
+    /// at end of tick. v2 reproduces this with a per-tick scratch
+    /// cache.
+    ///
+    /// Encoding: transient slots use positive integers >= TRANSIENT_BASE
+    /// (well above any real memory address). The walker detects them
+    /// by `slot >= TRANSIENT_BASE` and routes reads/writes through a
+    /// transient cache that does *not* commit to State.
+    pub transient_slot_count: usize,
+    /// Bare-property-name → SlotId for every name the lowering saw.
+    /// Includes both committed slots (from
+    /// `eval::property_to_address`) and transient slots allocated for
+    /// unregistered names. Consumers (e.g. the broadcast executor)
+    /// should consult this map rather than `property_to_address`
+    /// directly, because it reflects v2's view of the slot space —
+    /// in particular, transient slots that v2 allocates for `--opcode`,
+    /// `--_slot0Live`, etc., aren't visible via the global address
+    /// map.
+    pub name_to_slot: std::collections::HashMap<String, SlotId>,
 }
+
+/// Transient-slot encoding base. Memory addresses are <= 0xFFFFFFF
+/// (under 256MB); we put transient slots well above that range.
+pub const TRANSIENT_BASE: SlotId = 1 << 30;
 
 impl Dag {
     /// Allocate a new node, returning its `NodeId`.

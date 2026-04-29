@@ -1713,6 +1713,11 @@ impl Evaluator {
         let n_state_vars = state.state_var_count();
         let mut state_var_cache: Vec<Option<i32>> = vec![None; n_state_vars];
         let mut memory_cache: HashMap<i32, i32> = HashMap::new();
+        // Transient slots are positive ints >= TRANSIENT_BASE; reset
+        // each tick. Per-tick computed values for properties that
+        // aren't @property-declared (CSS-DOS uses these for --opcode,
+        // --uOp, --_tf, etc — internal computed signals).
+        let mut transient_cache: Vec<Option<i32>> = vec![None; dag.transient_slot_count];
 
         for &term_id in &dag.terminals {
             match &dag.nodes[term_id as usize] {
@@ -1724,6 +1729,7 @@ impl Evaluator {
                         value_id,
                         &state_var_cache,
                         &memory_cache,
+                        &transient_cache,
                         state,
                     );
                     if slot < 0 {
@@ -1731,15 +1737,27 @@ impl Evaluator {
                         if idx < state_var_cache.len() {
                             state_var_cache[idx] = Some(v);
                         }
+                        state.write_mem(slot, v);
+                    } else if slot >= crate::dag::TRANSIENT_BASE {
+                        let idx = (slot - crate::dag::TRANSIENT_BASE) as usize;
+                        if idx < transient_cache.len() {
+                            transient_cache[idx] = Some(v);
+                        }
+                        // Transients do NOT commit to State — they're
+                        // tick-local scratch.
                     } else {
                         memory_cache.insert(slot, v);
+                        state.write_mem(slot, v);
                     }
-                    state.write_mem(slot, v);
                 }
                 crate::dag::DagNode::IndirectStore { port_id, packed } => {
-                    log::debug!(
-                        "v2 walker: IndirectStore port={port_id} packed={packed} not yet implemented",
-                    );
+                    let port_id = *port_id;
+                    let packed = *packed;
+                    if packed {
+                        self.dag_exec_packed_broadcast(&dag, port_id, state);
+                    } else {
+                        self.dag_exec_broadcast(&dag, port_id, state);
+                    }
                 }
                 _ => {}
             }
@@ -1757,6 +1775,7 @@ impl Evaluator {
         node_id: crate::dag::NodeId,
         state_var_cache: &[Option<i32>],
         memory_cache: &HashMap<i32, i32>,
+        transient_cache: &[Option<i32>],
         state: &State,
     ) -> i32 {
         use crate::dag::types::CalcKind;
@@ -1764,12 +1783,19 @@ impl Evaluator {
         match &dag.nodes[node_id as usize] {
             DagNode::Lit(v) => *v as i32,
             DagNode::LitStr(_) => 0,
-            DagNode::LoadVar { slot, kind } => {
-                self.dag_read_slot(*slot, *kind, state_var_cache, memory_cache, state)
-            }
+            DagNode::LoadVar { slot, kind } => self.dag_read_slot(
+                *slot,
+                *kind,
+                state_var_cache,
+                memory_cache,
+                transient_cache,
+                state,
+            ),
             DagNode::Calc { op, args } => {
                 let af = |this: &mut Self, idx: usize| {
-                    this.dag_eval_node(dag, args[idx], state_var_cache, memory_cache, state) as f64
+                    this.dag_eval_node(
+                        dag, args[idx], state_var_cache, memory_cache, transient_cache, state,
+                    ) as f64
                 };
                 let result: f64 = match op {
                     CalcKind::Add => af(self, 0) + af(self, 1),
@@ -1792,13 +1818,27 @@ impl Evaluator {
                     CalcKind::Min => args
                         .iter()
                         .map(|&n| {
-                            self.dag_eval_node(dag, n, state_var_cache, memory_cache, state) as f64
+                            self.dag_eval_node(
+                                dag,
+                                n,
+                                state_var_cache,
+                                memory_cache,
+                                transient_cache,
+                                state,
+                            ) as f64
                         })
                         .fold(f64::INFINITY, f64::min),
                     CalcKind::Max => args
                         .iter()
                         .map(|&n| {
-                            self.dag_eval_node(dag, n, state_var_cache, memory_cache, state) as f64
+                            self.dag_eval_node(
+                                dag,
+                                n,
+                                state_var_cache,
+                                memory_cache,
+                                transient_cache,
+                                state,
+                            ) as f64
                         })
                         .fold(f64::NEG_INFINITY, f64::max),
                     CalcKind::Clamp => {
@@ -1845,11 +1885,6 @@ impl Evaluator {
                 result as i32
             }
             DagNode::FuncCall { fn_id, args } => {
-                // Delegate to v1's eval_function_call. We rebuild Expr
-                // arguments as Literals from the DAG-evaluated values —
-                // the function body itself is then walked through v1's
-                // interpreter, which handles parameter binding via
-                // self.properties. Phase 2 will inline directly.
                 let name = dag
                     .function_names
                     .iter()
@@ -1863,25 +1898,80 @@ impl Evaluator {
                 let evaluated_args: Vec<Expr> = args_owned
                     .iter()
                     .map(|&a| {
-                        let v = self.dag_eval_node(dag, a, state_var_cache, memory_cache, state);
+                        let v = self.dag_eval_node(
+                            dag,
+                            a,
+                            state_var_cache,
+                            memory_cache,
+                            transient_cache,
+                            state,
+                        );
                         Expr::Literal(v as f64)
                     })
                     .collect();
-                self.eval_function_call(&name, &evaluated_args, state).as_number() as i32
+                // Bridge v2 transient cache → v1 self.properties so the
+                // function body's `var(--transient)` reads can find the
+                // value. v1's resolve_property only checks
+                // self.properties + state, neither of which sees v2's
+                // transient cache. We populate self.properties with the
+                // current snapshot of every transient with a known
+                // value, call the function, then clear self.properties
+                // (preserving v1's invariant that self.properties is
+                // empty between non-string evaluations).
+                //
+                // This is a Phase 1 stub — Phase 2 inlines function
+                // bodies into the DAG, eliminating the bridge entirely.
+                let mut populated_names: Vec<String> = Vec::new();
+                for (bare, &slot) in &dag.name_to_slot {
+                    if slot >= crate::dag::TRANSIENT_BASE {
+                        let idx = (slot - crate::dag::TRANSIENT_BASE) as usize;
+                        if let Some(Some(v)) = transient_cache.get(idx) {
+                            self.properties
+                                .insert(format!("--{bare}"), Value::Number(*v as f64));
+                            populated_names.push(format!("--{bare}"));
+                        }
+                    }
+                }
+                let result = self.eval_function_call(&name, &evaluated_args, state).as_number() as i32;
+                // Drop the bridge entries so the next FuncCall starts
+                // from a clean slate (param binding inside
+                // eval_function_call uses the same self.properties
+                // map; we don't want stale transient values leaking).
+                for n in &populated_names {
+                    self.properties.remove(n);
+                }
+                result
             }
             DagNode::If { branches, fallback } => {
                 let branches = branches.clone();
                 let fallback = *fallback;
                 for (cond, then_id) in &branches {
                     if self.dag_eval_style_cond(
-                        dag, cond, state_var_cache, memory_cache, state,
+                        dag,
+                        cond,
+                        state_var_cache,
+                        memory_cache,
+                        transient_cache,
+                        state,
                     ) {
                         return self.dag_eval_node(
-                            dag, *then_id, state_var_cache, memory_cache, state,
+                            dag,
+                            *then_id,
+                            state_var_cache,
+                            memory_cache,
+                            transient_cache,
+                            state,
                         );
                     }
                 }
-                self.dag_eval_node(dag, fallback, state_var_cache, memory_cache, state)
+                self.dag_eval_node(
+                    dag,
+                    fallback,
+                    state_var_cache,
+                    memory_cache,
+                    transient_cache,
+                    state,
+                )
             }
             DagNode::Concat(_) => 0,
             DagNode::WriteVar { .. } | DagNode::IndirectStore { .. } => 0,
@@ -1894,6 +1984,7 @@ impl Evaluator {
         cond: &crate::dag::StyleCondNode,
         state_var_cache: &[Option<i32>],
         memory_cache: &HashMap<i32, i32>,
+        transient_cache: &[Option<i32>],
         state: &State,
     ) -> bool {
         use crate::dag::types::TickPosition;
@@ -1905,17 +1996,28 @@ impl Evaluator {
                     TickPosition::Current,
                     state_var_cache,
                     memory_cache,
+                    transient_cache,
                     state,
                 );
-                let rhs =
-                    self.dag_eval_node(dag, *value, state_var_cache, memory_cache, state);
+                let rhs = self.dag_eval_node(
+                    dag,
+                    *value,
+                    state_var_cache,
+                    memory_cache,
+                    transient_cache,
+                    state,
+                );
                 lhs == rhs
             }
             StyleCondNode::And(parts) => parts.iter().all(|p| {
-                self.dag_eval_style_cond(dag, p, state_var_cache, memory_cache, state)
+                self.dag_eval_style_cond(
+                    dag, p, state_var_cache, memory_cache, transient_cache, state,
+                )
             }),
             StyleCondNode::Or(parts) => parts.iter().any(|p| {
-                self.dag_eval_style_cond(dag, p, state_var_cache, memory_cache, state)
+                self.dag_eval_style_cond(
+                    dag, p, state_var_cache, memory_cache, transient_cache, state,
+                )
             }),
         }
     }
@@ -1926,9 +2028,19 @@ impl Evaluator {
         kind: crate::dag::TickPosition,
         state_var_cache: &[Option<i32>],
         memory_cache: &HashMap<i32, i32>,
+        transient_cache: &[Option<i32>],
         state: &State,
     ) -> i32 {
         use crate::dag::types::TickPosition;
+        // Transient slots have no notion of "prev" — they exist only
+        // for one tick.
+        if slot >= crate::dag::TRANSIENT_BASE {
+            if matches!(kind, TickPosition::Prev) {
+                return 0;
+            }
+            let idx = (slot - crate::dag::TRANSIENT_BASE) as usize;
+            return transient_cache.get(idx).and_then(|x| *x).unwrap_or(0);
+        }
         if matches!(kind, TickPosition::Prev) {
             return state.read_mem(slot);
         }
@@ -1941,6 +2053,150 @@ impl Evaluator {
             return v;
         }
         state.read_mem(slot)
+    }
+
+    /// Execute one unpacked broadcast-write port. Reads `gate_property`
+    /// (if any) and `dest_property` from committed state (the tick's
+    /// WriteVars have already committed by the time this fires —
+    /// IndirectStore terminals come last in topo order). On address
+    /// hit, evaluates `value_expr` via the v1 interpreter against
+    /// committed state, and writes to `state.write_mem(dest, value)`.
+    /// Spillover, if present, fires the same way for `dest+1` when
+    /// `spillover_guard` reads 1.
+    fn dag_exec_broadcast(
+        &mut self,
+        dag: &crate::dag::Dag,
+        port_id: u32,
+        state: &mut State,
+    ) {
+        // Clone to release the borrow on dag — eval_expr mutates self.
+        let bw = dag.broadcast_writes[port_id as usize].clone();
+        let resolve = |name: &str| {
+            let bare = to_bare_name(name);
+            dag.name_to_slot.get(bare).copied()
+        };
+
+        // Gate check.
+        if let Some(ref gate_prop) = bw.gate_property {
+            let gate_addr = match resolve(gate_prop) {
+                Some(a) => a,
+                None => return,
+            };
+            if state.read_mem(gate_addr) != 1 {
+                return;
+            }
+        }
+
+        // Resolve destination address.
+        let dest_addr_prop = &bw.dest_property;
+        let dest_slot = match resolve(dest_addr_prop) {
+            Some(a) => a,
+            None => return,
+        };
+        let dest = state.read_mem(dest_slot);
+        let dest_i64 = dest as i64;
+
+        // Direct write.
+        if bw.address_map.contains_key(&dest_i64) {
+            let value = self.eval_expr(&bw.value_expr, state).as_number() as i32;
+            state.write_mem(dest, value);
+        }
+
+        // Spillover: word-write high byte at dest+1.
+        if let Some(ref guard_prop) = bw.spillover_guard {
+            let guard_slot = match property_to_address(guard_prop) {
+                Some(a) => a,
+                None => return,
+            };
+            if state.read_mem(guard_slot) == 1 {
+                if let Some((_target_var, hi_expr)) = bw.spillover_map.get(&dest_i64) {
+                    let value = self.eval_expr(hi_expr, state).as_number() as i32;
+                    state.write_mem(dest + 1, value);
+                }
+            }
+        }
+    }
+
+    /// Execute one packed-cell broadcast-write port. Reads gate, byte
+    /// address, value, width from committed state. Splices the byte
+    /// (or word) into the affected cell(s) per CSS-DOS PACK_SIZE=2
+    /// semantics — see compile.rs::execute for the v1 reference.
+    fn dag_exec_packed_broadcast(
+        &mut self,
+        dag: &crate::dag::Dag,
+        port_id: u32,
+        state: &mut State,
+    ) {
+        let port = dag.packed_broadcast_ports[port_id as usize].clone();
+
+        // Resolve via the DAG's slot map — covers committed slots AND
+        // transient slots, which `property_to_address` does not see.
+        let resolve = |name: &str| {
+            let bare = to_bare_name(name);
+            dag.name_to_slot.get(bare).copied()
+        };
+        let gate_slot = match resolve(&port.gate_property) {
+            Some(s) => s,
+            None => return,
+        };
+        if state.read_mem(gate_slot) != 1 {
+            return;
+        }
+        let addr_slot = match resolve(&port.addr_property) {
+            Some(s) => s,
+            None => return,
+        };
+        let val_slot = match resolve(&port.val_property) {
+            Some(s) => s,
+            None => return,
+        };
+        let width_slot = match resolve(&port.width_property) {
+            Some(s) => s,
+            None => return,
+        };
+
+        let byte_addr = state.read_mem(addr_slot);
+        if byte_addr < 0 {
+            return;
+        }
+        let val = state.read_mem(val_slot);
+        let width = state.read_mem(width_slot);
+
+        // Resolve cell variable name → state-var slot.
+        let pack = port.pack as i32;
+        let splice_byte = |state: &mut State, byte_addr: i32, byte_val: i32| {
+            let cell_byte_base = (byte_addr / pack) * pack;
+            let off = (byte_addr - cell_byte_base) as u32;
+            let Some(cell_var) = port.address_map.get(&(cell_byte_base as i64)) else {
+                return;
+            };
+            let Some(cell_slot) = property_to_address(cell_var) else {
+                return;
+            };
+            let old = state.read_mem(cell_slot);
+            let mask: i32 = !(0xFF << (8 * off));
+            let new = (old & mask) | ((byte_val & 0xFF) << (8 * off));
+            state.write_mem(cell_slot, new);
+        };
+
+        if width == 2 {
+            if byte_addr & 1 == 0 && pack == 2 {
+                // Aligned word: whole cell.
+                let cell_byte_base = byte_addr;
+                if let Some(cell_var) = port.address_map.get(&(cell_byte_base as i64)) {
+                    if let Some(cell_slot) = property_to_address(cell_var) {
+                        state.write_mem(cell_slot, val & 0xFFFF);
+                    }
+                }
+            } else {
+                // Straddle: lo at byte_addr, hi at byte_addr+1.
+                splice_byte(state, byte_addr, val & 0xFF);
+                splice_byte(state, byte_addr + 1, (val >> 8) & 0xFF);
+            }
+        } else {
+            // Byte splice (width=1).
+            splice_byte(state, byte_addr, val & 0xFF);
+        }
     }
 
     /// Evaluate an expression to a `Value` (number or string).
@@ -2149,6 +2405,29 @@ impl Evaluator {
             return Value::Number(0.0);
         }
 
+        // Dispatch tables take precedence over body-pattern fast paths
+        // when both are recognised. v1's bytecode path uses dispatch
+        // tables exclusively for these functions; the body-pattern
+        // matcher is more permissive and can misclassify (e.g.
+        // `--getReg8` matched IdentityRead because its branches all
+        // do `var(--paramN)`, but the correct semantics are dispatch
+        // on the index). Honour dispatch first.
+        if let Some(table) = self.dispatch_tables.get(name) {
+            let table_key = &table.key_property as *const String;
+            let table_entries = &table.entries as *const HashMap<i64, Expr>;
+            let table_fallback = &table.fallback as *const Expr;
+            // SAFETY: dispatch_tables is not modified during evaluation.
+            return unsafe {
+                self.eval_dispatch_raw(
+                    name,
+                    &*table_key,
+                    &*table_entries,
+                    &*table_fallback,
+                    args,
+                    state,
+                )
+            };
+        }
         // Fast paths based on precomputed body-pattern analysis.
         // These match mathematical patterns in function bodies, not names.
         if let Some(&pattern) = self.function_patterns.get(name) {
@@ -2333,7 +2612,6 @@ impl Evaluator {
         };
 
         let key = self.resolve_property(key_property, state).as_number() as i64;
-
         let result = if let Some(result_expr) = entries.get(&key) {
             self.eval_expr(result_expr, state)
         } else {

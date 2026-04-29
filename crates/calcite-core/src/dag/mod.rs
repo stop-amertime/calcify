@@ -11,7 +11,7 @@ pub mod types;
 pub mod lowering;
 pub mod walker;
 
-pub use types::{Dag, DagNode, NodeId, SlotId, StyleCondNode, TickPosition};
+pub use types::{Dag, DagNode, NodeId, SlotId, StyleCondNode, TickPosition, TRANSIENT_BASE};
 
 use crate::types::ParsedProgram;
 

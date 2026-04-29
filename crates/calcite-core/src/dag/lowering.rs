@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use super::types::{CalcKind, Dag, DagNode, NodeId, SlotId, StyleCondNode, TickPosition};
 use crate::types::{
-    Assignment, CalcOp, Expr, FunctionDef, ParsedProgram, StyleBranch, StyleTest,
+    Assignment, CalcOp, Expr, ParsedProgram, StyleBranch, StyleTest,
 };
 
 /// Strip `--`, then optional `__0`/`__1`/`__2` prefix. Returns the bare
@@ -35,22 +35,37 @@ fn is_buffer_copy(name: &str) -> bool {
     name.starts_with("--__0") || name.starts_with("--__1") || name.starts_with("--__2")
 }
 
-/// Resolve a bare property name to its slot.
-///
-/// Defers to `crate::eval::property_to_address`, which is v1's global
-/// resolver (state vars + memory + dispatch-table-derived addresses).
-fn slot_of(name: &str) -> Option<SlotId> {
+/// Resolve a bare property name to its committed slot (state var or
+/// memory address). Returns `None` for properties that don't have a
+/// committed slot — the caller must allocate a transient slot for
+/// these.
+fn committed_slot_of(name: &str) -> Option<SlotId> {
     crate::eval::property_to_address(&format!("--{name}"))
 }
 
-/// Lowering context: a fresh DAG plus mutable function id allocator.
+/// Lowering context: a fresh DAG plus a transient-slot allocator for
+/// property names that don't resolve to committed state.
 struct LowerCtx {
     dag: Dag,
+    /// Bare-name → SlotId for transient (per-tick scratch) properties.
+    /// Allocated lazily as references and assignments reach unknown
+    /// property names. Slot ids are encoded `TRANSIENT_BASE + idx`.
+    transient_slots: HashMap<String, SlotId>,
+    /// Set of bare property names that appear as the LHS of some
+    /// assignment. Used by `Expr::Var` lowering to distinguish
+    /// "name is computed by this program but not @property-declared"
+    /// (→ allocate transient, ignore var() fallback) from "name is
+    /// genuinely unresolved" (→ use var() fallback per CSS spec).
+    assigned_names: std::collections::HashSet<String>,
 }
 
 impl LowerCtx {
     fn new() -> Self {
-        Self { dag: Dag::default() }
+        Self {
+            dag: Dag::default(),
+            transient_slots: HashMap::new(),
+            assigned_names: std::collections::HashSet::new(),
+        }
     }
 
     fn intern_function(&mut self, name: &str) -> u32 {
@@ -60,6 +75,30 @@ impl LowerCtx {
         let id = self.dag.function_names.len() as u32;
         self.dag.function_names.insert(name.to_string(), id);
         id
+    }
+
+    /// Look up or allocate a slot for a bare property name. State-var
+    /// and memory slots come from the global address map; transients
+    /// are allocated on demand and don't commit to State.
+    ///
+    /// Every name we see is recorded in `dag.name_to_slot` — that's
+    /// v2's authoritative slot map. Consumers that need to resolve a
+    /// property name to a slot (e.g. the broadcast executor reading
+    /// `--_slot0Live`) should consult that map, not
+    /// `property_to_address` (which doesn't know about transients).
+    fn slot_for(&mut self, bare: &str) -> SlotId {
+        if let Some(&s) = self.dag.name_to_slot.get(bare) {
+            return s;
+        }
+        let slot = if let Some(s) = committed_slot_of(bare) {
+            s
+        } else {
+            let id = crate::dag::TRANSIENT_BASE + self.transient_slots.len() as SlotId;
+            self.transient_slots.insert(bare.to_string(), id);
+            id
+        };
+        self.dag.name_to_slot.insert(bare.to_string(), slot);
+        slot
     }
 
     /// Lower an `Expr` to a `NodeId`. Pure (no side effects beyond
@@ -72,16 +111,25 @@ impl LowerCtx {
 
             Expr::Var { name, fallback } => {
                 let (bare, kind) = strip_var_name(name);
-                if let Some(slot) = slot_of(bare) {
+                // CSS spec: `var(--x, fb)` evaluates fb only when --x
+                // is unresolved. "Unresolved" means: --x has neither
+                // a registered @property declaration nor any
+                // assignment that produces it. v2 distinguishes:
+                //   - committed_slot_of(bare).is_some() → state var
+                //     or memory address → resolved.
+                //   - assigned_names.contains(bare) → an assignment
+                //     produces it (transient if not committed) →
+                //     resolved, allocate slot.
+                //   - neither → unresolved, use fallback or 0.
+                if committed_slot_of(bare).is_some() || self.assigned_names.contains(bare) {
+                    let slot = self.slot_for(bare);
                     self.dag.push(DagNode::LoadVar { slot, kind })
                 } else if let Some(fb) = fallback.as_deref() {
-                    // Unknown property with fallback: lower the fallback
-                    // expression and use it directly. Matches v1's
-                    // compile_var (compile.rs:1700).
                     self.lower_expr(fb)
                 } else {
-                    // Unknown property, no fallback: literal 0. Matches
-                    // v1's compile.rs:1704.
+                    // Unresolved, no fallback: CSS spec falls back to
+                    // the property's registered initial value, which
+                    // is 0 for unregistered numeric properties.
                     self.dag.push(DagNode::Lit(0.0))
                 }
             }
@@ -150,12 +198,12 @@ impl LowerCtx {
         match test {
             StyleTest::Single { property, value } => {
                 let (bare, _kind) = strip_var_name(property);
-                // The slot of a `style(--P: V)` test is always P's
-                // *current-tick* slot. v1's evaluator reads style()
-                // queries from this-tick computed values (or state on
-                // miss). We don't carry a TickPosition for style tests
-                // — Current is implicit.
-                let slot = slot_of(bare).unwrap_or(0);
+                // The slot of a `style(--P: V)` test is P's current-
+                // tick slot. May be transient if --P is computed but
+                // not @property-declared (e.g. --opcode in CSS-DOS
+                // cabinets). The walker handles transient slots in
+                // both reads (LoadVar) and StyleCondNode lookups.
+                let slot = self.slot_for(bare);
                 let value_id = self.lower_expr(value);
                 StyleCondNode::Single { slot, value: value_id }
             }
@@ -173,68 +221,124 @@ impl LowerCtx {
             return None;
         }
         let (bare, _kind) = strip_var_name(&a.property);
-        let slot = slot_of(bare)?;
+        let slot = self.slot_for(bare);
         let value = self.lower_expr(&a.value);
         let id = self.dag.push(DagNode::WriteVar { slot, value });
         Some(id)
     }
 
-    fn lower_function(&mut self, f: &FunctionDef) -> NodeId {
-        // Each function's body is its own sub-DAG; we lower the result
-        // expression and record the root. Parameters and locals are
-        // not lowered yet — Phase 1 walker uses v1's interpreter to
-        // evaluate function calls. Phase 2 inlines.
-        self.lower_expr(&f.result)
-    }
+    // Function bodies are NOT lowered in Phase 1.
+    //
+    // Why: function parameters (`--at`, `--n`, etc.) and locals are
+    // call-site-bound, not tick-global. If we lowered a function body
+    // by walking its `result` expression, every `var(--paramName)`
+    // would allocate a tick-global transient slot, conflating param
+    // values across call sites and across the body's surrounding
+    // scope. Lowering function bodies needs a parameter-frame
+    // mechanism, which is Phase 2 work.
+    //
+    // Phase 1 delegates function-call evaluation entirely to
+    // v1's `eval_function_call` (which binds parameters into
+    // self.properties at call time, then evaluates the body via the
+    // interpreter). The DAG records the function name so the walker
+    // can route to the right callee, but the body itself stays in
+    // `Expr` form on `Evaluator::functions`.
 }
 
 /// Lower a `ParsedProgram` to a `Dag`.
 pub fn lower_parsed_program(program: &ParsedProgram) -> Dag {
     let mut ctx = LowerCtx::new();
 
-    // Lower each `@function`: intern the name, lower the body, record
-    // the root. Sub-DAG is shared with the main DAG (one Vec<DagNode>).
-    let mut function_roots: Vec<(u32, NodeId)> = Vec::new();
-    for f in &program.functions {
-        let fn_id = ctx.intern_function(&f.name);
-        let root = ctx.lower_function(f);
-        function_roots.push((fn_id, root));
+    // Pre-populate the set of LHS-assigned names so Expr::Var lowering
+    // can distinguish "computed but not declared" (resolved → use slot)
+    // from "never declared" (unresolved → use var() fallback per CSS spec).
+    // Strip prefixes so --__1foo and --foo share an entry.
+    for a in &program.assignments {
+        let (bare, _) = strip_var_name(&a.property);
+        ctx.assigned_names.insert(bare.to_string());
     }
-    // Pack into Dag::function_roots indexed by fn_id. Resize first.
-    let max_id = ctx.dag.function_names.len();
-    ctx.dag.function_roots = vec![NodeId::MAX; max_id];
-    for (id, root) in function_roots {
-        ctx.dag.function_roots[id as usize] = root;
+    // The parser fast-path absorbs property declarations directly;
+    // those names are also "computed" — their assignments live in the
+    // prebuilt broadcast lists, not in program.assignments.
+    for name in &program.fast_path_absorbed {
+        let (bare, _) = strip_var_name(name);
+        ctx.assigned_names.insert(bare.to_string());
     }
 
-    // Lower each top-level assignment. Skip buffer copies and any
-    // assignment whose slot doesn't resolve (the latter shouldn't
-    // happen in practice — every property in a parsed program has a
-    // declaration — but matches v1's filter behaviour).
+    // Run broadcast recognisers on the residual assignments. Their
+    // results merge with the parser fast-path's prebuilt ports to form
+    // the complete broadcast set; absorbed property names are filtered
+    // out of the WriteVar lowering loop below.
+    //
+    // The recognisers are pure-CSS-shape matchers over Expr trees (see
+    // pattern/broadcast_write.rs:61, packed_broadcast_write.rs:103) —
+    // calling them is using shape-matching code, not inheriting v1's
+    // bytecode decisions. See design doc § What v1 code stays callable.
+    let bw_result = crate::pattern::broadcast_write::recognise_broadcast(
+        &program.assignments,
+    );
+    let packed_result = crate::pattern::packed_broadcast_write::recognise_packed_broadcast(
+        &program.assignments,
+    );
+
+    // Merge: recogniser output first, then parser-fast-path prebuilt.
+    // Order is stable for given input. Indices into these vecs are
+    // referenced by IndirectStore::port_id.
+    let mut broadcast_writes = bw_result.writes;
+    broadcast_writes.extend(program.prebuilt_broadcast_writes.iter().cloned());
+    let mut packed_broadcast_ports = packed_result.ports;
+    packed_broadcast_ports.extend(program.prebuilt_packed_broadcast_ports.iter().cloned());
+
+    // Build the absorbed-properties union. v2 filters WriteVar lowering
+    // against this; v1 does the same at eval.rs:418.
+    let mut absorbed: std::collections::HashSet<String> = bw_result.absorbed_properties;
+    absorbed.extend(packed_result.absorbed_properties);
+    absorbed.extend(program.fast_path_absorbed.iter().cloned());
+
+    // Intern function names so call sites can reference them by id.
+    // Phase 1 does NOT lower function bodies — see lower_function
+    // above for the rationale. The walker delegates entire calls to
+    // v1's eval_function_call, which handles parameter binding.
+    for f in &program.functions {
+        ctx.intern_function(&f.name);
+    }
+
+    // Lower top-level assignments. Skip:
+    //   - Buffer-copy assignments (`--__0/__1/__2` prefix) — the slot
+    //     model exposes prior-tick values as LoadVar Prev directly.
+    //   - Assignments absorbed into broadcast lists — they're
+    //     evaluated via IndirectStore terminals below.
     for a in &program.assignments {
+        if absorbed.contains(&a.property) {
+            continue;
+        }
         if let Some(terminal) = ctx.lower_assignment(a) {
             ctx.dag.terminals.push(terminal);
         }
     }
 
-    // Phase 1: prebuilt broadcast writes from the parser fast-path get
-    // an `IndirectStore` placeholder per port. The walker delegates
-    // their evaluation to v1's executor for now (Phase 2 promotes them
-    // to fully self-contained DAG nodes).
-    for (i, _bw) in program.prebuilt_broadcast_writes.iter().enumerate() {
+    // Emit IndirectStore terminals for every broadcast port (recognised
+    // + prebuilt). port_id indexes into Dag::broadcast_writes /
+    // Dag::packed_broadcast_ports.
+    for i in 0..broadcast_writes.len() {
         let id = ctx.dag.push(DagNode::IndirectStore {
             port_id: i as u32,
             packed: false,
         });
         ctx.dag.terminals.push(id);
     }
-    for (i, _port) in program.prebuilt_packed_broadcast_ports.iter().enumerate() {
+    for i in 0..packed_broadcast_ports.len() {
         let id = ctx.dag.push(DagNode::IndirectStore {
             port_id: i as u32,
             packed: true,
         });
         ctx.dag.terminals.push(id);
     }
+
+    ctx.dag.broadcast_writes = broadcast_writes;
+    ctx.dag.packed_broadcast_ports = packed_broadcast_ports;
+    ctx.dag.absorbed_properties = absorbed;
+    ctx.dag.transient_slot_count = ctx.transient_slots.len();
 
     sort_terminals(&mut ctx.dag);
     ctx.dag
