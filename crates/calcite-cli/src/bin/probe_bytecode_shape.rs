@@ -159,6 +159,7 @@ fn op_name(op: &Op) -> &'static str {
         Op::BranchIfZero { .. } => "BranchIfZero",
         Op::BranchIfNotEqLit { .. } => "BranchIfNotEqLit",
         Op::LoadStateAndBranchIfNotEqLit { .. } => "LoadStateAndBranchIfNotEqLit",
+        Op::BranchIfNotEqLit2 { .. } => "BranchIfNotEqLit2",
         Op::Jump { .. } => "Jump",
         Op::DispatchChain { .. } => "DispatchChain",
         Op::Dispatch { .. } => "Dispatch",

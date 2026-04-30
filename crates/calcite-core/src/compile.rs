@@ -328,6 +328,27 @@ pub enum Op {
         val: i32,
         target: u32,
     },
+
+    /// Two-condition AND-guard fusion. Replaces adjacent BranchIfNotEqLit
+    /// pairs (different slots) that share a target — the dominant runtime
+    /// adjacency surviving the chain pass.
+    ///
+    /// Semantics:
+    ///   if slots[a1] != val1 { pc = target; continue; }
+    ///   if slots[a2] != val2 { pc = target; continue; }
+    ///   pc += 2;   // skip the dead BIfNEL left at i+1 for external-jump safety
+    ///
+    /// On fall-through, advances pc by 2 (not 1) — the original BIfNEL at
+    /// ops[i+1] is left in place as dead code so external jumps that
+    /// landed on it still execute correctly. Mirrors the DispatchChain
+    /// dead-code convention.
+    BranchIfNotEqLit2 {
+        a1: Slot,
+        val1: i32,
+        a2: Slot,
+        val2: i32,
+        target: u32,
+    },
     /// Unconditional jump to target op index
     Jump {
         target: u32,
@@ -3312,6 +3333,20 @@ pub fn compile(
     let lsfused = fuse_loadstate_branch(&mut program);
     log::info!("[compile detail] fuse_loadstate_branch: {} fused, {:.2}s", lsfused, _ct.elapsed().as_secs_f64());
 
+    // BIfNEL2 fusion: OFF by default. Static analysis shows 1330 adjacent
+    // diff-slot AND-guard pairs in doom8088 (95% of all such pairs), but
+    // web bench shows the saved dispatch is offset by the `pc += 2; continue;`
+    // cost and possibly cache effects from a new Op variant. Net wash on
+    // doom8088. See logbook 2026-04-30. Set CALCITE_BIF2_FUSE=1 to enable
+    // for measurement / future cabinets.
+    let _ct = web_time::Instant::now();
+    let bif2_fused = if std::env::var("CALCITE_BIF2_FUSE").is_ok() {
+        fuse_diff_slot_bifnel_pairs(&mut program)
+    } else {
+        0
+    };
+    log::info!("[compile detail] fuse_diff_slot_bifnel_pairs: {} fused, {:.2}s", bif2_fused, _ct.elapsed().as_secs_f64());
+
     let _ct = web_time::Instant::now();
     compact_slots(&mut program);
     log::info!("[compile detail] slot compaction: {:.2}s", _ct.elapsed().as_secs_f64());
@@ -3360,6 +3395,7 @@ fn shift_branch_targets(ops: &mut [Op], offset: u32) {
             Op::BranchIfZero { target, .. } => *target += offset,
             Op::BranchIfNotEqLit { target, .. } => *target += offset,
             Op::LoadStateAndBranchIfNotEqLit { target, .. } => *target += offset,
+            Op::BranchIfNotEqLit2 { target, .. } => *target += offset,
             Op::DispatchChain { miss_target, .. } => *miss_target += offset,
             // Dispatch op's fallback_target is unused (sub-ops live in dispatch tables).
             _ => {}
@@ -3465,6 +3501,7 @@ fn expand_calls_in_stream(ops: &mut Vec<Op>, flat_bodies: &[Vec<Op>], param_slot
             | Op::BranchIfZero { target, .. }
             | Op::BranchIfNotEqLit { target, .. }
             | Op::LoadStateAndBranchIfNotEqLit { target, .. }
+            | Op::BranchIfNotEqLit2 { target, .. }
             | Op::DispatchChain { miss_target: target, .. } => {
                 let old = *target as usize;
                 if old <= src_len {
@@ -3680,6 +3717,9 @@ fn fuse_ops(ops: &mut Vec<Op>) -> usize {
         match op {
             Op::BranchIfZero { target, .. }
             | Op::BranchIfNotEqLit { target, .. }
+            | Op::LoadStateAndBranchIfNotEqLit { target, .. }
+            | Op::BranchIfNotEqLit2 { target, .. }
+            | Op::DispatchChain { miss_target: target, .. }
             | Op::Jump { target } => {
                 let old = *target as usize;
                 *target = if old < new_indices.len() {
@@ -3722,6 +3762,126 @@ fn fuse_ops(ops: &mut Vec<Op>) -> usize {
 ///
 /// Must run AFTER `build_dispatch_chains` so we only fuse isolated BranchIfNotEqLit
 /// ops left behind after chain collapsing.
+// ---------------------------------------------------------------------------
+// Peephole: fuse adjacent BranchIfNotEqLit pairs sharing a target → BranchIfNotEqLit2
+// ---------------------------------------------------------------------------
+//
+// Static structure (doom8088): 1395 adjacent BIfNEL pairs in the static op
+// stream, all different-slot. 1330 of those (95.3%) share their `target` —
+// they form an AND-guard:
+//
+//   BranchIfNotEqLit { a: A, val: vA, target: T }
+//   BranchIfNotEqLit { a: B, val: vB, target: T }
+//
+// = "if (slots[A] != vA OR slots[B] != vB) goto T". When both equal,
+// fall through to ops[i+2].
+//
+// Runtime impact (200K-tick window post-stage_loading): BIfNEL→BIfNEL is
+// 12.35% of dispatched ops — the largest adjacency in the profile.
+//
+// Fusion replaces ops[i] with `BranchIfNotEqLit2 { a1, val1, a2, val2,
+// target: T }`. ops[i+1] is left in place as the original BIfNEL so any
+// external jump that lands on it still executes correctly (same dead-code
+// convention as `build_dispatch_chains`). The fused op explicitly advances
+// pc by 2 on fall-through to skip it.
+//
+// Constraints:
+// - ops[i+1] must NOT be a jump target (would skip the second check). We
+//   build is_target by scanning all ops for branch destinations, chain-
+//   table body PCs, and dispatch fallback targets.
+// - The two slots must differ (same-slot pairs go through chain pass).
+// - Targets must match.
+fn fuse_diff_slot_bifnel_pairs(program: &mut CompiledProgram) -> usize {
+    let mut total = 0;
+    total += fuse_bif2_ops(&mut program.ops, &program.chain_tables);
+    for table in &mut program.dispatch_tables {
+        for (_k, (entry_ops, _s)) in &mut table.entries {
+            total += fuse_bif2_ops(entry_ops, &program.chain_tables);
+        }
+        total += fuse_bif2_ops(&mut table.fallback_ops, &program.chain_tables);
+    }
+    for bw in &mut program.broadcast_writes {
+        total += fuse_bif2_ops(&mut bw.value_ops, &program.chain_tables);
+        if let Some(ref mut sp) = bw.spillover {
+            for (_k, (spill_ops, _s)) in &mut sp.entries {
+                total += fuse_bif2_ops(spill_ops, &program.chain_tables);
+            }
+        }
+    }
+    total
+}
+
+fn fuse_bif2_ops(ops: &mut [Op], chain_tables: &[DispatchChainTable]) -> usize {
+    let n = ops.len();
+    if n < 2 { return 0; }
+
+    // Build is_target: every op index that is a branch destination, a chain-
+    // table body PC pointing into this array, or a flat-table chain target.
+    let mut is_target = vec![false; n];
+    let mark = |is_t: &mut Vec<bool>, t: u32| {
+        let t = t as usize;
+        if t < is_t.len() { is_t[t] = true; }
+    };
+    for op in ops.iter() {
+        match op {
+            Op::BranchIfZero { target, .. }
+            | Op::BranchIfNotEqLit { target, .. }
+            | Op::LoadStateAndBranchIfNotEqLit { target, .. }
+            | Op::BranchIfNotEqLit2 { target, .. }
+            | Op::Jump { target } => mark(&mut is_target, *target),
+            Op::DispatchChain { miss_target, chain_id, .. } => {
+                mark(&mut is_target, *miss_target);
+                let table = &chain_tables[*chain_id as usize];
+                for (_v, body_pc) in &table.entries {
+                    mark(&mut is_target, *body_pc);
+                }
+                if let Some(flat) = &table.flat_table {
+                    for &t in &flat.targets {
+                        if t != u32::MAX { mark(&mut is_target, t); }
+                    }
+                }
+            }
+            Op::Dispatch { fallback_target, .. } => mark(&mut is_target, *fallback_target),
+            Op::MemoryFill { exit_target, .. } | Op::MemoryCopy { exit_target, .. } => {
+                mark(&mut is_target, *exit_target);
+            }
+            _ => {}
+        }
+    }
+
+    let mut fused = 0;
+    let mut i = 0;
+    while i + 1 < ops.len() {
+        // Snapshot inputs to avoid double-borrow.
+        let (a0, v0, t0) = match &ops[i] {
+            Op::BranchIfNotEqLit { a, val, target } => (*a, *val, *target),
+            _ => { i += 1; continue; }
+        };
+        let (a1, v1, t1) = match &ops[i + 1] {
+            Op::BranchIfNotEqLit { a, val, target } => (*a, *val, *target),
+            _ => { i += 1; continue; }
+        };
+
+        // Constraints. Targets must match; slots must differ; ops[i+1] must
+        // not itself be a branch destination (otherwise external jumps that
+        // land on it expect a single-condition test).
+        if t0 != t1 { i += 1; continue; }
+        if a0 == a1 { i += 1; continue; }
+        if is_target[i + 1] { i += 1; continue; }
+
+        ops[i] = Op::BranchIfNotEqLit2 {
+            a1: a0, val1: v0,
+            a2: a1, val2: v1,
+            target: t0,
+        };
+        // ops[i+1] stays as-is (dead BIfNEL preserved for external-jump safety).
+        // The fused op's eval arm explicitly advances pc by 2 on fall-through.
+        fused += 1;
+        i += 2;
+    }
+    fused
+}
+
 fn fuse_loadstate_branch(program: &mut CompiledProgram) -> usize {
     // Gather chain-table body PCs that point into each ops array so we
     // can remap them after fusion. chain_tables are shared across all
@@ -3770,6 +3930,7 @@ fn fuse_ls_ops(ops: &mut Vec<Op>, chain_tables: &mut [DispatchChainTable]) -> us
             Op::BranchIfZero { target, .. }
             | Op::BranchIfNotEqLit { target, .. }
             | Op::LoadStateAndBranchIfNotEqLit { target, .. }
+            | Op::BranchIfNotEqLit2 { target, .. }
             | Op::Jump { target } => {
                 let t = *target as usize;
                 if t < is_target.len() { is_target[t] = true; }
@@ -3848,6 +4009,7 @@ fn fuse_ls_ops(ops: &mut Vec<Op>, chain_tables: &mut [DispatchChainTable]) -> us
             Op::BranchIfZero { target, .. }
             | Op::BranchIfNotEqLit { target, .. }
             | Op::LoadStateAndBranchIfNotEqLit { target, .. }
+            | Op::BranchIfNotEqLit2 { target, .. }
             | Op::Jump { target } => {
                 let old = *target as usize;
                 *target = if old < new_indices.len() { new_indices[old] } else { new_end };
@@ -3973,6 +4135,7 @@ fn recognise_replicated_in(
             Op::BranchIfZero { target, .. }
             | Op::BranchIfNotEqLit { target, .. }
             | Op::LoadStateAndBranchIfNotEqLit { target, .. }
+            | Op::BranchIfNotEqLit2 { target, .. }
             | Op::Jump { target } => mark_target(&mut is_target, *target),
             Op::DispatchChain { miss_target, .. } => mark_target(&mut is_target, *miss_target),
             Op::Dispatch { fallback_target, .. } => mark_target(&mut is_target, *fallback_target),
@@ -4169,6 +4332,7 @@ fn recognise_replicated_in(
             Op::BranchIfZero { target, .. }
             | Op::BranchIfNotEqLit { target, .. }
             | Op::LoadStateAndBranchIfNotEqLit { target, .. }
+            | Op::BranchIfNotEqLit2 { target, .. }
             | Op::Jump { target } => {
                 let o = *target as usize;
                 *target = if o < new_indices.len() { new_indices[o] } else { new_end };
@@ -4932,6 +5096,7 @@ fn op_slots_read(op: &Op) -> Vec<Slot> {
         Op::BranchIfZero { cond, .. } => vec![*cond],
         Op::BranchIfNotEqLit { a, .. } => vec![*a],
         Op::LoadStateAndBranchIfNotEqLit { .. } => vec![],
+        Op::BranchIfNotEqLit2 { a1, a2, .. } => vec![*a1, *a2],
         Op::Jump { .. } => vec![],
         Op::DispatchChain { a, .. } => vec![*a],
         Op::Dispatch { key, .. } => vec![*key],
@@ -4991,7 +5156,7 @@ fn op_dst(op: &Op) -> Option<Slot> {
         | Op::AndLit { dst, .. } | Op::ShrLit { dst, .. } | Op::ShlLit { dst, .. }
         | Op::ModLit { dst, .. } => Some(*dst),
         Op::LoadStateAndBranchIfNotEqLit { dst, .. } => Some(*dst),
-        Op::BranchIfZero { .. } | Op::BranchIfNotEqLit { .. } | Op::Jump { .. } | Op::DispatchChain { .. } | Op::StoreState { .. } | Op::StoreMem { .. } | Op::MemoryFill { .. } | Op::MemoryCopy { .. } => {
+        Op::BranchIfZero { .. } | Op::BranchIfNotEqLit { .. } | Op::BranchIfNotEqLit2 { .. } | Op::Jump { .. } | Op::DispatchChain { .. } | Op::StoreState { .. } | Op::StoreMem { .. } | Op::MemoryFill { .. } | Op::MemoryCopy { .. } => {
             None
         }
         Op::ReplicatedBody { .. } => unreachable!(
@@ -5102,6 +5267,10 @@ fn map_op_slots(op: &mut Op, slot_map: &mut HashMap<Slot, Slot>, alloc: &mut Slo
         Op::LoadStateAndBranchIfNotEqLit { dst, .. } => {
             *dst = alloc.get_or_alloc(*dst, slot_map);
         }
+        Op::BranchIfNotEqLit2 { a1, a2, .. } => {
+            *a1 = alloc.get_or_alloc(*a1, slot_map);
+            *a2 = alloc.get_or_alloc(*a2, slot_map);
+        }
         Op::DispatchChain { a, .. } => {
             *a = alloc.get_or_alloc(*a, slot_map);
         }
@@ -5188,6 +5357,7 @@ fn seed_from_parent(
         Op::BranchIfZero { cond, .. } => { seed(*cond); }
         Op::BranchIfNotEqLit { a, .. } => { seed(*a); }
         Op::LoadStateAndBranchIfNotEqLit { .. } => {}
+        Op::BranchIfNotEqLit2 { a1, a2, .. } => { seed(*a1); seed(*a2); }
         Op::DispatchChain { a, .. } => { seed(*a); }
         Op::Jump { .. } => {}
         Op::Dispatch { key, .. } => { seed(*key); }
@@ -6609,15 +6779,9 @@ fn exec_ops(
         }};
     }
 
-    let op_profile_enabled = crate::pattern::op_profile::op_profile_is_enabled();
-
     while pc < len {
         // Safety: pc < len checked by loop condition.
         let op = unsafe { ops.get_unchecked(pc) };
-        if op_profile_enabled {
-            let kind = crate::pattern::op_profile::op_kind_index(op);
-            crate::pattern::op_profile::op_profile_tick(kind);
-        }
         match op {
             // Hot path: 96%+ of ops in CSS-DOS programs are this one variant.
             // Keep it first so the compiler can (hopefully) lay out the jump table
@@ -6635,6 +6799,15 @@ fn exec_ops(
                     pc = *target as usize;
                     continue;
                 }
+            }
+            Op::BranchIfNotEqLit2 { a1, val1, a2, val2, target } => {
+                if sload!(*a1) != *val1 || sload!(*a2) != *val2 {
+                    pc = *target as usize;
+                    continue;
+                }
+                // Skip the dead BIfNEL at i+1 left for external-jump safety.
+                // The natural `pc += 1` at end-of-loop will advance the rest.
+                pc += 1;
             }
             Op::LoadLit { dst, val } => {
                 sstore!(*dst, *val);
@@ -7383,6 +7556,18 @@ fn exec_ops_profiled(
                     profile.branches_not_taken += 1;
                 }
             }
+            Op::BranchIfNotEqLit2 { a1, val1, a2, val2, target } => {
+                count_op!(profile, "BranchIfNotEqLit2");
+                if slots[*a1 as usize] != *val1 || slots[*a2 as usize] != *val2 {
+                    profile.branches_taken += 1;
+                    pc = *target as usize;
+                    continue;
+                } else {
+                    profile.branches_not_taken += 1;
+                    pc += 2;
+                    continue;
+                }
+            }
             Op::Jump { target } => {
                 count_op!(profile, "Jump");
                 pc = *target as usize;
@@ -7896,6 +8081,25 @@ pub fn exec_ops_traced(
                 }
                 if taken {
                     pc = *target as usize;
+                    continue;
+                }
+            }
+            Op::BranchIfNotEqLit2 { a1, val1, a2, val2, target } => {
+                let v1 = slots[*a1 as usize];
+                let v2 = slots[*a2 as usize];
+                let taken = v1 != *val1 || v2 != *val2;
+                if should_trace {
+                    trace.push(TraceEntry {
+                        pc, op: format!("BranchIfNotEqLit2 a1={} val1={} a2={} val2={} target={}", a1, val1, a2, val2, target),
+                        dst_slot: None, dst_value: None,
+                        inputs: vec![(*a1, v1), (*a2, v2)], branch_taken: Some(taken), depth,
+                    });
+                }
+                if taken {
+                    pc = *target as usize;
+                    continue;
+                } else {
+                    pc += 2;
                     continue;
                 }
             }

@@ -427,6 +427,7 @@ fn extract_op_fields(op: &Op) -> OpFields {
         BranchIfZero { .. }
         | BranchIfNotEqLit { .. }
         | LoadStateAndBranchIfNotEqLit { .. }
+        | BranchIfNotEqLit2 { .. }
         | Jump { .. }
         | DispatchChain { .. }
         | Dispatch { .. } => OpFields {
@@ -505,6 +506,7 @@ fn branch_name(op: &Op) -> &'static str {
         Op::BranchIfZero { .. } => "BranchIfZero",
         Op::BranchIfNotEqLit { .. } => "BranchIfNotEqLit",
         Op::LoadStateAndBranchIfNotEqLit { .. } => "LoadStateAndBranchIfNotEqLit",
+        Op::BranchIfNotEqLit2 { .. } => "BranchIfNotEqLit2",
         Op::Jump { .. } => "Jump",
         Op::DispatchChain { .. } => "DispatchChain",
         Op::Dispatch { .. } => "Dispatch",
@@ -844,6 +846,7 @@ pub fn apply_strides(template: &Op, k: u32, strides: &[(u8, i32)]) -> Op {
         BranchIfZero { .. }
         | BranchIfNotEqLit { .. }
         | LoadStateAndBranchIfNotEqLit { .. }
+        | BranchIfNotEqLit2 { .. }
         | Jump { .. }
         | DispatchChain { .. }
         | Dispatch { .. }
