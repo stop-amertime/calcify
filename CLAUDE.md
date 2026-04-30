@@ -1,286 +1,219 @@
-NOTE: this workspace covers multiple repos:
-- `./` — calcite (usually the cwd)
-- `../CSS-DOS/` — the CSS-DOS transpiler, BIOS, and tools
-- `../doom.css/` — Doom port (future)
+# calc(ite)
 
-You may need to work in CSS-DOS when fixing transpiler bugs or updating BIOS
-handlers. **If you do, read `../CSS-DOS/CLAUDE.md` first.** It has critical
-rules about the architecture, the cardinal rule (CSS is source of truth), and
-the canonical PC memory layout. Do not guess at how CSS-DOS works — read its docs.
+A load-time compiler for computational CSS. Calcite is a JIT for CSS:
+parses a `.css` cabinet, recognises patterns, and evaluates them orders
+of magnitude faster than Chrome would — same results, faster.
 
-Similarly, if a CSS-DOS agent needs calcite changes, they should read this file
-first. The repos are independent (no code dependency) but tightly coupled in
-practice: CSS-DOS generates CSS, calcite runs it.
+
+## STOP — read this first, every session, no exceptions
+
+**You MUST read `../CSS-DOS/CLAUDE.md` before doing anything else in
+this repo.** It owns the rules that govern both repos: the cardinal
+rule, the checkpoint system, coding guidelines, git/collaboration
+rules, documentation rules, debugging rules, vocabulary (cart, floppy,
+cabinet, Kiln, builder, BIOSes, player), the conformance harness, the
+2-minute wall-clock cap, NASM path, `CALCITE_REPO` worktree handling,
+and `tests/harness/` tooling.
+
+Those rules are NOT repeated below. If you skipped CSS-DOS's CLAUDE.md
+and are looking for any of them here, go back and read it. This file
+covers only what's calcite-specific.
+
+@docs/log.md
+
+`ls docs/` for the rest. `docs/log.md` is the perf logbook with
+current bottleneck analysis and recent optimisation work — read before
+any perf work. `docs/benchmarking.md` is the full `calcite-bench`
+reference. `docs/debugger.md` covers the HTTP debug server.
+`docs/v2-rewrite-design.md` and `docs/v2-self-review-2026-04-29.md`
+cover the v2 DAG walker.
+
 
 ## Web is the only delivery method
 
-calcite-wasm in the browser is the product. calcite-cli is a test harness.
+`calcite-wasm` in the browser is the product. `calcite-cli` is a test
+harness. **Anything that works in calcite-cli but not in calcite-wasm
+is broken**, and any code path that exists in calcite-cli but not in
+calcite-wasm (sidecar files, native-only state setup, fs reads at
+startup) is a bug to be removed, not a feature to preserve. Route the
+same logic through compile-time data on `CompiledProgram` (which both
+targets share), or delete it.
 
-A consequence of that: **anything that works in calcite-cli but not in
-calcite-wasm is broken**, and any code path that exists in calcite-cli but
-not in calcite-wasm (loading sidecar files, native-only state setup,
-filesystem reads at startup, etc.) is a bug to be removed, not a feature to
-preserve. If you find a CLI-only mechanism, your first instinct should be
-to delete it and route the same logic through compile-time data on
-`CompiledProgram` (which both targets share). Don't add CLI-only
-optimisations or workarounds — fix it for the web or don't fix it.
-
-If you are tempted to write `#[cfg(not(target_arch = "wasm32"))]` for
-anything beyond what's already documented in the wasm-safety section
-below (timing, threads, fs/net), stop and find a different design. The
-two targets must produce identical results from the same cabinet.
+If you reach for `#[cfg(not(target_arch = "wasm32"))]` for anything
+beyond what the wasm-safety section permits (timing, threads, fs/net),
+stop and find a different design. Both targets must produce identical
+results from the same cabinet.
 
 
-# calc(ite)
+## Performance and conformance are measured on real carts
 
-A JIT compiler for computational CSS.
+Boot DOS or a real game. **Always.** Micro-fixtures (`hello-text.css`,
+primitives, anything in `tests/conformance/`) can pass with enormous
+structural bugs latent (broadcast spillover, huge dispatch chains,
+function inlining cascades, slot-cache cross-tick interactions) and
+can show flattering speedups that vanish on real workloads. **A perf
+claim with no real-cart number behind it is not a claim.** Never
+write micro-fixture numbers into `docs/log.md` as results.
 
-## Quick reference
+The benchmark of record is `../CSS-DOS/player/bench.html`, driven
+headless by `node ../CSS-DOS/tests/harness/bench-web.mjs`. It builds
+the cabinet in-browser via the same path the site uses, so it measures
+the engine the user actually runs (calcite-wasm, not calcite-cli).
+Dev server (`node ../CSS-DOS/web/scripts/dev.mjs`) must be running.
 
-```sh
-cargo test --workspace          # tests
-cargo clippy --workspace        # lint
-cargo fmt --all                 # format
-just check                      # all three
+Workloads, increasing cost:
 
-cargo bench -p calcite-core     # criterion benchmarks (needs fixture)
-wasm-pack build crates/calcite-wasm --target web --out-dir ../../web/pkg
+1. **Smoke suite** — fail fast, not declare success.
+2. **Zork (`carts/zork1`)** — lightest "real program" baseline.
+   Default for `bench-web.mjs --cart=zork`. First stop for "is this
+   actually faster?".
+3. **Rogue, bootle, bootle-ctest** — established perf workloads with
+   baselines in `docs/log.md`. Bootle-ctest exercises the splash-fill
+   regression magnet.
+4. **Doom8088** — the ultimate test (`bench-web.mjs --cart=doom8088`,
+   ~28M ticks to first frame). **Doom8088 numbers are the only ones
+   that ship.** A change that doesn't help (or hurts) doom8088 isn't
+   a perf win regardless of micro-bench output.
 
-# Benchmark: headless speed measurement + profiling
-cargo run --release --bin calcite-bench -- -i output/rogue.css -n 5000 --warmup 500
-cargo run --release --bin calcite-bench -- -i output/rogue.css -n 2000 --profile
-# See docs/benchmarking.md for full flag reference
+Conformance is the same: passing primitives + matching v1 on a
+2000-tick `hello-text` walk tells you almost nothing. Boot a cart and
+diff against v1 (or the reference emulator via the conformance
+harness) before claiming correctness.
 
-# Debug server: parse once, step/inspect/compare via HTTP
-cargo run --release -p calcite-debugger -- -i program.css
-# Then: curl localhost:3333/state, /tick, /seek, /compare-paths, etc.
-# See docs/debugger.md for full API
-```
+
+## v1 → v2
+
+### v1 pipeline (still the default)
+
+`CSS text → parse → pattern recognition → compile → bytecode → evaluate`
+
+1. **Parser** (`parser/`) — tokenises via `cssparser`. Parses
+   `@property`, `@function`, `if(style())`, `calc()`, `var()`, math
+   functions, string literals. Output: `ParsedProgram`.
+2. **Pattern recognition** (`pattern/`) — detects optimisable shapes:
+   - Dispatch tables: `if(style(--prop: N))` chains (≥4 branches) →
+     HashMap.
+   - Broadcast writes: `if(style(--dest: N): val; else: keep)` (≥10
+     entries) → direct store, with word-write spillover.
+3. **Compiler** (`compile.rs`) — flattens `Expr` trees → flat `Op`
+   bytecode against indexed slots. Function-body patterns (identity,
+   bitmask, shifts, bit extraction) detected for interpreter fast paths.
+4. **Evaluator** (`eval.rs`) — runs the tick loop. Two paths: compiled
+   linear bytecode (fast), recursive `Expr` walking (fallback).
+   Topological sort on assignments. Pre-tick hooks for side effects.
+5. **State** (`state.rs`) — flat mutable replacement for CSS triple
+   buffer. Unified address space (negative = registers, non-negative =
+   memory). Split-register merging (AH/AL ↔ AX). Auto-sized from
+   `@property` decls.
+
+Key types in `types.rs`: `Expr`, `ParsedProgram`, `Assignment`,
+`FunctionDef`, `PropertyDef`, `CssValue` (Integer | String).
+
+### v2 is underway
+
+A DAG-based walker is being built in parallel — see
+`docs/v2-rewrite-design.md`, `docs/v2-self-review-2026-04-29.md`, and
+the `calcite-v2-rewrite` worktree under `.claude/worktrees/`.
+Correctness-clean on `hello-text` for ≥2000 ticks; ~18.5× slower than
+v1 on the same workload. Stacking order to close that gap is in
+`docs/log.md`. Per the testing rule, those numbers are debug
+telemetry — the real comparison is bench-web.mjs against v1 on zork,
+bootle, and doom8088.
+
 
 ## Project layout
 
 ```
 crates/
-  calcite-core/      Core engine: parser, pattern compiler, evaluator, state
+  calcite-core/      Engine: parser, pattern compiler, evaluator, state
   calcite-cli/       CLI tool (calcite-cli) + benchmark runner (calcite-bench)
+                       + perf/diagnostic probe bins (probe_*.rs)
   calcite-debugger/  HTTP debug server — see docs/debugger.md
-  calcite-wasm/      WASM bindings (wasm-bindgen) for browser Web Worker
-web/
-  index.html           Browser UI
-  calcite-worker.js    Web Worker bridge
-site/
-  index.html           CSS-DOS showcase site
-  programs/            Pre-compiled .css.gz program files for the site
-programs/
-  *.com, *.exe         DOS programs to run
-output/
-  *.css                Pre-built CSS files (run directly, no regeneration)
-tools/
-  js8086.js            Reference 8086 emulator (vendored from emu8)
-  fulldiff.mjs         Primary: first-divergence finder (REP-aware, full FLAGS)
-  diagnose.mjs         Property-level CSS diagnosis at divergence point
-  compare.mjs          Tick-by-tick comparison for simple BIOS .COM programs
-  ref-emu.mjs          Standalone reference emulator (simple BIOS programs)
-  ref-dos.mjs          Standalone reference emulator (DOS boot mode)
+  calcite-wasm/      wasm-bindgen layer for the browser Web Worker
+docs/                Architecture, perf logbook, debugger, benchmarking,
+                       v2-rewrite docs
+output/              Pre-built `.css` cabinets (run directly, no rebuild)
+tools/               Mostly retired; `js8086.js` still useful as
+                       reference 8086 emulator. The old `fulldiff.mjs`
+                       / `ref-dos.mjs` / `diagnose.mjs` scripts no
+                       longer work — use the CSS-DOS harness instead.
 tests/
-  fixtures/            Pre-compiled CSS from CSS-DOS
-run.bat                Interactive menu to run/diagnose DOS programs
+  conformance/       Primitive .css unit fixtures
+  fixtures/          Pre-compiled CSS imported from CSS-DOS
 ```
 
-## Architecture
+The CSS-DOS player, web frontend, builder, carts, and integration
+tests live in `../CSS-DOS/`. There is no crate-level dependency
+between the two repos and there must never be one — calcite's only
+interface to CSS-DOS is the `.css` output.
 
-### Pipeline
 
+## Quick reference
+
+```sh
+cargo test --workspace                    # tests
+cargo clippy --workspace                  # lint
+cargo fmt --all                           # format
+just check                                # all three
+
+cargo run --release --bin calcite-bench -- -i output/rogue.css \
+                  -n 5000 --warmup 500    # native bench (debug telemetry)
+cargo bench -p calcite-core               # criterion benches (fixture needed)
+
+wasm-pack build crates/calcite-wasm --target web --out-dir ../../web/pkg
+                                          # wasm; verify via web player
+
+# The benchmark of record (CSS-DOS dev server must be running):
+node ../CSS-DOS/tests/harness/bench-web.mjs                   # zork, 1 run
+node ../CSS-DOS/tests/harness/bench-web.mjs --runs=3
+node ../CSS-DOS/tests/harness/bench-web.mjs --cart=doom8088
+
+# Native CLI for ad-hoc runs (test harness, not the product):
+target/release/calcite-cli.exe -i ../CSS-DOS/output/rogue.css
+
+# Debugger
+cargo run --release -p calcite-debugger -- -i program.css
+# Then: curl localhost:3333/state, /tick, /seek, /compare-paths, etc.
 ```
-CSS text → parse → pattern recognition → compile → bytecode → evaluate (tick loop)
-```
 
-1. **Parser** (`parser/`): Tokenises via `cssparser` crate. Parses `@property`,
-   `@function`, `if(style())`, `calc()`, `var()`, CSS math functions, string
-   literals. Output: `ParsedProgram` (properties + functions + assignments).
 
-2. **Pattern recognition** (`pattern/`): Detects optimisable structures:
-   - Dispatch tables: `if(style(--prop: N))` chains (≥4 branches) → HashMap
-   - Broadcast writes: `if(style(--dest: N): val; else: keep)` (≥10 entries)
-     → direct store, with word-write spillover support
+## Wasm safety — calcite-core must build and run on wasm32
 
-3. **Compiler** (`compile.rs`): Flattens `Expr` trees → flat `Op` bytecode
-   with indexed slots. Function body patterns (identity, bitmask, shifts,
-   bit extraction) detected for interpreter fast-paths.
+`calcite-wasm` wraps `calcite-core` and runs in the browser. Anything
+in `calcite-core` the web build exercises must not panic or fail to
+link on `wasm32-unknown-unknown`.
 
-4. **Evaluator** (`eval.rs`): Runs the tick loop. Two paths:
-   - Compiled: linear bytecode against slot array (fast path)
-   - Interpreted: recursive Expr walking (fallback)
-   Topological sort on assignments. Pre-tick hooks for side effects.
-
-5. **State** (`state.rs`): Flat mutable replacement for CSS triple-buffer.
-   Unified address space (negative = registers, non-negative = memory).
-   Split-register merging (AH/AL ↔ AX). Auto-sized from @property decls.
-
-### Key types (`types.rs`)
-
-- `Expr` — expression tree (Literal, Var, Calc, StyleCondition, FunctionCall, etc.)
-- `ParsedProgram` — parser output (properties, functions, assignments)
-- `Assignment` — property name → Expr
-- `FunctionDef` — name, parameters, locals, result expression
-- `PropertyDef` — name, syntax, initial value, inheritance
-- `CssValue` — Integer | String
-
-### The cardinal rule
-
-The entire point of this project is to see what pure CSS can do. The CSS
-is a working program that runs in Chrome — no JavaScript, no WebAssembly,
-just CSS custom properties and `calc()` evaluating an 8086 CPU. That's the
-joke and the demo: "Doom runs in a stylesheet."
-
-The CSS must be completely self-contained and functional on its own.
-Chrome is the reference implementation. If you open the HTML file in Chrome,
-it works. Slowly — maybe one frame per year — but it works. Every memory
-cell, every register, every instruction decode is a CSS expression.
-
-Calcite exists to make that CSS fast enough to be usable. It is a JIT
-compiler for CSS, analogous to V8 for JavaScript. It parses the CSS, finds
-patterns it can execute more efficiently, and produces the same results
-Chrome would — just orders of magnitude faster.
-
-What this means in practice:
-
-- **Calcite must NEVER have x86 knowledge.** No opcode reading, no
-  instruction semantics, no emulation. It evaluates CSS expressions — it
-  doesn't know or care what they compute.
-- **The CSS dictates everything, not calcite.** If the CSS has 6000 memory
-  cell properties, calcite evaluates 6000 memory cell properties. If it
-  needs a million properties for 1MB of RAM, calcite handles a million
-  properties. It can recognise patterns and optimise (broadcast writes,
-  dispatch tables), but it cannot skip, remove, or alter what the CSS
-  expresses — just like V8 can't skip your JavaScript, only run it faster.
-- **CSS restructuring to help calcite is allowed IF Chrome still evaluates
-  it correctly and the work is real.** Expressing the same computation in
-  a different, more pattern-recognisable shape is fine — that's how
-  compilers and runtimes co-evolve with the code they run. What is NOT
-  fine: adding dummy properties, metadata signals, or side-channels whose
-  only purpose is to leak information to calcite. The CSS has to do
-  honest work in Chrome; calcite just gets to recognise patterns in that
-  honest work faster.
-- **No features that don't exist in CSS.** If Chrome can't evaluate it,
-  calcite can't rely on it. Calcite can be smarter about evaluating CSS
-  patterns, but it can't invent new semantics.
-- **If calcite disagrees with Chrome, calcite is wrong.**
-- **Pattern recognition is the whole game.** Recognising that 6000
-  assignments all check the same property and converting them to a HashMap
-  lookup is exactly what a JIT does. Same results, faster. That's the job.
-
-### Wasm safety — everything calcite-core touches must build and run on wasm32
-
-`calcite-wasm` wraps `calcite-core` and runs in the browser via the web
-player. `calcite-core` therefore has to stay wasm32-clean: anything the web
-build exercises must not panic or fail to link on `wasm32-unknown-unknown`.
-
-**Rules:**
-
-- **Never use `std::time::Instant` or `std::time::SystemTime`** anywhere
+- **Never use `std::time::Instant` / `std::time::SystemTime`** anywhere
   `calcite-core` or `calcite-wasm` can reach. Raw `std::time` panics on
-  `wasm32-unknown-unknown` with "time not implemented on this platform".
-  Use `web_time::Instant` instead — it transparently maps to `performance.now()`
-  on wasm and `std::time::Instant` on native. (The `web_time` crate is already
-  a workspace dependency.)
-- **Same applies to anything with a hidden `SystemTime`/`Instant` dependency:**
-  `std::thread::sleep`, random seeding from `SystemTime`, `std::sync::Mutex`
-  timeouts, etc. Audit before adding.
-- **No `std::thread::spawn`** or OS-thread APIs. Wasm is single-threaded in
-  our setup. If you need concurrency for native-only code paths, gate it
-  with `#[cfg(not(target_arch = "wasm32"))]`.
-- **No `std::fs`, `std::net`, `std::process::Command`, or `std::env` writes**
-  in core paths. Reads (`std::env::var`) are tolerated by the wasm stub but
-  avoid them in hot paths.
-- **Dev-only timing and logging (`CALCITE_PROFILE_COMPILE`, env-driven debug
-  dumps) must still use `web_time`** — they run on every `compile()` call,
-  including the one invoked from wasm, even when the feature is "disabled"
-  (the scope constructor still touches `Instant`).
+  wasm with "time not implemented on this platform". Use
+  `web_time::Instant` (already a workspace dep — maps to
+  `performance.now()` on wasm and `std::time::Instant` on native).
+- **Same for hidden `SystemTime`/`Instant` deps:** `std::thread::sleep`,
+  random seeding from `SystemTime`, `std::sync::Mutex` timeouts.
+- **No `std::thread::spawn`** or OS-thread APIs. Wasm is single-threaded
+  here. Native-only concurrency must be `#[cfg(not(target_arch =
+  "wasm32"))]`.
+- **No `std::fs`, `std::net`, `std::process::Command`, or `std::env`
+  writes** in core paths. Reads (`std::env::var`) are tolerated by the
+  stub but avoid them in hot paths.
+- **Dev-only timing/logging (`CALCITE_PROFILE_COMPILE`, env-driven
+  dumps) must still use `web_time`** — they run on every `compile()`
+  including the wasm one (the scope ctor touches `Instant` even when
+  the feature is "disabled").
 
-**If you must use something native-only**, cfg-gate it:
+Native-only escape hatch when truly needed:
 
 ```rust
 #[cfg(not(target_arch = "wasm32"))]
 {
-    // native-only code here
+    // native-only code
 }
 ```
 
-**How to verify:** `wasm-pack build crates/calcite-wasm --target web --out-dir ../../web/pkg`
-must succeed with no errors, and the resulting cabinet must load in the web
-player without a `WASM panic:` line in the browser console.
+Verify: `wasm-pack build crates/calcite-wasm --target web --out-dir
+../../web/pkg` must succeed with no errors, and the cabinet must load
+in the web player without a `WASM panic:` line in the console.
 
-When in doubt: the crates a wasm build pulls in are `calcite-core` and
-`calcite-wasm`. Anything else (`calcite-cli`, `calcite-debugger`, the
-benchmark and probe bins) is native-only and can use `std::time` freely.
-
-### Relationship to CSS-DOS
-
-[CSS-DOS](../CSS-DOS) is a sibling repo that generates 8086 CSS. It uses a
-JS→CSS transpiler (`transpiler/`) with a v3 cycle-accurate microcode execution
-model. BIOS handlers are microcode (not assembly). See its `CLAUDE.md` and
-`V3-PLAN-1.md` for the full architecture.
-
-Calcite's only interface with CSS-DOS is the `.css` output — test fixtures in
-`tests/fixtures/` are pre-compiled CSS. There is no crate dependency and must
-never be one.
-
-### Performance — the main optimisation workflow
-
-**Read `docs/log.md` for the current bottleneck analysis and optimisation
-roadmap.** It has profiling results, op frequency data, and the specific
-patterns that dominate execution time.
-
-**Read `docs/benchmarking.md` for the full benchmarking tool reference.**
-The primary tool is `calcite-bench` — a headless binary with `--profile`
-for granular per-phase and per-op-type breakdown.
-
-Key facts (2026-04-14, v4 CSS):
-- ~6050 ticks/s on rogue (1.1% of 8086 speed), goal: much faster
-- 96% of bytecode ops are `BranchIfNotEqLit` (fused compare-and-branch)
-- 34K branches/tick, 99.9% taken (dead code skip)
-- Main bottleneck: linear if-chains inside dispatch table entries
-
-### Conformance testing — the main debugging workflow
-
-**The conformance harness lives in `../CSS-DOS/tests/harness/`.** Use
-
-    node ../CSS-DOS/tests/harness/pipeline.mjs fulldiff <cabinet>.css --max-ticks=10000
-
-as the first-line divergence finder. See
-[`../CSS-DOS/docs/TESTING.md`](../CSS-DOS/docs/TESTING.md) and
-`../CSS-DOS/tests/harness/README.md` for the full tool list.
-
-The legacy tools in `tools/fulldiff.mjs`, `tools/ref-dos.mjs`, and
-`tools/diagnose.mjs` depend on the deleted `../CSS-DOS/transpiler/` and
-don't run — their headers now say so. Don't try to "fix" them; the
-harness is the replacement.
-
-**Read `docs/conformance-testing.md` before doing any debugging work.** It
-has the full tool reference, usage examples, and step-by-step workflows.
-
-The key principles:
-
-- **Always diff against the reference.** `tools/js8086.js` is a reference
-  8086 emulator that serves as ground truth. When calcite and the reference
-  disagree, calcite is wrong (or the CSS is wrong). Never assume calcite is
-  correct — always verify with the reference.
-- **Bugs are often in the CSS generator**, not calcite. When compiled and
-  interpreted paths agree but diverge from the reference, it's a transpiler
-  bug — fix it in `../CSS-DOS/transpiler/`. Read CSS-DOS's CLAUDE.md first.
-- **Use the debugger** (`docs/debugger.md`) to inspect calcite's internal
-  state at any tick, compare compiled vs interpreted paths, and read memory.
-
-### Running programs
-
-Drop any `.com` or `.exe` file into `programs/` and use `run.bat`:
-
-```
-run.bat              Interactive menu — pick a program by number
-run.bat diagnose     Conformance diagnosis menu
-```
-
-CSS is regenerated from source on every run via the DOS transpiler pipeline
-(`../CSS-DOS/transpiler/generate-dos.mjs`). Pre-built `.css` files in `output/`
-can also be run directly from the menu without regeneration.
+When in doubt: the crates the wasm build pulls in are `calcite-core`
+and `calcite-wasm`. Everything else (`calcite-cli`, `calcite-debugger`,
+benches, probes) is native-only and can use `std::time` freely.
