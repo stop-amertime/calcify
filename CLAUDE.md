@@ -19,14 +19,20 @@ Those rules are NOT repeated below. If you skipped CSS-DOS's CLAUDE.md
 and are looking for any of them here, go back and read it. This file
 covers only what's calcite-specific.
 
+**If your task touches v2 (calcite-v2, calcite-v2-rewrite, `dag/`,
+`Backend::DagV2`, or any brief that references v2): read
+`docs/compiler-mission.md` and `docs/v2-rewrite-design.md` end-to-end
+before touching code. No exceptions, including briefs that claim to
+summarise them.**
+
 @docs/log.md
 
 `ls docs/` for the rest. `docs/log.md` is the perf logbook with
 current bottleneck analysis and recent optimisation work — read before
 any perf work. `docs/benchmarking.md` is the full `calcite-bench`
 reference. `docs/debugger.md` covers the HTTP debug server.
-`docs/v2-rewrite-design.md` and `docs/v2-self-review-2026-04-29.md`
-cover the v2 DAG walker.
+`docs/compiler-mission.md` and `docs/v2-rewrite-design.md` cover the
+v2 DAG walker (mandatory reading per the v2 rule above).
 
 
 ## Web is the only delivery method
@@ -112,13 +118,12 @@ Key types in `types.rs`: `Expr`, `ParsedProgram`, `Assignment`,
 ### v2 is underway
 
 A DAG-based walker is being built in parallel — see
-`docs/v2-rewrite-design.md`, `docs/v2-self-review-2026-04-29.md`, and
-the `calcite-v2-rewrite` worktree under `.claude/worktrees/`.
-Correctness-clean on `hello-text` for ≥2000 ticks; ~18.5× slower than
-v1 on the same workload. Stacking order to close that gap is in
-`docs/log.md`. Per the testing rule, those numbers are debug
-telemetry — the real comparison is bench-web.mjs against v1 on zork,
-bootle, and doom8088.
+`docs/compiler-mission.md` (strategy) and `docs/v2-rewrite-design.md`
+(IR + walker contract). Phase 1 correctness has landed: identical
+state to v1 for ≥2000 ticks on `hello-text`, Phase 0.5 conformance
+suite passes. Per the mission, **Phase 1 has no perf component**; the
+perf wins live in Phase 3 codegen. Anything framing v2 work as
+"close the v1-vs-v2 walker gap" is solving the wrong problem.
 
 
 ## Project layout
@@ -175,6 +180,31 @@ target/release/calcite-cli.exe -i ../CSS-DOS/output/rogue.css
 cargo run --release -p calcite-debugger -- -i program.css
 # Then: curl localhost:3333/state, /tick, /seek, /compare-paths, etc.
 ```
+
+
+## REP fast-forward: fail loud, don't fall back
+
+`compile.rs::rep_fast_forward` recognises REP MOVS/STOS/CMPS/SCAS/LODS
+shapes and bulk-applies them in one step. **Unhandled variants panic
+with a descriptive message — they do NOT fall back to per-iteration
+execution.** The slow path (running CX iterations of the REP through
+the bytecode loop) makes benches time out at ten-plus minutes; the
+panic forces the variant to be handled in the bulk path before it
+ships, instead of silently degrading.
+
+This is the project's house rule: **fail loud and early instead of
+sinking time into something that will never ship**. If you find a new
+REP shape calcite doesn't yet recognise, extend `rep_fast_forward` (or
+add a guard in `should_rep_fast_forward` to skip the bulk path with
+zero cost only when the next op is genuinely cheap) — don't paper over
+it with a slow fallback. If `tests/rep_fast_forward.rs` fails with
+"REP fast-forward refused: $variant", that's a punch list, not a
+regression: a real cabinet will exercise that shape and run 100×
+slower than it should until it's handled.
+
+The same rule applies elsewhere: per-tick REP execution, per-byte mode
+13h fills, and any other "we know this is slow but it'll work" path
+should panic instead of silently making the engine 100× too slow.
 
 
 ## Wasm safety — calcite-core must build and run on wasm32

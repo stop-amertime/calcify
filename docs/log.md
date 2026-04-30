@@ -11,99 +11,67 @@ and the Criterion benchmarks.
 
 ---
 
-## 2026-04-30: v2 DAG backend — perf snapshot and roadmap
+## 2026-04-30: v2 DAG backend — Phase 1 correctness landed
 
-After landing the v2 walker correctness work (memoised tree walker,
-shared function sub-DAGs with `Param`/`Call`, three-phase tick split,
-native broadcast + packed-broadcast value evaluation, sibling-Call
-epoch isolation, tick-6 cabinet differential closed), v2 produces
-identical state to v1 for ≥2000 ticks on `hello-text.css`.
+v2 produces identical state to v1 for ≥2000 ticks on `hello-text.css`,
+and the Phase 0.5 primitive conformance suite (Chrome as oracle) passes
+under both backends with the same 41-pass / 5-skip / 3-xfail split.
+Phase 1 acceptance gates from `docs/v2-rewrite-design.md` are met:
+Phase 0.5 conformance ✓, `cargo test -p calcite-core` green ✓,
+`wasm-pack build` clean ✓.
 
-**Headline numbers (hello-text.css, release):**
+The work that landed since the previous v2 self-review:
 
-- v1 bytecode: ~509K ticks/sec
-- v2 dag:      ~27K ticks/sec
-- **v2 is ~18.5× slower than v1.**
+- **Three-phase tick split** in `dag_v2_tick`: scalar WriteVars
+  populate cascade caches → caches commit to State → broadcasts run.
+  Mirrors v1's `compile.rs::execute` ordering. Required so that a
+  `LoadVar { kind: Prev }` reading mid-tick sees pre-tick committed
+  state, not a partially-applied scalar write.
+- **Native broadcast value evaluation.** Both unpacked
+  (`BroadcastWrite`) and packed (`PackedSlotPort`) ports lower at
+  build time to v2-native records (`DagBroadcast`, `DagPackedBroadcast`)
+  with every property pre-resolved to a slot and the value expression
+  lowered to a NodeId. The walker calls v2's broadcast executors,
+  not v1's interpreter — closes the v1-bridge that was on the hot
+  path before.
+- **Packed splice updates `state.memory[]` in lock-step** with the
+  cell state-var, matching v1's `packed_splice_byte` /
+  `packed_splice_word_aligned`. Without this, readers that go through
+  `state.memory` directly (differential test, renderer, debugger) saw
+  stale zeros even though state-vars were correct.
+- **Sibling Calls no longer collide** in the per-tick memo. Epoch is
+  now a globally-monotonic counter on `Evaluator`; each Call entry
+  bumps it and saves/restores the caller's local tag. Caught by a
+  synthetic reproducer (`--inner(x)` and `--inner(x+1)` in the same
+  caller).
+- **Function bodies as shared sub-DAGs** with `Param`/`Call` nodes
+  (replacing the inlining-per-call-site approach). One body, multiple
+  call sites, frame-keyed parameter resolution.
 
-(Up from the ~52× gap measured in the v2 self-review on 2026-04-29 —
-walker memoisation + Param/Call sharing closed about half the gap.
-Three-phase tick split and packed-write `state.memory[]` writeback
-were correctness-driven and may have cost a few %.)
+What's next, per `docs/compiler-mission.md` Phase 1 → Phase 2:
 
-**The gap is structural, not microscopic.** v1 is a flat bytecode
-interpreter against an `i32` slot array with peephole-fused
-`BranchIfNotEqLit` etc. v2 is a recursive tree-walker over `DagNode`
-enum variants with per-call HashMap lookups for memo, transient
-slot reads, and (until we land the next win) per-tick re-decoding
-of branch arms. That's why a single optimisation won't close it —
-a sequence of structural changes will.
-
-### What's on the table next, in stacking order
-
-1. **Flatten the DAG into a Vec\<Op\> and walk iteratively.** The
-   single biggest expected win, and the one called out as highest
-   leverage in the self-review. Replaces `dag_eval_node` recursion
-   + Vec\<Option\<i32\>\> memo with linear bytecode + slot array.
-   Keep the tree walker as oracle behind `--backend=dag-tree`
-   during transition; conformance suite + cabinet differential
-   are the gates. Estimated 3–5× on its own.
-
-2. **Direct slot reads on the hot path.** Right now every `LoadVar`
-   pays for the `transient_cache` / `state_var_cache` /
-   `memory_cache` / committed-state dispatch. After flattening,
-   bake the dispatch into the op kind — `LoadStateVar(idx)`,
-   `LoadMemory(addr)`, `LoadTransient(idx)`, `LoadCommitted(slot)`
-   — so the inner loop is a flat match with no branch on slot id
-   range. Mirrors v1's specialised loads.
-
-3. **Peephole-fuse Calc + LoadVar / Lit.** v1's `AddLit`, `SubLit`,
-   `MulLit`, `AndLit`, `ShrLit`, etc., were each 5–15% wins. v2
-   gets none of these today. Once we have a flat op stream, the
-   same fuser applies trivially.
-
-4. **Switch fast-path on the flat stream.** Today `Switch` does a
-   HashMap lookup per evaluation. With integer keys clustered in a
-   small range (which dispatch chains usually are), v1's
-   dense-array `DispatchFlatArray` op was the single biggest perf
-   win in the 2026-04-16 round. Port it.
-
-5. **Drop the tree walker.** Once (1)–(4) ship and v2 is at parity
-   or better, `dag_eval_node` and friends go. `name_to_slot`,
-   `absorbed_properties` (lifetime smell), and the legacy
-   `FuncCall` variant come out at the same time — they're
-   bridge scaffolding, not part of the v2 design.
-
-6. **Bigger structural moves (deferred until 1–5 land):** native
-   16-bit bitwise recognition (carry over from v1's
-   `classify_bitwise_decomposition`), wider dispatch-chain
-   recognition, change-gated ops, affine self-loop fixed-point —
-   all the moves listed in `docs/optimisation-ideas.md`. None
-   of these matter until the v2 walker is no longer the
-   bottleneck.
-
-### Out of scope right now
-
-- Slot model rework (sum-type `Slot` enum vs i32-with-regions).
-  Demoted in the self-review's corrections — not worth the
-  per-read dispatch cost without measurement showing
-  TRANSIENT\_BASE actually causes a problem.
-- Splitting numeric and string IRs. One IR with a side table
-  for `Concat` is the right answer; do it when we wire up
-  textBuffer rendering, not before.
-- The Phase 2 node-count probe (#22). Useful diagnostic, not
-  a perf lever.
-
-### Verification protocol for each step
-
-Same as the 2026-04-16 round: alternating change/baseline runs,
-three runs per side, mean. Plus on every commit:
-
-- `cargo test --workspace` (Phase 0.5 conformance + cabinet
-  differential).
-- `calcite-bench --backend=dag` on hello-text.css and at least
-  one other cabinet.
-- v1 vs v2 first-divergent-tick check on hello-text — must
-  remain ≥2000 ticks identical, ideally further.
+- **Phase 1 cleanup.** Bridge debt to remove: the `FuncCall` variant
+  (dead in any correct program now that `Call` exists), the
+  `name_to_slot` map (used only by the v1 bridge for transient reads,
+  redundant once the bridge is gone), `absorbed_properties`
+  (lowering-time set leaking into the runtime `Dag` struct).
+  Mechanical removals; no design questions.
+- **Phase 2 idiom recognisers.** First deliverable is the catalogue
+  itself — read `kiln/emit-css.mjs` and enumerate the structural CSS
+  idioms (broadcast write, packed-cell write, conditional cascade,
+  paragraph-relocate cascade, applySlot cascade, …). For each idiom:
+  shape-matcher over the DAG + a normalised replacement super-node.
+  Validation is bit-identical end-of-tick state under
+  normalised-DAG vs raw-DAG, plus a meaningful node-count
+  reduction. Per the mission, **node count is the intermediate metric;
+  runtime perf stays interpreter-bound until Phase 3 codegen**.
+- **Phase 3 codegen** is where perf wins live. Per
+  `docs/compiler-mission.md`, "no perf gain expected" in Phase 1, and
+  Phase 2's gate is node-count reduction, not ticks/second. Anything
+  that motivates v2 work with a `v1 vs v2 ticks/sec` ratio is solving
+  the wrong problem — the comparison that matters is v2 vs Chrome on
+  the conformance suite, plus eventually doom8088 wall-clock per the
+  mission's headline target.
 
 ---
 
