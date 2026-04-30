@@ -125,10 +125,35 @@ pub struct Evaluator {
     slots: Vec<i32>,
     /// Which backend `tick()` dispatches to. Default `Bytecode`.
     backend: Backend,
-    /// v2 DAG, lowered from `ParsedProgram` during `from_parsed`.
-    /// Populated even when `backend == Bytecode` so `set_backend(DagV2)`
-    /// is a cheap toggle. Phase 1 only.
+    /// v2 DAG, lowered lazily when `set_backend(DagV2)` is first
+    /// called. Default `Backend::Bytecode` therefore costs nothing
+    /// extra at construction. Holding the program ref lets us defer
+    /// the lowering without re-parsing.
     dag_v2: crate::dag::Dag,
+    /// Set after the first successful v2 lowering so subsequent
+    /// `set_backend(DagV2)` calls are no-ops.
+    dag_v2_ready: bool,
+    /// Stashed parsed program — only populated when v2 lowering is
+    /// pending. Cleared after `dag_v2_ready` flips true.
+    pending_parsed: Option<crate::types::ParsedProgram>,
+    /// v2 walker scratch — kept here so the per-tick walk doesn't
+    /// allocate. Sized lazily on first use to match dag_v2.nodes.len().
+    /// Memo entries are valid only when their epoch tag matches the
+    /// current `dag_v2_epoch`; bumping the epoch invalidates the memo
+    /// in O(1) without clearing the vec.
+    dag_v2_memo: Vec<i32>,
+    dag_v2_memo_epoch: Vec<u32>,
+    dag_v2_epoch: u32,
+    /// v2 cascade caches — accumulate per-tick WriteVar results.
+    /// Cleared at the top of each tick (cheap relative to the walk).
+    dag_v2_state_var_cache: Vec<Option<i32>>,
+    dag_v2_memory_cache: HashMap<i32, i32>,
+    dag_v2_transient_cache: Vec<Option<i32>>,
+    /// v2 walker call-frame stack. Empty between top-level walks; the
+    /// walker pushes a frame on every Call entry and pops on return.
+    /// Function recursion is forbidden in CSS @function so depth is
+    /// bounded by the call graph (typically 3-4).
+    dag_v2_call_stack: Vec<Vec<i32>>,
 }
 
 /// Granular timing breakdown from [`Evaluator::tick_profiled`].
@@ -516,7 +541,10 @@ impl Evaluator {
 
         let slot_count = compiled.slot_count as usize;
         let properties_capacity = assignments.len();
-        let dag_v2 = crate::dag::build_dag(program);
+        // Defer v2 DAG lowering until `set_backend(DagV2)` is called.
+        // On large cabinets (zork: 362K assignments) v2 lowering can
+        // be slow or OOM; v1 users shouldn't pay for v2 they never use.
+        let pending_parsed = Some(program.clone());
         Evaluator {
             functions,
             assignments,
@@ -532,7 +560,16 @@ impl Evaluator {
             compiled,
             slots: Vec::with_capacity(slot_count),
             backend: Backend::default(),
-            dag_v2,
+            dag_v2: crate::dag::Dag::default(),
+            dag_v2_ready: false,
+            pending_parsed,
+            dag_v2_memo: Vec::new(),
+            dag_v2_memo_epoch: Vec::new(),
+            dag_v2_epoch: 0,
+            dag_v2_state_var_cache: Vec::new(),
+            dag_v2_memory_cache: HashMap::new(),
+            dag_v2_transient_cache: Vec::new(),
+            dag_v2_call_stack: Vec::new(),
         }
     }
 
@@ -546,8 +583,17 @@ impl Evaluator {
     }
 
     /// Select which backend `tick()` will dispatch to. Default is
-    /// `Backend::Bytecode` (v1). See `Backend` for details.
+    /// `Backend::Bytecode` (v1). When switching to `DagV2` for the
+    /// first time, this triggers v2 DAG lowering — potentially
+    /// expensive on large cabinets, but only paid by callers that
+    /// actually use v2.
     pub fn set_backend(&mut self, backend: Backend) {
+        if matches!(backend, Backend::DagV2) && !self.dag_v2_ready {
+            if let Some(program) = self.pending_parsed.take() {
+                self.dag_v2 = crate::dag::build_dag(&program);
+                self.dag_v2_ready = true;
+            }
+        }
         self.backend = backend;
     }
 
@@ -702,7 +748,14 @@ impl Evaluator {
         for hook in &self.pre_tick_hooks {
             hook(state);
         }
-        compile::execute(&self.compiled, state, &mut self.slots);
+        match self.backend {
+            Backend::Bytecode => {
+                compile::execute(&self.compiled, state, &mut self.slots);
+            }
+            Backend::DagV2 => {
+                self.dag_v2_tick(state);
+            }
+        }
         if !self.string_assignments.is_empty() {
             self.properties.clear();
             self.call_depth = 0;
@@ -1697,6 +1750,31 @@ const MAX_CALL_DEPTH: usize = 64;
 // properties. This is safe because functions/dispatch_tables are never modified
 // during evaluation.
 
+/// Per-walk scratch used by the v2 DAG walker. Bundles the memo (for
+/// dedup'ing repeated NodeId reads within a single top-level walk) and
+/// the per-tick cascade caches (which accumulate WriteVar results
+/// across the whole tick).
+///
+/// Memo invalidation is epoch-based: each top-level walk bumps `epoch`,
+/// and `memo[id]` is only valid when `memo_epoch[id] == epoch`. Bumping
+/// the epoch invalidates the memo in O(1); per-walk Vec clearing on a
+/// cabinet with tens of thousands of nodes was the main reason the
+/// naive memoised walker was 900× slower than the un-memoised one.
+struct DagWalkBuf<'a> {
+    memo: &'a mut [i32],
+    memo_epoch: &'a mut [u32],
+    epoch: u32,
+    state_var_cache: &'a [Option<i32>],
+    memory_cache: &'a HashMap<i32, i32>,
+    transient_cache: &'a [Option<i32>],
+    /// Active function-call frame stack. Each entry is the call's
+    /// already-evaluated arg values, in declaration order. `Param(i)`
+    /// reads `call_stack.last().unwrap()[i]`. Functions in CSS can't
+    /// recurse, so the stack depth is bounded by the call-graph depth
+    /// (a handful of frames in practice).
+    call_stack: &'a mut Vec<Vec<i32>>,
+}
+
 impl Evaluator {
     /// Walk the v2 DAG once, mutating `state` to commit this tick's
     /// writes. See `docs/v2-rewrite-design.md` § State model.
@@ -1706,346 +1784,572 @@ impl Evaluator {
     /// (Phase 2 inlines); `IndirectStore` is a stub (Phase 2 promotes
     /// to a self-contained DAG super-node).
     fn dag_v2_tick(&mut self, state: &mut State) {
-        // Take ownership of the DAG temporarily so we can mutate self
-        // (eval_function_call needs &mut self) while walking. Cheap —
-        // Vec swaps are pointer-copies, no allocation.
+        // Take ownership of the DAG and walker scratch buffers
+        // temporarily so we can mutate self (eval_function_call needs
+        // &mut self) while walking. Vec swaps are pointer-copies — no
+        // allocation. Buffers persist across ticks; we just resize on
+        // first use and clear cascade caches per tick.
         let dag = std::mem::take(&mut self.dag_v2);
-        let n_state_vars = state.state_var_count();
-        let mut state_var_cache: Vec<Option<i32>> = vec![None; n_state_vars];
-        let mut memory_cache: HashMap<i32, i32> = HashMap::new();
-        // Transient slots are positive ints >= TRANSIENT_BASE; reset
-        // each tick. Per-tick computed values for properties that
-        // aren't @property-declared (CSS-DOS uses these for --opcode,
-        // --uOp, --_tf, etc — internal computed signals).
-        let mut transient_cache: Vec<Option<i32>> = vec![None; dag.transient_slot_count];
+        let mut memo = std::mem::take(&mut self.dag_v2_memo);
+        let mut memo_epoch = std::mem::take(&mut self.dag_v2_memo_epoch);
+        let mut state_var_cache = std::mem::take(&mut self.dag_v2_state_var_cache);
+        let mut memory_cache = std::mem::take(&mut self.dag_v2_memory_cache);
+        let mut transient_cache = std::mem::take(&mut self.dag_v2_transient_cache);
+        let mut call_stack = std::mem::take(&mut self.dag_v2_call_stack);
+        // Epoch counter: stored on self so dag_eval_call can advance
+        // it from inside a recursive walk (sibling Calls must each get
+        // a globally-fresh tag — they share a body NodeId so reusing
+        // the same tag would let one Call's memo entries collide with
+        // the next Call's body walk).
 
+        let n_state_vars = state.state_var_count();
+        let n_nodes = dag.nodes.len();
+        let n_transients = dag.transient_slot_count;
+
+        // Resize on first use / cabinet swap. Subsequent ticks reuse
+        // the same allocations.
+        if state_var_cache.len() != n_state_vars {
+            state_var_cache.clear();
+            state_var_cache.resize(n_state_vars, None);
+        } else {
+            state_var_cache.fill(None);
+        }
+        if transient_cache.len() != n_transients {
+            transient_cache.clear();
+            transient_cache.resize(n_transients, None);
+        } else {
+            transient_cache.fill(None);
+        }
+        memory_cache.clear();
+        if memo.len() != n_nodes {
+            memo.resize(n_nodes, 0);
+            memo_epoch.clear();
+            memo_epoch.resize(n_nodes, 0);
+        }
+        // Memo invalidation: bumping epoch is O(1). On wrap (every
+        // 2^32 walks — never in practice), we'd risk a stale tag
+        // collision, so reset the epoch tags then.
+        if self.dag_v2_epoch == u32::MAX {
+            memo_epoch.fill(0);
+            self.dag_v2_epoch = 0;
+        }
+
+        // Phase 1: scalar WriteVars. Defer State writes — each
+        // assignment commits to the per-tick cascade caches only. State
+        // remains at pre-tick values throughout this phase, so
+        // `LoadVar { kind: Prev }` reads (which bypass the cache and
+        // hit State) see the *previous tick*'s value, matching v1's
+        // bytecode model where all reads happen against `slots[]`
+        // before writeback. Without this, a `--memAddr2:
+        // calc(--__1SS * 16 + …)` after `--SP` is written would read
+        // the just-written SP, corrupting downstream broadcast
+        // addresses by 6.
         for &term_id in &dag.terminals {
-            match &dag.nodes[term_id as usize] {
-                crate::dag::DagNode::WriteVar { slot, value } => {
-                    let slot = *slot;
-                    let value_id = *value;
-                    let v = self.dag_eval_node(
-                        &dag,
-                        value_id,
-                        &state_var_cache,
-                        &memory_cache,
-                        &transient_cache,
-                        state,
-                    );
-                    if slot < 0 {
-                        let idx = (-slot - 1) as usize;
-                        if idx < state_var_cache.len() {
-                            state_var_cache[idx] = Some(v);
-                        }
-                        state.write_mem(slot, v);
-                    } else if slot >= crate::dag::TRANSIENT_BASE {
-                        let idx = (slot - crate::dag::TRANSIENT_BASE) as usize;
-                        if idx < transient_cache.len() {
-                            transient_cache[idx] = Some(v);
-                        }
-                        // Transients do NOT commit to State — they're
-                        // tick-local scratch.
-                    } else {
-                        memory_cache.insert(slot, v);
-                        state.write_mem(slot, v);
+            if let crate::dag::DagNode::WriteVar { slot, value } = &dag.nodes[term_id as usize] {
+                let slot = *slot;
+                let value_id = *value;
+                self.dag_v2_epoch = self.dag_v2_epoch.wrapping_add(1);
+                let mut buf = DagWalkBuf {
+                    memo: &mut memo,
+                    memo_epoch: &mut memo_epoch,
+                    epoch: self.dag_v2_epoch,
+                    state_var_cache: &state_var_cache,
+                    memory_cache: &memory_cache,
+                    transient_cache: &transient_cache,
+                    call_stack: &mut call_stack,
+                };
+                let v = self.dag_eval_node(&dag, value_id, &mut buf, state);
+                if slot < 0 {
+                    let idx = (-slot - 1) as usize;
+                    if idx < state_var_cache.len() {
+                        state_var_cache[idx] = Some(v);
                     }
-                }
-                crate::dag::DagNode::IndirectStore { port_id, packed } => {
-                    let port_id = *port_id;
-                    let packed = *packed;
-                    if packed {
-                        self.dag_exec_packed_broadcast(&dag, port_id, state);
-                    } else {
-                        self.dag_exec_broadcast(&dag, port_id, state);
+                } else if slot >= crate::dag::TRANSIENT_BASE {
+                    let idx = (slot - crate::dag::TRANSIENT_BASE) as usize;
+                    if idx < transient_cache.len() {
+                        transient_cache[idx] = Some(v);
                     }
+                } else {
+                    memory_cache.insert(slot, v);
                 }
-                _ => {}
             }
         }
 
-        // Restore the DAG.
+        // Phase 2: writeback. Cascade caches → State. Mirrors v1's
+        // post-`exec_ops` writeback step that flushes computed slots.
+        for (idx, slot_value) in state_var_cache.iter().enumerate() {
+            if let Some(v) = *slot_value {
+                let slot = -(idx as i32) - 1;
+                state.write_mem(slot, v);
+            }
+        }
+        for (&slot, &v) in memory_cache.iter() {
+            state.write_mem(slot, v);
+        }
+
+        // Phase 3: broadcasts (IndirectStore terminals). These read
+        // committed State (now containing this-tick scalar writes) for
+        // their dest/value/gate slots — matching v1's broadcast phase
+        // which runs after writeback.
+        for &term_id in &dag.terminals {
+            if let crate::dag::DagNode::IndirectStore { port_id, packed } = &dag.nodes[term_id as usize] {
+                let port_id = *port_id;
+                let packed = *packed;
+                self.dag_v2_epoch = self.dag_v2_epoch.wrapping_add(1);
+                if packed {
+                    self.dag_exec_packed_broadcast(&dag, port_id, state, &transient_cache);
+                } else {
+                    let bcast_epoch_base = self.dag_v2_epoch;
+                    self.dag_v2_epoch = self.dag_v2_epoch.wrapping_add(1);
+                    self.dag_exec_broadcast_with(
+                        &dag,
+                        port_id,
+                        state,
+                        &mut memo,
+                        &mut memo_epoch,
+                        bcast_epoch_base,
+                        &mut call_stack,
+                        &transient_cache,
+                    );
+                }
+            }
+        }
+
+        // Restore.
         self.dag_v2 = dag;
+        self.dag_v2_memo = memo;
+        self.dag_v2_memo_epoch = memo_epoch;
+        self.dag_v2_state_var_cache = state_var_cache;
+        self.dag_v2_memory_cache = memory_cache;
+        self.dag_v2_call_stack = call_stack;
+        self.dag_v2_transient_cache = transient_cache;
     }
 
-    /// Evaluate a single DAG node to an i32. Reads cache first, falls
-    /// back to committed state. Recursive on Calc/If/Concat/FuncCall.
+    /// Evaluate a single DAG node to an `i32`, with per-walk memoization.
+    ///
+    /// Memoization uses epoch-tagged entries: `memo_epoch[id] == epoch`
+    /// means `memo[id]` holds a valid result for the current walk;
+    /// any other epoch means stale. Bumping `epoch` invalidates the
+    /// whole memo in O(1) — no per-tick or per-walk Vec clearing,
+    /// which would dominate runtime on cabinets with tens of thousands
+    /// of nodes and thousands of terminals.
+    ///
+    /// One fresh epoch per top-level invocation (one per WriteVar
+    /// value, one per broadcast value/spillover hi). Memo cannot be
+    /// shared across broadcast invocations because broadcasts mutate
+    /// state mid-tick — a previously-memoised `LoadVar Prev` could be
+    /// stale.
+    ///
+    /// Cascade caches (`state_var_cache`, `memory_cache`,
+    /// `transient_cache`) accumulate WriteVar results across the tick;
+    /// they have a different role from the per-walk memo and aren't
+    /// reset between walks.
+    ///
+    /// Hot paths avoid `clone()` of branches/tables by re-indexing into
+    /// `dag.nodes[id]` between recursive calls — the dag is not mutated
+    /// during a walk, so re-indexing is cheap and free of borrow-check
+    /// drama.
     fn dag_eval_node(
         &mut self,
         dag: &crate::dag::Dag,
         node_id: crate::dag::NodeId,
-        state_var_cache: &[Option<i32>],
-        memory_cache: &HashMap<i32, i32>,
-        transient_cache: &[Option<i32>],
+        buf: &mut DagWalkBuf<'_>,
         state: &State,
     ) -> i32 {
-        use crate::dag::types::CalcKind;
+        let idx = node_id as usize;
+        if buf.memo_epoch[idx] == buf.epoch {
+            return buf.memo[idx];
+        }
+
         use crate::dag::DagNode;
-        match &dag.nodes[node_id as usize] {
+
+        let result: i32 = match &dag.nodes[idx] {
             DagNode::Lit(v) => *v as i32,
             DagNode::LitStr(_) => 0,
             DagNode::LoadVar { slot, kind } => self.dag_read_slot(
                 *slot,
                 *kind,
-                state_var_cache,
-                memory_cache,
-                transient_cache,
+                buf.state_var_cache,
+                buf.memory_cache,
+                buf.transient_cache,
                 state,
             ),
-            DagNode::Calc { op, args } => {
-                let af = |this: &mut Self, idx: usize| {
-                    this.dag_eval_node(
-                        dag, args[idx], state_var_cache, memory_cache, transient_cache, state,
-                    ) as f64
-                };
-                let result: f64 = match op {
-                    CalcKind::Add => af(self, 0) + af(self, 1),
-                    CalcKind::Sub => af(self, 0) - af(self, 1),
-                    CalcKind::Mul => af(self, 0) * af(self, 1),
-                    CalcKind::Div => {
-                        let b = af(self, 1);
-                        if b == 0.0 { 0.0 } else { af(self, 0) / b }
-                    }
-                    CalcKind::Mod => {
-                        let b = af(self, 1);
-                        if b == 0.0 {
-                            0.0
-                        } else {
-                            let av = af(self, 0);
-                            av - (av / b).floor() * b
-                        }
-                    }
-                    CalcKind::Pow => af(self, 0).powf(af(self, 1)),
-                    CalcKind::Min => args
-                        .iter()
-                        .map(|&n| {
-                            self.dag_eval_node(
-                                dag,
-                                n,
-                                state_var_cache,
-                                memory_cache,
-                                transient_cache,
-                                state,
-                            ) as f64
-                        })
-                        .fold(f64::INFINITY, f64::min),
-                    CalcKind::Max => args
-                        .iter()
-                        .map(|&n| {
-                            self.dag_eval_node(
-                                dag,
-                                n,
-                                state_var_cache,
-                                memory_cache,
-                                transient_cache,
-                                state,
-                            ) as f64
-                        })
-                        .fold(f64::NEG_INFINITY, f64::max),
-                    CalcKind::Clamp => {
-                        let lo = af(self, 0);
-                        let v = af(self, 1);
-                        let hi = af(self, 2);
-                        v.clamp(lo, hi)
-                    }
-                    CalcKind::Round(strategy) => {
-                        let v = af(self, 0);
-                        let interval = af(self, 1);
-                        if interval == 0.0 {
-                            v
-                        } else {
-                            let q = v / interval;
-                            let rounded = match strategy {
-                                RoundStrategy::Nearest => {
-                                    let f = q.floor();
-                                    let frac = q - f;
-                                    if frac < 0.5 {
-                                        f
-                                    } else if frac > 0.5 {
-                                        f + 1.0
-                                    } else if (f as i64) % 2 == 0 {
-                                        f
-                                    } else {
-                                        f + 1.0
-                                    }
-                                }
-                                RoundStrategy::Up => q.ceil(),
-                                RoundStrategy::Down => q.floor(),
-                                RoundStrategy::ToZero => q.trunc(),
-                            };
-                            rounded * interval
-                        }
-                    }
-                    CalcKind::Sign => {
-                        let v = af(self, 0);
-                        if v > 0.0 { 1.0 } else if v < 0.0 { -1.0 } else { 0.0 }
-                    }
-                    CalcKind::Abs => af(self, 0).abs(),
-                    CalcKind::Neg => -af(self, 0),
-                };
-                result as i32
-            }
-            DagNode::FuncCall { fn_id, args } => {
-                let name = dag
-                    .function_names
-                    .iter()
-                    .find(|(_, &id)| id == *fn_id)
-                    .map(|(n, _)| n.clone());
-                let Some(name) = name else {
-                    log::warn!("v2 walker: FuncCall fn_id={fn_id} has no name");
-                    return 0;
-                };
-                let args_owned = args.clone();
-                let evaluated_args: Vec<Expr> = args_owned
-                    .iter()
-                    .map(|&a| {
-                        let v = self.dag_eval_node(
-                            dag,
-                            a,
-                            state_var_cache,
-                            memory_cache,
-                            transient_cache,
-                            state,
-                        );
-                        Expr::Literal(v as f64)
-                    })
-                    .collect();
-                // Bridge v2 transient cache → v1 self.properties so the
-                // function body's `var(--transient)` reads can find the
-                // value. v1's resolve_property only checks
-                // self.properties + state, neither of which sees v2's
-                // transient cache. We populate self.properties with the
-                // current snapshot of every transient with a known
-                // value, call the function, then clear self.properties
-                // (preserving v1's invariant that self.properties is
-                // empty between non-string evaluations).
-                //
-                // This is a Phase 1 stub — Phase 2 inlines function
-                // bodies into the DAG, eliminating the bridge entirely.
-                let mut populated_names: Vec<String> = Vec::new();
-                for (bare, &slot) in &dag.name_to_slot {
-                    if slot >= crate::dag::TRANSIENT_BASE {
-                        let idx = (slot - crate::dag::TRANSIENT_BASE) as usize;
-                        if let Some(Some(v)) = transient_cache.get(idx) {
-                            self.properties
-                                .insert(format!("--{bare}"), Value::Number(*v as f64));
-                            populated_names.push(format!("--{bare}"));
-                        }
-                    }
-                }
-                let result = self.eval_function_call(&name, &evaluated_args, state).as_number() as i32;
-                // Drop the bridge entries so the next FuncCall starts
-                // from a clean slate (param binding inside
-                // eval_function_call uses the same self.properties
-                // map; we don't want stale transient values leaking).
-                for n in &populated_names {
-                    self.properties.remove(n);
-                }
-                result
-            }
-            DagNode::If { branches, fallback } => {
-                let branches = branches.clone();
-                let fallback = *fallback;
-                for (cond, then_id) in &branches {
-                    if self.dag_eval_style_cond(
-                        dag,
-                        cond,
-                        state_var_cache,
-                        memory_cache,
-                        transient_cache,
-                        state,
-                    ) {
-                        return self.dag_eval_node(
-                            dag,
-                            *then_id,
-                            state_var_cache,
-                            memory_cache,
-                            transient_cache,
-                            state,
-                        );
-                    }
-                }
-                self.dag_eval_node(
-                    dag,
-                    fallback,
-                    state_var_cache,
-                    memory_cache,
-                    transient_cache,
-                    state,
-                )
-            }
-            DagNode::Switch { key, table, fallback } => {
-                // Read the key once, look up, evaluate matched branch
-                // or fallback. The clone of `table` mirrors the
-                // borrow-release pattern used for `If` (we hand `dag`
-                // back to recursive eval below).
-                let key_val = self.dag_eval_node(
-                    dag,
-                    *key,
-                    state_var_cache,
-                    memory_cache,
-                    transient_cache,
-                    state,
-                );
-                let table = table.clone();
-                let fallback = *fallback;
-                let target = table
-                    .get(&(key_val as i64))
-                    .copied()
-                    .unwrap_or(fallback);
-                self.dag_eval_node(
-                    dag,
-                    target,
-                    state_var_cache,
-                    memory_cache,
-                    transient_cache,
-                    state,
-                )
+            DagNode::Param(i) => {
+                // Read the i-th arg of the active call frame. Args are
+                // pre-evaluated at Call entry, so this is a Vec read.
+                let i = *i as usize;
+                buf.call_stack
+                    .last()
+                    .and_then(|frame| frame.get(i).copied())
+                    .unwrap_or(0)
             }
             DagNode::Concat(_) => 0,
             DagNode::WriteVar { .. } | DagNode::IndirectStore { .. } => 0,
-        }
+            DagNode::Calc { .. } => self.dag_eval_calc(dag, node_id, buf, state),
+            DagNode::Call { .. } => self.dag_eval_call(dag, node_id, buf, state),
+            DagNode::FuncCall { .. } => self.dag_eval_funccall(dag, node_id, buf, state),
+            DagNode::If { .. } => self.dag_eval_if(dag, node_id, buf, state),
+            DagNode::Switch { .. } => self.dag_eval_switch(dag, node_id, buf, state),
+        };
+
+        buf.memo[idx] = result;
+        buf.memo_epoch[idx] = buf.epoch;
+        result
     }
 
-    fn dag_eval_style_cond(
+    fn dag_eval_calc(
         &mut self,
         dag: &crate::dag::Dag,
-        cond: &crate::dag::StyleCondNode,
-        state_var_cache: &[Option<i32>],
-        memory_cache: &HashMap<i32, i32>,
-        transient_cache: &[Option<i32>],
+        node_id: crate::dag::NodeId,
+        buf: &mut DagWalkBuf<'_>,
+        state: &State,
+    ) -> i32 {
+        use crate::dag::types::CalcKind;
+        use crate::dag::DagNode;
+
+        // Snapshot scalar fields and (for the rare variadic cases)
+        // copy args into a small SmallVec. The hot path is fixed-arity
+        // (2-3 args) so we read those into stack locals up front and
+        // never re-index the dag node again.
+        let (op, a0, a1, a2, variadic_args): (
+            CalcKind,
+            crate::dag::NodeId,
+            crate::dag::NodeId,
+            crate::dag::NodeId,
+            Option<Vec<crate::dag::NodeId>>,
+        ) = match &dag.nodes[node_id as usize] {
+            DagNode::Calc { op, args } => {
+                let a0 = args.first().copied().unwrap_or(0);
+                let a1 = args.get(1).copied().unwrap_or(0);
+                let a2 = args.get(2).copied().unwrap_or(0);
+                let variadic = matches!(op, CalcKind::Min | CalcKind::Max);
+                let v = if variadic { Some(args.clone()) } else { None };
+                (op.clone(), a0, a1, a2, v)
+            }
+            _ => unreachable!(),
+        };
+
+        let walk = |this: &mut Self, buf: &mut DagWalkBuf<'_>, id: crate::dag::NodeId| -> f64 {
+            this.dag_eval_node(dag, id, buf, state) as f64
+        };
+
+        let result: f64 = match op {
+            CalcKind::Add => walk(self, buf, a0) + walk(self, buf, a1),
+            CalcKind::Sub => walk(self, buf, a0) - walk(self, buf, a1),
+            CalcKind::Mul => walk(self, buf, a0) * walk(self, buf, a1),
+            CalcKind::Div => {
+                let b = walk(self, buf, a1);
+                if b == 0.0 { 0.0 } else { walk(self, buf, a0) / b }
+            }
+            CalcKind::Mod => {
+                let b = walk(self, buf, a1);
+                if b == 0.0 {
+                    0.0
+                } else {
+                    let av = walk(self, buf, a0);
+                    av - (av / b).floor() * b
+                }
+            }
+            CalcKind::Pow => walk(self, buf, a0).powf(walk(self, buf, a1)),
+            CalcKind::Min => {
+                let args = variadic_args.expect("Min is variadic");
+                let mut acc = f64::INFINITY;
+                for &id in &args {
+                    acc = acc.min(walk(self, buf, id));
+                }
+                acc
+            }
+            CalcKind::Max => {
+                let args = variadic_args.expect("Max is variadic");
+                let mut acc = f64::NEG_INFINITY;
+                for &id in &args {
+                    acc = acc.max(walk(self, buf, id));
+                }
+                acc
+            }
+            CalcKind::Clamp => {
+                let lo = walk(self, buf, a0);
+                let v = walk(self, buf, a1);
+                let hi = walk(self, buf, a2);
+                v.clamp(lo, hi)
+            }
+            CalcKind::Round(strategy) => {
+                let v = walk(self, buf, a0);
+                let interval = walk(self, buf, a1);
+                if interval == 0.0 {
+                    v
+                } else {
+                    let q = v / interval;
+                    let rounded = match strategy {
+                        RoundStrategy::Nearest => {
+                            let f = q.floor();
+                            let frac = q - f;
+                            if frac < 0.5 {
+                                f
+                            } else if frac > 0.5 {
+                                f + 1.0
+                            } else if (f as i64) % 2 == 0 {
+                                f
+                            } else {
+                                f + 1.0
+                            }
+                        }
+                        RoundStrategy::Up => q.ceil(),
+                        RoundStrategy::Down => q.floor(),
+                        RoundStrategy::ToZero => q.trunc(),
+                    };
+                    rounded * interval
+                }
+            }
+            CalcKind::Sign => {
+                let v = walk(self, buf, a0);
+                if v > 0.0 { 1.0 } else if v < 0.0 { -1.0 } else { 0.0 }
+            }
+            CalcKind::Abs => walk(self, buf, a0).abs(),
+            CalcKind::Neg => -walk(self, buf, a0),
+        };
+        result as i32
+    }
+
+    fn dag_eval_funccall(
+        &mut self,
+        dag: &crate::dag::Dag,
+        node_id: crate::dag::NodeId,
+        buf: &mut DagWalkBuf<'_>,
+        state: &State,
+    ) -> i32 {
+        use crate::dag::DagNode;
+
+        let (fn_id, args) = match &dag.nodes[node_id as usize] {
+            // args is small (one per param) and FuncCall is the cold
+            // path (Phase 2 inlines every callable function); the clone
+            // here is acceptable.
+            DagNode::FuncCall { fn_id, args } => (*fn_id, args.clone()),
+            _ => unreachable!(),
+        };
+        let name = dag
+            .function_names
+            .iter()
+            .find(|(_, &id)| id == fn_id)
+            .map(|(n, _)| n.clone());
+        let Some(name) = name else {
+            log::warn!("v2 walker: FuncCall fn_id={fn_id} has no name");
+            return 0;
+        };
+        let evaluated_args: Vec<Expr> = args
+            .iter()
+            .map(|&a| {
+                let v = self.dag_eval_node(dag, a, buf, state);
+                Expr::Literal(v as f64)
+            })
+            .collect();
+        // Bridge v2 transient cache → v1 self.properties so the
+        // function body's `var(--transient)` reads can find the value.
+        let mut populated_names: Vec<String> = Vec::new();
+        for (bare, &slot) in &dag.name_to_slot {
+            if slot >= crate::dag::TRANSIENT_BASE {
+                let idx = (slot - crate::dag::TRANSIENT_BASE) as usize;
+                if let Some(Some(v)) = buf.transient_cache.get(idx) {
+                    self.properties
+                        .insert(format!("--{bare}"), Value::Number(*v as f64));
+                    populated_names.push(format!("--{bare}"));
+                }
+            }
+        }
+        let result = self.eval_function_call(&name, &evaluated_args, state).as_number() as i32;
+        for n in &populated_names {
+            self.properties.remove(n);
+        }
+        result
+    }
+
+    /// Evaluate a `Call { fn_id, args }` node. Pre-evaluate every arg
+    /// in the caller context, push them as a frame, walk the function
+    /// body root with a fresh memo epoch (body NodeIds are shared
+    /// across calls but their *values* depend on params), and pop on
+    /// return.
+    fn dag_eval_call(
+        &mut self,
+        dag: &crate::dag::Dag,
+        node_id: crate::dag::NodeId,
+        buf: &mut DagWalkBuf<'_>,
+        state: &State,
+    ) -> i32 {
+        use crate::dag::DagNode;
+
+        // Snapshot the call's args; clone is small (param count).
+        let (fn_id, args) = match &dag.nodes[node_id as usize] {
+            DagNode::Call { fn_id, args } => (*fn_id, args.clone()),
+            _ => unreachable!(),
+        };
+
+        // Resolve the body root. If missing (lowering bug), return 0.
+        let Some(&body_root) = dag.function_roots.get(fn_id as usize) else {
+            log::warn!("v2 walker: Call fn_id={fn_id} has no body root");
+            return 0;
+        };
+        if body_root == crate::dag::NodeId::MAX {
+            log::warn!("v2 walker: Call fn_id={fn_id} body root not lowered");
+            return 0;
+        }
+
+        // Evaluate args in caller context.
+        let mut frame: Vec<i32> = Vec::with_capacity(args.len());
+        for arg_id in &args {
+            let v = self.dag_eval_node(dag, *arg_id, buf, state);
+            frame.push(v);
+        }
+
+        // Push frame, walk body at a FRESH epoch (never reused), pop
+        // frame, restore caller's epoch.
+        //
+        // Why a globally-fresh epoch instead of `buf.epoch + 1`: two
+        // sibling Calls in the same caller scope would otherwise both
+        // bump from the same caller-epoch and thus walk the body at
+        // identical epoch tags. The memo entries from the first Call
+        // would then collide with the second Call's body walk (same
+        // body NodeIds, same epoch tag), so the second Call returns
+        // the first Call's result — which is the cabinet's tick-6
+        // CS bug. The shared bump counter on the Evaluator hands out
+        // monotonically distinct epoch tags so each Call walk is
+        // isolated. Caller-context memo entries are unaffected because
+        // we restore `buf.epoch` on return.
+        let saved_epoch = buf.epoch;
+        buf.call_stack.push(frame);
+        self.dag_v2_epoch = self.dag_v2_epoch.wrapping_add(1);
+        buf.epoch = self.dag_v2_epoch;
+        let result = self.dag_eval_node(dag, body_root, buf, state);
+        buf.call_stack.pop();
+        buf.epoch = saved_epoch;
+        result
+    }
+
+    fn dag_eval_if(
+        &mut self,
+        dag: &crate::dag::Dag,
+        node_id: crate::dag::NodeId,
+        buf: &mut DagWalkBuf<'_>,
+        state: &State,
+    ) -> i32 {
+        use crate::dag::DagNode;
+
+        let (nbranches, fallback) = match &dag.nodes[node_id as usize] {
+            DagNode::If { branches, fallback } => (branches.len(), *fallback),
+            _ => unreachable!(),
+        };
+        for i in 0..nbranches {
+            let cond_matches = self.dag_eval_style_cond_at(dag, node_id, i, buf, state);
+            if cond_matches {
+                let then_id = match &dag.nodes[node_id as usize] {
+                    DagNode::If { branches, .. } => branches[i].1,
+                    _ => unreachable!(),
+                };
+                return self.dag_eval_node(dag, then_id, buf, state);
+            }
+        }
+        self.dag_eval_node(dag, fallback, buf, state)
+    }
+
+    fn dag_eval_switch(
+        &mut self,
+        dag: &crate::dag::Dag,
+        node_id: crate::dag::NodeId,
+        buf: &mut DagWalkBuf<'_>,
+        state: &State,
+    ) -> i32 {
+        use crate::dag::DagNode;
+
+        let key_id = match &dag.nodes[node_id as usize] {
+            DagNode::Switch { key, .. } => *key,
+            _ => unreachable!(),
+        };
+        let key_val = self.dag_eval_node(dag, key_id, buf, state);
+        let target = match &dag.nodes[node_id as usize] {
+            DagNode::Switch { table, fallback, .. } => table
+                .get(&(key_val as i64))
+                .copied()
+                .unwrap_or(*fallback),
+            _ => unreachable!(),
+        };
+        self.dag_eval_node(dag, target, buf, state)
+    }
+
+    fn dag_eval_style_cond_at(
+        &mut self,
+        dag: &crate::dag::Dag,
+        if_node_id: crate::dag::NodeId,
+        branch_idx: usize,
+        buf: &mut DagWalkBuf<'_>,
         state: &State,
     ) -> bool {
-        use crate::dag::StyleCondNode;
-        match cond {
-            StyleCondNode::Single { lhs, value } => {
-                let lhs_v = self.dag_eval_node(
-                    dag,
-                    *lhs,
-                    state_var_cache,
-                    memory_cache,
-                    transient_cache,
-                    state,
-                );
-                let rhs = self.dag_eval_node(
-                    dag,
-                    *value,
-                    state_var_cache,
-                    memory_cache,
-                    transient_cache,
-                    state,
-                );
-                lhs_v == rhs
+        let mut path: Vec<usize> = Vec::new();
+        self.dag_eval_style_cond_path(dag, if_node_id, branch_idx, &mut path, buf, state)
+    }
+
+    fn dag_eval_style_cond_path(
+        &mut self,
+        dag: &crate::dag::Dag,
+        if_node_id: crate::dag::NodeId,
+        branch_idx: usize,
+        path: &mut Vec<usize>,
+        buf: &mut DagWalkBuf<'_>,
+        state: &State,
+    ) -> bool {
+        use crate::dag::{DagNode, StyleCondNode};
+
+        enum CondShape {
+            Single(crate::dag::NodeId, crate::dag::NodeId),
+            And(usize),
+            Or(usize),
+        }
+        let shape = {
+            let mut cur: &StyleCondNode = match &dag.nodes[if_node_id as usize] {
+                DagNode::If { branches, .. } => &branches[branch_idx].0,
+                _ => unreachable!(),
+            };
+            for &idx in path.iter() {
+                cur = match cur {
+                    StyleCondNode::And(parts) | StyleCondNode::Or(parts) => &parts[idx],
+                    StyleCondNode::Single { .. } => unreachable!("path past Single"),
+                };
             }
-            StyleCondNode::And(parts) => parts.iter().all(|p| {
-                self.dag_eval_style_cond(
-                    dag, p, state_var_cache, memory_cache, transient_cache, state,
-                )
-            }),
-            StyleCondNode::Or(parts) => parts.iter().any(|p| {
-                self.dag_eval_style_cond(
-                    dag, p, state_var_cache, memory_cache, transient_cache, state,
-                )
-            }),
+            match cur {
+                StyleCondNode::Single { lhs, value } => CondShape::Single(*lhs, *value),
+                StyleCondNode::And(parts) => CondShape::And(parts.len()),
+                StyleCondNode::Or(parts) => CondShape::Or(parts.len()),
+            }
+        };
+
+        match shape {
+            CondShape::Single(lhs, rhs) => {
+                let l = self.dag_eval_node(dag, lhs, buf, state);
+                let r = self.dag_eval_node(dag, rhs, buf, state);
+                l == r
+            }
+            CondShape::And(n) => {
+                for i in 0..n {
+                    path.push(i);
+                    let ok = self
+                        .dag_eval_style_cond_path(dag, if_node_id, branch_idx, path, buf, state);
+                    path.pop();
+                    if !ok {
+                        return false;
+                    }
+                }
+                true
+            }
+            CondShape::Or(n) => {
+                for i in 0..n {
+                    path.push(i);
+                    let ok = self
+                        .dag_eval_style_cond_path(dag, if_node_id, branch_idx, path, buf, state);
+                    path.pop();
+                    if ok {
+                        return true;
+                    }
+                }
+                false
+            }
         }
     }
 
@@ -2082,69 +2386,97 @@ impl Evaluator {
         state.read_mem(slot)
     }
 
-    /// Execute one unpacked broadcast-write port. Reads `gate_property`
-    /// (if any) and `dest_property` from committed state (the tick's
-    /// WriteVars have already committed by the time this fires —
-    /// IndirectStore terminals come last in topo order). On address
-    /// hit, evaluates `value_expr` via the v1 interpreter against
-    /// committed state, and writes to `state.write_mem(dest, value)`.
-    /// Spillover, if present, fires the same way for `dest+1` when
-    /// `spillover_guard` reads 1.
-    fn dag_exec_broadcast(
+    /// Execute one unpacked broadcast-write port using the v2-native
+    /// record. Caller supplies the memo + memo_epoch buffers and an
+    /// epoch base; this method bumps the epoch internally for the
+    /// direct hit and (if it fires) the spillover hi-walk.
+    fn dag_exec_broadcast_with(
         &mut self,
         dag: &crate::dag::Dag,
         port_id: u32,
         state: &mut State,
+        memo: &mut [i32],
+        memo_epoch: &mut [u32],
+        epoch_base: u32,
+        call_stack: &mut Vec<Vec<i32>>,
+        transient_cache: &[Option<i32>],
     ) {
-        // Clone to release the borrow on dag — eval_expr mutates self.
-        let bw = dag.broadcast_writes[port_id as usize].clone();
-        let resolve = |name: &str| {
-            let bare = to_bare_name(name);
-            dag.name_to_slot.get(bare).copied()
-        };
+        let bw = &dag.dag_broadcasts[port_id as usize];
 
-        // Gate check.
-        if let Some(ref gate_prop) = bw.gate_property {
-            let gate_addr = match resolve(gate_prop) {
-                Some(a) => a,
-                None => return,
-            };
-            if state.read_mem(gate_addr) != 1 {
+        // Gate / dest / spillover-guard slots may resolve to transients
+        // (`--_slot0Live`, `--memAddr0`, etc. are transient when not
+        // declared as `@property`). State doesn't store transient slot
+        // values, so route those through `transient_cache`. Committed
+        // slots fall through to `state.read_mem`.
+        fn read_slot_dispatch(
+            s: crate::dag::SlotId,
+            transient_cache: &[Option<i32>],
+            state: &State,
+        ) -> i32 {
+            if s >= crate::dag::TRANSIENT_BASE {
+                let idx = (s - crate::dag::TRANSIENT_BASE) as usize;
+                transient_cache.get(idx).and_then(|x| *x).unwrap_or(0)
+            } else {
+                state.read_mem(s)
+            }
+        }
+
+        if let Some(gate_slot) = bw.gate_slot {
+            if read_slot_dispatch(gate_slot, transient_cache, state) != 1 {
                 return;
             }
         }
 
-        // Resolve destination address.
-        let dest_addr_prop = &bw.dest_property;
-        let dest_slot = match resolve(dest_addr_prop) {
-            Some(a) => a,
-            None => return,
-        };
-        let dest = state.read_mem(dest_slot);
+        let dest = read_slot_dispatch(bw.dest_slot, transient_cache, state);
         let dest_i64 = dest as i64;
+        let direct_hit = bw.address_map.contains_key(&dest_i64);
+        let spillover_target = bw.spillover_map.get(&dest_i64).copied();
+        let spillover_guard = bw.spillover_guard;
+        let value_node = bw.value_node;
 
-        // Direct write.
-        if bw.address_map.contains_key(&dest_i64) {
-            let value = self.eval_expr(&bw.value_expr, state).as_number() as i32;
+        // Broadcast value subgraph LoadVars are forced to Prev at
+        // lowering time, so they bypass these caches and read State
+        // directly. We pass the live transient_cache through anyway
+        // because the value walker may still hit transient reads via
+        // `Param`-style indirect lookups in future.
+        let empty_state_vars: Vec<Option<i32>> = Vec::new();
+        let empty_memory: HashMap<i32, i32> = HashMap::new();
+
+        if direct_hit {
+            let mut buf = DagWalkBuf {
+                memo,
+                memo_epoch,
+                epoch: epoch_base,
+                state_var_cache: &empty_state_vars,
+                memory_cache: &empty_memory,
+                transient_cache,
+                call_stack,
+            };
+            let value = self.dag_eval_node(dag, value_node, &mut buf, state);
             state.write_mem(dest, value);
         }
 
-        // Spillover: word-write high byte at dest+1.
-        if let Some(ref guard_prop) = bw.spillover_guard {
-            let guard_slot = match property_to_address(guard_prop) {
-                Some(a) => a,
-                None => return,
-            };
-            if state.read_mem(guard_slot) == 1 {
-                if let Some((_target_var, hi_expr)) = bw.spillover_map.get(&dest_i64) {
-                    let value = self.eval_expr(hi_expr, state).as_number() as i32;
+        if let Some(guard_slot) = spillover_guard {
+            if read_slot_dispatch(guard_slot, transient_cache, state) == 1 {
+                if let Some((_target_slot, hi_node)) = spillover_target {
+                    let mut buf = DagWalkBuf {
+                        memo,
+                        memo_epoch,
+                        epoch: epoch_base.wrapping_add(1),
+                        state_var_cache: &empty_state_vars,
+                        memory_cache: &empty_memory,
+                        transient_cache,
+                        call_stack,
+                    };
+                    let value = self.dag_eval_node(dag, hi_node, &mut buf, state);
                     state.write_mem(dest + 1, value);
                 }
             }
         }
     }
 
-    /// Execute one packed-cell broadcast-write port. Reads gate, byte
+    /// Execute one packed-cell broadcast-write port using the v2-native
+    /// record (every property pre-resolved to a slot). Reads gate, byte
     /// address, value, width from committed state. Splices the byte
     /// (or word) into the affected cell(s) per CSS-DOS PACK_SIZE=2
     /// semantics — see compile.rs::execute for the v1 reference.
@@ -2153,66 +2485,82 @@ impl Evaluator {
         dag: &crate::dag::Dag,
         port_id: u32,
         state: &mut State,
+        transient_cache: &[Option<i32>],
     ) {
-        let port = dag.packed_broadcast_ports[port_id as usize].clone();
+        let port = &dag.dag_packed_broadcasts[port_id as usize];
 
-        // Resolve via the DAG's slot map — covers committed slots AND
-        // transient slots, which `property_to_address` does not see.
-        let resolve = |name: &str| {
-            let bare = to_bare_name(name);
-            dag.name_to_slot.get(bare).copied()
+        // Gate / addr / val / width may be transient slots — route via
+        // transient_cache when so. Mirrors `dag_exec_broadcast_with`.
+        let read = |s: crate::dag::SlotId| -> i32 {
+            if s >= crate::dag::TRANSIENT_BASE {
+                let idx = (s - crate::dag::TRANSIENT_BASE) as usize;
+                transient_cache.get(idx).and_then(|x| *x).unwrap_or(0)
+            } else {
+                state.read_mem(s)
+            }
         };
-        let gate_slot = match resolve(&port.gate_property) {
-            Some(s) => s,
-            None => return,
-        };
-        if state.read_mem(gate_slot) != 1 {
+
+        if read(port.gate_slot) != 1 {
             return;
         }
-        let addr_slot = match resolve(&port.addr_property) {
-            Some(s) => s,
-            None => return,
-        };
-        let val_slot = match resolve(&port.val_property) {
-            Some(s) => s,
-            None => return,
-        };
-        let width_slot = match resolve(&port.width_property) {
-            Some(s) => s,
-            None => return,
-        };
 
-        let byte_addr = state.read_mem(addr_slot);
+        let byte_addr = read(port.addr_slot);
         if byte_addr < 0 {
             return;
         }
-        let val = state.read_mem(val_slot);
-        let width = state.read_mem(width_slot);
+        let val = read(port.val_slot);
+        let width = read(port.width_slot);
 
-        // Resolve cell variable name → state-var slot.
         let pack = port.pack as i32;
+        let address_map = &port.address_map;
+        // Splice a single byte. Updates both the state-var holding the
+        // cell AND the flat `state.memory` shadow — mirrors v1's
+        // `packed_splice_byte` (compile.rs). Without the shadow update,
+        // any reader that goes through `state.memory` directly (e.g.
+        // the differential test, the renderer, the debugger) sees
+        // stale zeros even though the state-vars are correct.
         let splice_byte = |state: &mut State, byte_addr: i32, byte_val: i32| {
             let cell_byte_base = (byte_addr / pack) * pack;
             let off = (byte_addr - cell_byte_base) as u32;
-            let Some(cell_var) = port.address_map.get(&(cell_byte_base as i64)) else {
-                return;
-            };
-            let Some(cell_slot) = property_to_address(cell_var) else {
+            let Some(&cell_slot) = address_map.get(&(cell_byte_base as i64)) else {
                 return;
             };
             let old = state.read_mem(cell_slot);
             let mask: i32 = !(0xFF << (8 * off));
             let new = (old & mask) | ((byte_val & 0xFF) << (8 * off));
-            state.write_mem(cell_slot, new);
+            if cell_slot < 0 {
+                let sidx = (-cell_slot - 1) as usize;
+                if sidx < state.state_vars.len() {
+                    state.state_vars[sidx] = new;
+                }
+            } else {
+                state.write_mem(cell_slot, new);
+            }
+            let addr_u = byte_addr as usize;
+            if addr_u < state.memory.len() {
+                state.memory[addr_u] = (byte_val & 0xFF) as u8;
+            }
         };
 
         if width == 2 {
             if byte_addr & 1 == 0 && pack == 2 {
-                // Aligned word: whole cell.
+                // Aligned word: whole cell. Single read-modify-write of
+                // the cell state-var, plus two-byte shadow update.
                 let cell_byte_base = byte_addr;
-                if let Some(cell_var) = port.address_map.get(&(cell_byte_base as i64)) {
-                    if let Some(cell_slot) = property_to_address(cell_var) {
-                        state.write_mem(cell_slot, val & 0xFFFF);
+                if let Some(&cell_slot) = address_map.get(&(cell_byte_base as i64)) {
+                    let new = val & 0xFFFF;
+                    if cell_slot < 0 {
+                        let sidx = (-cell_slot - 1) as usize;
+                        if sidx < state.state_vars.len() {
+                            state.state_vars[sidx] = new;
+                        }
+                    } else {
+                        state.write_mem(cell_slot, new);
+                    }
+                    let addr_u = byte_addr as usize;
+                    if addr_u + 1 < state.memory.len() {
+                        state.memory[addr_u] = (new & 0xFF) as u8;
+                        state.memory[addr_u + 1] = ((new >> 8) & 0xFF) as u8;
                     }
                 }
             } else {
@@ -2708,6 +3056,15 @@ mod tests {
             slots: Vec::new(),
             backend: Backend::default(),
             dag_v2: crate::dag::Dag::default(),
+            dag_v2_ready: false,
+            pending_parsed: None,
+            dag_v2_memo: Vec::new(),
+            dag_v2_memo_epoch: Vec::new(),
+            dag_v2_epoch: 0,
+            dag_v2_state_var_cache: Vec::new(),
+            dag_v2_memory_cache: HashMap::new(),
+            dag_v2_transient_cache: Vec::new(),
+            dag_v2_call_stack: Vec::new(),
         };
         (evaluator, state)
     }

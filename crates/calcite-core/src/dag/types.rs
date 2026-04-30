@@ -13,7 +13,7 @@ pub type NodeId = u32;
 pub type SlotId = i32;
 
 /// Tick position for a `LoadVar` read.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TickPosition {
     /// Read the current tick's value: per-tick property cache first,
     /// then committed state on cache miss.
@@ -25,7 +25,7 @@ pub enum TickPosition {
 }
 
 /// `Calc` op kind — mirrors `crate::types::CalcOp` 1:1.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum CalcKind {
     Add,
     Sub,
@@ -86,8 +86,27 @@ pub enum DagNode {
     Calc { op: CalcKind, args: Vec<NodeId> },
 
     /// Pure user-`@function` call. The function body is its own
-    /// sub-DAG (not represented as a node here — looked up by `fn_id`
-    /// at walk time).
+    /// sub-DAG rooted at `Dag::function_results[fn_id]`; this node
+    /// supplies the call-site arguments and triggers a body walk.
+    /// At walk time, the walker pushes a call frame containing
+    /// `args` (caller-context NodeIds) and walks the body root;
+    /// `Param(i)` references in the body resolve to `args[i]`
+    /// evaluated in the caller's context.
+    ///
+    /// Replaces the v1-style "delegate to interpreter" `FuncCall` —
+    /// kept that variant name above for callers that haven't migrated;
+    /// new lowering emits `Call`.
+    Call { fn_id: u32, args: Vec<NodeId> },
+
+    /// Parameter placeholder inside a function body sub-DAG. The body
+    /// is lowered once into the global node arena; `Param(i)` reads
+    /// the i-th argument of the enclosing `Call`. Resolved at walk time
+    /// against the topmost call frame.
+    Param(u32),
+
+    /// Legacy fallback: delegates to v1's `eval_function_call`. Only
+    /// emitted when v2 lowering can't resolve a callee (unknown name,
+    /// recursion guard). Phase 1 default; new lowering emits `Call`.
     FuncCall { fn_id: u32, args: Vec<NodeId> },
 
     /// `if(cond1: e1; cond2: e2; ...; else: ef)` conditional.
@@ -127,6 +146,49 @@ pub enum DagNode {
     IndirectStore { port_id: u32, packed: bool },
 }
 
+/// V2-native broadcast write: every property reference resolved to a
+/// `SlotId`, and the value expression lowered to a `NodeId` that the
+/// walker evaluates directly. Replaces the runtime `name_to_slot`
+/// lookups + v1-interpreter delegation that the bridge version did.
+///
+/// Built at lowering time from `pattern::broadcast_write::BroadcastWrite`
+/// (which carries v1-shaped names + `Expr`); the original is kept on
+/// `Dag::broadcast_writes` until the bridge is fully removed.
+#[derive(Debug, Clone)]
+pub struct DagBroadcast {
+    /// Optional outer gate. The whole port is skipped when the gate's
+    /// committed value isn't 1.
+    pub gate_slot: Option<SlotId>,
+    /// Slot holding the destination byte address. Read once per tick.
+    pub dest_slot: SlotId,
+    /// DAG node producing the value to write on a direct hit.
+    pub value_node: NodeId,
+    /// addr → cell-var slot, pre-resolved.
+    pub address_map: std::collections::HashMap<i64, SlotId>,
+    /// Word-write spillover: addr → (high-byte cell-var slot, hi value
+    /// node). Mirrors `BroadcastWrite::spillover_map` with names and
+    /// Exprs replaced by slots and NodeIds.
+    pub spillover_map: std::collections::HashMap<i64, (SlotId, NodeId)>,
+    /// Slot for the spillover guard (e.g. `--isWordWrite`). When set,
+    /// spillover only fires if the slot's committed value is 1.
+    pub spillover_guard: Option<SlotId>,
+}
+
+/// V2-native packed broadcast: same shape as `PackedSlotPort` but every
+/// property name is pre-resolved to a slot. The port's value comes from
+/// reading `val_slot` directly (no expression to evaluate), so this
+/// doesn't need a NodeId — only slot resolution.
+#[derive(Debug, Clone)]
+pub struct DagPackedBroadcast {
+    pub gate_slot: SlotId,
+    pub addr_slot: SlotId,
+    pub val_slot: SlotId,
+    pub width_slot: SlotId,
+    /// Cell-base byte address → cell-var slot.
+    pub address_map: std::collections::HashMap<i64, SlotId>,
+    pub pack: u8,
+}
+
 /// A complete DAG ready to walk.
 #[derive(Debug, Default, Clone)]
 pub struct Dag {
@@ -137,8 +199,15 @@ pub struct Dag {
     /// Terminal nodes: every `WriteVar` and `IndirectStore` in
     /// declaration order. The walker drives evaluation from these.
     pub terminals: Vec<NodeId>,
-    /// Per-`@function` sub-DAG roots, indexed by `fn_id`.
+    /// Per-`@function` sub-DAG roots, indexed by `fn_id`. Each entry is
+    /// the result NodeId of that function's body; the body lives in
+    /// `nodes` alongside top-level nodes and references its parameters
+    /// via `Param(i)` placeholders.
     pub function_roots: Vec<NodeId>,
+    /// Per-`@function` parameter count, indexed by `fn_id`. Used by
+    /// the walker to size call frames and by lowering to validate
+    /// `Param(i)` indices.
+    pub function_param_counts: Vec<u32>,
     /// Function name → `fn_id`, for resolving `Expr::FunctionCall`.
     pub function_names: std::collections::HashMap<String, u32>,
     /// Broadcast-write ports (recognised + prebuilt-from-parser-fast-path),
@@ -147,6 +216,15 @@ pub struct Dag {
     /// Packed-cell broadcast ports, indexed by `IndirectStore::port_id`
     /// when `packed = true`.
     pub packed_broadcast_ports: Vec<crate::pattern::packed_broadcast_write::PackedSlotPort>,
+    /// V2-native broadcast records: same indexing as `broadcast_writes`,
+    /// every name pre-resolved to a slot and `value_expr` lowered to a
+    /// `NodeId`. Built at lowering time. The walker prefers these over
+    /// the v1-shaped vec above.
+    pub dag_broadcasts: Vec<DagBroadcast>,
+    /// V2-native packed broadcast records: same indexing as
+    /// `packed_broadcast_ports`. Pure slot resolution (no value
+    /// expression to lower).
+    pub dag_packed_broadcasts: Vec<DagPackedBroadcast>,
     /// Property names absorbed into the broadcast lists. The lowering
     /// loop filters assignments against this set so absorbed cells are
     /// not double-evaluated as both `WriteVar` and `IndirectStore`.

@@ -26,6 +26,219 @@ use calcite_core::State;
 
 // ----- Synthetic regression tests (always run) ---------------------
 
+/// Two nested function calls where the inner is called with
+/// `calc(--at + 1)`. Even simpler than the read2/readMem case but
+/// the same Param-flowing-through-calc-into-nested-call shape.
+#[test]
+fn v2_nested_call_calc_param_plus_one() {
+    let css = r#"
+        @property --result { syntax: "<integer>"; inherits: true; initial-value: -1; }
+        @function --inner(--x <integer>) returns <integer> {
+          result: var(--x);
+        }
+        @function --outer(--at <integer>) returns <integer> {
+          result: calc(--inner(var(--at)) * 1000 + --inner(calc(var(--at) + 1)));
+        }
+        :root { --result: --outer(5); }
+    "#;
+    let parsed = parse_css(css).expect("parse");
+
+    let mut s1 = State::default();
+    s1.load_properties(&parsed.properties);
+    let mut e1 = Evaluator::from_parsed(&parsed);
+    e1.set_backend(Backend::Bytecode);
+    e1.tick(&mut s1);
+    let mut s2 = State::default();
+    s2.load_properties(&parsed.properties);
+    let mut e2 = Evaluator::from_parsed(&parsed);
+    e2.set_backend(Backend::DagV2);
+    e2.tick(&mut s2);
+
+    let r1 = s1.get_var("result").unwrap();
+    let r2 = s2.get_var("result").unwrap();
+    eprintln!("v1 result={r1} v2 result={r2}");
+    // Expect 5*1000 + 6 = 5006
+    assert_eq!(r1, 5006, "v1 sanity");
+    assert_eq!(r2, 5006, "v2 should match v1");
+}
+
+/// Reproduce nested function calls returning the right value for a
+/// computed arg. Mirrors `--read2(calc(var(--q1) * 4 + 2))` in the
+/// cabinet — `read2` calls `readMem` twice, each result is added.
+#[test]
+fn v2_nested_function_with_calc_arg() {
+    let css = r#"
+        @property --mc33 { syntax: "<integer>"; inherits: true; initial-value: 61440; }
+        @property --q1 { syntax: "<integer>"; inherits: true; initial-value: 16; }
+        @property --result { syntax: "<integer>"; inherits: true; initial-value: -1; }
+        @function --readMem(--at <integer>) returns <integer> {
+          result: if(
+            style(--at: 64): 0;
+            style(--at: 65): 0;
+            style(--at: 66): mod(var(--__1mc33), 256);
+            style(--at: 67): round(down, var(--__1mc33) / 256);
+          else: 0);
+        }
+        @function --read2(--at <integer>) returns <integer> {
+          result: calc(--readMem(var(--at)) + --readMem(calc(var(--at) + 1)) * 256);
+        }
+        :root {
+          --result: --read2(calc(var(--q1) * 4 + 2));
+        }
+    "#;
+    let parsed = parse_css(css).expect("parse");
+
+    let mut s1 = State::default();
+    s1.load_properties(&parsed.properties);
+    let mut e1 = Evaluator::from_parsed(&parsed);
+    e1.set_backend(Backend::Bytecode);
+    e1.tick(&mut s1);
+
+    let mut s2 = State::default();
+    s2.load_properties(&parsed.properties);
+    let mut e2 = Evaluator::from_parsed(&parsed);
+    e2.set_backend(Backend::DagV2);
+    e2.tick(&mut s2);
+
+    let r1 = s1.get_var("result").unwrap();
+    let r2 = s2.get_var("result").unwrap();
+    eprintln!("v1 result={r1} v2 result={r2}");
+    assert_eq!(r1, 61440, "v1 sanity");
+    assert_eq!(r2, 61440, "v2 should match v1");
+}
+
+/// Function with dispatch-table-shape if() on a parameter (the
+/// param is the LHS of every style() test). Mirrors the cabinet's
+/// `--readMem(--at)` dispatch. The recogniser must build a Switch
+/// whose `key` references the function's `Param(0)` — without
+/// substituting in the call-site arg. v1's bytecode lowering had
+/// equivalent path; v2 must match.
+#[test]
+fn v2_function_dispatch_table_param_key() {
+    let css = r#"
+        @property --r { syntax: "<integer>"; inherits: true; initial-value: 0; }
+        @property --result { syntax: "<integer>"; inherits: true; initial-value: -1; }
+        @function --readMem(--at <integer>) returns <integer> {
+          result: if(
+            style(--at: 0): 100;
+            style(--at: 1): 101;
+            style(--at: 2): 102;
+            style(--at: 3): 103;
+            style(--at: 4): 104;
+            style(--at: 5): 105;
+          else: -1);
+        }
+        :root {
+          --r: 3;
+          --result: --readMem(var(--r));
+        }
+    "#;
+    let parsed = parse_css(css).expect("parse");
+
+    let mut s1 = State::default();
+    s1.load_properties(&parsed.properties);
+    let mut e1 = Evaluator::from_parsed(&parsed);
+    e1.set_backend(Backend::Bytecode);
+    e1.tick(&mut s1);
+
+    let mut s2 = State::default();
+    s2.load_properties(&parsed.properties);
+    let mut e2 = Evaluator::from_parsed(&parsed);
+    e2.set_backend(Backend::DagV2);
+    e2.tick(&mut s2);
+
+    let r1 = s1.get_var("result").unwrap();
+    let r2 = s2.get_var("result").unwrap();
+    assert_eq!(r1, 103, "v1 sanity: readMem(3) should be 103");
+    assert_eq!(r2, 103, "v2 readMem(3) wrong: got {}", r2);
+}
+
+/// Reproduce read2 returning 61440 from a packed cell with
+/// initial-value 61440.
+#[test]
+fn v2_read2_packed_cell_initial_value() {
+    // `--mc33` is a packed-cell state-var holding bytes mem[66] and mem[67].
+    // initial-value 61440 = 0x_F000 → mem[66]=0x00, mem[67]=0xF0.
+    // read2(66) should return 0 + 0xF0*256 = 61440.
+    //
+    // Note: just declaring `--mc33: <integer>; initial-value: 61440;` isn't
+    // enough — calcite's packed-cell layout is set up via
+    // `wire_state_for_packed_memory`, which expects a specific
+    // packed_cell_table. Without that, mc33 is a plain state var, so
+    // reading mem[66] still returns 0. Skip if wiring isn't exposed.
+    let css = r#"
+        @property --mc33 { syntax: "<integer>"; inherits: true; initial-value: 61440; }
+        @property --result { syntax: "<integer>"; inherits: true; initial-value: -1; }
+        @function --readMem(--at <integer>) returns <integer> {
+          result: if(
+            style(--at: 66): mod(var(--__1mc33), 256);
+            style(--at: 67): round(down, var(--__1mc33) / 256);
+          else: 0);
+        }
+        @function --read2(--at <integer>) returns <integer> {
+          result: calc(--readMem(var(--at)) + --readMem(calc(var(--at) + 1)) * 256);
+        }
+        :root { --result: --read2(66); }
+    "#;
+    let parsed = parse_css(css).expect("parse");
+
+    let mut s1 = State::default();
+    s1.load_properties(&parsed.properties);
+    let mut e1 = Evaluator::from_parsed(&parsed);
+    e1.set_backend(Backend::Bytecode);
+    e1.tick(&mut s1);
+
+    let mut s2 = State::default();
+    s2.load_properties(&parsed.properties);
+    let mut e2 = Evaluator::from_parsed(&parsed);
+    e2.set_backend(Backend::DagV2);
+    e2.tick(&mut s2);
+
+    let r1 = s1.get_var("result").unwrap();
+    let r2 = s2.get_var("result").unwrap();
+    eprintln!("v1 result={r1} v2 result={r2}");
+    eprintln!("v1 mc33={:?} v2 mc33={:?}", s1.get_var("mc33"), s2.get_var("mc33"));
+    // Don't assert; just observe.
+}
+
+/// Reproduce the cabinet's `--bit` shape: nested function calls with
+/// arithmetic on params, used as the LHS of a parent's style() test.
+/// This was the suspected root of the tick-6 cabinet divergence.
+#[test]
+fn v2_bit_function_zero_for_low_bit() {
+    let css = r#"
+        @property --flags { syntax: "<integer>"; inherits: true; initial-value: 6; }
+        @property --result { syntax: "<integer>"; inherits: true; initial-value: -1; }
+        @function --rightShift(--a <integer>, --b <integer>) returns <integer> {
+          result: round(down, var(--a) / pow(2, var(--b)));
+        }
+        @function --bit(--val <integer>, --idx <integer>) returns <integer> {
+          result: mod(--rightShift(var(--val), var(--idx)), 2);
+        }
+        :root {
+          --result: --bit(var(--__1flags), 9);
+        }
+    "#;
+    let parsed = parse_css(css).expect("parse");
+
+    let mut s1 = State::default();
+    s1.load_properties(&parsed.properties);
+    let mut e1 = Evaluator::from_parsed(&parsed);
+    e1.set_backend(Backend::Bytecode);
+    e1.tick(&mut s1);
+    let r1 = s1.get_var("result").unwrap();
+
+    let mut s2 = State::default();
+    s2.load_properties(&parsed.properties);
+    let mut e2 = Evaluator::from_parsed(&parsed);
+    e2.set_backend(Backend::DagV2);
+    e2.tick(&mut s2);
+    let r2 = s2.get_var("result").unwrap();
+
+    assert_eq!(r1, 0, "v1 sanity: bit(6, 9) should be 0");
+    assert_eq!(r2, 0, "v2 bit(6, 9) wrong: got {}", r2);
+}
+
 /// Function call with parameter dispatch: returns one of the args
 /// based on a key parameter. v2's FuncCall delegates to v1's
 /// eval_function_call which uses dispatch_tables; this exercises the
@@ -168,6 +381,82 @@ fn first_divergent_tick(
         }
     }
     None
+}
+
+/// Diagnostic: dump named-property values at start of tick T from
+/// both backends side-by-side. Useful when pinpointing which input
+/// to a divergent assignment is wrong. Run with:
+///   DIAG_TICK=6 cargo test -p calcite-core --test v2_cabinet_differential v2_diagnose -- --ignored --nocapture
+#[test]
+#[ignore]
+fn v2_diagnose() {
+    let Some(path) = cabinet_path() else {
+        eprintln!("no cabinet, skipping");
+        return;
+    };
+    let css = std::fs::read_to_string(&path).expect("read");
+    let target_tick: usize = std::env::var("DIAG_TICK")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(6);
+    let parsed = parse_css(&css).expect("parse cabinet");
+    let mut s1 = State::default();
+    s1.load_properties(&parsed.properties);
+    let mut e1 = Evaluator::from_parsed(&parsed);
+    e1.wire_state_for_packed_memory(&mut s1);
+    e1.wire_state_for_disk_window(&mut s1);
+    e1.set_backend(Backend::Bytecode);
+
+    let mut s2 = State::default();
+    s2.load_properties(&parsed.properties);
+    let mut e2 = Evaluator::from_parsed(&parsed);
+    e2.wire_state_for_packed_memory(&mut s2);
+    e2.wire_state_for_disk_window(&mut s2);
+    e2.set_backend(Backend::DagV2);
+
+    // Run target_tick - 1 ticks: state at this point reflects what
+    // tick `target_tick` will read for `--__1*` (Prev) reads.
+    for _ in 1..target_tick {
+        e1.tick(&mut s1);
+        e2.tick(&mut s2);
+    }
+    eprintln!("=== mem bytes after tick {} ===", target_tick - 1);
+    for addr in [0, 1, 2, 3, 4, 5, 6, 7, 32, 33, 34, 35, 64, 65, 66, 67] {
+        let m1 = s1.memory.get(addr).copied().unwrap_or(0);
+        let m2 = s2.memory.get(addr).copied().unwrap_or(0);
+        // Read via state.read_mem too (which uses packed cells path)
+        let r1 = s1.read_mem(addr as i32);
+        let r2 = s2.read_mem(addr as i32);
+        let mark = if m1 == m2 && r1 == r2 { "  " } else { "!!" };
+        eprintln!("  {} mem[{addr}] flat: v1={m1} v2={m2}  read_mem: v1={r1} v2={r2}", mark);
+    }
+
+    let names = [
+        "AX", "CX", "DX", "BX", "SP", "BP", "SI", "DI",
+        "CS", "DS", "ES", "SS", "IP", "flags",
+        "_tf", "_irqActive", "picVector", "opcode",
+        "mc0", "mc1", "mc17", "mc18", "mc33", "mc761", "mc762", "mc763",
+        "_slot0Live", "_slot1Live", "_slot2Live",
+        "memAddr0", "memAddr1", "memAddr2", "memVal0", "memVal1", "memVal2",
+        "_writeWidth", "tickCount",
+    ];
+    eprintln!("=== state after tick {} (= start of tick {}) ===", target_tick - 1, target_tick);
+    for n in names {
+        let v1 = s1.get_var(n).unwrap_or(i32::MIN);
+        let v2 = s2.get_var(n).unwrap_or(i32::MIN);
+        let mark = if v1 == v2 { "  " } else { "!!" };
+        eprintln!("  {} --{:<14} v1={:>10} v2={:>10}", mark, n, v1, v2);
+    }
+    // Run the target tick.
+    e1.tick(&mut s1);
+    e2.tick(&mut s2);
+    eprintln!("=== state after tick {} ===", target_tick);
+    for n in names {
+        let v1 = s1.get_var(n).unwrap_or(i32::MIN);
+        let v2 = s2.get_var(n).unwrap_or(i32::MIN);
+        let mark = if v1 == v2 { "  " } else { "!!" };
+        eprintln!("  {} --{:<14} v1={:>10} v2={:>10}", mark, n, v1, v2);
+    }
 }
 
 /// Find the first tick at which v2 diverges from v1 on the cabinet.

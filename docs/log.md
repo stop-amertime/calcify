@@ -11,6 +11,102 @@ and the Criterion benchmarks.
 
 ---
 
+## 2026-04-30: v2 DAG backend — perf snapshot and roadmap
+
+After landing the v2 walker correctness work (memoised tree walker,
+shared function sub-DAGs with `Param`/`Call`, three-phase tick split,
+native broadcast + packed-broadcast value evaluation, sibling-Call
+epoch isolation, tick-6 cabinet differential closed), v2 produces
+identical state to v1 for ≥2000 ticks on `hello-text.css`.
+
+**Headline numbers (hello-text.css, release):**
+
+- v1 bytecode: ~509K ticks/sec
+- v2 dag:      ~27K ticks/sec
+- **v2 is ~18.5× slower than v1.**
+
+(Up from the ~52× gap measured in the v2 self-review on 2026-04-29 —
+walker memoisation + Param/Call sharing closed about half the gap.
+Three-phase tick split and packed-write `state.memory[]` writeback
+were correctness-driven and may have cost a few %.)
+
+**The gap is structural, not microscopic.** v1 is a flat bytecode
+interpreter against an `i32` slot array with peephole-fused
+`BranchIfNotEqLit` etc. v2 is a recursive tree-walker over `DagNode`
+enum variants with per-call HashMap lookups for memo, transient
+slot reads, and (until we land the next win) per-tick re-decoding
+of branch arms. That's why a single optimisation won't close it —
+a sequence of structural changes will.
+
+### What's on the table next, in stacking order
+
+1. **Flatten the DAG into a Vec\<Op\> and walk iteratively.** The
+   single biggest expected win, and the one called out as highest
+   leverage in the self-review. Replaces `dag_eval_node` recursion
+   + Vec\<Option\<i32\>\> memo with linear bytecode + slot array.
+   Keep the tree walker as oracle behind `--backend=dag-tree`
+   during transition; conformance suite + cabinet differential
+   are the gates. Estimated 3–5× on its own.
+
+2. **Direct slot reads on the hot path.** Right now every `LoadVar`
+   pays for the `transient_cache` / `state_var_cache` /
+   `memory_cache` / committed-state dispatch. After flattening,
+   bake the dispatch into the op kind — `LoadStateVar(idx)`,
+   `LoadMemory(addr)`, `LoadTransient(idx)`, `LoadCommitted(slot)`
+   — so the inner loop is a flat match with no branch on slot id
+   range. Mirrors v1's specialised loads.
+
+3. **Peephole-fuse Calc + LoadVar / Lit.** v1's `AddLit`, `SubLit`,
+   `MulLit`, `AndLit`, `ShrLit`, etc., were each 5–15% wins. v2
+   gets none of these today. Once we have a flat op stream, the
+   same fuser applies trivially.
+
+4. **Switch fast-path on the flat stream.** Today `Switch` does a
+   HashMap lookup per evaluation. With integer keys clustered in a
+   small range (which dispatch chains usually are), v1's
+   dense-array `DispatchFlatArray` op was the single biggest perf
+   win in the 2026-04-16 round. Port it.
+
+5. **Drop the tree walker.** Once (1)–(4) ship and v2 is at parity
+   or better, `dag_eval_node` and friends go. `name_to_slot`,
+   `absorbed_properties` (lifetime smell), and the legacy
+   `FuncCall` variant come out at the same time — they're
+   bridge scaffolding, not part of the v2 design.
+
+6. **Bigger structural moves (deferred until 1–5 land):** native
+   16-bit bitwise recognition (carry over from v1's
+   `classify_bitwise_decomposition`), wider dispatch-chain
+   recognition, change-gated ops, affine self-loop fixed-point —
+   all the moves listed in `docs/optimisation-ideas.md`. None
+   of these matter until the v2 walker is no longer the
+   bottleneck.
+
+### Out of scope right now
+
+- Slot model rework (sum-type `Slot` enum vs i32-with-regions).
+  Demoted in the self-review's corrections — not worth the
+  per-read dispatch cost without measurement showing
+  TRANSIENT\_BASE actually causes a problem.
+- Splitting numeric and string IRs. One IR with a side table
+  for `Concat` is the right answer; do it when we wire up
+  textBuffer rendering, not before.
+- The Phase 2 node-count probe (#22). Useful diagnostic, not
+  a perf lever.
+
+### Verification protocol for each step
+
+Same as the 2026-04-16 round: alternating change/baseline runs,
+three runs per side, mean. Plus on every commit:
+
+- `cargo test --workspace` (Phase 0.5 conformance + cabinet
+  differential).
+- `calcite-bench --backend=dag` on hello-text.css and at least
+  one other cabinet.
+- v1 vs v2 first-divergent-tick check on hello-text — must
+  remain ≥2000 ticks identical, ideally further.
+
+---
+
 ## 2026-04-16: big round of peephole/specialization wins
 
 Cumulative commits:

@@ -6,6 +6,10 @@ The brief was: ask questions thoroughly, take nothing for granted, see
 if there are more elegant ways to do what's already been done.
 Presented without editing.
 
+> **Second-pass corrections (appended at end).** A re-read flagged
+> several over-claims and one major omission. See the "Corrections on
+> re-read" section at the bottom before acting on anything in this doc.
+
 ---
 
 OK. Going to do this in the open. No structure imposed — I'll think
@@ -485,3 +489,130 @@ are minor IR shape questions that can be cleaned up later. The walker
 is the one that's going to bite.
 
 End of self-review. No edits.
+
+---
+
+## Corrections on re-read
+
+After re-reading the doc against `eval.rs` (the actual walker code) and
+thinking about what the self-review missed, here are the items I'd
+change. Originals stand above; this section is the audit.
+
+### Claims I'd retract
+
+**"Forcing string and numeric into one IR is propagation" (Concat
+section).** Wrong. CSS is one expression language; `Concat` participates
+in `var()` substitution exactly like numeric expressions. Splitting into
+two parallel IRs would mean two walkers, two name-resolution paths, two
+topo sorts. The correct fix is to give the walker a string-valued
+return path (probably a side table indexed by NodeId) so `Concat` can
+produce a real value. One IR, two value kinds. Retract the split-IR
+recommendation.
+
+**"5-10x slower than v1" (perf section).** I made this number up. I
+have no measurements. The recursive walker plus per-call clones plus no
+memoization is consistent with a large gap, but the specific multiple
+was invented. The honest version is "I don't know how big the gap is,
+build the bench first."
+
+**"Sum-type Slot enum is a clean win blocked on measurement" (slot
+model section).** Overstated. Slot reads are on the inner-loop hot
+path. Going from `i32` to a tagged enum doubles the size and adds a
+dispatch on every read. The TRANSIENT_BASE constant is ugly but cheap;
+the burden of proof is on the change, not the status quo. Demote this
+from "would do differently" to "wouldn't bother unless something else
+forces it."
+
+### Claims I'd reframe
+
+**Repeated arg evaluation as "a real bug, not just perf."** The
+dramatic wind-up in the original was misleading — the conclusion two
+sentences later (perf only) was right. Within a tick the cache state is
+monotonic, so repeated evaluation of pure expressions is consistent.
+This is straight perf debt, full stop.
+
+**Prev / self-ref conflation.** The analysis is correct but the
+actionable observation is buried. The real point: I don't have a
+fixture that distinguishes self-reference from `--__1foo`. Without one,
+the discussion is theoretical. Reframe as "build the fixture, then
+decide" rather than "cold start would split them."
+
+**Switch as a separate node "is genuinely useful."** Weaker than I
+made it sound. The walker arm at `eval.rs:1976` is two lines —
+`table.get(&key)` and recurse. That could live inside an `If` arm with
+a precomputed `Option<HashMap>` side field. Still defensible (cheap
+shape check at lowering time, fast-path is obvious in the walker), but
+not the slam dunk I framed it as.
+
+**"Rewrite the walker now, before any more Phase 2 work."** Right
+diagnosis (highest-leverage change), wrong sequencing. The cabinet
+differential still diverges at tick 6 because broadcast value
+evaluation goes through v1's interpreter. Native broadcast eval should
+go first: it removes the v1 bridge that `name_to_slot` and the
+`FuncCall` arm exist to support, which makes the walker rewrite
+strictly smaller and cleaner. Reorder: native broadcasts → walker
+rewrite.
+
+### What I missed entirely
+
+**The scalar walker is not the hot path for real cabinets.** The whole
+walker section in the original review focused on `dag_eval_node` —
+which handles scalar assignments. But CSS-DOS cabinets are
+broadcast-dominated: thousands of memory cells written via
+`BroadcastWrite` / `PackedSlotPort` per tick. Those go through
+`dag_exec_broadcast` (eval.rs:2093) and `dag_exec_packed_broadcast`
+(eval.rs:2151), both of which currently delegate the value expression
+to v1's `eval_expr`. **No amount of scalar-walker optimisation matters
+until the broadcast value path is native.** This is the biggest
+omission — the original review optimised the wrong loop.
+
+**No testing strategy for the walker rewrite.** A flat-Op walker is a
+substantial change to a load-bearing component. The original said
+"rewrite it" without acknowledging that the Phase 0.5 conformance suite
+plus the cabinet differential would need to be the gate, and the
+existing tree walker should stay around as an oracle during the
+transition. That's an implementation-discipline omission.
+
+### Revised priority list
+
+In order:
+
+1. **Native broadcast value evaluation** (highest leverage; unblocks
+   tick-6 cabinet divergence; lets `name_to_slot` and the `FuncCall`
+   bridge be deleted).
+2. **Wall-clock benchmark on a real cabinet** (need numbers before
+   making perf-driven design decisions; "5-10x slower" was a guess).
+3. **Walker rewrite** — flat Op array, memoised by node id, iterative.
+   After (1) and (2), with the existing tree walker kept as an oracle.
+4. Smaller IR cleanups (drop FuncCall variant, demote
+   absorbed_properties to a local, decide on Concat string semantics).
+5. The Prev / self-ref fixture, once we have a CSS that distinguishes
+   them.
+
+### Score
+
+Direction-of-travel: ~80% right. Weighting and sequencing: ~60%.
+Single biggest correction: broadcasts are the hot path, not scalars.
+
+### Post-implementation update
+
+After landing native broadcast value evaluation (slots pre-resolved at
+lowering, `value_expr` lowered to `NodeId`s, both unpacked and packed
+executors switched off the v1 bridge), measured wall-clock on
+`hello-text.css` (1000 ticks, 100 warmup, release build):
+
+- **v1 bytecode: 187K ticks/sec**
+- **v2 dag: 3.6K ticks/sec**
+- **v2 is ~52× slower than v1.**
+
+That's far worse than the made-up "5-10×" estimate. The walker is
+indeed the bottleneck, and the gap is large enough that the rewrite is
+no longer optional.
+
+A second finding: native broadcast value eval did **not** fix the
+tick-6 cabinet divergence. The differing properties (`--memAddr0/1/2`,
+`--memVal1/2`) are computed *upstream* by scalar assignments, then
+read by the broadcast. Bug is in the scalar walker (or lowering),
+not in broadcast evaluation. Hypothesis from the original review
+("very likely because broadcast value evaluation goes through v1") was
+wrong — another argument for measuring before guessing.

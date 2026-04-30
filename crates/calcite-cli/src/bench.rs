@@ -63,6 +63,17 @@ struct Args {
     /// match the one used to produce the snapshot.
     #[arg(long, value_name = "PATH")]
     restore: Option<PathBuf>,
+
+    /// Evaluator backend: `bytecode` (v1, default) or `dag-v2`.
+    #[arg(long, default_value = "bytecode")]
+    backend: String,
+
+    /// Time budget in seconds. When set, the bench stops at the first
+    /// batch boundary past this many seconds and reports ticks-per-sec
+    /// achieved. Useful for "how far does cabinet X get in 1 minute"
+    /// comparisons. Combine with -n large enough not to exhaust early.
+    #[arg(long, value_name = "SECS")]
+    budget_secs: Option<f64>,
 }
 
 const REAL_8086_HZ: f64 = 4_772_727.0;
@@ -165,6 +176,7 @@ fn run_bench(
     batch: u32,
     collect_histogram: bool,
     collect_profile: bool,
+    budget_secs: Option<f64>,
 ) -> BenchResult {
     let mut tick_durations = if collect_histogram {
         Some(Vec::with_capacity(ticks as usize))
@@ -191,6 +203,12 @@ fn run_bench(
             ticks_run += batch;
             if let Some(addr) = halt_addr {
                 if state.read_mem(addr) != 0 {
+                    halted = true;
+                    break;
+                }
+            }
+            if let Some(budget) = budget_secs {
+                if start.elapsed().as_secs_f64() >= budget {
                     halted = true;
                     break;
                 }
@@ -464,11 +482,21 @@ fn main() {
     };
     let parse_time = t_parse_start.elapsed().as_secs_f64();
 
+    let backend = match args.backend.as_str() {
+        "bytecode" | "v1" => calcite_core::Backend::Bytecode,
+        "dag-v2" | "v2" => calcite_core::Backend::DagV2,
+        other => {
+            eprintln!("--backend: unknown value '{other}' (expected 'bytecode' or 'dag-v2')");
+            std::process::exit(2);
+        }
+    };
+
     // --- Compile ---
     let t_compile_start = Instant::now();
     let mut state = calcite_core::State::default();
     state.load_properties(&parsed.properties);
     let mut evaluator = calcite_core::Evaluator::from_parsed(&parsed);
+    evaluator.set_backend(backend);
     evaluator.wire_state_for_packed_memory(&mut state);
     evaluator.wire_state_for_disk_window(&mut state);
     if let Some(path) = &args.restore {
@@ -536,6 +564,7 @@ fn main() {
             state = calcite_core::State::default();
             state.load_properties(&parsed.properties);
             evaluator = calcite_core::Evaluator::from_parsed(&parsed);
+            evaluator.set_backend(backend);
             evaluator.wire_state_for_packed_memory(&mut state);
             evaluator.wire_state_for_disk_window(&mut state);
             if let Some(path) = &args.restore {
@@ -562,6 +591,7 @@ fn main() {
             args.batch,
             args.histogram && iter == 0, // only collect histogram on first iteration
             args.profile && iter == 0,   // only collect profile on first iteration
+            args.budget_secs,
         );
         results.push(result);
     }

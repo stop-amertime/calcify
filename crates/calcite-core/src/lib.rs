@@ -34,5 +34,5 @@ pub mod summary;
 pub mod types;
 
 pub use error::{CalciteError, Result};
-pub use eval::{property_to_address, Evaluator, TickProfile};
+pub use eval::{property_to_address, Backend, Evaluator, TickProfile};
 pub use state::{State, StateDelta};

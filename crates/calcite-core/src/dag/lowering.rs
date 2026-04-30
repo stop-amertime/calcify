@@ -6,7 +6,12 @@
 
 use std::collections::HashMap;
 
-use super::types::{CalcKind, Dag, DagNode, NodeId, SlotId, StyleCondNode, TickPosition};
+use super::types::{
+    CalcKind, Dag, DagBroadcast, DagNode, DagPackedBroadcast, NodeId, SlotId, StyleCondNode,
+    TickPosition,
+};
+use crate::pattern::broadcast_write::BroadcastWrite;
+use crate::pattern::packed_broadcast_write::PackedSlotPort;
 use crate::types::{
     Assignment, CalcOp, Expr, FunctionDef, ParsedProgram, StyleBranch, StyleTest,
 };
@@ -73,6 +78,27 @@ struct LowerCtx<'a> {
     /// FuncCall node (delegated to v1) — CSS @function doesn't support
     /// recursion, so this is defensive.
     inlining_stack: Vec<String>,
+    /// When true, every `Expr::Var` lowering uses `TickPosition::Prev`
+    /// regardless of the property name. Set while lowering broadcast
+    /// value expressions, which run against committed state (after all
+    /// `WriteVar` terminals have flushed their per-tick-cache entries
+    /// to State). Default false for normal assignment lowering.
+    force_prev_reads: bool,
+    /// Hash-cons caches for the high-frequency pure node kinds. Without
+    /// these, inlining N call sites of an identical function body emits
+    /// N separate copies — on a 362K-assignment cabinet (zork) that
+    /// blows past tens of GB of node memory and OOMs. With them,
+    /// identical sub-expressions collapse to a single NodeId, so the
+    /// DAG actually behaves like a DAG.
+    ///
+    /// We only intern the leaf-and-near-leaf kinds (Lit, LoadVar, Calc).
+    /// If/Switch/Concat/FuncCall are composed of NodeIds that themselves
+    /// got interned, so the structural sharing already happens via their
+    /// children — the parent nodes themselves are rare enough that
+    /// hashing them is not worth the cost.
+    lit_cache: HashMap<u64, NodeId>,
+    load_var_cache: HashMap<(SlotId, TickPosition), NodeId>,
+    calc_cache: HashMap<(CalcKind, Vec<NodeId>), NodeId>,
 }
 
 impl<'a> LowerCtx<'a> {
@@ -84,7 +110,49 @@ impl<'a> LowerCtx<'a> {
             functions: HashMap::new(),
             inline_frames: Vec::new(),
             inlining_stack: Vec::new(),
+            force_prev_reads: false,
+            lit_cache: HashMap::new(),
+            load_var_cache: HashMap::new(),
+            calc_cache: HashMap::new(),
         }
+    }
+
+    /// Hash-cons a `Lit(v)` node — return an existing NodeId if we've
+    /// already produced one for the same bit pattern, otherwise push a
+    /// fresh one. NaN handling: NaN compares unequal to itself, but
+    /// `to_bits()` is reflexive, so two NaNs with identical bit
+    /// patterns share. Different-bit NaNs don't share, which is fine.
+    fn intern_lit(&mut self, v: f64) -> NodeId {
+        let key = v.to_bits();
+        if let Some(&id) = self.lit_cache.get(&key) {
+            return id;
+        }
+        let id = self.dag.push(DagNode::Lit(v));
+        self.lit_cache.insert(key, id);
+        id
+    }
+
+    fn intern_load_var(&mut self, slot: SlotId, kind: TickPosition) -> NodeId {
+        if let Some(&id) = self.load_var_cache.get(&(slot, kind)) {
+            return id;
+        }
+        let id = self.dag.push(DagNode::LoadVar { slot, kind });
+        self.load_var_cache.insert((slot, kind), id);
+        id
+    }
+
+    fn intern_calc(&mut self, op: CalcKind, args: Vec<NodeId>) -> NodeId {
+        let key = (op, args);
+        if let Some(&id) = self.calc_cache.get(&key) {
+            return id;
+        }
+        let (op, args) = key;
+        let id = self.dag.push(DagNode::Calc {
+            op: op.clone(),
+            args: args.clone(),
+        });
+        self.calc_cache.insert((op, args), id);
+        id
     }
 
     /// Look up a name in the active inline frames (innermost first).
@@ -133,15 +201,30 @@ impl<'a> LowerCtx<'a> {
     }
 
     /// Lower an `Expr` to a `NodeId`. Pure (no side effects beyond
-    /// allocating new nodes).
+    /// allocating new nodes). Hot-path leaves (Lit, LoadVar, Calc) go
+    /// through hash-cons interns so identical sub-expressions share a
+    /// NodeId — required for inlining at this scale to fit in memory.
     fn lower_expr(&mut self, expr: &Expr) -> NodeId {
         match expr {
-            Expr::Literal(v) => self.dag.push(DagNode::Lit(*v)),
+            Expr::Literal(v) => self.intern_lit(*v),
 
             Expr::StringLiteral(s) => self.dag.push(DagNode::LitStr(s.clone())),
 
             Expr::Var { name, fallback } => {
                 let (bare, kind) = strip_var_name(name);
+                // Broadcast value expressions read committed state — the
+                // executor runs after every WriteVar terminal has flushed
+                // its per-tick cache entry to State. Force `Prev` reads
+                // (which bypass the cache) so we don't accidentally pick
+                // up scalar-walker per-tick scratch values. Inline-frame
+                // lookups (param/local references inside an inlined
+                // function body) take precedence — they refer to
+                // call-bound NodeIds, not slot reads.
+                let kind = if self.force_prev_reads && self.lookup_inline(bare).is_none() {
+                    TickPosition::Prev
+                } else {
+                    kind
+                };
                 // 1. Inline frame check (param/local of the function
                 //    we're currently inlining). This must come before
                 //    the global-slot resolution: param names like
@@ -167,14 +250,14 @@ impl<'a> LowerCtx<'a> {
                 //   - neither → unresolved, use fallback or 0.
                 if committed_slot_of(bare).is_some() || self.assigned_names.contains(bare) {
                     let slot = self.slot_for(bare);
-                    self.dag.push(DagNode::LoadVar { slot, kind })
+                    self.intern_load_var(slot, kind)
                 } else if let Some(fb) = fallback.as_deref() {
                     self.lower_expr(fb)
                 } else {
                     // Unresolved, no fallback: CSS spec falls back to
                     // the property's registered initial value, which
                     // is 0 for unregistered numeric properties.
-                    self.dag.push(DagNode::Lit(0.0))
+                    self.intern_lit(0.0)
                 }
             }
 
@@ -206,7 +289,7 @@ impl<'a> LowerCtx<'a> {
                     CalcOp::Abs(a) => (CalcKind::Abs, vec![self.lower_expr(a)]),
                     CalcOp::Negate(a) => (CalcKind::Neg, vec![self.lower_expr(a)]),
                 };
-                self.dag.push(DagNode::Calc { op: kind, args })
+                self.intern_calc(kind, args)
             }
 
             Expr::FunctionCall { name, args } => {
@@ -250,69 +333,150 @@ impl<'a> LowerCtx<'a> {
         }
     }
 
-    /// Lower a function call: inline the body if possible, fall back
-    /// to a `FuncCall` delegation node otherwise.
+    /// Emit a `Call { fn_id, args }` node for a `@function` call.
     ///
-    /// Inlining model: push a frame mapping each param name to the
-    /// corresponding caller-evaluated arg `NodeId`, then lower the
-    /// callee's `result` expression. Locals are lowered sequentially,
-    /// each adding to the same frame so subsequent locals (and the
-    /// result) can reference them.
+    /// Function bodies are lowered once into the global node arena
+    /// (see `lower_function_body`) — call sites just reference the
+    /// shared body via `fn_id`. Args are caller-context NodeIds that
+    /// the walker resolves into the body's `Param(i)` placeholders.
     ///
-    /// Recursion: `inlining_stack` tracks function names currently
-    /// being inlined. CSS `@function` doesn't allow recursion (Chrome
-    /// rejects it), so encountering a recursive call falls back to a
-    /// `FuncCall` delegation node — defensive, not expected.
+    /// This replaces the inline-at-lowering model that was O(call
+    /// sites × body size) — combinatorial expansion that OOMs on
+    /// real cabinets like zork (362K assignments × deep call graphs).
+    /// New model is O(unique functions × body size + call sites).
     ///
     /// Unknown callees: if the program declares no function with this
-    /// name, emit a `FuncCall` to mirror v1's behaviour
-    /// (`eval_function_call` returns 0 for undefined functions); the
-    /// walker will hit the same not-found path. The `fn_id` is interned
-    /// so the call site has a stable handle.
+    /// name, fall back to `FuncCall` so v1's interpreter can handle it
+    /// (returns 0 for undefined functions). Stable `fn_id` either way.
     fn lower_call(&mut self, name: &str, arg_ids: Vec<NodeId>) -> NodeId {
-        let func = match self.functions.get(name) {
-            Some(f) => *f,
+        let fn_id = match self.dag.function_names.get(name).copied() {
+            Some(id) => id,
             None => {
+                if self.functions.contains_key(name) {
+                    // Function exists but body hasn't been lowered yet
+                    // (forward reference within the function pre-pass,
+                    // or we're being called before the pre-pass ran).
+                    // The pre-pass `lower_all_function_bodies` lowers
+                    // in declaration order; out-of-order references
+                    // here mean our call graph isn't a DAG, which
+                    // CSS @function rejects. Emit a FuncCall as a
+                    // defensive fallback — v1's interpreter handles it.
+                    let fn_id = self.intern_function(name);
+                    return self.dag.push(DagNode::FuncCall { fn_id, args: arg_ids });
+                }
+                // Truly unknown — same fallback.
                 let fn_id = self.intern_function(name);
                 return self.dag.push(DagNode::FuncCall { fn_id, args: arg_ids });
             }
         };
-        if self.inlining_stack.iter().any(|n| n == name) {
-            let fn_id = self.intern_function(name);
-            return self.dag.push(DagNode::FuncCall { fn_id, args: arg_ids });
+        // Pad missing args with Lit(0.0), matching v1 semantics
+        // (`unwrap_or(Value::Number(0.0))` in eval_function_call).
+        let expected = self.dag.function_param_counts.get(fn_id as usize).copied().unwrap_or(0) as usize;
+        let mut padded = arg_ids;
+        while padded.len() < expected {
+            padded.push(self.intern_lit(0.0));
         }
+        padded.truncate(expected);
+        self.dag.push(DagNode::Call { fn_id, args: padded })
+    }
 
-        // Build the param/local frame. Missing args (caller passed
-        // fewer than declared) bind to a literal 0, matching v1
-        // (`unwrap_or(Value::Number(0.0))`).
+    /// Lower one `@function` body into the global node arena, using
+    /// `Param(i)` placeholders for parameter references and stashing
+    /// local bindings in the inline-frame stack so locals can be
+    /// referenced by subsequent locals and the result.
+    ///
+    /// Returns the result NodeId (root of the body sub-DAG) and the
+    /// parameter count.
+    fn lower_function_body(&mut self, func: &FunctionDef) -> (NodeId, u32) {
+        let n_params = func.parameters.len() as u32;
+
+        // Build the param frame: each param is a Param(i) node. Param
+        // nodes are NOT hash-consed — each function gets fresh Param
+        // nodes scoped to its own body, since `Param(0)` of function A
+        // is a different value from `Param(0)` of function B.
         let mut frame: HashMap<String, NodeId> = HashMap::new();
         for (i, param) in func.parameters.iter().enumerate() {
             let bare = param.name.strip_prefix("--").unwrap_or(&param.name).to_string();
-            let id = arg_ids.get(i).copied().unwrap_or_else(|| self.dag.push(DagNode::Lit(0.0)));
+            let id = self.dag.push(DagNode::Param(i as u32));
             frame.insert(bare, id);
         }
 
-        self.inlining_stack.push(name.to_string());
+        // Use the inline-frame stack as the symbol table: param + local
+        // bindings go here; `Expr::Var` lowering scans innermost-first.
+        // A function body has only its own frame on the stack.
         self.inline_frames.push(frame);
 
-        // Lower locals sequentially. Each local's body sees previously-
-        // bound params and earlier locals (frame is on the stack), and
-        // its lowered NodeId becomes the binding for its own name.
+        // Locals lowered sequentially — each may reference earlier locals
+        // and any param.
         for local in &func.locals {
             let value_id = self.lower_expr(&local.value);
             let bare = local.name.strip_prefix("--").unwrap_or(&local.name).to_string();
             self.inline_frames
                 .last_mut()
-                .expect("inline frame just pushed")
+                .expect("frame just pushed")
                 .insert(bare, value_id);
         }
 
         let result_id = self.lower_expr(&func.result);
 
         self.inline_frames.pop();
-        self.inlining_stack.pop();
+        (result_id, n_params)
+    }
 
-        result_id
+    /// Lower every declared `@function` body once, in declaration order.
+    /// Populates `dag.function_names`, `dag.function_roots`, and
+    /// `dag.function_param_counts`. Must run before top-level
+    /// assignments are lowered so that `Expr::FunctionCall` lowering
+    /// can resolve callees.
+    fn lower_all_function_bodies(&mut self, functions: &'a [FunctionDef]) {
+        // Pre-pass: populate function_param_counts so that any forward
+        // call site (function A's body lowering emits Call to function
+        // B that hasn't been lowered yet) can correctly pad its arg
+        // list. Without this, B's param_count reads as 0 and lower_call
+        // truncates args to nothing — the symptom is calls returning
+        // 0 instead of computed values.
+        for func in functions {
+            let fn_id = self.intern_function(&func.name);
+            if (fn_id as usize) >= self.dag.function_param_counts.len() {
+                self.dag
+                    .function_param_counts
+                    .resize(fn_id as usize + 1, 0);
+                self.dag
+                    .function_roots
+                    .resize(fn_id as usize + 1, NodeId::MAX);
+            }
+            self.dag.function_param_counts[fn_id as usize] = func.parameters.len() as u32;
+        }
+        for func in functions {
+            let fn_id = self.intern_function(&func.name);
+            // Hash-cons caches must NOT be carried across function
+            // boundaries: a `Param(0)` placeholder in function A is a
+            // different node from a `Param(0)` placeholder in function
+            // B, but their LoadVar/Lit children might collide on key.
+            // In practice Lit and LoadVar interns ARE safe to share
+            // (a literal 5 is a literal 5 anywhere), but Calc nodes
+            // built over Param children must not be reused across
+            // functions because Param NodeIds differ. To stay safe,
+            // we just clear the calc cache per function.
+            self.calc_cache.clear();
+            let (root, n_params) = self.lower_function_body(func);
+            // function_roots / function_param_counts are indexed by
+            // fn_id — extend if needed.
+            if (fn_id as usize) >= self.dag.function_roots.len() {
+                self.dag
+                    .function_roots
+                    .resize(fn_id as usize + 1, NodeId::MAX);
+                self.dag
+                    .function_param_counts
+                    .resize(fn_id as usize + 1, 0);
+            }
+            self.dag.function_roots[fn_id as usize] = root;
+            self.dag.function_param_counts[fn_id as usize] = n_params;
+        }
+        // Top-level lowering is a fresh scope — clear the calc cache
+        // again so call sites don't accidentally reuse a Calc node
+        // built inside a function body (which references Params).
+        self.calc_cache.clear();
     }
 
     /// Try lowering a `StyleCondition` to a `Switch` (dispatch table).
@@ -388,9 +552,9 @@ impl<'a> LowerCtx<'a> {
         }
         if committed_slot_of(bare).is_some() || self.assigned_names.contains(bare) {
             let slot = self.slot_for(bare);
-            self.dag.push(DagNode::LoadVar { slot, kind })
+            self.intern_load_var(slot, kind)
         } else {
-            self.dag.push(DagNode::Lit(0.0))
+            self.intern_lit(0.0)
         }
     }
 
@@ -416,16 +580,16 @@ impl<'a> LowerCtx<'a> {
                         || self.assigned_names.contains(bare)
                     {
                         let slot = self.slot_for(bare);
-                        self.dag.push(DagNode::LoadVar { slot, kind })
+                        self.intern_load_var(slot, kind)
                     } else {
                         // Unresolved property in a style() test reads
                         // as 0 (the registered initial-value default
                         // for unregistered numeric properties).
-                        self.dag.push(DagNode::Lit(0.0))
+                        self.intern_lit(0.0)
                     }
                 } else {
                     let slot = self.slot_for(bare);
-                    self.dag.push(DagNode::LoadVar { slot, kind })
+                    self.intern_load_var(slot, kind)
                 };
                 let value_id = self.lower_expr(value);
                 StyleCondNode::Single { lhs, value: value_id }
@@ -466,6 +630,89 @@ impl<'a> LowerCtx<'a> {
     // interpreter). The DAG records the function name so the walker
     // can route to the right callee, but the body itself stays in
     // `Expr` form on `Evaluator::functions`.
+
+    /// Lower a v1-shaped `BroadcastWrite` into a v2-native record:
+    /// resolve every property name to a `SlotId`, lower `value_expr`
+    /// (and any spillover hi expressions) to `NodeId`s. Reads inside
+    /// the value expression are forced to `TickPosition::Prev` because
+    /// the broadcast executor runs against committed state — by the
+    /// time it fires, every preceding `WriteVar` has already flushed
+    /// its per-tick cache entry to State.
+    fn lower_broadcast(&mut self, bw: &BroadcastWrite) -> DagBroadcast {
+        // Use slot_for to register names in name_to_slot AND allocate
+        // transients on demand — `--memAddr0` etc. aren't registered
+        // @properties and need transient slots that match the slots
+        // the rest of the program uses.
+        let bare_of = |n: &str| {
+            n.strip_prefix("--").unwrap_or(n).to_string()
+        };
+        let gate_slot = bw.gate_property.as_ref().map(|n| self.slot_for(&bare_of(n)));
+        let dest_slot = self.slot_for(&bare_of(&bw.dest_property));
+
+        // Address map: cell-var name → SlotId.
+        let address_map: std::collections::HashMap<i64, SlotId> = bw
+            .address_map
+            .iter()
+            .map(|(addr, name)| (*addr, self.slot_for(&bare_of(name))))
+            .collect();
+
+        // Lower value_expr with Prev reads forced.
+        let prev_force = std::mem::replace(&mut self.force_prev_reads, true);
+        let value_node = self.lower_expr(&bw.value_expr);
+
+        // Spillover map: each entry has a target var name + a hi-byte
+        // expression. Lower both alongside `value_node` (still under
+        // force_prev_reads).
+        let spillover_map: std::collections::HashMap<i64, (SlotId, NodeId)> = bw
+            .spillover_map
+            .iter()
+            .map(|(addr, (target_name, hi_expr))| {
+                let slot = self.slot_for(&bare_of(target_name));
+                let hi_node = self.lower_expr(hi_expr);
+                (*addr, (slot, hi_node))
+            })
+            .collect();
+        self.force_prev_reads = prev_force;
+
+        let spillover_guard = bw
+            .spillover_guard
+            .as_ref()
+            .map(|n| self.slot_for(&bare_of(n)));
+
+        DagBroadcast {
+            gate_slot,
+            dest_slot,
+            value_node,
+            address_map,
+            spillover_map,
+            spillover_guard,
+        }
+    }
+
+    /// Lower a v1-shaped `PackedSlotPort` into a v2-native record:
+    /// pre-resolve every property name. Packed broadcasts have no
+    /// value expression (the byte/word value comes from a slot read
+    /// at execution time), so this is pure slot resolution.
+    fn lower_packed_broadcast(&mut self, p: &PackedSlotPort) -> DagPackedBroadcast {
+        let bare_of = |n: &str| n.strip_prefix("--").unwrap_or(n).to_string();
+        let gate_slot = self.slot_for(&bare_of(&p.gate_property));
+        let addr_slot = self.slot_for(&bare_of(&p.addr_property));
+        let val_slot = self.slot_for(&bare_of(&p.val_property));
+        let width_slot = self.slot_for(&bare_of(&p.width_property));
+        let address_map: std::collections::HashMap<i64, SlotId> = p
+            .address_map
+            .iter()
+            .map(|(addr, name)| (*addr, self.slot_for(&bare_of(name))))
+            .collect();
+        DagPackedBroadcast {
+            gate_slot,
+            addr_slot,
+            val_slot,
+            width_slot,
+            address_map,
+            pack: p.pack,
+        }
+    }
 }
 
 /// Lower a `ParsedProgram` to a `Dag`.
@@ -518,15 +765,20 @@ pub fn lower_parsed_program(program: &ParsedProgram) -> Dag {
     absorbed.extend(packed_result.absorbed_properties);
     absorbed.extend(program.fast_path_absorbed.iter().cloned());
 
-    // Index function definitions by name so `lower_call` can resolve
-    // callees and inline their bodies. Also intern each name so that
-    // any call we can't inline (currently: recursive callees only —
-    // CSS rejects them but the guard is defensive) still has a stable
-    // `fn_id` for the FuncCall fallback delegated to v1.
+    // Index function definitions by name. Stable fn_ids assigned in
+    // declaration order so call sites can reference any function
+    // regardless of where it's declared.
     for f in &program.functions {
         ctx.functions.insert(f.name.clone(), f);
         ctx.intern_function(&f.name);
     }
+
+    // Lower every @function body once into the global node arena.
+    // Bodies use `Param(i)` placeholders for parameter references;
+    // call sites later emit `Call { fn_id, args }` instead of
+    // duplicating the body. This is the change from inline-at-lowering
+    // (combinatorial blowup on real cabinets) to shared sub-DAGs.
+    ctx.lower_all_function_bodies(&program.functions);
 
     // Lower top-level assignments. Skip:
     //   - Buffer-copy assignments (`--__0/__1/__2` prefix) — the slot
@@ -560,8 +812,24 @@ pub fn lower_parsed_program(program: &ParsedProgram) -> Dag {
         ctx.dag.terminals.push(id);
     }
 
+    // Lower v1-shaped broadcast records into v2-native records:
+    // every property name pre-resolved to a slot, every value
+    // expression lowered to a NodeId. The walker uses these natively;
+    // the v1-shaped vecs above are kept around only as scaffolding for
+    // any path that hasn't migrated yet.
+    let dag_broadcasts: Vec<DagBroadcast> = broadcast_writes
+        .iter()
+        .map(|bw| ctx.lower_broadcast(bw))
+        .collect();
+    let dag_packed_broadcasts: Vec<DagPackedBroadcast> = packed_broadcast_ports
+        .iter()
+        .map(|p| ctx.lower_packed_broadcast(p))
+        .collect();
+
     ctx.dag.broadcast_writes = broadcast_writes;
     ctx.dag.packed_broadcast_ports = packed_broadcast_ports;
+    ctx.dag.dag_broadcasts = dag_broadcasts;
+    ctx.dag.dag_packed_broadcasts = dag_packed_broadcasts;
     ctx.dag.absorbed_properties = absorbed;
     ctx.dag.transient_slot_count = ctx.transient_slots.len();
 
@@ -677,14 +945,23 @@ fn collect_current_reads(
                 collect_current_reads(dag, a, slot_to_term, out);
             }
         }
-        DagNode::FuncCall { args, .. } => {
-            // Conservatively include arg-side reads. The function
-            // body's own reads aren't traced here (the body evaluates
-            // arguments, not the call site's other slots) — Phase 2
-            // inlining will tighten this.
+        DagNode::FuncCall { args, .. } | DagNode::Call { args, .. } => {
+            // Arg-side reads count as dependencies. The function
+            // body's *own* reads (LoadVar Current of tick-globals)
+            // are conservatively NOT traversed here: bodies are
+            // shared across call sites and may reference slots the
+            // current call's caller doesn't depend on. A future
+            // refinement would traverse the body once per fn_id and
+            // cache the slot set.
             for &a in args {
                 collect_current_reads(dag, a, slot_to_term, out);
             }
+        }
+        DagNode::Param(_) => {
+            // Param placeholders only appear inside function bodies,
+            // which the top-level traversal doesn't enter (see Call
+            // arm above). If we ever do, Param resolves to a caller-
+            // context arg — which has already been traversed.
         }
         DagNode::If { branches, fallback } => {
             for (cond, then_id) in branches {
@@ -815,7 +1092,7 @@ mod tests {
     }
 
     #[test]
-    fn lowers_function_call_by_inlining() {
+    fn lowers_function_call_to_shared_call_node() {
         // `--double(21)` should inline to `calc(21 * 2)` — i.e. a Calc
         // node whose first arg is the lit 21 (param substitution) and
         // second is the lit 2. No FuncCall node should remain because
@@ -830,33 +1107,47 @@ mod tests {
         let dag = build(css);
         assert_eq!(dag.terminals.len(), 1);
 
-        // No FuncCall in the DAG.
+        // No legacy FuncCall in the DAG (would mean v1 fallback fired).
         for n in &dag.nodes {
             if matches!(n, DagNode::FuncCall { .. }) {
-                panic!("expected no FuncCall after inlining; DAG: {:?}", dag.nodes);
+                panic!("unexpected FuncCall fallback; DAG: {:?}", dag.nodes);
             }
         }
 
-        // Terminal's value is a Mul node.
+        // Terminal's value is a Call referencing the shared body root.
         let terminal_id = dag.terminals[0];
         let value_id = match &dag.nodes[terminal_id as usize] {
             DagNode::WriteVar { value, .. } => *value,
             other => panic!("expected WriteVar, got {other:?}"),
         };
-        match &dag.nodes[value_id as usize] {
-            DagNode::Calc { op: CalcKind::Mul, args } => {
-                assert_eq!(args.len(), 2);
-                // Param substitution: arg[0] should resolve to Lit(21).
-                match &dag.nodes[args[0] as usize] {
-                    DagNode::Lit(v) => assert_eq!(*v, 21.0),
-                    other => panic!("expected Lit(21) for substituted --x, got {other:?}"),
+        let (fn_id, args) = match &dag.nodes[value_id as usize] {
+            DagNode::Call { fn_id, args } => (*fn_id, args.clone()),
+            other => panic!("expected Call, got {other:?}"),
+        };
+        assert_eq!(args.len(), 1);
+        // Arg is Lit(21) at the call site.
+        match &dag.nodes[args[0] as usize] {
+            DagNode::Lit(v) => assert_eq!(*v, 21.0),
+            other => panic!("expected Lit(21), got {other:?}"),
+        }
+
+        // Function body root (lowered once) is a Mul node whose first
+        // arg is Param(0) and second is Lit(2).
+        assert_eq!(dag.function_param_counts[fn_id as usize], 1);
+        let body_root = dag.function_roots[fn_id as usize];
+        match &dag.nodes[body_root as usize] {
+            DagNode::Calc { op: CalcKind::Mul, args: body_args } => {
+                assert_eq!(body_args.len(), 2);
+                match &dag.nodes[body_args[0] as usize] {
+                    DagNode::Param(0) => {}
+                    other => panic!("expected Param(0), got {other:?}"),
                 }
-                match &dag.nodes[args[1] as usize] {
+                match &dag.nodes[body_args[1] as usize] {
                     DagNode::Lit(v) => assert_eq!(*v, 2.0),
                     other => panic!("expected Lit(2), got {other:?}"),
                 }
             }
-            other => panic!("expected Calc(Mul), got {other:?}"),
+            other => panic!("expected Calc(Mul) body, got {other:?}"),
         }
     }
 
@@ -943,6 +1234,59 @@ mod tests {
             }
         }
         assert!(found, "inlined dispatch on substituted param should become Switch");
+    }
+
+    #[test]
+    fn broadcast_value_lowers_with_prev_reads() {
+        // Build a broadcast write: 10+ branches dispatching on `--dest`
+        // to write `var(--src)` into different cells. Verify a
+        // DagBroadcast is produced and its value_node walks back to a
+        // LoadVar with TickPosition::Prev (broadcasts read committed
+        // state, not the per-tick scalar cache).
+        let mut css = String::from(
+            r#"
+            @property --dest { syntax: "<integer>"; inherits: true; initial-value: 0; }
+            @property --src { syntax: "<integer>"; inherits: true; initial-value: 0; }
+            "#,
+        );
+        for i in 0..12 {
+            css.push_str(&format!(
+                "@property --cell{i} {{ syntax: \"<integer>\"; inherits: true; initial-value: 0; }}\n"
+            ));
+        }
+        css.push_str(":root {\n");
+        for i in 0..12 {
+            css.push_str(&format!(
+                "  --cell{i}: if(style(--dest: {i}): var(--src); else: var(--__1cell{i}));\n"
+            ));
+        }
+        css.push_str("}\n");
+
+        let dag = build(&css);
+
+        // Recogniser fires (12 ≥ 10 entries) → one v2-native broadcast.
+        assert_eq!(
+            dag.dag_broadcasts.len(),
+            1,
+            "expected one v2-native broadcast"
+        );
+        let bw = &dag.dag_broadcasts[0];
+        assert_eq!(bw.address_map.len(), 12);
+
+        // Walk the value_node — should be a single LoadVar Prev for
+        // --src (broadcast value reads bypass the per-tick cache).
+        match &dag.nodes[bw.value_node as usize] {
+            DagNode::LoadVar { kind: TickPosition::Prev, .. } => {}
+            other => panic!("expected LoadVar Prev, got {other:?}"),
+        }
+
+        // dest_slot should match what slot_for(--dest) would resolve to.
+        let dest_in_map = dag
+            .name_to_slot
+            .get("dest")
+            .copied()
+            .expect("dest registered");
+        assert_eq!(bw.dest_slot, dest_in_map);
     }
 
     #[test]
