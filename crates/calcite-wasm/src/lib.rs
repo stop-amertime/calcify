@@ -183,30 +183,19 @@ impl CalciteEngine {
         self.state.restore(blob).map_err(JsError::new)
     }
 
-    /// Inject a keypress into the BDA ring buffer.
+    /// Inject a keypress.
     /// Pass (scancode << 8 | ascii), matching the standard PC keyboard convention.
-    /// Two delivery paths are populated:
-    ///   1. The BDA keyboard buffer at 0x41E (for INT 16h consumers).
-    ///   2. The `--keyboard` shadow at linear 0x500 (for INT 9h / port 0x60
-    ///      consumers — programs that hook IRQ 1 directly).
-    ///
-    /// In pure-CSS the player drives `--keyboard` from button :active state,
-    /// and CSS edge-detects make/break in `--_kbdPress` / `--_kbdRelease`.
-    /// Calcite implements `var(--keyboard)` as `read_mem(0x500)`, so writing
-    /// here is the equivalent. To produce a make/break pair the caller posts
+    /// Writes the `--keyboard` shadow at linear 0x500; the cabinet's IRQ 1 edge
+    /// detection then fires INT 09h, which is what populates the BDA ring buffer
+    /// at 0x41E for INT 16h consumers (zork, etc.) and lets DOOM read the
+    /// scancode via `IN AL, 0x60`. To produce a make/break pair the caller posts
     /// (key=N, then key=0) on consecutive `set_keyboard` calls.
-    ///
-    /// DOOM8088 reads scancodes via `IN AL, 0x60` from its own INT 9h handler;
-    /// without this 0x500 write IRQ 1 never fires and the title-screen demo
-    /// loop never advances.
     pub fn set_keyboard(&mut self, key: i32) {
-        self.state.bda_push_key(key);
         // Drive the `--keyboard` state-var that calcite watches for IRQ 1
-        // edges. (CSS-DOS pure-CSS sets --keyboard via `:has(:active)` button
-        // rules; in calcite that mapping is replaced by a state-var slot of
-        // the same name. Without this write, --keyboard stays 0 forever and
-        // _kbdEdge never fires.) Smoke / SDK tests don't depend on this so
-        // it's a free addition.
+        // edges. The cabinet's INT 09h ISR is the single source of BDA ring
+        // pushes. Earlier versions of this method also called bda_push_key
+        // directly; once corduroy installed an INT 09h handler that also
+        // pushes, every press doubled (zork "G" → "gg").
         self.state.set_var("keyboard", key & 0xFFFF);
     }
 
