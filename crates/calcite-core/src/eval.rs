@@ -673,25 +673,10 @@ impl Evaluator {
             self.dag_v2_inlined_locals.resize(inlined.max_locals.max(1), 0);
             self.dag_v2_inlined = Some(inlined);
         }
-        // Materialise the wasm DAG + host on first switch into the
-        // wasm backend. Same DAG-clone shape; the host owns a
-        // wasmtime engine + instance + per-terminal TypedFunc cache.
-        // Failure to instantiate (e.g. malformed emit, host import
-        // wiring drift) is caught at backend-switch time, not at
-        // first tick.
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            if matches!(backend, Backend::DagV2Wasm) && self.dag_v2_wasm.is_none() {
-                let wasm_dag = crate::dag::WasmDag::build(self.dag_v2.clone());
-                let host = crate::dag::WasmHost::instantiate(
-                    &wasm_dag.wasm_bytes,
-                    &wasm_dag.emitted,
-                )
-                .expect("wasm host instantiate (codegen drift?)");
-                self.dag_v2_wasm = Some(wasm_dag);
-                self.dag_v2_wasm_host = Some(host);
-            }
-        }
+        // Wasm DAG + host: deferred to first tick. Codegen needs to
+        // know `state.state_var_count()` (for the linear-memory
+        // layout) and we don't have access to State from here.
+        // `dag_v2_wasm_tick` builds the host lazily on its first call.
         self.backend = backend;
     }
 
@@ -2348,6 +2333,21 @@ impl Evaluator {
     /// reentry would NPE rather than read stale memory.
     #[cfg(not(target_arch = "wasm32"))]
     fn dag_v2_wasm_tick(&mut self, state: &mut State) {
+        // Lazy build: codegen needs `state.state_var_count()` to size
+        // the wasm linear memory, but `set_backend` doesn't have
+        // State access. Build on first tick.
+        if self.dag_v2_wasm.is_none() {
+            let n_state_vars = state.state_var_count() as u32;
+            let wasm_dag = crate::dag::WasmDag::build(self.dag_v2.clone(), n_state_vars);
+            let host = crate::dag::WasmHost::instantiate(
+                &wasm_dag.wasm_bytes,
+                &wasm_dag.emitted,
+                wasm_dag.layout,
+            )
+            .expect("wasm host instantiate (codegen drift?)");
+            self.dag_v2_wasm = Some(wasm_dag);
+            self.dag_v2_wasm_host = Some(host);
+        }
         let wdag = self.dag_v2_wasm.take().expect("dag_v2_wasm must be set");
         let host = self
             .dag_v2_wasm_host
@@ -2389,6 +2389,15 @@ impl Evaluator {
 
         // Phase 1: scalar WriteVars. For each terminal: if it has a
         // wasm function, call it; otherwise walker fallback.
+        //
+        // Wasm linear memory holds the cascade caches for state-var
+        // and transient reads. Reset once at tick start, then poke
+        // after each terminal so subsequent terminals see prior
+        // writes (matches walker semantics — every LoadVar reads the
+        // live cascade cache). Bulk re-zeroing per-terminal would
+        // cost O(n_state_vars × n_terminals) of memory writes, which
+        // exceeds the wasm savings on cabinets with hundreds of slots.
+        host.reset_tick();
         for (i, &term_id) in wdag.dag.terminals.iter().enumerate() {
             let crate::dag::DagNode::WriteVar { slot, value } = &wdag.dag.nodes[term_id as usize]
             else {
@@ -2397,13 +2406,7 @@ impl Evaluator {
             let slot = *slot;
             let value_id = *value;
             let v = if wdag.emitted[i].is_some() {
-                host.run_terminal(
-                    i,
-                    state,
-                    &state_var_cache,
-                    &memory_cache,
-                    &transient_cache,
-                )
+                host.run_terminal(i, state, &memory_cache)
             } else {
                 self.dag_v2_epoch = self.dag_v2_epoch.wrapping_add(1);
                 let mut buf = DagWalkBuf {
@@ -2421,11 +2424,13 @@ impl Evaluator {
                 let idx = (-slot - 1) as usize;
                 if idx < state_var_cache.len() {
                     state_var_cache[idx] = Some(v);
+                    host.poke_state_var(idx, v);
                 }
             } else if slot >= crate::dag::TRANSIENT_BASE {
                 let idx = (slot - crate::dag::TRANSIENT_BASE) as usize;
                 if idx < transient_cache.len() {
                     transient_cache[idx] = Some(v);
+                    host.poke_transient(idx, v);
                 }
             } else {
                 memory_cache.insert(slot, v);

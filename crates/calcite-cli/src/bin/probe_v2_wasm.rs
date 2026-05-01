@@ -45,7 +45,12 @@ fn main() {
             _ => {}
         }
     }
-    let wasm_dag = WasmDag::build(dag);
+    // Need state.state_var_count() to size linear memory. Build a
+    // throwaway state from properties just for the count.
+    let mut tmp_state = State::default();
+    tmp_state.load_properties(&parsed.properties);
+    let n_state_vars = tmp_state.state_var_count() as u32;
+    let wasm_dag = WasmDag::build(dag, n_state_vars);
     let (total, covered) = wasm_dag.coverage();
     println!("=== wasm-codegen coverage ===");
     println!("  total nodes:         {n_nodes}");

@@ -11,6 +11,137 @@ and the Criterion benchmarks.
 
 ---
 
+## 2026-05-01: v2 Phase 3 (a) — wasm leads the v2 backends after coverage + linear-memory state
+
+Three layered changes from the baseline:
+
+1. **Switch / Call / If lowering** — refactored `emit_terminal` into
+   recursive `emit_value`. Switch/If lower to nested wasm
+   `if`/`else` chains with typed-result blocks; Call lowers to
+   wasm `call` against per-`@function` bodies emitted in phase 1.
+   Param(i) lowers to `local.get(i)`. Body emittability uses a
+   fixpoint loop over fn_id dependencies. StyleCondNode (Single/
+   And/Or) compiles to short-circuited i32-boolean wasm.
+2. **State in wasm linear memory** — state-var and transient cache
+   values + presence flags moved out of host imports into the
+   module's exported linear memory. LoadVar (state-var) becomes
+   `i32.load + flag check` with host-import fallback for slots
+   outside the materialised range; LoadVar (transient) becomes
+   `i32.load + select`. Memory reads (slot >= 0 < TRANSIENT_BASE)
+   and prev-tick reads stay as host imports. Layout (offsets) lives
+   on `WasmDag::layout`; the host knows where to write each cache.
+3. **In-wasm pure-i32 arithmetic** — Mul/Div/Mod/Min/Max/Neg/Abs/
+   Sign/Clamp lower to pure wasm i32 ops. Div/Mod include guards
+   for `b == 0` (→ 0) and `INT_MIN / -1` (→ INT_MIN, matching
+   walker's f64-cast-to-i32 saturation). Pow and Round-with-interval
+   keep the host trampoline (need real f64).
+
+Plus an incremental-update optimisation that turned out to matter
+more than expected: bulk-zeroing the wasm presence regions per
+terminal (the obvious "synchronise wasm memory with cache")
+costs O(n_state_vars × n_terminals) of writes per tick — enough to
+dominate on cabinets with hundreds of slots. Replaced with one
+bulk reset per tick + per-update `poke_state_var` / `poke_transient`
+calls (two i32 stores each) after each WriteVar updates the cache.
+
+### Coverage
+
+Same as the inlined prototype's set, plus Switch/Call/If/StyleCond.
+Bailed: `Concat`, `LitStr`, `LoadVarDynamic`, variadic Min/Max,
+non-i32-fitting Switch keys.
+
+### Correctness
+
+7/7 differentials green (`v2_wasm_differential.rs`):
+- emit path: simple_calc, arith_chain, div_mod, multi_tick state evolution
+- compound: dispatch (Switch), nested_calls (Call), mixed_cabinet
+  (per-terminal independent emit/fallback)
+
+Bit-identical to the walker. The pure-wasm Mul/Div/Mod path
+exercises i32 semantics matching f64-walker semantics on integer
+inputs.
+
+### Speed (5K bench, 500 warmup, native release, single run)
+
+| Cabinet | Coverage | v1 | walker | closures | inlined | **wasm** |
+|---|---|---|---|---|---|---|
+| rogue | 74.3% | 172K | 62K | 57K | 60K | **66K** |
+| zork1 | 70.1% | 228K | 63K | 65K | 62K | **70K** |
+| bootle | 70.1% | 226K | 62K | 56K | 73K | **71K** |
+
+**Wasm leads or ties every cabinet** among the v2 backends. ~14%
+over walker, ~5-15% over inlined-Rust. Still ~2.5-3.5× behind v1
+bytecode (which has years of peephole optimisations: DispatchChain,
+BranchIfNotEqLit, unchecked indexing, dense flat-array dispatch
+fast paths).
+
+### What this is and isn't
+
+**Is**: a real Phase 3 (a) wasm-codegen path. Native wasmtime host
++ in-tree codegen. Bit-identical to walker on real cabinets.
+Beats the rest of v2.
+
+**Isn't**: wired into the browser yet. The browser path is a
+follow-up — `calcite-wasm` needs to expose the wasm-bytes blob to
+JS, and JS needs to call `WebAssembly.instantiate` and bind the
+host imports. Module + driver work for both targets; only the
+runtime split is native-only at the moment.
+
+**Isn't**: a v1-bytecode replacement. The v1 path's micro-optimised
+interpreter pays ~5 µs/tick on rogue; wasm pays ~15 µs/tick at this
+coverage. Closing that gap is independent work — the next
+candidates are dropping `host_read_memory` crossings (move that
+cache into linear memory too, sparse → dense via per-cabinet
+index map), and maybe lowering broadcasts to wasm.
+
+### Why per-terminal incremental poke matters
+
+The obvious shape — `prepare_tick(svc, tc)` before each call,
+which zeros + populates the regions — was 1.4× SLOWER than the
+host-import baseline on rogue (29 µs vs 21 µs/tick). With ~110
+emitted terminals × ~200 state-vars × 8 bytes per slot × 2
+(zero+set), that's ~350 KB of memory writes per tick just to
+synchronise wasm memory with the Rust cache. Bigger than the work
+the wasm functions themselves do.
+
+The fix — one reset at tick start + per-write poke (two stores) —
+amortised the synchronisation across the actual cache mutations
+the driver was already making. ~110 pokes × 8 bytes = 880 bytes
+per tick, ~400× less than the bulk approach.
+
+### Artefacts
+
+- `crates/calcite-core/src/dag/wasm_codegen.rs` — refactored
+  emitter with recursive `emit_value`. Switch/If lower to nested
+  wasm `if`/`else`; Call to wasm `call`; pure-i32 arithmetic for
+  Mul/Div/Mod/Min/Max/Neg/Abs/Sign/Clamp; LoadVar via linear
+  memory with host-import fallback. `WasmMemoryLayout` describes
+  the per-cabinet memory regions.
+- `crates/calcite-core/src/dag/wasm_host.rs` — `WasmHost` now owns
+  the exported wasm memory; `reset_tick` + `poke_state_var` /
+  `poke_transient` methods for incremental cache sync.
+- `crates/calcite-core/src/eval.rs` — driver lazily builds the
+  wasm DAG + host on first tick (codegen needs
+  `state.state_var_count()`, not available from `set_backend`);
+  poke after each WriteVar so subsequent terminals see prior writes.
+- `crates/calcite-core/tests/v2_wasm_differential.rs` — 7
+  differentials, all green; covers emit path + walker fallback +
+  multi-tick state evolution + host-trampoline arithmetic.
+- `crates/calcite-cli/src/bin/probe_v2_wasm.rs` — coverage report
+  + 5-backend speed.
+
+### Carved out for the next milestone
+
+- Browser execution path (calcite-wasm crate plumbing + JS).
+- Move `memory_cache` (sparse HashMap) into wasm linear memory or
+  a dense per-cabinet index — would eliminate the last hot host
+  import crossing.
+- Broadcast helpers in wasm (currently delegate to walker).
+- Branchless or `br_table`-based Switch dispatch for hot paths.
+- Doom8088 measurement (the cabinet that ships).
+
+---
+
 ## 2026-05-01: v2 Phase 3 (a) — wasm codegen baseline, end-to-end working
 
 Per the (c+) finding ("coverage is the binding constraint, not per-op

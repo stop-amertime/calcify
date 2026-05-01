@@ -7,46 +7,46 @@
 //! (wasmtime on native, `WebAssembly.instantiate` in the browser —
 //! browser wiring is a follow-up).
 //!
-//! This module is **portable** — it builds for both native and
-//! `wasm32-unknown-unknown`. The host runtime is not portable;
-//! `WasmHost` lives in `wasm_host.rs` behind a `cfg(not(target_arch =
-//! "wasm32"))` gate.
+//! Portable: builds for both native and `wasm32-unknown-unknown`.
+//! The host runtime lives in `wasm_host.rs` behind a
+//! `cfg(not(target_arch = "wasm32"))` gate.
 //!
-//! ## Design
+//! ## State in linear memory
 //!
-//! `emit_value(node, ...)` recursively emits any covered DAG node
-//! such that its result is left on the wasm operand stack. The
-//! emitter handles:
+//! State-var and transient cache values + presence flags live in the
+//! wasm module's linear memory. Layout (computed at codegen time):
 //!
-//! - **Pure straight-line nodes** (Lit, LoadVar, Calc, BitField,
-//!   BitwiseOp): evaluate deps recursively, then emit the op. Cached
-//!   in `local_of` for CSE reuse — but only at the unconditional
-//!   level (see § Conditional sharing below).
-//! - **Switch**: emit the key, then a chain of `i32.eq` + wasm `if`
-//!   blocks (one per branch). Each branch recursively emits its
-//!   sub-cone, leaving the branch's result on the stack as the
-//!   `if`-block's typed result. The fallback is the innermost else.
-//! - **If**: same chain shape, with `StyleCondNode` predicates
-//!   compiled to short-circuited i32-boolean wasm.
-//! - **Call**: each `@function` body lowers to its own wasm function
-//!   in the same module (with `(param i32 ... i32) (result i32)`
-//!   matching the function's arity). A `Call { fn_id, args }` lowers
-//!   to evaluating each arg onto the stack then `wasm.call`. `Param(i)`
-//!   inside a body lowers to `local.get i`.
+//! ```text
+//!   [0,                  n_state_vars*4)        state-var values
+//!   [n_state_vars*4,    2*n_state_vars*4)       state-var present flags
+//!   [2*n_state_vars*4,  ... + n_transients*4)   transient values
+//!   [..,                ... + n_transients*4)   transient present flags
+//! ```
+//!
+//! `WasmDag::layout` carries the offsets so the host can populate
+//! the regions before each tick. Cache misses (flag == 0) fall
+//! through to a host import (state-var) or just return 0 (transient).
+//!
+//! Memory reads (slot >= 0, < TRANSIENT_BASE) still go via host
+//! import (`host_read_memory`) because their per-tick cache is sparse
+//! (HashMap) and not worth materialising. Cross-tick reads
+//! (`TickPosition::Prev`) go via `host_read_prev`.
+//!
+//! ## In-wasm arithmetic
+//!
+//! Add/Sub/Mul/Div/Mod/Min/Max/Neg/Abs/Sign/Clamp lower to pure
+//! wasm i32 ops, matching the walker's f64 semantics on integer
+//! inputs (the typical cabinet workload — verified by differential).
+//! Pow and Round-with-interval keep the host trampoline because they
+//! need real f64.
 //!
 //! ## Conditional sharing
 //!
-//! Locals persist for the lifetime of the wasm function but are
-//! initialised to zero. A node reachable from multiple Switch/If
-//! branches can't be safely cached as a local because if branch A
-//! computed it and branch B reads it, B sees a stale zero. So
-//! `local_of` caching is only used for nodes emitted at the
-//! function's unconditional top level — once we descend into a
-//! control branch, we re-emit shared sub-DAGs locally to that
-//! branch. This costs wasm bytes on cabinets with shared
-//! sub-expressions across branches; in practice the DAG lowering
-//! rarely shares across branches because each branch is lowered
-//! independently.
+//! Locals persist for the lifetime of the wasm function but default
+//! to zero. A node reachable from multiple Switch/If branches can't
+//! safely cache as a local because if branch A computed it and
+//! branch B reads it, B sees a stale zero. So `local_of` caching
+//! is only honoured outside control flow (`inside_branch == false`).
 //!
 //! Cardinal rule: this module knows nothing about CSS-DOS, x86, or
 //! cabinets. It walks `Dag` shapes — same vocabulary as the walker,
@@ -56,63 +56,42 @@ use std::collections::HashMap;
 
 use wasm_encoder::{
     BlockType, CodeSection, ConstExpr, EntityType, ExportKind, ExportSection, Function,
-    FunctionSection, ImportSection, Instruction, MemoryType, Module, TypeSection, ValType,
+    FunctionSection, ImportSection, Instruction, MemArg, MemoryType, Module, TypeSection, ValType,
 };
 
 use crate::dag::types::{BitwiseKind, CalcKind, Dag, DagNode, NodeId, StyleCondNode, TickPosition};
 
-/// Function index of `host_read_state_var(slot: i32) -> i32`.
-pub const HOST_READ_STATE_VAR: u32 = 0;
-/// Function index of `host_read_memory(slot: i32) -> i32`.
-pub const HOST_READ_MEMORY: u32 = 1;
-/// Function index of `host_read_transient(slot: i32) -> i32`.
-pub const HOST_READ_TRANSIENT: u32 = 2;
-/// Function index of `host_read_prev(slot: i32) -> i32`. Bypasses
-/// the per-tick caches; goes straight to `state.read_mem`.
-pub const HOST_READ_PREV: u32 = 3;
-/// Function index of `host_calc_binary(kind: i32, a: i32, b: i32) -> i32`.
-/// Generic binary op trampoline — `kind` selects f64 op, args are
-/// passed as `i32` (the f64 cast happens host-side to match walker
-/// semantics exactly).
-pub const HOST_CALC_BINARY: u32 = 4;
-/// Function index of `host_calc_unary(kind: i32, a: i32) -> i32`.
-pub const HOST_CALC_UNARY: u32 = 5;
-/// Function index of `host_calc_ternary(kind: i32, a: i32, b: i32, c: i32) -> i32`.
-/// Used by Clamp (lo, v, hi) and Round(strategy, v, interval).
-pub const HOST_CALC_TERNARY: u32 = 6;
-/// Number of host imports above. User functions start at this index.
-const N_IMPORTS: u32 = 7;
+// ---------- host imports ---------------------------------------------
 
-/// Op kinds for the `host_calc_*` trampolines.
+/// `host_read_memory(slot: i32) -> i32`. Memory reads (slot >= 0,
+/// < TRANSIENT_BASE) consult the host's sparse per-tick HashMap
+/// cache, then fall through to `state.read_mem`.
+pub const HOST_READ_MEMORY: u32 = 0;
+/// `host_read_prev(slot: i32) -> i32`. Cross-tick reads bypass all
+/// per-tick caches; goes straight to `state.read_mem`.
+pub const HOST_READ_PREV: u32 = 1;
+/// `host_calc_binary(kind: i32, a: i32, b: i32) -> i32`. Used for
+/// `Pow`, the only binary calc that wasm i32 can't reproduce.
+pub const HOST_CALC_BINARY: u32 = 2;
+/// `host_calc_ternary(kind: i32, a: i32, b: i32, c: i32) -> i32`.
+/// Used for `Round(strategy)`; strategy id is the third arg.
+pub const HOST_CALC_TERNARY: u32 = 3;
+/// User function indices start after the imports.
+const N_IMPORTS: u32 = 4;
+
+/// Op kinds for the `host_calc_*` trampolines. Trimmed to just the
+/// f64-rounded ops that don't lower cleanly to pure wasm.
 #[repr(i32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WasmCalcKind {
-    Mul = 1,
-    Div = 2,
-    Mod = 3,
     Pow = 4,
-    Min2 = 5,
-    Max2 = 6,
-    Neg = 10,
-    Abs = 11,
-    Sign = 12,
-    Clamp = 20,
     Round = 21,
 }
 
 impl WasmCalcKind {
     pub fn from_i32(v: i32) -> Option<WasmCalcKind> {
         Some(match v {
-            1 => WasmCalcKind::Mul,
-            2 => WasmCalcKind::Div,
-            3 => WasmCalcKind::Mod,
             4 => WasmCalcKind::Pow,
-            5 => WasmCalcKind::Min2,
-            6 => WasmCalcKind::Max2,
-            10 => WasmCalcKind::Neg,
-            11 => WasmCalcKind::Abs,
-            12 => WasmCalcKind::Sign,
-            20 => WasmCalcKind::Clamp,
             21 => WasmCalcKind::Round,
             _ => return None,
         })
@@ -124,59 +103,76 @@ pub const ROUND_UP: i32 = 31;
 pub const ROUND_DOWN: i32 = 32;
 pub const ROUND_TO_ZERO: i32 = 33;
 
+// ---------- public types ---------------------------------------------
+
 /// One emitted terminal: the wasm function index inside the module
 /// and the local count (for diagnostics).
 #[derive(Debug, Clone)]
 pub struct EmittedWasmTerminal {
-    /// Index into the module's function space (post-imports).
     pub func_idx: u32,
-    /// Number of i32 locals the function declared.
     pub local_count: u32,
 }
 
-/// A compiled wasm module for one cabinet, plus the per-terminal
-/// dispatch info the driver uses to decide emit-vs-fallback.
+/// Linear-memory layout of the per-cabinet wasm module. Sized at
+/// codegen time from the host's `state.state_var_count()` and
+/// `dag.transient_slot_count`.
+#[derive(Debug, Clone, Copy)]
+pub struct WasmMemoryLayout {
+    pub n_state_vars: u32,
+    pub n_transients: u32,
+    pub sv_value_base: u32,
+    pub sv_present_base: u32,
+    pub tr_value_base: u32,
+    pub tr_present_base: u32,
+    pub mem_bytes: u32,
+    pub mem_pages: u32,
+}
+
+impl WasmMemoryLayout {
+    pub fn new(n_state_vars: u32, n_transients: u32) -> Self {
+        let sv_value_base = 0u32;
+        let sv_present_base = sv_value_base + n_state_vars * 4;
+        let tr_value_base = sv_present_base + n_state_vars * 4;
+        let tr_present_base = tr_value_base + n_transients * 4;
+        let used = tr_present_base + n_transients * 4;
+        let mem_pages = ((used as usize + 0xFFFF) / 0x10000).max(1) as u32;
+        let mem_bytes = mem_pages * 0x10000;
+        WasmMemoryLayout {
+            n_state_vars,
+            n_transients,
+            sv_value_base,
+            sv_present_base,
+            tr_value_base,
+            tr_present_base,
+            mem_bytes,
+            mem_pages,
+        }
+    }
+}
+
+/// A compiled wasm module for one cabinet.
 pub struct WasmDag {
-    /// The full DAG (used by the driver for walker fallback).
     pub dag: Dag,
-    /// One slot per `dag.terminals` entry. `Some` means the terminal
-    /// has an emitted wasm function; `None` means the driver falls
-    /// back to the walker.
     pub emitted: Vec<Option<EmittedWasmTerminal>>,
-    /// The complete wasm module bytes, ready for instantiation.
     pub wasm_bytes: Vec<u8>,
+    pub layout: WasmMemoryLayout,
 }
 
 impl WasmDag {
-    /// Diagnostic: (n_terminals_total, n_terminals_emitted).
     pub fn coverage(&self) -> (usize, usize) {
         let total = self.emitted.len();
         let covered = self.emitted.iter().filter(|x| x.is_some()).count();
         (total, covered)
     }
 
-    /// Build a wasm module + per-terminal dispatch table from the DAG.
-    pub fn build(dag: Dag) -> Self {
-        let mut builder = ModuleBuilder::new();
+    /// Build a wasm module from `dag`. `n_state_vars` is the host's
+    /// state-var slot count (used to size the wasm linear memory).
+    pub fn build(dag: Dag, n_state_vars: u32) -> Self {
+        let n_transients = dag.transient_slot_count as u32;
+        let layout = WasmMemoryLayout::new(n_state_vars, n_transients);
+        let mut builder = ModuleBuilder::new(layout);
 
-        // Phase 1: lower each `@function` body to a wasm function.
-        //
-        // Each body has a fixed wasm function index allocated up front
-        // so that intra-module `call` instructions resolve regardless
-        // of emit order (CSS @function forbids recursion but mutual
-        // helpers reach each other through forward references). A
-        // body's body-cone may contain a Call into a sibling whose own
-        // cone fails to lower; in that case both bodies become
-        // non-emittable and any Call into either bails its enclosing
-        // terminal.
-        //
-        // Detect this by emitting bodies until the emittability set
-        // reaches a fixpoint. Initial pass marks "structurally
-        // emittable" bodies (no unsupported nodes in own cone). Each
-        // subsequent pass invalidates bodies whose Calls now point at
-        // a body marked non-emittable. Converges in at most
-        // `function_roots.len()` passes (one body per pass in the
-        // worst case of a chain of dependencies).
+        // Phase 1: emit one wasm function per `@function` body.
         let n_fns = dag.function_roots.len();
         let mut fn_wasm_idx: Vec<Option<u32>> = Vec::with_capacity(n_fns);
         let mut fn_type_indices: Vec<u32> = Vec::with_capacity(n_fns);
@@ -189,30 +185,27 @@ impl WasmDag {
             fn_wasm_idx.push(Some(func_idx));
         }
 
-        // Fixpoint loop: try to lower each body; on failure mark its
-        // wasm idx as None; repeat until no body's status changed.
-        // O(n_fns) per pass × O(n_fns) passes worst case — acceptable
-        // for the typical n_fns < 100.
+        // Fixpoint: try to lower each body; on failure mark its idx
+        // as None; repeat until stable. Bodies whose Calls target a
+        // now-failed body fail too.
         loop {
             let mut changed = false;
             for fn_id in 0..n_fns {
                 if fn_wasm_idx[fn_id].is_none() {
-                    continue; // already marked failed
+                    continue;
                 }
                 let n_params = dag.function_param_counts[fn_id];
                 let root = dag.function_roots[fn_id];
                 let mut local_count: u32 = n_params;
                 let mut local_of: HashMap<NodeId, u32> = HashMap::new();
                 let mut body: Vec<Instruction<'static>> = Vec::new();
-                let ok = emit_value(
-                    &dag,
-                    root,
-                    &mut body,
-                    &mut local_count,
-                    &mut local_of,
-                    &fn_wasm_idx,
-                    /*inside_branch=*/ false,
-                );
+                let mut ctx = EmitCtx {
+                    local_count: &mut local_count,
+                    local_of: &mut local_of,
+                    fn_wasm_idx: &fn_wasm_idx,
+                    layout: &layout,
+                };
+                let ok = emit_value(&dag, root, &mut body, &mut ctx, false);
                 if !ok {
                     fn_wasm_idx[fn_id] = None;
                     changed = true;
@@ -223,10 +216,7 @@ impl WasmDag {
             }
         }
 
-        // Now emit final bodies. Successful bodies emit normally;
-        // failed bodies emit `unreachable` so the wasm validates but
-        // any (non-bailed) call into them traps loudly. (Calls
-        // SHOULD have bailed already — this is belt-and-suspenders.)
+        // Final body emit (committing to module).
         for fn_id in 0..n_fns {
             let fn_type_idx = fn_type_indices[fn_id];
             let n_params = dag.function_param_counts[fn_id];
@@ -235,15 +225,13 @@ impl WasmDag {
             let mut local_of: HashMap<NodeId, u32> = HashMap::new();
             let mut body: Vec<Instruction<'static>> = Vec::new();
             let ok = if fn_wasm_idx[fn_id].is_some() {
-                emit_value(
-                    &dag,
-                    root,
-                    &mut body,
-                    &mut local_count,
-                    &mut local_of,
-                    &fn_wasm_idx,
-                    false,
-                )
+                let mut ctx = EmitCtx {
+                    local_count: &mut local_count,
+                    local_of: &mut local_of,
+                    fn_wasm_idx: &fn_wasm_idx,
+                    layout: &layout,
+                };
+                emit_value(&dag, root, &mut body, &mut ctx, false)
             } else {
                 false
             };
@@ -262,74 +250,71 @@ impl WasmDag {
             builder.code.function(&func);
         }
 
-        // Phase 2: emit one wasm function per WriteVar terminal whose
-        // cone is fully supported.
+        // Phase 2: terminal functions.
         let mut emitted: Vec<Option<EmittedWasmTerminal>> = Vec::with_capacity(dag.terminals.len());
         for &term_id in &dag.terminals {
             let result = match &dag.nodes[term_id as usize] {
-                DagNode::WriteVar { value, .. } => emit_terminal(&dag, *value, &mut builder, &fn_wasm_idx),
+                DagNode::WriteVar { value, .. } => {
+                    emit_terminal(&dag, *value, &mut builder, &fn_wasm_idx)
+                }
                 _ => None,
             };
             emitted.push(result);
         }
 
         let wasm_bytes = builder.finish();
-        WasmDag { dag, emitted, wasm_bytes }
+        WasmDag { dag, emitted, wasm_bytes, layout }
     }
 }
 
-/// Encoder state.
+// ---------- module builder -------------------------------------------
+
 struct ModuleBuilder {
     types: TypeSection,
     imports: ImportSection,
     functions: FunctionSection,
     exports: ExportSection,
     code: CodeSection,
-    /// Index of `() -> i32` in the type section (terminal signature).
+    memory: wasm_encoder::MemorySection,
+    layout: WasmMemoryLayout,
     type_idx_terminal: u32,
-    /// Cache: arity → type index for `(param i32 × N) -> i32`. Reused
-    /// across function-body type definitions.
     fn_type_cache: HashMap<u32, u32>,
-    /// Next user function index (post-imports + already-allocated).
     next_func_idx: u32,
 }
 
 impl ModuleBuilder {
-    fn new() -> Self {
+    fn new(layout: WasmMemoryLayout) -> Self {
         let mut types = TypeSection::new();
-        // Index 0: () -> i32 (terminal functions).
         types.ty().function([], [ValType::I32]);
         let type_idx_terminal = 0;
-        // Index 1: (i32) -> i32 (host_read_*).
         types.ty().function([ValType::I32], [ValType::I32]);
         let type_idx_read_slot = 1;
-        // Index 2: (i32, i32, i32) -> i32 (host_calc_binary).
         types
             .ty()
             .function([ValType::I32, ValType::I32, ValType::I32], [ValType::I32]);
         let type_idx_calc_binary = 2;
-        // Index 3: (i32, i32) -> i32 (host_calc_unary).
-        types
-            .ty()
-            .function([ValType::I32, ValType::I32], [ValType::I32]);
-        let type_idx_calc_unary = 3;
-        // Index 4: (i32, i32, i32, i32) -> i32 (host_calc_ternary).
         types.ty().function(
             [ValType::I32, ValType::I32, ValType::I32, ValType::I32],
             [ValType::I32],
         );
-        let type_idx_calc_ternary = 4;
+        let type_idx_calc_ternary = 3;
 
         let mut imports = ImportSection::new();
-        imports.import("host", "read_state_var", EntityType::Function(type_idx_read_slot));
         imports.import("host", "read_memory", EntityType::Function(type_idx_read_slot));
-        imports.import("host", "read_transient", EntityType::Function(type_idx_read_slot));
         imports.import("host", "read_prev", EntityType::Function(type_idx_read_slot));
         imports.import("host", "calc_binary", EntityType::Function(type_idx_calc_binary));
-        imports.import("host", "calc_unary", EntityType::Function(type_idx_calc_unary));
         imports.import("host", "calc_ternary", EntityType::Function(type_idx_calc_ternary));
 
-        let _ = (type_idx_calc_binary, type_idx_calc_unary, type_idx_calc_ternary);
+        let mut memory = wasm_encoder::MemorySection::new();
+        memory.memory(MemoryType {
+            minimum: layout.mem_pages as u64,
+            maximum: None,
+            memory64: false,
+            shared: false,
+            page_size_log2: None,
+        });
+
+        let _ = (type_idx_calc_binary, type_idx_calc_ternary);
 
         ModuleBuilder {
             types,
@@ -337,28 +322,25 @@ impl ModuleBuilder {
             functions: FunctionSection::new(),
             exports: ExportSection::new(),
             code: CodeSection::new(),
+            memory,
+            layout,
             type_idx_terminal,
             fn_type_cache: HashMap::new(),
             next_func_idx: N_IMPORTS,
         }
     }
 
-    /// Get/create a function-body type index for `(param i32 × n) -> i32`.
     fn add_function_type(&mut self, n_params: u32) -> u32 {
         if let Some(&idx) = self.fn_type_cache.get(&n_params) {
             return idx;
         }
         let params: Vec<ValType> = (0..n_params).map(|_| ValType::I32).collect();
-        // Allocate next type index. The five base types occupy 0..5;
-        // each new one appends.
-        let new_idx = 5 + self.fn_type_cache.len() as u32;
+        let new_idx = 4 + self.fn_type_cache.len() as u32;
         self.types.ty().function(params, [ValType::I32]);
         self.fn_type_cache.insert(n_params, new_idx);
         new_idx
     }
 
-    /// Append a terminal function. `body` must terminate with the
-    /// result on the stack; `End` is appended automatically.
     fn add_terminal(&mut self, n_locals: u32, body: Vec<Instruction<'static>>) -> u32 {
         let func_idx = self.next_func_idx;
         self.next_func_idx += 1;
@@ -374,22 +356,38 @@ impl ModuleBuilder {
         func_idx
     }
 
-    /// Assemble the module.
-    fn finish(self) -> Vec<u8> {
+    fn finish(mut self) -> Vec<u8> {
+        self.exports.export("mem", ExportKind::Memory, 0);
         let mut module = Module::new();
         module.section(&self.types);
         module.section(&self.imports);
         module.section(&self.functions);
+        module.section(&self.memory);
         module.section(&self.exports);
         module.section(&self.code);
         let _ = ConstExpr::i32_const(0);
-        let _ = MemoryType { minimum: 0, maximum: None, memory64: false, shared: false, page_size_log2: None };
         let _ = BlockType::Empty;
         module.finish()
     }
 }
 
-/// Emit a terminal function for one `WriteVar`'s value root.
+// ---------- emit context ---------------------------------------------
+
+struct EmitCtx<'a> {
+    local_count: &'a mut u32,
+    local_of: &'a mut HashMap<NodeId, u32>,
+    fn_wasm_idx: &'a [Option<u32>],
+    layout: &'a WasmMemoryLayout,
+}
+
+impl<'a> EmitCtx<'a> {
+    fn alloc_local(&mut self) -> u32 {
+        let id = *self.local_count;
+        *self.local_count += 1;
+        id
+    }
+}
+
 fn emit_terminal(
     dag: &Dag,
     value_root: NodeId,
@@ -399,15 +397,13 @@ fn emit_terminal(
     let mut local_count: u32 = 0;
     let mut local_of: HashMap<NodeId, u32> = HashMap::new();
     let mut body: Vec<Instruction<'static>> = Vec::new();
-    let ok = emit_value(
-        dag,
-        value_root,
-        &mut body,
-        &mut local_count,
-        &mut local_of,
+    let mut ctx = EmitCtx {
+        local_count: &mut local_count,
+        local_of: &mut local_of,
         fn_wasm_idx,
-        /*inside_branch=*/ false,
-    );
+        layout: &builder.layout,
+    };
+    let ok = emit_value(dag, value_root, &mut body, &mut ctx, false);
     if !ok {
         return None;
     }
@@ -415,36 +411,17 @@ fn emit_terminal(
     Some(EmittedWasmTerminal { func_idx, local_count })
 }
 
-/// Emit `node` such that its result is left on the wasm operand stack.
-/// Returns false if the cone contains anything we can't lower (caller
-/// bails the whole terminal).
-///
-/// `local_count` is the total number of i32 locals the wasm function
-/// will declare (param count not included for terminal functions —
-/// they have no params; for body functions, the params occupy
-/// 0..n_params and `local_count` starts at `n_params`).
-///
-/// `local_of` caches non-Param nodes that have been emitted to a
-/// local; reads after the first cache the value via `local.tee` /
-/// `local.get`. Caching only happens at unconditional positions
-/// (`inside_branch == false`) for correctness — a node emitted inside
-/// one branch can't be safely reused from another branch (locals
-/// default to 0; the second branch would observe a stale read).
-#[allow(clippy::too_many_arguments)]
+// ---------- emit_value -----------------------------------------------
+
 fn emit_value(
     dag: &Dag,
     node_id: NodeId,
     body: &mut Vec<Instruction<'static>>,
-    local_count: &mut u32,
-    local_of: &mut HashMap<NodeId, u32>,
-    fn_wasm_idx: &[Option<u32>],
+    ctx: &mut EmitCtx<'_>,
     inside_branch: bool,
 ) -> bool {
-    // Cache hit (only honoured outside branches; see § Conditional
-    // sharing). Param nodes never cache — they always read from the
-    // function's parameter local directly.
     if !inside_branch {
-        if let Some(&local) = local_of.get(&node_id) {
+        if let Some(&local) = ctx.local_of.get(&node_id) {
             body.push(Instruction::LocalGet(local));
             return true;
         }
@@ -455,88 +432,22 @@ fn emit_value(
             body.push(Instruction::I32Const(*v as i32));
         }
         DagNode::LoadVar { slot, kind } => {
-            emit_load_var(body, *slot, *kind);
+            emit_load_var(body, *slot, *kind, ctx);
         }
         DagNode::Param(idx) => {
-            // Function param. Read directly; never cached.
             body.push(Instruction::LocalGet(*idx));
             return true;
         }
         DagNode::Calc { op, args } => {
-            // Three shapes:
-            // - Pure i32 ops (Add/Sub): args first, then op. Direct.
-            // - Binary/unary trampoline (Mul/Div/Mod/Pow/Min/Max/
-            //   Neg/Abs/Sign): kind first, then args, then call.
-            // - Ternary trampoline (Clamp/Round): kind first, then
-            //   args, optional strategy id, then call.
-            match (op, args.len()) {
-                (CalcKind::Add, 2) => {
-                    if !emit_value(dag, args[0], body, local_count, local_of, fn_wasm_idx, inside_branch) { return false; }
-                    if !emit_value(dag, args[1], body, local_count, local_of, fn_wasm_idx, inside_branch) { return false; }
-                    body.push(Instruction::I32Add);
-                }
-                (CalcKind::Sub, 2) => {
-                    if !emit_value(dag, args[0], body, local_count, local_of, fn_wasm_idx, inside_branch) { return false; }
-                    if !emit_value(dag, args[1], body, local_count, local_of, fn_wasm_idx, inside_branch) { return false; }
-                    body.push(Instruction::I32Sub);
-                }
-                (CalcKind::Mul, 2) | (CalcKind::Div, 2) | (CalcKind::Mod, 2)
-                | (CalcKind::Pow, 2) | (CalcKind::Min, 2) | (CalcKind::Max, 2) => {
-                    let k = match op {
-                        CalcKind::Mul => WasmCalcKind::Mul,
-                        CalcKind::Div => WasmCalcKind::Div,
-                        CalcKind::Mod => WasmCalcKind::Mod,
-                        CalcKind::Pow => WasmCalcKind::Pow,
-                        CalcKind::Min => WasmCalcKind::Min2,
-                        CalcKind::Max => WasmCalcKind::Max2,
-                        _ => unreachable!(),
-                    };
-                    body.push(Instruction::I32Const(k as i32));
-                    if !emit_value(dag, args[0], body, local_count, local_of, fn_wasm_idx, inside_branch) { return false; }
-                    if !emit_value(dag, args[1], body, local_count, local_of, fn_wasm_idx, inside_branch) { return false; }
-                    body.push(Instruction::Call(HOST_CALC_BINARY));
-                }
-                (CalcKind::Neg, 1) | (CalcKind::Abs, 1) | (CalcKind::Sign, 1) => {
-                    let k = match op {
-                        CalcKind::Neg => WasmCalcKind::Neg,
-                        CalcKind::Abs => WasmCalcKind::Abs,
-                        CalcKind::Sign => WasmCalcKind::Sign,
-                        _ => unreachable!(),
-                    };
-                    body.push(Instruction::I32Const(k as i32));
-                    if !emit_value(dag, args[0], body, local_count, local_of, fn_wasm_idx, inside_branch) { return false; }
-                    body.push(Instruction::Call(HOST_CALC_UNARY));
-                }
-                (CalcKind::Clamp, 3) => {
-                    body.push(Instruction::I32Const(WasmCalcKind::Clamp as i32));
-                    if !emit_value(dag, args[0], body, local_count, local_of, fn_wasm_idx, inside_branch) { return false; }
-                    if !emit_value(dag, args[1], body, local_count, local_of, fn_wasm_idx, inside_branch) { return false; }
-                    if !emit_value(dag, args[2], body, local_count, local_of, fn_wasm_idx, inside_branch) { return false; }
-                    body.push(Instruction::Call(HOST_CALC_TERNARY));
-                }
-                (CalcKind::Round(strategy), 2) => {
-                    body.push(Instruction::I32Const(WasmCalcKind::Round as i32));
-                    if !emit_value(dag, args[0], body, local_count, local_of, fn_wasm_idx, inside_branch) { return false; }
-                    if !emit_value(dag, args[1], body, local_count, local_of, fn_wasm_idx, inside_branch) { return false; }
-                    let strat_id = match strategy {
-                        crate::types::RoundStrategy::Nearest => ROUND_NEAREST,
-                        crate::types::RoundStrategy::Up => ROUND_UP,
-                        crate::types::RoundStrategy::Down => ROUND_DOWN,
-                        crate::types::RoundStrategy::ToZero => ROUND_TO_ZERO,
-                    };
-                    body.push(Instruction::I32Const(strat_id));
-                    body.push(Instruction::Call(HOST_CALC_TERNARY));
-                }
-                // Variadic Min/Max with arity > 2 not supported.
-                _ => return false,
+            if !emit_calc(dag, op, args, body, ctx, inside_branch) {
+                return false;
             }
         }
         DagNode::BitField { src, shift, width } => {
-            // Shift >= 32 → result is constant 0.
             if *shift >= 32 {
                 body.push(Instruction::I32Const(0));
             } else {
-                if !emit_value(dag, *src, body, local_count, local_of, fn_wasm_idx, inside_branch) {
+                if !emit_value(dag, *src, body, ctx, inside_branch) {
                     return false;
                 }
                 body.push(Instruction::I32Const(*shift as i32));
@@ -552,12 +463,12 @@ fn emit_value(
             }
         }
         DagNode::BitwiseOp { kind, args } => {
-            if !emit_bitwise(body, dag, *kind, args, local_count, local_of, fn_wasm_idx, inside_branch) {
+            if !emit_bitwise(dag, *kind, args, body, ctx, inside_branch) {
                 return false;
             }
         }
         DagNode::Call { fn_id, args } => {
-            let Some(target_idx) = fn_wasm_idx.get(*fn_id as usize).and_then(|x| *x) else {
+            let Some(target_idx) = ctx.fn_wasm_idx.get(*fn_id as usize).and_then(|x| *x) else {
                 return false;
             };
             let expected_arity = dag.function_param_counts[*fn_id as usize] as usize;
@@ -565,39 +476,22 @@ fn emit_value(
                 return false;
             }
             for a in args {
-                if !emit_value(dag, *a, body, local_count, local_of, fn_wasm_idx, inside_branch) {
+                if !emit_value(dag, *a, body, ctx, inside_branch) {
                     return false;
                 }
             }
             body.push(Instruction::Call(target_idx));
         }
         DagNode::Switch { key, table, fallback } => {
-            // Compute key into a fresh local (we reference it once per
-            // i32.eq comparison). Allocate the local even inside a
-            // branch — wasm locals default to 0 so the inner branch
-            // initialises before reading.
-            let key_local = *local_count;
-            *local_count += 1;
-            if !emit_value(dag, *key, body, local_count, local_of, fn_wasm_idx, inside_branch) {
+            let key_local = ctx.alloc_local();
+            if !emit_value(dag, *key, body, ctx, inside_branch) {
                 return false;
             }
             body.push(Instruction::LocalSet(key_local));
 
-            // Emit chained `if` blocks: for each (k, branch) in `table`,
-            //   if (key == k) { emit branch } else { ...next... }
-            // Innermost else is the fallback.
-            //
-            // Iteration order is HashMap-arbitrary, which doesn't
-            // affect correctness (keys are tested for equality) but
-            // makes the wasm bytes non-deterministic across builds. To
-            // give us stable output and deterministic differentials,
-            // sort by key first.
             let mut entries: Vec<(i64, NodeId)> =
                 table.iter().map(|(k, v)| (*k, *v)).collect();
             entries.sort_by_key(|x| x.0);
-
-            // Validate every key fits in i32 before emitting anything
-            // (so failure doesn't leave half-emitted ops in body).
             for (k, _) in &entries {
                 if i32::try_from(*k).is_err() {
                     return false;
@@ -610,12 +504,12 @@ fn emit_value(
                 body.push(Instruction::I32Const(kv));
                 body.push(Instruction::I32Eq);
                 body.push(Instruction::If(BlockType::Result(ValType::I32)));
-                if !emit_value(dag, *branch_id, body, local_count, local_of, fn_wasm_idx, true) {
+                if !emit_value(dag, *branch_id, body, ctx, true) {
                     return false;
                 }
                 body.push(Instruction::Else);
             }
-            if !emit_value(dag, *fallback, body, local_count, local_of, fn_wasm_idx, true) {
+            if !emit_value(dag, *fallback, body, ctx, true) {
                 return false;
             }
             for _ in &entries {
@@ -623,40 +517,29 @@ fn emit_value(
             }
         }
         DagNode::If { branches, fallback } => {
-            // Cascade: for each branch, eval its predicate; if true,
-            // emit branch value; else continue to next predicate or
-            // fallback. Same chain structure as Switch except that
-            // the predicate is a StyleCondNode tree, not an equality
-            // test.
             if branches.is_empty() {
-                // Degenerate If — just emit fallback.
-                return emit_value(dag, *fallback, body, local_count, local_of, fn_wasm_idx, inside_branch);
+                return emit_value(dag, *fallback, body, ctx, inside_branch);
             }
             for (cond, branch) in branches {
-                if !emit_style_cond(dag, cond, body, local_count, local_of, fn_wasm_idx, inside_branch) {
+                if !emit_style_cond(dag, cond, body, ctx, inside_branch) {
                     return false;
                 }
                 body.push(Instruction::If(BlockType::Result(ValType::I32)));
-                if !emit_value(dag, *branch, body, local_count, local_of, fn_wasm_idx, true) {
+                if !emit_value(dag, *branch, body, ctx, true) {
                     return false;
                 }
                 body.push(Instruction::Else);
             }
-            if !emit_value(dag, *fallback, body, local_count, local_of, fn_wasm_idx, true) {
+            if !emit_value(dag, *fallback, body, ctx, true) {
                 return false;
             }
             for _ in branches {
                 body.push(Instruction::End);
             }
         }
-        // Concat / LitStr / IndirectStore / WriteVar / LoadVarDynamic
-        // — not handled in this codegen pass.
         _ => return false,
     }
 
-    // Cache leaf results so subsequent reads inside this same
-    // (unconditional) cone hit the cache. Skip for control nodes
-    // since their result is freshly-emitted on each path through.
     if !inside_branch {
         match &dag.nodes[node_id as usize] {
             DagNode::Lit(_)
@@ -665,68 +548,348 @@ fn emit_value(
             | DagNode::BitField { .. }
             | DagNode::BitwiseOp { .. }
             | DagNode::Call { .. } => {
-                // Tee into a fresh local for caching.
-                let local = *local_count;
-                *local_count += 1;
+                let local = ctx.alloc_local();
                 body.push(Instruction::LocalTee(local));
-                local_of.insert(node_id, local);
+                ctx.local_of.insert(node_id, local);
             }
-            // Switch / If / Param: already left on stack, no caching.
             _ => {}
         }
     }
     true
 }
 
-/// Emit a `StyleCondNode` predicate: leaves an i32 on the stack
-/// (1 = true, 0 = false).
-#[allow(clippy::too_many_arguments)]
+// ---------- LoadVar via linear memory --------------------------------
+
+fn emit_load_var(
+    body: &mut Vec<Instruction<'static>>,
+    slot: i32,
+    kind: TickPosition,
+    ctx: &EmitCtx<'_>,
+) {
+    if matches!(kind, TickPosition::Prev) {
+        body.push(Instruction::I32Const(slot));
+        body.push(Instruction::Call(HOST_READ_PREV));
+        return;
+    }
+
+    let layout = ctx.layout;
+    if slot >= crate::dag::TRANSIENT_BASE {
+        let idx = (slot - crate::dag::TRANSIENT_BASE) as i64;
+        if idx < 0 || idx as u32 >= layout.n_transients {
+            body.push(Instruction::I32Const(0));
+            return;
+        }
+        let value_addr = layout.tr_value_base + (idx as u32) * 4;
+        let present_addr = layout.tr_present_base + (idx as u32) * 4;
+        // present ? value : 0 (transients with no cache hit return 0
+        // — matches inlined runner's `unwrap_or(0)`).
+        body.push(Instruction::I32Const(value_addr as i32));
+        body.push(Instruction::I32Load(memarg_at(0)));
+        body.push(Instruction::I32Const(0));
+        body.push(Instruction::I32Const(present_addr as i32));
+        body.push(Instruction::I32Load(memarg_at(0)));
+        body.push(Instruction::Select);
+        return;
+    }
+    if slot < 0 {
+        let idx = (-slot - 1) as i64;
+        if idx < 0 || idx as u32 >= layout.n_state_vars {
+            body.push(Instruction::I32Const(slot));
+            body.push(Instruction::Call(HOST_READ_MEMORY));
+            return;
+        }
+        let value_addr = layout.sv_value_base + (idx as u32) * 4;
+        let present_addr = layout.sv_present_base + (idx as u32) * 4;
+        // if present then value else host_read_memory(slot).
+        body.push(Instruction::I32Const(present_addr as i32));
+        body.push(Instruction::I32Load(memarg_at(0)));
+        body.push(Instruction::If(BlockType::Result(ValType::I32)));
+        body.push(Instruction::I32Const(value_addr as i32));
+        body.push(Instruction::I32Load(memarg_at(0)));
+        body.push(Instruction::Else);
+        body.push(Instruction::I32Const(slot));
+        body.push(Instruction::Call(HOST_READ_MEMORY));
+        body.push(Instruction::End);
+        return;
+    }
+    body.push(Instruction::I32Const(slot));
+    body.push(Instruction::Call(HOST_READ_MEMORY));
+}
+
+#[inline]
+fn memarg_at(_offset: u64) -> MemArg {
+    MemArg { offset: 0, align: 2, memory_index: 0 }
+}
+
+// ---------- Calc -----------------------------------------------------
+
+fn emit_calc(
+    dag: &Dag,
+    op: &CalcKind,
+    args: &[NodeId],
+    body: &mut Vec<Instruction<'static>>,
+    ctx: &mut EmitCtx<'_>,
+    inside_branch: bool,
+) -> bool {
+    match (op, args.len()) {
+        (CalcKind::Add, 2) => {
+            if !emit_value(dag, args[0], body, ctx, inside_branch) { return false; }
+            if !emit_value(dag, args[1], body, ctx, inside_branch) { return false; }
+            body.push(Instruction::I32Add);
+        }
+        (CalcKind::Sub, 2) => {
+            if !emit_value(dag, args[0], body, ctx, inside_branch) { return false; }
+            if !emit_value(dag, args[1], body, ctx, inside_branch) { return false; }
+            body.push(Instruction::I32Sub);
+        }
+        (CalcKind::Mul, 2) => {
+            if !emit_value(dag, args[0], body, ctx, inside_branch) { return false; }
+            if !emit_value(dag, args[1], body, ctx, inside_branch) { return false; }
+            body.push(Instruction::I32Mul);
+        }
+        (CalcKind::Div, 2) => return emit_div(dag, args, body, ctx, inside_branch),
+        (CalcKind::Mod, 2) => return emit_mod(dag, args, body, ctx, inside_branch),
+        (CalcKind::Min, 2) => return emit_min_or_max(dag, args, body, ctx, inside_branch, true),
+        (CalcKind::Max, 2) => return emit_min_or_max(dag, args, body, ctx, inside_branch, false),
+        (CalcKind::Neg, 1) => {
+            body.push(Instruction::I32Const(0));
+            if !emit_value(dag, args[0], body, ctx, inside_branch) { return false; }
+            body.push(Instruction::I32Sub);
+        }
+        (CalcKind::Abs, 1) => return emit_abs(dag, args, body, ctx, inside_branch),
+        (CalcKind::Sign, 1) => return emit_sign(dag, args, body, ctx, inside_branch),
+        (CalcKind::Clamp, 3) => return emit_clamp(dag, args, body, ctx, inside_branch),
+        (CalcKind::Pow, 2) => {
+            body.push(Instruction::I32Const(WasmCalcKind::Pow as i32));
+            if !emit_value(dag, args[0], body, ctx, inside_branch) { return false; }
+            if !emit_value(dag, args[1], body, ctx, inside_branch) { return false; }
+            body.push(Instruction::Call(HOST_CALC_BINARY));
+        }
+        (CalcKind::Round(strategy), 2) => {
+            body.push(Instruction::I32Const(WasmCalcKind::Round as i32));
+            if !emit_value(dag, args[0], body, ctx, inside_branch) { return false; }
+            if !emit_value(dag, args[1], body, ctx, inside_branch) { return false; }
+            let strat_id = match strategy {
+                crate::types::RoundStrategy::Nearest => ROUND_NEAREST,
+                crate::types::RoundStrategy::Up => ROUND_UP,
+                crate::types::RoundStrategy::Down => ROUND_DOWN,
+                crate::types::RoundStrategy::ToZero => ROUND_TO_ZERO,
+            };
+            body.push(Instruction::I32Const(strat_id));
+            body.push(Instruction::Call(HOST_CALC_TERNARY));
+        }
+        _ => return false,
+    }
+    true
+}
+
+fn emit_div(
+    dag: &Dag,
+    args: &[NodeId],
+    body: &mut Vec<Instruction<'static>>,
+    ctx: &mut EmitCtx<'_>,
+    inside_branch: bool,
+) -> bool {
+    let n_local = ctx.alloc_local();
+    let d_local = ctx.alloc_local();
+    if !emit_value(dag, args[0], body, ctx, inside_branch) { return false; }
+    body.push(Instruction::LocalSet(n_local));
+    if !emit_value(dag, args[1], body, ctx, inside_branch) { return false; }
+    body.push(Instruction::LocalSet(d_local));
+    body.push(Instruction::LocalGet(d_local));
+    body.push(Instruction::I32Eqz);
+    body.push(Instruction::If(BlockType::Result(ValType::I32)));
+    body.push(Instruction::I32Const(0));
+    body.push(Instruction::Else);
+    // Guard INT_MIN / -1 (i32.div_s would trap). Walker behaviour:
+    // (INT_MIN as f64 / -1.0) as i32 == INT_MIN.
+    body.push(Instruction::LocalGet(n_local));
+    body.push(Instruction::I32Const(i32::MIN));
+    body.push(Instruction::I32Eq);
+    body.push(Instruction::LocalGet(d_local));
+    body.push(Instruction::I32Const(-1));
+    body.push(Instruction::I32Eq);
+    body.push(Instruction::I32And);
+    body.push(Instruction::If(BlockType::Result(ValType::I32)));
+    body.push(Instruction::I32Const(i32::MIN));
+    body.push(Instruction::Else);
+    body.push(Instruction::LocalGet(n_local));
+    body.push(Instruction::LocalGet(d_local));
+    body.push(Instruction::I32DivS);
+    body.push(Instruction::End);
+    body.push(Instruction::End);
+    true
+}
+
+fn emit_mod(
+    dag: &Dag,
+    args: &[NodeId],
+    body: &mut Vec<Instruction<'static>>,
+    ctx: &mut EmitCtx<'_>,
+    inside_branch: bool,
+) -> bool {
+    let n_local = ctx.alloc_local();
+    let d_local = ctx.alloc_local();
+    if !emit_value(dag, args[0], body, ctx, inside_branch) { return false; }
+    body.push(Instruction::LocalSet(n_local));
+    if !emit_value(dag, args[1], body, ctx, inside_branch) { return false; }
+    body.push(Instruction::LocalSet(d_local));
+    body.push(Instruction::LocalGet(d_local));
+    body.push(Instruction::I32Eqz);
+    body.push(Instruction::If(BlockType::Result(ValType::I32)));
+    body.push(Instruction::I32Const(0));
+    body.push(Instruction::Else);
+    body.push(Instruction::LocalGet(n_local));
+    body.push(Instruction::I32Const(i32::MIN));
+    body.push(Instruction::I32Eq);
+    body.push(Instruction::LocalGet(d_local));
+    body.push(Instruction::I32Const(-1));
+    body.push(Instruction::I32Eq);
+    body.push(Instruction::I32And);
+    body.push(Instruction::If(BlockType::Result(ValType::I32)));
+    body.push(Instruction::I32Const(0));
+    body.push(Instruction::Else);
+    body.push(Instruction::LocalGet(n_local));
+    body.push(Instruction::LocalGet(d_local));
+    body.push(Instruction::I32RemS);
+    body.push(Instruction::End);
+    body.push(Instruction::End);
+    true
+}
+
+fn emit_min_or_max(
+    dag: &Dag,
+    args: &[NodeId],
+    body: &mut Vec<Instruction<'static>>,
+    ctx: &mut EmitCtx<'_>,
+    inside_branch: bool,
+    is_min: bool,
+) -> bool {
+    let a_local = ctx.alloc_local();
+    let b_local = ctx.alloc_local();
+    if !emit_value(dag, args[0], body, ctx, inside_branch) { return false; }
+    body.push(Instruction::LocalSet(a_local));
+    if !emit_value(dag, args[1], body, ctx, inside_branch) { return false; }
+    body.push(Instruction::LocalSet(b_local));
+    body.push(Instruction::LocalGet(a_local));
+    body.push(Instruction::LocalGet(b_local));
+    body.push(Instruction::LocalGet(a_local));
+    body.push(Instruction::LocalGet(b_local));
+    body.push(if is_min { Instruction::I32LtS } else { Instruction::I32GtS });
+    body.push(Instruction::Select);
+    true
+}
+
+fn emit_abs(
+    dag: &Dag,
+    args: &[NodeId],
+    body: &mut Vec<Instruction<'static>>,
+    ctx: &mut EmitCtx<'_>,
+    inside_branch: bool,
+) -> bool {
+    let a_local = ctx.alloc_local();
+    if !emit_value(dag, args[0], body, ctx, inside_branch) { return false; }
+    body.push(Instruction::LocalSet(a_local));
+    body.push(Instruction::LocalGet(a_local));
+    body.push(Instruction::I32Const(0));
+    body.push(Instruction::LocalGet(a_local));
+    body.push(Instruction::I32Sub);
+    body.push(Instruction::LocalGet(a_local));
+    body.push(Instruction::I32Const(0));
+    body.push(Instruction::I32GeS);
+    body.push(Instruction::Select);
+    true
+}
+
+fn emit_sign(
+    dag: &Dag,
+    args: &[NodeId],
+    body: &mut Vec<Instruction<'static>>,
+    ctx: &mut EmitCtx<'_>,
+    inside_branch: bool,
+) -> bool {
+    let a_local = ctx.alloc_local();
+    if !emit_value(dag, args[0], body, ctx, inside_branch) { return false; }
+    body.push(Instruction::LocalSet(a_local));
+    // (x > 0 ? 1 : 0) - (x < 0 ? 1 : 0)
+    body.push(Instruction::I32Const(1));
+    body.push(Instruction::I32Const(0));
+    body.push(Instruction::LocalGet(a_local));
+    body.push(Instruction::I32Const(0));
+    body.push(Instruction::I32GtS);
+    body.push(Instruction::Select);
+    body.push(Instruction::I32Const(1));
+    body.push(Instruction::I32Const(0));
+    body.push(Instruction::LocalGet(a_local));
+    body.push(Instruction::I32Const(0));
+    body.push(Instruction::I32LtS);
+    body.push(Instruction::Select);
+    body.push(Instruction::I32Sub);
+    true
+}
+
+fn emit_clamp(
+    dag: &Dag,
+    args: &[NodeId],
+    body: &mut Vec<Instruction<'static>>,
+    ctx: &mut EmitCtx<'_>,
+    inside_branch: bool,
+) -> bool {
+    let lo_local = ctx.alloc_local();
+    let v_local = ctx.alloc_local();
+    let hi_local = ctx.alloc_local();
+    let max_local = ctx.alloc_local();
+    if !emit_value(dag, args[0], body, ctx, inside_branch) { return false; }
+    body.push(Instruction::LocalSet(lo_local));
+    if !emit_value(dag, args[1], body, ctx, inside_branch) { return false; }
+    body.push(Instruction::LocalSet(v_local));
+    if !emit_value(dag, args[2], body, ctx, inside_branch) { return false; }
+    body.push(Instruction::LocalSet(hi_local));
+    // max(v, lo)
+    body.push(Instruction::LocalGet(v_local));
+    body.push(Instruction::LocalGet(lo_local));
+    body.push(Instruction::LocalGet(v_local));
+    body.push(Instruction::LocalGet(lo_local));
+    body.push(Instruction::I32GtS);
+    body.push(Instruction::Select);
+    body.push(Instruction::LocalSet(max_local));
+    // min(max_local, hi)
+    body.push(Instruction::LocalGet(max_local));
+    body.push(Instruction::LocalGet(hi_local));
+    body.push(Instruction::LocalGet(max_local));
+    body.push(Instruction::LocalGet(hi_local));
+    body.push(Instruction::I32LtS);
+    body.push(Instruction::Select);
+    true
+}
+
+// ---------- StyleCondNode --------------------------------------------
+
 fn emit_style_cond(
     dag: &Dag,
     cond: &StyleCondNode,
     body: &mut Vec<Instruction<'static>>,
-    local_count: &mut u32,
-    local_of: &mut HashMap<NodeId, u32>,
-    fn_wasm_idx: &[Option<u32>],
+    ctx: &mut EmitCtx<'_>,
     inside_branch: bool,
 ) -> bool {
     match cond {
         StyleCondNode::Single { lhs, value } => {
-            if !emit_value(dag, *lhs, body, local_count, local_of, fn_wasm_idx, inside_branch) {
-                return false;
-            }
-            if !emit_value(dag, *value, body, local_count, local_of, fn_wasm_idx, inside_branch) {
-                return false;
-            }
+            if !emit_value(dag, *lhs, body, ctx, inside_branch) { return false; }
+            if !emit_value(dag, *value, body, ctx, inside_branch) { return false; }
             body.push(Instruction::I32Eq);
         }
         StyleCondNode::And(parts) => {
-            // Short-circuit AND: for each part, (cond) if(result i32)
-            // {next} else {0}. Innermost cond drops through.
             if parts.is_empty() {
                 body.push(Instruction::I32Const(1));
                 return true;
             }
             for part in &parts[..parts.len() - 1] {
-                if !emit_style_cond(dag, part, body, local_count, local_of, fn_wasm_idx, inside_branch) {
-                    return false;
-                }
+                if !emit_style_cond(dag, part, body, ctx, inside_branch) { return false; }
                 body.push(Instruction::If(BlockType::Result(ValType::I32)));
             }
-            // Innermost: emit last predicate as the value of this
-            // chain on the matching side; 0 on the failing side.
-            if !emit_style_cond(
-                dag,
-                &parts[parts.len() - 1],
-                body,
-                local_count,
-                local_of,
-                fn_wasm_idx,
-                inside_branch,
-            ) {
+            if !emit_style_cond(dag, &parts[parts.len() - 1], body, ctx, inside_branch) {
                 return false;
             }
-            // Close N-1 `if`s (each one with Else 0).
             for _ in 0..parts.len() - 1 {
                 body.push(Instruction::Else);
                 body.push(Instruction::I32Const(0));
@@ -739,23 +902,12 @@ fn emit_style_cond(
                 return true;
             }
             for part in &parts[..parts.len() - 1] {
-                if !emit_style_cond(dag, part, body, local_count, local_of, fn_wasm_idx, inside_branch) {
-                    return false;
-                }
-                // If true, short-circuit to 1; else continue.
+                if !emit_style_cond(dag, part, body, ctx, inside_branch) { return false; }
                 body.push(Instruction::If(BlockType::Result(ValType::I32)));
                 body.push(Instruction::I32Const(1));
                 body.push(Instruction::Else);
             }
-            if !emit_style_cond(
-                dag,
-                &parts[parts.len() - 1],
-                body,
-                local_count,
-                local_of,
-                fn_wasm_idx,
-                inside_branch,
-            ) {
+            if !emit_style_cond(dag, &parts[parts.len() - 1], body, ctx, inside_branch) {
                 return false;
             }
             for _ in 0..parts.len() - 1 {
@@ -766,43 +918,21 @@ fn emit_style_cond(
     true
 }
 
-fn emit_load_var(body: &mut Vec<Instruction<'static>>, slot: i32, kind: TickPosition) {
-    body.push(Instruction::I32Const(slot));
-    let func = match kind {
-        TickPosition::Prev => HOST_READ_PREV,
-        TickPosition::Current => {
-            if slot >= crate::dag::TRANSIENT_BASE {
-                HOST_READ_TRANSIENT
-            } else if slot < 0 {
-                HOST_READ_STATE_VAR
-            } else {
-                HOST_READ_MEMORY
-            }
-        }
-    };
-    body.push(Instruction::Call(func));
-}
+// ---------- BitwiseOp ------------------------------------------------
 
-#[allow(clippy::too_many_arguments)]
 fn emit_bitwise(
-    body: &mut Vec<Instruction<'static>>,
     dag: &Dag,
     kind: BitwiseKind,
     args: &[NodeId],
-    local_count: &mut u32,
-    local_of: &mut HashMap<NodeId, u32>,
-    fn_wasm_idx: &[Option<u32>],
+    body: &mut Vec<Instruction<'static>>,
+    ctx: &mut EmitCtx<'_>,
     inside_branch: bool,
 ) -> bool {
     let mask16 = 0xFFFFi32;
     match kind {
         BitwiseKind::Not => {
-            if args.len() != 1 {
-                return false;
-            }
-            if !emit_value(dag, args[0], body, local_count, local_of, fn_wasm_idx, inside_branch) {
-                return false;
-            }
+            if args.len() != 1 { return false; }
+            if !emit_value(dag, args[0], body, ctx, inside_branch) { return false; }
             body.push(Instruction::I32Const(mask16));
             body.push(Instruction::I32And);
             body.push(Instruction::I32Const(-1));
@@ -811,17 +941,11 @@ fn emit_bitwise(
             body.push(Instruction::I32And);
         }
         BitwiseKind::And | BitwiseKind::Or | BitwiseKind::Xor => {
-            if args.len() != 2 {
-                return false;
-            }
-            if !emit_value(dag, args[0], body, local_count, local_of, fn_wasm_idx, inside_branch) {
-                return false;
-            }
+            if args.len() != 2 { return false; }
+            if !emit_value(dag, args[0], body, ctx, inside_branch) { return false; }
             body.push(Instruction::I32Const(mask16));
             body.push(Instruction::I32And);
-            if !emit_value(dag, args[1], body, local_count, local_of, fn_wasm_idx, inside_branch) {
-                return false;
-            }
+            if !emit_value(dag, args[1], body, ctx, inside_branch) { return false; }
             body.push(Instruction::I32Const(mask16));
             body.push(Instruction::I32And);
             let op = match kind {
@@ -847,7 +971,7 @@ mod tests {
         let term = dag.push(DagNode::WriteVar { slot: -1, value: lit });
         dag.terminals.push(term);
 
-        let wasm_dag = WasmDag::build(dag);
+        let wasm_dag = WasmDag::build(dag, 4);
         assert_eq!(wasm_dag.coverage(), (1, 1));
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -866,18 +990,27 @@ mod tests {
         let four = dag.push(DagNode::Lit(4.0));
         let add = dag.push(DagNode::Calc { op: CalcKind::Add, args: vec![one, two] });
         let sub = dag.push(DagNode::Calc { op: CalcKind::Sub, args: vec![three, four] });
-        // Use only Add/Sub (pure i32) — Mul would need the trampoline
-        // shape we haven't fixed yet.
-        let combine = dag.push(DagNode::Calc { op: CalcKind::Add, args: vec![add, sub] });
+        let combine = dag.push(DagNode::Calc { op: CalcKind::Mul, args: vec![add, sub] });
         let term = dag.push(DagNode::WriteVar { slot: -1, value: combine });
         dag.terminals.push(term);
 
-        let wasm_dag = WasmDag::build(dag);
+        let wasm_dag = WasmDag::build(dag, 4);
         assert_eq!(wasm_dag.coverage(), (1, 1));
         #[cfg(not(target_arch = "wasm32"))]
         {
             let engine = wasmtime::Engine::default();
             wasmtime::Module::validate(&engine, &wasm_dag.wasm_bytes).expect("valid wasm");
         }
+    }
+
+    #[test]
+    fn memory_layout_sizes_correctly() {
+        let layout = WasmMemoryLayout::new(100, 50);
+        assert_eq!(layout.sv_value_base, 0);
+        assert_eq!(layout.sv_present_base, 400);
+        assert_eq!(layout.tr_value_base, 800);
+        assert_eq!(layout.tr_present_base, 1000);
+        assert_eq!(layout.mem_pages, 1);
+        assert_eq!(layout.mem_bytes, 65536);
     }
 }
