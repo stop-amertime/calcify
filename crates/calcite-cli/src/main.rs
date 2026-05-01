@@ -8,6 +8,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 mod calcite_logo;
 mod cssdos_logo;
 mod menu;
+mod watch_spec;
 
 /// calc(ite) — JIT compiler for computational CSS.
 ///
@@ -156,40 +157,6 @@ struct Cli {
     #[arg(long, value_name = "N")]
     trace_halt_skip: Option<u32>,
 
-    /// Scripted action to fire at a specific tick. Repeatable.
-    ///
-    /// Format: `TICK:KIND[:ARGS...]`. TICK may be decimal or 0xHEX. KIND is
-    /// one of:
-    ///
-    ///   `kbd:VALUE`               — set --keyboard to VALUE at TICK.
-    ///                               VALUE = (scan << 8) | ascii. Decimal or 0xHEX.
-    ///   `tap:VALUE[:HOLD]`        — press VALUE at TICK, release at TICK+HOLD.
-    ///                               HOLD defaults to 5000 ticks. Use this for
-    ///                               menu/key input — a single `kbd` doesn't
-    ///                               produce a release edge, so subsequent
-    ///                               keys are sometimes ignored.
-    ///   `dump:ADDR:LEN:PATH`      — write LEN bytes from guest linear ADDR to PATH.
-    ///   `regs[:TAG]`              — print one line of regs to stdout, prefixed `tag=TAG`.
-    ///   `halt`                    — stop the run at TICK.
-    ///
-    /// Examples:
-    ///   `--script-event=2000000:tap:0x1c0d` (Enter at 2M ticks)
-    ///   `--script-event=10000000:dump:0xa0000:64000:vga@10m.bin`
-    ///   `--script-event=15000000:regs:title-check`
-    ///   `--script-event=30000000:halt`
-    ///
-    /// Events are sorted by TICK; between events calcite uses run_batch
-    /// for full speed. This is the way to script multi-step interactions
-    /// (press a key, wait, dump, press another key) without paying the
-    /// per-tick cost of `--key-events`.
-    #[arg(long = "script-event", value_name = "TICK:KIND[:ARGS]")]
-    script_events: Vec<String>,
-
-    /// Read additional --script-event entries from a file, one per line.
-    /// Lines starting with `#` and blank lines are ignored.
-    #[arg(long = "script-file", value_name = "PATH")]
-    script_file: Option<PathBuf>,
-
     /// Restore a snapshot blob (produced by `--snapshot-out`) into the
     /// engine **before** the run begins. The cabinet must be the same one
     /// that produced the snapshot — slot ordering is parse-dependent.
@@ -206,16 +173,6 @@ struct Cli {
     /// rendering.
     #[arg(long = "snapshot-out", value_name = "PATH")]
     snapshot_out: Option<PathBuf>,
-
-    /// Run the engine in chunks of N ticks instead of one unbounded batch.
-    ///
-    /// Required for `--cond` to fire — conditions are evaluated only at
-    /// chunk boundaries. Default 0 = disabled (one big run_batch). At
-    /// 4.77 MHz, 50_000 ticks ≈ 10.5 ms of guest time, comparable to the
-    /// web bench's 250 ms wall poll once you account for native being
-    /// ~25× faster than the bridge.
-    #[arg(long = "poll-stride", value_name = "N", default_value = "0")]
-    poll_stride: u32,
 
     /// Sample CS:IP at fixed and bursty intervals for offline analysis.
     ///
@@ -248,42 +205,58 @@ struct Cli {
     #[arg(long = "op-profile", value_name = "PATH")]
     op_profile_path: Option<PathBuf>,
 
-    /// Stage condition. Repeatable.
+    /// Generic measurement watch. Repeatable.
     ///
-    /// Format: `NAME:ADDR=VAL[,ADDR=VAL...][:then=ACTION]`. ADDR/VAL may
-    /// be decimal or 0xHEX. ADDR is a linear guest-memory byte address;
-    /// VAL is the byte value to match. `ADDR!=VAL` matches when the byte
-    /// differs. Multiple comma-separated tests must all hold.
+    /// Format: `NAME:KIND:SPEC[:gate=NAME][:sample=VAR1,VAR2][:then=ACTION1+ACTION2+...]`
     ///
-    /// Special address tokens:
-    ///   `vram_text:NEEDLE`    — true if the ASCII string NEEDLE appears
-    ///                          in 80x25 text VRAM (B8000..B8FA0). NEEDLE
-    ///                          may not contain `,` `:` or `=`.
+    /// KIND:SPEC variants:
+    ///   `stride:every=N`           — fire every N ticks.
+    ///   `burst:every=N,count=K`    — fire on K consecutive ticks every N.
+    ///   `at:tick=T`                — fire exactly once at tick T (replaces
+    ///                                old --script-event scheduling).
+    ///   `edge:addr=A`              — fire on byte transitions at A.
+    ///   `cond:TEST1[,TEST2...][,repeat]`
+    ///                              — fire when all tests hold. Add
+    ///                                `,repeat` to fire on every rising
+    ///                                edge (default fires once).
+    ///   `halt:addr=A`              — fire and stop the run when byte at A
+    ///                                is non-zero.
     ///
-    /// At every `--poll-stride` boundary, all unfired stages are checked
-    /// in declaration order. On first match, the stage prints one line:
-    ///   `stage=NAME t_ms=W tick=T cycles=C`
-    /// and runs ACTION (if present), then is removed from polling. Each
-    /// stage fires at most once.
+    /// TEST: `ADDR=VAL` | `ADDR!=VAL` | `pattern@BASE:STRIDE:WINDOW=NEEDLE`
     ///
-    /// ACTION = one of:
-    ///   `tap:VALUE[:HOLD]`     — single press+release of (scan<<8)|ascii.
-    ///   `spam:VALUE:every=K`   — start tapping every K ticks. Continues
-    ///                            until a stage with `then=spam-stop`
-    ///                            fires or run ends.
-    ///   `spam-stop`            — stop any running spam.
-    ///   `halt`                 — stop the run.
+    /// ACTION (within `then=`, separated by `+`):
+    ///   `emit`                     — push a measurement event.
+    ///   `halt`                     — stop the run.
+    ///   `setvar=NAME,VALUE`        — write VALUE to state var NAME (e.g.
+    ///                                `setvar=keyboard,0x1c0d`).
+    ///   `dump=ADDR,LEN[,PATH]`     — write LEN bytes from ADDR to PATH.
+    ///                                PATH supports `{tick}` and `{name}`.
+    ///   `snapshot[=PATH]`          — write a snapshot blob to PATH.
     ///
-    /// Example (Doom8088 stage_menu):
-    ///   --cond=menu:0x3ac62=1:then=spam:0x1c0d:every=250000
+    /// Cheap-vs-expensive gating: `cond` and `edge` read guest memory and
+    /// are too expensive to evaluate per-tick on hot loops. Each watch
+    /// may name a `gate` (the name of another registered watch) — the
+    /// gated watch only evaluates on ticks where its gate fired.
     ///
-    /// Example (text-mode banner):
-    ///   --cond=text_drdos:0x449=0x03,vram_text:DR-DOS
+    /// Examples:
+    ///   --watch poll:stride:every=50000
+    ///   --watch ingame:cond:0x3a3c4=0:gate=poll:then=emit+halt
+    ///   --watch text_drdos:cond:0x449=0x03,pattern@0xb8000:2:4000=DR-DOS:gate=poll:then=emit
+    ///   --watch enter_at_2m:at:tick=2000000:then=setvar=keyboard,0x1c0d
+    ///   --watch dump_vram:stride:every=1000000:then=dump=0xb8000,4000,vram_{tick}.bin
     ///
-    /// Stage output goes to stdout as one line per stage. Polling is
-    /// silent unless a stage fires.
-    #[arg(long = "cond", value_name = "NAME:CONDS[:then=ACTION]")]
-    conds: Vec<String>,
+    /// Events go to stderr (one line each) and, if `--measure-out=PATH`
+    /// is given, to PATH as JSON Lines.
+    #[arg(long = "watch", value_name = "NAME:KIND:SPEC[:OPTS]")]
+    watches: Vec<String>,
+
+    /// Write measurement events to PATH as JSON Lines (one event per line).
+    ///
+    /// Each event is a `{"tick":T, "watch":"NAME", "vars":[[NAME,VAL],...],
+    /// "halted":bool, "dumps":[{tag, addr, path}]}` object. `--watch ...:then=emit`
+    /// (or any action that produces an event) populates this stream.
+    #[arg(long = "measure-out", value_name = "PATH")]
+    measure_out: Option<PathBuf>,
 }
 
 
@@ -433,284 +406,6 @@ fn dump_mem_range(spec: &str, state: &calcite_core::State) -> Result<(), String>
     Ok(())
 }
 
-/// One scheduled action during a run. Parsed from `--script-event` strings
-/// of the form `TICK:KIND[:ARGS...]`. See the flag's clap help for syntax.
-#[derive(Debug, Clone)]
-enum ScriptAction {
-    Kbd { value: i32 },
-    DumpMem { addr: i64, len: i64, path: String },
-    Regs { tag: String },
-    Halt,
-}
-
-#[derive(Debug, Clone)]
-struct ScriptEvent {
-    tick: u32,
-    action: ScriptAction,
-}
-
-fn parse_int_flexible(s: &str, what: &str) -> Result<i64, String> {
-    let s = s.trim();
-    let v = if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-        i64::from_str_radix(hex, 16)
-    } else {
-        s.parse::<i64>()
-    };
-    v.map_err(|e| format!("invalid {what} {s:?}: {e}"))
-}
-
-/// Returns one or more events (a `tap` becomes a press + release pair).
-fn parse_script_event(spec: &str) -> Result<Vec<ScriptEvent>, String> {
-    let mut iter = spec.splitn(2, ':');
-    let tick_s = iter.next().ok_or_else(|| format!("empty script-event {spec:?}"))?;
-    let rest = iter.next().ok_or_else(|| format!("script-event missing KIND: {spec:?}"))?;
-    let tick = parse_int_flexible(tick_s, "TICK")?;
-    if tick < 0 || tick > u32::MAX as i64 {
-        return Err(format!("TICK out of range in {spec:?}"));
-    }
-    let mut kind_iter = rest.splitn(2, ':');
-    let kind = kind_iter.next().unwrap_or("").trim();
-    let args = kind_iter.next().unwrap_or("");
-    match kind {
-        "kbd" => {
-            let v = parse_int_flexible(args, "VALUE")?;
-            Ok(vec![ScriptEvent { tick: tick as u32, action: ScriptAction::Kbd { value: v as i32 } }])
-        }
-        "tap" => {
-            // tap:VALUE[:HOLD_TICKS] — synthesize a press + release pair so
-            // the cabinet sees an _kbdPress edge then an _kbdRelease edge.
-            // Without the release, --prevKeyboard stays non-zero and the
-            // next "kbd <- VAL" only triggers a press if VAL differs from
-            // prev. Default hold = 5000 ticks, plenty for the 18.2 Hz PIT
-            // to fire IRQ 1 several times.
-            let parts: Vec<&str> = args.splitn(2, ':').collect();
-            let v = parse_int_flexible(parts[0], "VALUE")?;
-            let hold = if parts.len() == 2 {
-                parse_int_flexible(parts[1], "HOLD_TICKS")? as u32
-            } else { 5000 };
-            let release_tick = (tick as u32).saturating_add(hold);
-            Ok(vec![
-                ScriptEvent { tick: tick as u32, action: ScriptAction::Kbd { value: v as i32 } },
-                ScriptEvent { tick: release_tick, action: ScriptAction::Kbd { value: 0 } },
-            ])
-        }
-        "dump" => {
-            let parts: Vec<&str> = args.splitn(3, ':').collect();
-            if parts.len() != 3 {
-                return Err(format!("dump expects ADDR:LEN:PATH, got {args:?}"));
-            }
-            let addr = parse_int_flexible(parts[0], "ADDR")?;
-            let len = parse_int_flexible(parts[1], "LEN")?;
-            if len < 0 { return Err(format!("LEN must be non-negative, got {len}")); }
-            Ok(vec![ScriptEvent { tick: tick as u32, action: ScriptAction::DumpMem { addr, len, path: parts[2].to_string() } }])
-        }
-        "regs" => {
-            let tag = if args.is_empty() { String::new() } else { args.to_string() };
-            Ok(vec![ScriptEvent { tick: tick as u32, action: ScriptAction::Regs { tag } }])
-        }
-        "halt" => Ok(vec![ScriptEvent { tick: tick as u32, action: ScriptAction::Halt }]),
-        _ => Err(format!("unknown script-event KIND {kind:?} in {spec:?}")),
-    }
-}
-
-fn load_script_events(specs: &[String], file: Option<&std::path::Path>) -> Result<Vec<ScriptEvent>, String> {
-    let mut out: Vec<ScriptEvent> = Vec::new();
-    for s in specs {
-        out.extend(parse_script_event(s)?);
-    }
-    if let Some(p) = file {
-        let text = std::fs::read_to_string(p).map_err(|e| format!("read {p:?}: {e}"))?;
-        for (i, line) in text.lines().enumerate() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') { continue; }
-            out.extend(parse_script_event(line).map_err(|e| format!("{p:?} line {}: {e}", i + 1))?);
-        }
-    }
-    out.sort_by_key(|e| e.tick);
-    Ok(out)
-}
-
-/// One condition test inside a `--cond` stage.
-///
-/// `ByteEq` / `ByteNe` test a single byte at the linear address. `VramText`
-/// scans 80x25 text VRAM (B8000..B8FA0) for the ASCII needle, reading even
-/// bytes only (text VRAM is char,attr,char,attr,…).
-#[derive(Debug, Clone)]
-enum CondTest {
-    ByteEq { addr: i32, val: u8 },
-    ByteNe { addr: i32, val: u8 },
-    VramText { needle: String },
-}
-
-/// Action to run when a stage's conditions first match.
-#[derive(Debug, Clone)]
-enum CondAction {
-    None,
-    Tap { value: i32, hold: u32 },
-    Spam { value: i32, every: u32 },
-    SpamStop,
-    Halt,
-}
-
-#[derive(Debug, Clone)]
-struct StageDef {
-    name: String,
-    tests: Vec<CondTest>,
-    action: CondAction,
-}
-
-/// Parse a single --cond NAME:ADDR=VAL[,ADDR=VAL...][:then=ACTION] into a StageDef.
-fn parse_cond(spec: &str) -> Result<StageDef, String> {
-    // Split off NAME first.
-    let (name, rest) = spec.split_once(':')
-        .ok_or_else(|| format!("--cond missing ':': {spec:?}"))?;
-    if name.is_empty() {
-        return Err(format!("--cond stage name is empty: {spec:?}"));
-    }
-    // Optional ":then=ACTION" trailing segment. Split on ":then=".
-    let (conds_part, action_part) = match rest.find(":then=") {
-        Some(i) => (&rest[..i], Some(&rest[i + ":then=".len()..])),
-        None => (rest, None),
-    };
-    if conds_part.is_empty() {
-        return Err(format!("--cond {name:?} has no condition tests"));
-    }
-    let mut tests: Vec<CondTest> = Vec::new();
-    for tok in conds_part.split(',') {
-        let tok = tok.trim();
-        if tok.is_empty() { continue; }
-        if let Some(needle) = tok.strip_prefix("vram_text:") {
-            tests.push(CondTest::VramText { needle: needle.to_string() });
-        } else if let Some(idx) = tok.find("!=") {
-            let (a, v) = tok.split_at(idx);
-            let v = &v[2..];
-            let addr = parse_int_flexible(a, "ADDR")? as i32;
-            let val = parse_int_flexible(v, "VAL")? as u8;
-            tests.push(CondTest::ByteNe { addr, val });
-        } else if let Some(idx) = tok.find('=') {
-            let (a, v) = tok.split_at(idx);
-            let v = &v[1..];
-            let addr = parse_int_flexible(a, "ADDR")? as i32;
-            let val = parse_int_flexible(v, "VAL")? as u8;
-            tests.push(CondTest::ByteEq { addr, val });
-        } else {
-            return Err(format!("--cond test {tok:?} not ADDR=VAL / ADDR!=VAL / vram_text:NEEDLE"));
-        }
-    }
-    if tests.is_empty() {
-        return Err(format!("--cond {name:?} parsed to zero tests"));
-    }
-    let action = match action_part {
-        None => CondAction::None,
-        Some(a) => parse_cond_action(a)
-            .map_err(|e| format!("--cond {name:?} action: {e}"))?,
-    };
-    Ok(StageDef { name: name.to_string(), tests, action })
-}
-
-fn parse_cond_action(spec: &str) -> Result<CondAction, String> {
-    let (kind, args) = match spec.split_once(':') {
-        Some((k, a)) => (k, a),
-        None => (spec, ""),
-    };
-    match kind {
-        "halt" => Ok(CondAction::Halt),
-        "spam-stop" => Ok(CondAction::SpamStop),
-        "tap" => {
-            let parts: Vec<&str> = args.splitn(2, ':').collect();
-            if parts.is_empty() || parts[0].is_empty() {
-                return Err(format!("tap missing VALUE in {spec:?}"));
-            }
-            let value = parse_int_flexible(parts[0], "VALUE")? as i32;
-            let hold = if parts.len() == 2 {
-                parse_int_flexible(parts[1], "HOLD")? as u32
-            } else { 5000 };
-            Ok(CondAction::Tap { value, hold })
-        }
-        "spam" => {
-            // spam:VALUE:every=K
-            let parts: Vec<&str> = args.splitn(2, ':').collect();
-            if parts.len() != 2 {
-                return Err(format!("spam expects VALUE:every=K, got {args:?}"));
-            }
-            let value = parse_int_flexible(parts[0], "VALUE")? as i32;
-            let every_s = parts[1].strip_prefix("every=")
-                .ok_or_else(|| format!("spam expects every=K, got {:?}", parts[1]))?;
-            let every = parse_int_flexible(every_s, "every")? as u32;
-            if every == 0 {
-                return Err("spam every=0 would tap every tick — refusing".to_string());
-            }
-            Ok(CondAction::Spam { value, every })
-        }
-        _ => Err(format!("unknown action kind {kind:?}")),
-    }
-}
-
-/// Evaluate a single condition test against current state.
-fn cond_test_holds(t: &CondTest, state: &calcite_core::State) -> bool {
-    match t {
-        CondTest::ByteEq { addr, val } => (state.read_mem(*addr) & 0xFF) as u8 == *val,
-        CondTest::ByteNe { addr, val } => (state.read_mem(*addr) & 0xFF) as u8 != *val,
-        CondTest::VramText { needle } => {
-            // Text VRAM is char,attr,char,attr,… — match needle against even
-            // bytes only. 80*25 = 2000 chars = 4000 bytes.
-            let bytes = needle.as_bytes();
-            if bytes.is_empty() { return true; }
-            let n = bytes.len();
-            // 2000 char positions; we need n consecutive matches starting at i.
-            for start in 0..(2000 - n) {
-                let mut ok = true;
-                for j in 0..n {
-                    let b = (state.read_mem(0xB8000 + ((start + j) as i32) * 2) & 0xFF) as u8;
-                    if b != bytes[j] { ok = false; break; }
-                }
-                if ok { return true; }
-            }
-            false
-        }
-    }
-}
-
-fn execute_script_action(action: &ScriptAction, state: &mut calcite_core::State, current_tick: u32) -> bool {
-    // Returns true if execution should halt after this action.
-    match action {
-        ScriptAction::Kbd { value } => {
-            state.set_var("keyboard", *value);
-            eprintln!("[script {}] kbd <- 0x{:04x}", current_tick, *value as u32 & 0xFFFF);
-            false
-        }
-        ScriptAction::DumpMem { addr, len, path } => {
-            let mut buf = vec![0u8; *len as usize];
-            for i in 0..(*len as usize) {
-                buf[i] = (state.read_mem(*addr as i32 + i as i32) & 0xFF) as u8;
-            }
-            if let Err(e) = std::fs::write(path, &buf) {
-                eprintln!("[script {}] dump 0x{:X}+{} -> {}: ERROR {}", current_tick, addr, len, path, e);
-            } else {
-                eprintln!("[script {}] dump 0x{:X}+{} -> {}", current_tick, addr, len, path);
-            }
-            false
-        }
-        ScriptAction::Regs { tag } => {
-            // Print a compact one-line regs dump prefixed with the tag.
-            let names = ["AX","BX","CX","DX","SP","BP","SI","DI","IP","CS","DS","ES","SS","flags","cycleCount"];
-            let mut line = format!("[script {} regs", current_tick);
-            if !tag.is_empty() { line.push_str(&format!(" tag={}", tag)); }
-            line.push(']');
-            for name in names {
-                let v = state.state_var_names.iter().position(|n| n == name)
-                    .map(|i| state.state_vars[i]).unwrap_or(0);
-                line.push_str(&format!(" {}={}", name, v));
-            }
-            println!("{}", line);
-            false
-        }
-        ScriptAction::Halt => {
-            eprintln!("[script {}] halt", current_tick);
-            true
-        }
-    }
-}
 
 fn main() {
     env_logger::init();
@@ -888,35 +583,52 @@ fn main() {
                     .collect()
             }).unwrap_or_default();
 
-            // Parse --script-event / --script-file. Sorted by tick.
-            let script_events: Vec<ScriptEvent> = match load_script_events(
-                &cli.script_events,
-                cli.script_file.as_deref(),
-            ) {
-                Ok(v) => v,
-                Err(e) => { eprintln!("script: {e}"); std::process::exit(1); }
-            };
-            if !script_events.is_empty() {
-                eprintln!("loaded {} script event(s)", script_events.len());
-            }
-
-            // Parse --cond stage definitions.
-            let mut stages: Vec<StageDef> = Vec::new();
-            for s in &cli.conds {
-                match parse_cond(s) {
-                    Ok(sd) => stages.push(sd),
-                    Err(e) => { eprintln!("--cond {s:?}: {e}"); std::process::exit(1); }
+            // Parse --watch specs into a WatchRegistry. The native CLI
+            // writes dump/snapshot payloads to disk via the templated
+            // path; events flow to stderr (one line each) and to
+            // --measure-out as JSON Lines.
+            let mut watch_registry = calcite_core::script::WatchRegistry::new();
+            watch_registry.set_dump_sink(calcite_core::script::DumpSink::File);
+            for s in &cli.watches {
+                match watch_spec::parse_watch(s) {
+                    Ok(w) => { watch_registry.register(w); }
+                    Err(e) => {
+                        eprintln!("--watch {s:?}: {e}");
+                        std::process::exit(1);
+                    }
                 }
             }
-            // --cond requires --poll-stride to fire (silent otherwise).
-            if !stages.is_empty() && cli.poll_stride == 0 {
-                eprintln!("--cond requires --poll-stride=N (default 0 means stages never poll)");
-                std::process::exit(1);
+            // Validate gate references.
+            {
+                let names: std::collections::HashSet<String> =
+                    watch_registry.watch_names().map(|s| s.to_string()).collect();
+                for s in &cli.watches {
+                    if let Ok(w) = watch_spec::parse_watch(s) {
+                        if let Some(g) = &w.gate {
+                            if !names.contains(g) {
+                                eprintln!("--watch {:?}: gate {:?} is not a registered watch", w.name, g);
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                }
             }
-            if !stages.is_empty() {
-                eprintln!("loaded {} stage condition(s), poll-stride={}", stages.len(), cli.poll_stride);
+            if !watch_registry.is_empty() {
+                eprintln!("registered {} watch(es)", watch_registry.len());
             }
-            let poll_stride: u32 = cli.poll_stride;
+
+            // --measure-out: open the JSON-lines stream up-front so we
+            // can append per emitted event.
+            let mut measure_out: Option<std::io::BufWriter<std::fs::File>> =
+                cli.measure_out.as_ref().and_then(|p| {
+                    match std::fs::File::create(p) {
+                        Ok(f) => Some(std::io::BufWriter::new(f)),
+                        Err(e) => {
+                            eprintln!("--measure-out={}: {}", p.display(), e);
+                            std::process::exit(1);
+                        }
+                    }
+                });
 
             let t2 = std::time::Instant::now();
 
@@ -1578,139 +1290,154 @@ fn main() {
                         }
                     }
                 }
-            } else if !script_events.is_empty() || !stages.is_empty() {
-                // Unified scripted-run path. Each iteration advances the
-                // engine to the next "interesting" tick — the soonest of:
-                //   - next scripted script-event tick
-                //   - next poll-stride boundary (if stages exist)
-                //   - next pending spam tap
-                //   - ticks_limit
-                // and then evaluates whichever of those fired.
+            } else if !watch_registry.is_empty() {
+                // Watch-driven runner. Advance in chunks; after each
+                // chunk poll the registry against the current state.
+                // Cheap watches (Stride/Burst/At/Halt) gate the
+                // expensive ones (Cond/Edge) per the registry's two-
+                // phase poll.
                 //
-                // run_batch is the only call that drives ticks; it's never
-                // invoked for batch < 1, and the stride is whatever the
-                // user configured. Per-tick overhead is zero when nothing
-                // fires this stride.
+                // We poll once per CHUNK_TICKS, not per individual
+                // tick, to keep the per-tick overhead at zero. This
+                // means stride watches with `every` smaller than
+                // CHUNK_TICKS only fire at chunk boundaries  not the
+                // exact stride boundary  but they still fire with
+                // the right cadence on average. For exact-tick fires
+                // (At, Halt) we shrink the next chunk to land on the
+                // target tick. CHUNK_TICKS picked at 50_000  matches
+                // the old --poll-stride default; ~10ms of guest time
+                // at 8086 4.77 MHz, ~150ms wall on the slower wasm
+                // runtime.
+                const CHUNK_TICKS: u32 = 50_000;
+
+                // Pre-compute exact-tick targets (from At watches) and
+                // the smallest stride across stride-kind watches. The
+                // chunk size shrinks to whichever target lands soonest
+                // so cursor never overshoots a watch's exact firing
+                // tick.
+                let mut at_targets: Vec<u32> = Vec::new();
+                let mut min_stride: u32 = u32::MAX;
+                for spec_str in &cli.watches {
+                    if let Ok(w) = watch_spec::parse_watch(spec_str) {
+                        match w.kind {
+                            calcite_core::script::WatchKind::At { tick: t } => {
+                                at_targets.push(t);
+                            }
+                            calcite_core::script::WatchKind::Stride { every } => {
+                                if every > 0 && every < min_stride {
+                                    min_stride = every;
+                                }
+                            }
+                            calcite_core::script::WatchKind::Burst { every, .. } => {
+                                if every > 0 && every < min_stride {
+                                    min_stride = every;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                at_targets.sort_unstable();
+
                 let mut cursor: u32 = 0;
                 let mut halted = false;
-                let mut script_idx: usize = 0;
-
-                // Active spam state: which stage started it, the value, the
-                // cadence. None when no spam is active.
-                struct SpamState { value: i32, every: u32, next_tick: u32 }
-                let mut spam: Option<SpamState> = None;
-
-                // Pending release for any in-flight tap (spam taps too).
-                let mut pending_release_tick: Option<u32> = None;
-
-                // Map name -> stage index, plus a fired flag per stage.
-                let mut stage_fired: Vec<bool> = vec![false; stages.len()];
-
                 while cursor < ticks_limit && !halted {
-                    // Determine the next firing tick.
-                    let mut next_tick = ticks_limit;
-                    if poll_stride > 0 {
-                        // Next stride boundary > cursor.
-                        let n = (cursor / poll_stride + 1) * poll_stride;
-                        if n < next_tick { next_tick = n; }
+                    let mut chunk = CHUNK_TICKS.min(ticks_limit - cursor);
+                    if min_stride < chunk {
+                        chunk = min_stride;
                     }
-                    while script_idx < script_events.len()
-                        && script_events[script_idx].tick <= cursor {
-                        // Edge case: an event at tick==0 should fire at cursor==0.
-                        if script_events[script_idx].tick == cursor {
-                            if execute_script_action(&script_events[script_idx].action, &mut state, cursor) {
-                                halted = true;
-                            }
-                            script_idx += 1;
-                            if halted { break; }
-                        } else {
-                            // Past-due (shouldn't happen in practice given sort).
-                            script_idx += 1;
+                    // Land exactly on the next At target if one is
+                    // closer than the chunk size.
+                    if let Ok(idx) = at_targets.binary_search(&(cursor + 1)) {
+                        let t = at_targets[idx];
+                        if t > cursor && t - cursor < chunk {
+                            chunk = t - cursor;
+                        }
+                    } else if let Some(t) = at_targets.iter().find(|&&t| t > cursor) {
+                        if *t - cursor < chunk {
+                            chunk = *t - cursor;
                         }
                     }
-                    if halted { break; }
-                    if script_idx < script_events.len() {
-                        let t = script_events[script_idx].tick;
-                        if t < next_tick { next_tick = t; }
-                    }
-                    if let Some(s) = &spam {
-                        if s.next_tick < next_tick { next_tick = s.next_tick; }
-                    }
-                    if let Some(rt) = pending_release_tick {
-                        if rt < next_tick { next_tick = rt; }
+                    if chunk == 0 { chunk = 1; }
+                    evaluator.run_batch(&mut state, chunk);
+                    cursor = cursor.saturating_add(chunk);
+                    calcite_core::script_eval::poll(&mut watch_registry, &mut state, cursor);
+
+                    let elapsed_ms = t2.elapsed().as_millis() as u64;
+                    let cycles = state.get_var("cycleCount").unwrap_or(0);
+                    for ev in watch_registry.drain_events() {
+                        // Stderr summary line.
+                        eprintln!(
+                            "watch={} tick={} t_ms={} cycles={}{}{}",
+                            ev.watch_name,
+                            ev.tick,
+                            elapsed_ms,
+                            cycles,
+                            if ev.halted { " halted=1" } else { "" },
+                            if ev.sampled_vars.is_empty() {
+                                String::new()
+                            } else {
+                                let pairs: Vec<String> = ev
+                                    .sampled_vars
+                                    .iter()
+                                    .map(|(n, v)| format!(" {}={}", n, v))
+                                    .collect();
+                                pairs.join("")
+                            },
+                        );
+                        // JSONL stream to --measure-out.
+                        if let Some(out) = measure_out.as_mut() {
+                            use std::io::Write;
+                            let vars: Vec<String> = ev
+                                .sampled_vars
+                                .iter()
+                                .map(|(n, v)| format!("[\"{}\",{}]", n, v))
+                                .collect();
+                            let dumps: Vec<String> = ev
+                                .dumps
+                                .iter()
+                                .map(|d| {
+                                    let path = d
+                                        .path
+                                        .as_deref()
+                                        .map(|p| format!("\"{}\"", p.replace('\\', "\\\\")))
+                                        .unwrap_or_else(|| "null".to_string());
+                                    format!(
+                                        "{{\"tag\":\"{}\",\"addr\":{},\"path\":{},\"len\":{}}}",
+                                        d.tag,
+                                        d.addr,
+                                        path,
+                                        d.bytes.len(),
+                                    )
+                                })
+                                .collect();
+                            let _ = writeln!(
+                                out,
+                                "{{\"tick\":{},\"watch\":\"{}\",\"halted\":{},\"vars\":[{}],\"dumps\":[{}]}}",
+                                ev.tick,
+                                ev.watch_name,
+                                ev.halted,
+                                vars.join(","),
+                                dumps.join(","),
+                            );
+                        }
                     }
 
-                    let batch = next_tick.saturating_sub(cursor);
-                    if batch > 0 {
-                        evaluator.run_batch(&mut state, batch);
-                        cursor = next_tick;
+                    if watch_registry.halt_requested() {
+                        halted = true;
                     }
-
-                    // Fire scripted events at exactly this tick.
-                    while script_idx < script_events.len()
-                        && script_events[script_idx].tick == cursor {
-                        if execute_script_action(&script_events[script_idx].action, &mut state, cursor) {
+                    if let Some(addr) = halt_addr {
+                        if state.read_mem(addr) != 0 {
+                            eprintln!("Halt: memory 0x{:X} set at tick {}", addr, cursor);
                             halted = true;
-                        }
-                        script_idx += 1;
-                        if halted { break; }
-                    }
-                    if halted { break; }
-
-                    // Spam tap: fire if due.
-                    if let Some(s) = spam.as_mut() {
-                        if s.next_tick <= cursor {
-                            state.set_var("keyboard", s.value);
-                            pending_release_tick = Some(cursor.saturating_add(5000));
-                            s.next_tick = cursor.saturating_add(s.every);
-                        }
-                    }
-
-                    // Release any in-flight tap.
-                    if let Some(rt) = pending_release_tick {
-                        if cursor >= rt {
-                            state.set_var("keyboard", 0);
-                            pending_release_tick = None;
-                        }
-                    }
-
-                    // Stage polling: only at stride boundaries (or terminal tick).
-                    let at_stride_boundary =
-                        poll_stride > 0 && cursor % poll_stride == 0;
-                    if at_stride_boundary {
-                        let cycles = state.get_var("cycleCount").unwrap_or(0);
-                        let elapsed_ms = t2.elapsed().as_millis() as u64;
-                        for (i, sd) in stages.iter().enumerate() {
-                            if stage_fired[i] { continue; }
-                            if sd.tests.iter().all(|t| cond_test_holds(t, &state)) {
-                                stage_fired[i] = true;
-                                println!(
-                                    "stage={} t_ms={} tick={} cycles={}",
-                                    sd.name, elapsed_ms, cursor, cycles
-                                );
-                                match &sd.action {
-                                    CondAction::None => {}
-                                    CondAction::Halt => { halted = true; }
-                                    CondAction::Tap { value, hold } => {
-                                        state.set_var("keyboard", *value);
-                                        pending_release_tick =
-                                            Some(cursor.saturating_add(*hold));
-                                    }
-                                    CondAction::Spam { value, every } => {
-                                        spam = Some(SpamState {
-                                            value: *value,
-                                            every: *every,
-                                            next_tick: cursor,
-                                        });
-                                    }
-                                    CondAction::SpamStop => { spam = None; }
-                                }
-                                if halted { break; }
-                            }
                         }
                     }
                 }
                 ticks_run = cursor;
+                if let Some(out) = measure_out.as_mut() {
+                    use std::io::Write;
+                    let _ = out.flush();
+                }
             } else {
                 evaluator.run_batch(&mut state, ticks_limit);
                 ticks_run = ticks_limit;
