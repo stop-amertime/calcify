@@ -48,6 +48,99 @@ fn committed_slot_of(name: &str) -> Option<SlotId> {
     crate::eval::property_to_address(&format!("--{name}"))
 }
 
+/// True if `id` references a `Lit(v)` whose value bit-equals `expected`.
+fn is_lit(dag: &Dag, id: NodeId, expected: f64) -> bool {
+    matches!(dag.nodes[id as usize], DagNode::Lit(v) if v.to_bits() == expected.to_bits())
+}
+
+/// True if `id` references `Param(idx)`.
+fn is_param(dag: &Dag, id: NodeId, idx: u32) -> bool {
+    matches!(dag.nodes[id as usize], DagNode::Param(i) if i == idx)
+}
+
+/// Find the largest subset of `(key, slot)` pairs whose values lie on
+/// a single line `slot = a + b * key` for integer `a`, `b` representable
+/// as `i32`. Returns the subset (sorted by key) and the line params.
+///
+/// The returned subset has length 0 or 1 when no line fits at least
+/// two points; line_params is `None` in those cases. For 2+ pairs,
+/// line_params is `Some((a, b))`.
+///
+/// Strategy: for each ordered pair of distinct-key points, fit a
+/// candidate line and count how many other pairs lie on it. Return
+/// the line with the largest support set. O(n²) in pair count; fine
+/// for the table sizes Phase 2 sees (millions of entries are still
+/// quadratic but every entry is a constant-time check, and in practice
+/// the first candidate line catches everything when the table really
+/// is a clean progression). For large tables, an early-exit is the
+/// natural extension if quadratic blows up.
+fn largest_line_fit(pairs: &[(i64, SlotId)]) -> (Vec<(i64, SlotId)>, Option<(i32, i32)>) {
+    if pairs.len() < 2 {
+        return (pairs.to_vec(), None);
+    }
+    // Fast path: test the line through the first two points first. Real
+    // cabinets typically have one giant clean progression and we want to
+    // avoid the O(n²) outer loop in that common case.
+    let candidate = fit_line_through(pairs[0], pairs[1]);
+    if let Some((a, b)) = candidate {
+        let mut on_line: Vec<(i64, SlotId)> = pairs
+            .iter()
+            .copied()
+            .filter(|&(k, s)| (a as i64) + (b as i64) * k == s as i64)
+            .collect();
+        if on_line.len() == pairs.len() {
+            on_line.sort_unstable_by_key(|p| p.0);
+            return (on_line, Some((a, b)));
+        }
+    }
+    // Slower fallback: exhaustively try lines through every pair.
+    // Capped at a small number of candidate seeds to avoid quadratic
+    // blowup on adversarial inputs; in practice the first-two-points
+    // candidate already covers the common case.
+    let cap = pairs.len().min(64);
+    let mut best: (Vec<(i64, SlotId)>, Option<(i32, i32)>) = (Vec::new(), None);
+    for i in 0..cap {
+        for j in (i + 1)..cap {
+            let Some((a, b)) = fit_line_through(pairs[i], pairs[j]) else {
+                continue;
+            };
+            let on_line: Vec<(i64, SlotId)> = pairs
+                .iter()
+                .copied()
+                .filter(|&(k, s)| (a as i64) + (b as i64) * k == s as i64)
+                .collect();
+            if on_line.len() > best.0.len() {
+                best = (on_line, Some((a, b)));
+            }
+        }
+    }
+    best.0.sort_unstable_by_key(|p| p.0);
+    best
+}
+
+/// Fit a line `slot = a + b * key` through two points. Returns `None`
+/// if the keys are equal (vertical line is degenerate) or if `a` or
+/// `b` doesn't fit in i32.
+fn fit_line_through(p0: (i64, SlotId), p1: (i64, SlotId)) -> Option<(i32, i32)> {
+    let (k0, s0) = p0;
+    let (k1, s1) = p1;
+    let dk = k1 - k0;
+    if dk == 0 {
+        return None;
+    }
+    let ds = (s1 as i64) - (s0 as i64);
+    if ds % dk != 0 {
+        return None;
+    }
+    let b = ds / dk;
+    let a = (s0 as i64) - b * k0;
+    let i32_range = (i32::MIN as i64)..=(i32::MAX as i64);
+    if !i32_range.contains(&a) || !i32_range.contains(&b) {
+        return None;
+    }
+    Some((a as i32, b as i32))
+}
+
 /// Lowering context: a fresh DAG plus a transient-slot allocator for
 /// property names that don't resolve to committed state.
 struct LowerCtx<'a> {
@@ -56,6 +149,12 @@ struct LowerCtx<'a> {
     /// Allocated lazily as references and assignments reach unknown
     /// property names. Slot ids are encoded `TRANSIENT_BASE + idx`.
     transient_slots: HashMap<String, SlotId>,
+    /// Bare property name → SlotId, populated lazily as `slot_for`
+    /// resolves names. Lowering-only cache: every value the walker
+    /// needs is already baked into the resolved `SlotId`s on `LoadVar`,
+    /// `WriteVar`, and the `DagBroadcast`/`DagPackedBroadcast` records,
+    /// so this map doesn't need to survive into the runtime `Dag`.
+    name_to_slot: HashMap<String, SlotId>,
     /// Set of bare property names that appear as the LHS of some
     /// assignment. Used by `Expr::Var` lowering to distinguish
     /// "name is computed by this program but not @property-declared"
@@ -73,11 +172,6 @@ struct LowerCtx<'a> {
     /// Mirrors v1's `self.properties` shadow-and-restore in
     /// `eval_function_call`.
     inline_frames: Vec<HashMap<String, NodeId>>,
-    /// Currently-inlining function names. If a call site tries to
-    /// inline a function already on this stack, we fall back to a
-    /// FuncCall node (delegated to v1) — CSS @function doesn't support
-    /// recursion, so this is defensive.
-    inlining_stack: Vec<String>,
     /// When true, every `Expr::Var` lowering uses `TickPosition::Prev`
     /// regardless of the property name. Set while lowering broadcast
     /// value expressions, which run against committed state (after all
@@ -92,13 +186,49 @@ struct LowerCtx<'a> {
     /// DAG actually behaves like a DAG.
     ///
     /// We only intern the leaf-and-near-leaf kinds (Lit, LoadVar, Calc).
-    /// If/Switch/Concat/FuncCall are composed of NodeIds that themselves
+    /// If/Switch/Concat/Call are composed of NodeIds that themselves
     /// got interned, so the structural sharing already happens via their
     /// children — the parent nodes themselves are rare enough that
     /// hashing them is not worth the cost.
     lit_cache: HashMap<u64, NodeId>,
     load_var_cache: HashMap<(SlotId, TickPosition), NodeId>,
     calc_cache: HashMap<(CalcKind, Vec<NodeId>), NodeId>,
+    /// Classification of each `@function` body as a bit-slicer shape
+    /// (idiom 7). Indexed by `fn_id`. `None` for unclassified or non-
+    /// slicer functions. Populated immediately after
+    /// `lower_all_function_bodies` runs; consulted at top-level Call
+    /// lowering so a `--lowerBytes(X, 8)` call site emits a `BitField`
+    /// instead of a `Call`. Lowering-only — slicer rewrites happen at
+    /// the call site, so the runtime `Dag` doesn't need to carry this.
+    slicer_kinds: Vec<Option<SlicerKind>>,
+    /// Classification of each `@function` body as a 16-bit bitwise op
+    /// (idiom 8: AND/OR/XOR over two-input bit-decomposition; NOT over
+    /// one-input). Indexed by `fn_id`. `None` for unclassified or
+    /// non-bitwise functions. Populated alongside `slicer_kinds`;
+    /// consulted at every Call lowering — any call to a classified
+    /// bitwise function rewrites to a `BitwiseOp` super-node
+    /// regardless of the argument shape (the op is fully general).
+    bitwise_kinds: Vec<Option<crate::compile::BitwiseKind>>,
+}
+
+/// Bit-slicer body shapes (idiom 7). All three reduce to a `BitField`
+/// at literal-arg call sites:
+///
+/// - `LowerBytes`: `mod(Param(0), pow(2, Param(1)))` → mask to N low
+///   bits. At the call site `--lowerBytes(X, n)` with literal `n` ≥ 1,
+///   emit `BitField { src: X, shift: 0, width: Some(n) }`.
+/// - `RightShift`: `round(down, Param(0) / pow(2, Param(1)), 1)` →
+///   floor-div by 2^N, equivalent to arithmetic right shift on i32 for
+///   any N. At `--rightShift(X, n)` with literal `n`, emit
+///   `BitField { src: X, shift: n, width: None }`.
+/// - `Bit`: `mod(<RightShift body>(Param(0), Param(1)), 2)` → single-
+///   bit extract. At `--bit(X, i)` with literal `i`, emit
+///   `BitField { src: X, shift: i, width: Some(1) }`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlicerKind {
+    LowerBytes,
+    RightShift,
+    Bit,
 }
 
 impl<'a> LowerCtx<'a> {
@@ -106,14 +236,16 @@ impl<'a> LowerCtx<'a> {
         Self {
             dag: Dag::default(),
             transient_slots: HashMap::new(),
+            name_to_slot: HashMap::new(),
             assigned_names: std::collections::HashSet::new(),
             functions: HashMap::new(),
             inline_frames: Vec::new(),
-            inlining_stack: Vec::new(),
             force_prev_reads: false,
             lit_cache: HashMap::new(),
             load_var_cache: HashMap::new(),
             calc_cache: HashMap::new(),
+            slicer_kinds: Vec::new(),
+            bitwise_kinds: Vec::new(),
         }
     }
 
@@ -180,13 +312,12 @@ impl<'a> LowerCtx<'a> {
     /// and memory slots come from the global address map; transients
     /// are allocated on demand and don't commit to State.
     ///
-    /// Every name we see is recorded in `dag.name_to_slot` — that's
-    /// v2's authoritative slot map. Consumers that need to resolve a
-    /// property name to a slot (e.g. the broadcast executor reading
-    /// `--_slot0Live`) should consult that map, not
-    /// `property_to_address` (which doesn't know about transients).
+    /// The `name_to_slot` map lives only on the lowering context — by
+    /// the time the runtime `Dag` is built, every slot reference is
+    /// already baked into a `LoadVar`/`WriteVar`/broadcast record, so
+    /// the map has no runtime consumer.
     fn slot_for(&mut self, bare: &str) -> SlotId {
-        if let Some(&s) = self.dag.name_to_slot.get(bare) {
+        if let Some(&s) = self.name_to_slot.get(bare) {
             return s;
         }
         let slot = if let Some(s) = committed_slot_of(bare) {
@@ -196,7 +327,7 @@ impl<'a> LowerCtx<'a> {
             self.transient_slots.insert(bare.to_string(), id);
             id
         };
-        self.dag.name_to_slot.insert(bare.to_string(), slot);
+        self.name_to_slot.insert(bare.to_string(), slot);
         slot
     }
 
@@ -303,27 +434,7 @@ impl<'a> LowerCtx<'a> {
             }
 
             Expr::StyleCondition { branches, fallback } => {
-                // Idiom: dispatch table. If every branch tests
-                // `style(--P: <integer-literal>)` against the same
-                // property `--P`, lower to a Switch keyed on `--P`'s
-                // current value. O(1) lookup vs O(N) scan; matches
-                // the speedup v1 gets via `dispatch_tables`.
-                if let Some(switch_id) = self.try_lower_dispatch(branches, fallback) {
-                    return switch_id;
-                }
-                let lowered_branches: Vec<(StyleCondNode, NodeId)> = branches
-                    .iter()
-                    .map(|StyleBranch { condition, then }| {
-                        let cond = self.lower_style_test(condition);
-                        let then_id = self.lower_expr(then);
-                        (cond, then_id)
-                    })
-                    .collect();
-                let fallback_id = self.lower_expr(fallback);
-                self.dag.push(DagNode::If {
-                    branches: lowered_branches,
-                    fallback: fallback_id,
-                })
+                self.lower_style_condition(branches, fallback)
             }
 
             Expr::Concat(parts) => {
@@ -345,29 +456,17 @@ impl<'a> LowerCtx<'a> {
     /// real cabinets like zork (362K assignments × deep call graphs).
     /// New model is O(unique functions × body size + call sites).
     ///
-    /// Unknown callees: if the program declares no function with this
-    /// name, fall back to `FuncCall` so v1's interpreter can handle it
-    /// (returns 0 for undefined functions). Stable `fn_id` either way.
+    /// Unknown callees: CSS spec for an unresolved `@function` call is
+    /// the registered initial value of the surrounding property —
+    /// numerically 0 for `<integer>`-syntax props (our sole numeric
+    /// type). Lower to `Lit(0.0)` directly. Recursion (the call graph
+    /// not being a DAG) is rejected by CSS at parse time and never
+    /// reaches lowering; if a forward reference somehow appears here
+    /// it's a lowering-order bug, not a runtime concern.
     fn lower_call(&mut self, name: &str, arg_ids: Vec<NodeId>) -> NodeId {
         let fn_id = match self.dag.function_names.get(name).copied() {
             Some(id) => id,
-            None => {
-                if self.functions.contains_key(name) {
-                    // Function exists but body hasn't been lowered yet
-                    // (forward reference within the function pre-pass,
-                    // or we're being called before the pre-pass ran).
-                    // The pre-pass `lower_all_function_bodies` lowers
-                    // in declaration order; out-of-order references
-                    // here mean our call graph isn't a DAG, which
-                    // CSS @function rejects. Emit a FuncCall as a
-                    // defensive fallback — v1's interpreter handles it.
-                    let fn_id = self.intern_function(name);
-                    return self.dag.push(DagNode::FuncCall { fn_id, args: arg_ids });
-                }
-                // Truly unknown — same fallback.
-                let fn_id = self.intern_function(name);
-                return self.dag.push(DagNode::FuncCall { fn_id, args: arg_ids });
-            }
+            None => return self.intern_lit(0.0),
         };
         // Pad missing args with Lit(0.0), matching v1 semantics
         // (`unwrap_or(Value::Number(0.0))` in eval_function_call).
@@ -377,7 +476,91 @@ impl<'a> LowerCtx<'a> {
             padded.push(self.intern_lit(0.0));
         }
         padded.truncate(expected);
+        // Idiom 7: bit-slicer call site with a literal shift / width
+        // collapses to a `BitField` super-node. Falls through to a
+        // generic `Call` if the function isn't classified or the
+        // shift arg isn't a literal in range.
+        if let Some(node) = self.try_lower_slicer_call(fn_id, &padded) {
+            return node;
+        }
+        // Idiom 8: native 16-bit bitwise op. Any call to a function
+        // whose body matched the bit-decomposition shape rewrites
+        // unconditionally — the op is fully general, no per-call shape
+        // requirement.
+        if let Some(node) = self.try_lower_bitwise_call(fn_id, &padded) {
+            return node;
+        }
         self.dag.push(DagNode::Call { fn_id, args: padded })
+    }
+
+    /// Try rewriting a call to a classified bitwise function as a
+    /// `BitwiseOp` super-node. Returns `None` if the function isn't
+    /// classified as a bitwise op.
+    fn try_lower_bitwise_call(&mut self, fn_id: u32, args: &[NodeId]) -> Option<NodeId> {
+        use crate::compile::BitwiseKind as V1Kind;
+        use crate::dag::types::BitwiseKind as V2Kind;
+        let v1_kind = (*self.bitwise_kinds.get(fn_id as usize)?)?;
+        let kind = match v1_kind {
+            V1Kind::And => V2Kind::And,
+            V1Kind::Or => V2Kind::Or,
+            V1Kind::Xor => V2Kind::Xor,
+            V1Kind::Not => V2Kind::Not,
+        };
+        let expected_arity = if matches!(kind, V2Kind::Not) { 1 } else { 2 };
+        if args.len() != expected_arity {
+            return None;
+        }
+        Some(self.dag.push(DagNode::BitwiseOp {
+            kind,
+            args: args.to_vec(),
+        }))
+    }
+
+    /// Try rewriting a call to a classified bit-slicer function as a
+    /// `BitField` super-node. Returns `None` if the function isn't a
+    /// slicer, or if the second arg isn't a literal integer in `0..=31`.
+    fn try_lower_slicer_call(&mut self, fn_id: u32, args: &[NodeId]) -> Option<NodeId> {
+        let kind = (*self.slicer_kinds.get(fn_id as usize)?)?;
+        if args.len() != 2 {
+            return None;
+        }
+        // The shift / width / bit-index arg must be a literal in range.
+        let n = match self.dag.nodes[args[1] as usize] {
+            DagNode::Lit(v) if v.is_finite() && v >= 0.0 && v <= 31.0 && v.fract() == 0.0 => {
+                v as u8
+            }
+            _ => return None,
+        };
+        let src = args[0];
+        Some(match kind {
+            // mod(X, pow(2, n)) = X & ((1 << n) - 1) for non-negative X,
+            // and equals the floored modulo for negative X — both
+            // representable as `(X >> 0) & mask`. n=0 produces width=0
+            // which is invalid (mask = 0 means always-zero result, which
+            // does match `mod(X, 1) == 0` exactly), so we still emit it
+            // but with width clamped to 1 to keep the invariant
+            // 1<=width<=32. Width n=0 case: mod(X, pow(2, 0)) = mod(X, 1)
+            // = 0; reject so the call falls back to the generic body
+            // (which evaluates the same).
+            SlicerKind::LowerBytes if n == 0 => return None,
+            SlicerKind::LowerBytes => self.dag.push(DagNode::BitField {
+                src,
+                shift: 0,
+                width: Some(n),
+            }),
+            // round(down, X / pow(2, n), 1): pure shift, no mask.
+            SlicerKind::RightShift => self.dag.push(DagNode::BitField {
+                src,
+                shift: n,
+                width: None,
+            }),
+            // mod(rightShift(X, i), 2): single-bit extract.
+            SlicerKind::Bit => self.dag.push(DagNode::BitField {
+                src,
+                shift: n,
+                width: Some(1),
+            }),
+        })
     }
 
     /// Lower one `@function` body into the global node arena, using
@@ -477,6 +660,255 @@ impl<'a> LowerCtx<'a> {
         // again so call sites don't accidentally reuse a Calc node
         // built inside a function body (which references Params).
         self.calc_cache.clear();
+
+        // Classify each lowered body as a bit-slicer (idiom 7) so that
+        // top-level call-site lowering can rewrite to BitField. Walk in
+        // function-id order; if `--bit` calls `--rightShift`, the
+        // RightShift classification needs to be in place first. CSS
+        // forbids recursion at parse, so this runs in a single pass —
+        // any function whose dependencies didn't classify just stays
+        // unclassified and falls through to a regular Call (correct,
+        // just unoptimised).
+        self.slicer_kinds = vec![None; self.dag.function_roots.len()];
+        for fn_id in 0..self.dag.function_roots.len() {
+            let root = self.dag.function_roots[fn_id];
+            if root == NodeId::MAX {
+                continue;
+            }
+            let n_params = self.dag.function_param_counts[fn_id];
+            self.slicer_kinds[fn_id] = self.classify_slicer_body(root, n_params);
+        }
+
+        // Classify each function as a 16-bit bitwise op (idiom 8). v1's
+        // `classify_bitwise_decomposition` is a body-shape matcher over
+        // the parsed Expr — it inspects locals + result tree, never
+        // looks at function names. v2 reuses it directly: same matcher,
+        // both backends, no risk of the two recognisers drifting apart.
+        self.bitwise_kinds = vec![None; self.dag.function_roots.len()];
+        for func in functions {
+            if let Some(&fn_id) = self.dag.function_names.get(&func.name) {
+                self.bitwise_kinds[fn_id as usize] =
+                    crate::compile::classify_bitwise_decomposition(func);
+            }
+        }
+    }
+
+    /// Classify a function body root as one of the bit-slicer shapes
+    /// (idiom 7), or `None`. The body must reference `Param(0)` and
+    /// optionally `Param(1)`; any other Param is a non-match.
+    ///
+    /// Shape matching only — no name lookup. A `@function --xyz(--a,
+    /// --b) { result: mod(var(--a), pow(2, var(--b))); }` matches as
+    /// `LowerBytes` regardless of the helper name, satisfying the
+    /// catalogue's cardinal-rule note.
+    fn classify_slicer_body(&self, root: NodeId, n_params: u32) -> Option<SlicerKind> {
+        if n_params != 2 {
+            return None;
+        }
+        if self.body_matches_lower_bytes(root) {
+            return Some(SlicerKind::LowerBytes);
+        }
+        if self.body_matches_right_shift(root) {
+            return Some(SlicerKind::RightShift);
+        }
+        if self.body_matches_bit(root) {
+            return Some(SlicerKind::Bit);
+        }
+        None
+    }
+
+    /// Match `mod(Param(0), pow(2, Param(1)))`.
+    fn body_matches_lower_bytes(&self, root: NodeId) -> bool {
+        let DagNode::Calc { op: CalcKind::Mod, args } = &self.dag.nodes[root as usize] else {
+            return false;
+        };
+        if args.len() != 2 {
+            return false;
+        }
+        is_param(&self.dag, args[0], 0) && self.is_pow_two_to_param1(args[1])
+    }
+
+    /// Match `round(down, Param(0) / pow(2, Param(1)), 1)`.
+    fn body_matches_right_shift(&self, root: NodeId) -> bool {
+        use crate::types::RoundStrategy;
+        let DagNode::Calc { op: CalcKind::Round(RoundStrategy::Down), args } =
+            &self.dag.nodes[root as usize]
+        else {
+            return false;
+        };
+        if args.len() != 2 {
+            return false;
+        }
+        // Interval arg must be Lit(1) for a pure floor-div by pow2 to
+        // mean "shift". Anything else is not a slicer.
+        if !is_lit(&self.dag, args[1], 1.0) {
+            return false;
+        }
+        let DagNode::Calc { op: CalcKind::Div, args: div_args } =
+            &self.dag.nodes[args[0] as usize]
+        else {
+            return false;
+        };
+        if div_args.len() != 2 {
+            return false;
+        }
+        is_param(&self.dag, div_args[0], 0) && self.is_pow_two_to_param1(div_args[1])
+    }
+
+    /// Match `mod(Call{rightShift, [Param(0), Param(1)]}, 2)` — the
+    /// inlined form `mod(round(down, Param(0)/pow(2,Param(1)), 1), 2)`
+    /// also matches.
+    fn body_matches_bit(&self, root: NodeId) -> bool {
+        let DagNode::Calc { op: CalcKind::Mod, args } = &self.dag.nodes[root as usize] else {
+            return false;
+        };
+        if args.len() != 2 {
+            return false;
+        }
+        if !is_lit(&self.dag, args[1], 2.0) {
+            return false;
+        }
+        // Inner can be either:
+        //  (a) a Call to an already-classified RightShift function
+        //      with args [Param(0), Param(1)], or
+        //  (b) the raw RightShift body shape over Param(0), Param(1).
+        match &self.dag.nodes[args[0] as usize] {
+            DagNode::Call { fn_id, args: call_args } => {
+                call_args.len() == 2
+                    && is_param(&self.dag, call_args[0], 0)
+                    && is_param(&self.dag, call_args[1], 1)
+                    && self
+                        .slicer_kinds
+                        .get(*fn_id as usize)
+                        .copied()
+                        .flatten()
+                        == Some(SlicerKind::RightShift)
+            }
+            _ => self.body_matches_right_shift(args[0]),
+        }
+    }
+
+    /// Match `pow(2, Param(1))`.
+    fn is_pow_two_to_param1(&self, id: NodeId) -> bool {
+        let DagNode::Calc { op: CalcKind::Pow, args } = &self.dag.nodes[id as usize] else {
+            return false;
+        };
+        args.len() == 2 && is_lit(&self.dag, args[0], 2.0) && is_param(&self.dag, args[1], 1)
+    }
+
+    /// Lower an `Expr::StyleCondition` cascade. Tries idiom recognisers
+    /// in shape-specificity order, falling back to a generic `If`:
+    ///
+    /// 1. Whole-cascade dispatch table (idiom 1) — every branch tests the
+    ///    same property against an integer literal. Lowers to one
+    ///    `Switch`.
+    /// 2. Priority head + Switch tail (idiom 9 wrapping idiom 1) — the
+    ///    leading branches use heterogeneous keys (the priority head),
+    ///    the suffix matches idiom 1. Lowers to `If { head, fallback:
+    ///    Switch { … } }`. Catalogue note: kiln wraps every register
+    ///    dispatch and every memory port in a TF/IRQ priority head, so
+    ///    without this peel the inner cascade never gets recognised.
+    /// 3. Generic — lower every branch as-is into an `If` node.
+    ///
+    /// Bit-identical to a single `If` over all branches: priority
+    /// short-circuits left-to-right, so peeling the head and putting
+    /// the tail in the fallback evaluates each branch under exactly
+    /// the same conditions it would in the unpeeled form.
+    fn lower_style_condition(
+        &mut self,
+        branches: &[StyleBranch],
+        fallback: &Expr,
+    ) -> NodeId {
+        if let Some(switch_id) = self.try_lower_dispatch(branches, fallback) {
+            return switch_id;
+        }
+        if let Some(id) = self.try_lower_priority_head_switch(branches, fallback) {
+            return id;
+        }
+        let lowered_branches: Vec<(StyleCondNode, NodeId)> = branches
+            .iter()
+            .map(|StyleBranch { condition, then }| {
+                let cond = self.lower_style_test(condition);
+                let then_id = self.lower_expr(then);
+                (cond, then_id)
+            })
+            .collect();
+        let fallback_id = self.lower_expr(fallback);
+        self.dag.push(DagNode::If {
+            branches: lowered_branches,
+            fallback: fallback_id,
+        })
+    }
+
+    /// Recognise a priority-head + Switch-tail cascade (idiom 9 wrapping
+    /// idiom 1). Returns `Some(node_id)` when:
+    ///
+    /// - The trailing run of branches all test the same property against
+    ///   integer literals, AND that run has length ≥ 4 (same threshold
+    ///   as `try_lower_dispatch`).
+    /// - At least one branch precedes the run (otherwise
+    ///   `try_lower_dispatch` would already have matched the whole
+    ///   cascade).
+    ///
+    /// Lowers the head branches as a normal `If` whose fallback is a
+    /// `Switch` over the tail. Walking semantics are identical to the
+    /// original cascade because `If` short-circuits left-to-right and
+    /// only evaluates the fallback when no head branch matches.
+    fn try_lower_priority_head_switch(
+        &mut self,
+        branches: &[StyleBranch],
+        fallback: &Expr,
+    ) -> Option<NodeId> {
+        // Walk back from the end, gathering as long a same-key
+        // integer-literal run as possible. The first heterogeneous
+        // branch (or compound condition) bounds the tail's left edge.
+        let mut tail_start = branches.len();
+        let mut tail_key: Option<String> = None;
+        for (i, b) in branches.iter().enumerate().rev() {
+            let StyleTest::Single { property, value } = &b.condition else {
+                break;
+            };
+            if !matches!(value, Expr::Literal(_)) {
+                break;
+            }
+            match &tail_key {
+                None => tail_key = Some(property.clone()),
+                Some(k) if k == property => {}
+                _ => break,
+            }
+            tail_start = i;
+        }
+
+        let tail_len = branches.len() - tail_start;
+        // Need at least 4 in the tail (matches the dispatch threshold)
+        // and at least one branch in the head (otherwise the whole
+        // cascade would already have lowered as a Switch).
+        if tail_len < 4 || tail_start == 0 {
+            return None;
+        }
+
+        let head = &branches[..tail_start];
+        let tail = &branches[tail_start..];
+
+        // Build the inner Switch first so the head's fallback NodeId is
+        // ready before we lower the head bodies.
+        let switch_id = self
+            .try_lower_dispatch(tail, fallback)
+            .expect("tail passes the dispatch shape by construction");
+
+        let lowered_head: Vec<(StyleCondNode, NodeId)> = head
+            .iter()
+            .map(|StyleBranch { condition, then }| {
+                let cond = self.lower_style_test(condition);
+                let then_id = self.lower_expr(then);
+                (cond, then_id)
+            })
+            .collect();
+
+        Some(self.dag.push(DagNode::If {
+            branches: lowered_head,
+            fallback: switch_id,
+        }))
     }
 
     /// Try lowering a `StyleCondition` to a `Switch` (dispatch table).
@@ -532,11 +964,157 @@ impl<'a> LowerCtx<'a> {
             table.entry(k).or_insert_with(|| self.lower_expr(expr));
         }
         let fallback_id = self.lower_expr(fallback);
-        Some(self.dag.push(DagNode::Switch {
-            key: key_id,
-            table,
+        // If a subset of entries' bodies resolves to same-kind LoadVars
+        // whose (key, slot) pairs lie on a line, the per-key portion of
+        // the table is redundant for those entries — peel them out into
+        // a LoadVarDynamic and keep the remaining entries (literals,
+        // calls, off-line LoadVars) in a smaller Switch above it.
+        let final_node = self.try_peel_dispatch_to_dynamic_load(table, key_id, fallback_id);
+        Some(final_node)
+    }
+
+    /// Build a Switch node from a key, table, and fallback. Skips the
+    /// peel-to-LoadVarDynamic recogniser — used internally by the peel
+    /// itself to emit the residual outer Switch without re-entering
+    /// the recogniser.
+    fn push_switch(&mut self, key: NodeId, table: std::collections::HashMap<i64, NodeId>, fallback: NodeId) -> NodeId {
+        self.dag.push(DagNode::Switch { key, table, fallback })
+    }
+
+    /// Peel a `LoadVarDynamic` out of a `Switch` table.
+    ///
+    /// Partitions the table's entries into:
+    ///   - `loadvar_subset`: entries whose body is `LoadVar { slot,
+    ///     kind }` with a shared `kind` and whose `(key, slot)` pairs
+    ///     fit a single arithmetic-progression line.
+    ///   - `residual`: every other entry (literals, calls, off-line
+    ///     LoadVars, mismatched-kind LoadVars).
+    ///
+    /// When `loadvar_subset.len() >= 4` (the dispatch threshold), the
+    /// loadvar subset is replaced by one `LoadVarDynamic` super-node
+    /// computing `slot = a + b*key` and bounds-checking against the
+    /// covered slot range; the residual entries stay in an outer
+    /// `Switch` whose fallback is the LoadVarDynamic. Out-of-table
+    /// keys still hit the original fallback (LoadVarDynamic falls
+    /// through to it on bounds-check miss).
+    ///
+    /// When no peel applies, returns the original Switch as-is.
+    fn try_peel_dispatch_to_dynamic_load(
+        &mut self,
+        table: std::collections::HashMap<i64, NodeId>,
+        key_id: NodeId,
+        fallback_id: NodeId,
+    ) -> NodeId {
+        // Group LoadVar entries by tick-position; off-line entries and
+        // non-LoadVar entries go straight into the residual. We pick
+        // the largest line-fitting subset across all groups.
+        let mut by_kind_curr: Vec<(i64, SlotId)> = Vec::new();
+        let mut by_kind_prev: Vec<(i64, SlotId)> = Vec::new();
+        let mut residual_keys: Vec<i64> = Vec::new();
+        for (&k, &body) in &table {
+            match self.dag.nodes[body as usize] {
+                DagNode::LoadVar { slot, kind: TickPosition::Current } => {
+                    by_kind_curr.push((k, slot));
+                }
+                DagNode::LoadVar { slot, kind: TickPosition::Prev } => {
+                    by_kind_prev.push((k, slot));
+                }
+                _ => {
+                    residual_keys.push(k);
+                }
+            }
+        }
+
+        // For each kind, find the largest subset whose (key, slot)
+        // pairs fit one arithmetic-progression line. Take the larger
+        // of the two; if it's below threshold, no peel.
+        let (best_kind, best_pairs, mut off_line_keys) = {
+            let curr = largest_line_fit(&by_kind_curr);
+            let prev = largest_line_fit(&by_kind_prev);
+            let prefer_prev = prev.0.len() >= curr.0.len();
+            if prefer_prev {
+                let off_keys: Vec<i64> = by_kind_curr.iter().map(|&(k, _)| k).collect();
+                (TickPosition::Prev, prev, off_keys)
+            } else {
+                let off_keys: Vec<i64> = by_kind_prev.iter().map(|&(k, _)| k).collect();
+                (TickPosition::Current, curr, off_keys)
+            }
+        };
+        let (line_pairs, line_params) = best_pairs;
+        if line_pairs.len() < 4 {
+            return self.push_switch(key_id, table, fallback_id);
+        }
+        let (a, b) = line_params.expect("line_pairs.len() >= 4 implies fitted line");
+
+        // Build the LoadVarDynamic. valid_lo/hi cover the slot range
+        // of the line-fitting subset only.
+        let (mut lo, mut hi) = (i32::MAX, i32::MIN);
+        for &(_, s) in &line_pairs {
+            if s < lo { lo = s; }
+            if s > hi { hi = s; }
+        }
+        let valid_hi = hi.saturating_add(1);
+        let slot_expr = self.build_slot_expr(a, b, key_id);
+        let dynamic_load = self.dag.push(DagNode::LoadVarDynamic {
+            slot_expr,
+            valid_lo: lo,
+            valid_hi,
+            kind: best_kind,
             fallback: fallback_id,
-        }))
+        });
+
+        // Residual = literal/call/etc. entries + off-line LoadVar
+        // entries from the same kind + every entry from the other
+        // kind. Build a smaller outer Switch over them; its fallback
+        // is the LoadVarDynamic.
+        let line_keys: std::collections::HashSet<i64> =
+            line_pairs.iter().map(|&(k, _)| k).collect();
+        let mut residual_table: std::collections::HashMap<i64, NodeId> =
+            std::collections::HashMap::new();
+        for k in &residual_keys {
+            residual_table.insert(*k, table[k]);
+        }
+        // off-line LoadVars from the chosen kind (those not in the
+        // line-fitting subset) also go in the residual.
+        let chosen_kind_pairs = match best_kind {
+            TickPosition::Prev => &by_kind_prev,
+            TickPosition::Current => &by_kind_curr,
+        };
+        for &(k, _) in chosen_kind_pairs {
+            if !line_keys.contains(&k) {
+                residual_table.insert(k, table[&k]);
+            }
+        }
+        // Other-kind entries are unconditionally residual.
+        for k in off_line_keys.drain(..) {
+            residual_table.insert(k, table[&k]);
+        }
+
+        if residual_table.is_empty() {
+            return dynamic_load;
+        }
+        self.push_switch(key_id, residual_table, dynamic_load)
+    }
+
+    /// Build the slot expression `a + b * key`, specialising the
+    /// trivial cases so the walker doesn't pay Mul/Add cost when one
+    /// isn't needed.
+    fn build_slot_expr(&mut self, a: i32, b: i32, key_id: NodeId) -> NodeId {
+        if b == 1 && a == 0 {
+            return key_id;
+        }
+        if b == 1 {
+            let lit_a = self.intern_lit(a as f64);
+            return self.intern_calc(CalcKind::Add, vec![lit_a, key_id]);
+        }
+        if a == 0 {
+            let lit_b = self.intern_lit(b as f64);
+            return self.intern_calc(CalcKind::Mul, vec![key_id, lit_b]);
+        }
+        let lit_b = self.intern_lit(b as f64);
+        let mul = self.intern_calc(CalcKind::Mul, vec![key_id, lit_b]);
+        let lit_a = self.intern_lit(a as f64);
+        self.intern_calc(CalcKind::Add, vec![lit_a, mul])
     }
 
     /// Lower `var(--name)` in the current lowering scope. Same logic as
@@ -639,10 +1217,10 @@ impl<'a> LowerCtx<'a> {
     /// time it fires, every preceding `WriteVar` has already flushed
     /// its per-tick cache entry to State.
     fn lower_broadcast(&mut self, bw: &BroadcastWrite) -> DagBroadcast {
-        // Use slot_for to register names in name_to_slot AND allocate
-        // transients on demand — `--memAddr0` etc. aren't registered
-        // @properties and need transient slots that match the slots
-        // the rest of the program uses.
+        // slot_for resolves committed slots and allocates transients
+        // on demand — `--memAddr0` etc. aren't registered @properties
+        // and need transient slots that match the slots the rest of
+        // the program uses.
         let bare_of = |n: &str| {
             n.strip_prefix("--").unwrap_or(n).to_string()
         };
@@ -830,7 +1408,6 @@ pub fn lower_parsed_program(program: &ParsedProgram) -> Dag {
     ctx.dag.packed_broadcast_ports = packed_broadcast_ports;
     ctx.dag.dag_broadcasts = dag_broadcasts;
     ctx.dag.dag_packed_broadcasts = dag_packed_broadcasts;
-    ctx.dag.absorbed_properties = absorbed;
     ctx.dag.transient_slot_count = ctx.transient_slots.len();
 
     sort_terminals(&mut ctx.dag);
@@ -945,7 +1522,7 @@ fn collect_current_reads(
                 collect_current_reads(dag, a, slot_to_term, out);
             }
         }
-        DagNode::FuncCall { args, .. } | DagNode::Call { args, .. } => {
+        DagNode::Call { args, .. } => {
             // Arg-side reads count as dependencies. The function
             // body's *own* reads (LoadVar Current of tick-globals)
             // are conservatively NOT traversed here: bodies are
@@ -981,6 +1558,34 @@ fn collect_current_reads(
             for &p in parts {
                 collect_current_reads(dag, p, slot_to_term, out);
             }
+        }
+        DagNode::BitField { src, .. } => {
+            collect_current_reads(dag, *src, slot_to_term, out);
+        }
+        DagNode::BitwiseOp { args, .. } => {
+            for &a in args {
+                collect_current_reads(dag, a, slot_to_term, out);
+            }
+        }
+        DagNode::LoadVarDynamic { slot_expr, kind, fallback, valid_lo, valid_hi } => {
+            // The dynamic slot read can hit any slot in [valid_lo,
+            // valid_hi). For TickPosition::Current reads, that means a
+            // dependency on every Current-WriteVar terminal whose slot
+            // sits in that range — without it the topo sort can run a
+            // dependent assignment before its source has flushed.
+            if matches!(kind, TickPosition::Current) {
+                let lo = *valid_lo;
+                let hi = *valid_hi;
+                for (slot, &idx) in slot_to_term.iter() {
+                    if *slot >= lo && *slot < hi {
+                        out.push(idx);
+                    }
+                }
+            }
+            // The slot-expression is itself a normal sub-DAG; its
+            // Current reads are real dependencies regardless of kind.
+            collect_current_reads(dag, *slot_expr, slot_to_term, out);
+            collect_current_reads(dag, *fallback, slot_to_term, out);
         }
         DagNode::WriteVar { .. } | DagNode::IndirectStore { .. } => {
             // Not reached on well-formed sub-expressions.
@@ -1093,10 +1698,8 @@ mod tests {
 
     #[test]
     fn lowers_function_call_to_shared_call_node() {
-        // `--double(21)` should inline to `calc(21 * 2)` — i.e. a Calc
-        // node whose first arg is the lit 21 (param substitution) and
-        // second is the lit 2. No FuncCall node should remain because
-        // there's no recursion and the callee is known.
+        // `--double(21)` should lower to a Call referencing the shared
+        // body root, with `21` bound as the call's arg.
         let css = r#"
             @property --AX { syntax: "<integer>"; inherits: true; initial-value: 0; }
             @function --double(--x <integer>) returns <integer> {
@@ -1106,13 +1709,6 @@ mod tests {
         "#;
         let dag = build(css);
         assert_eq!(dag.terminals.len(), 1);
-
-        // No legacy FuncCall in the DAG (would mean v1 fallback fired).
-        for n in &dag.nodes {
-            if matches!(n, DagNode::FuncCall { .. }) {
-                panic!("unexpected FuncCall fallback; DAG: {:?}", dag.nodes);
-            }
-        }
 
         // Terminal's value is a Call referencing the shared body root.
         let terminal_id = dag.terminals[0];
@@ -1280,13 +1876,10 @@ mod tests {
             other => panic!("expected LoadVar Prev, got {other:?}"),
         }
 
-        // dest_slot should match what slot_for(--dest) would resolve to.
-        let dest_in_map = dag
-            .name_to_slot
-            .get("dest")
-            .copied()
-            .expect("dest registered");
-        assert_eq!(bw.dest_slot, dest_in_map);
+        // dest_slot should resolve to --dest's committed state-var slot.
+        let expected = crate::eval::property_to_address("--dest")
+            .expect("--dest is a declared @property");
+        assert_eq!(bw.dest_slot, expected);
     }
 
     #[test]
@@ -1302,12 +1895,577 @@ mod tests {
             .cpu { --AX: --plus3(10); }
         "#;
         let dag = build(css);
-        // No FuncCall remains.
+        assert_eq!(dag.terminals.len(), 1);
+    }
+
+    #[test]
+    fn unknown_callee_lowers_to_lit_zero() {
+        // Calling an undeclared `@function` is unresolved per CSS spec;
+        // the surrounding property gets its registered initial value
+        // (0 for `<integer>`). Lowering must emit a `Lit(0.0)` directly
+        // — no Call/FuncCall node, no v1-bridge fallback.
+        let css = r#"
+            @property --AX { syntax: "<integer>"; inherits: true; initial-value: 0; }
+            .cpu { --AX: --doesNotExist(42); }
+        "#;
+        let dag = build(css);
+        assert_eq!(dag.terminals.len(), 1);
+        let value_id = match &dag.nodes[dag.terminals[0] as usize] {
+            DagNode::WriteVar { value, .. } => *value,
+            other => panic!("expected WriteVar, got {other:?}"),
+        };
+        match &dag.nodes[value_id as usize] {
+            DagNode::Lit(v) => assert_eq!(*v, 0.0),
+            other => panic!("expected Lit(0.0), got {other:?}"),
+        }
+        // Defensively: no Call node anywhere either.
         for n in &dag.nodes {
-            if matches!(n, DagNode::FuncCall { .. }) {
-                panic!("expected no FuncCall after inlining");
+            if matches!(n, DagNode::Call { .. }) {
+                panic!("unexpected Call for undeclared function");
             }
         }
-        assert_eq!(dag.terminals.len(), 1);
+    }
+
+    #[test]
+    fn priority_head_peels_from_dispatch_tail() {
+        // A 2-branch priority head on different keys (--tf, --irq)
+        // followed by a 6-branch dispatch on --opcode. Whole-cascade
+        // dispatch fails the "same key everywhere" check; the
+        // priority-head peel should produce an If whose fallback is
+        // a Switch over the tail.
+        let css = r#"
+            @property --tf { syntax: "<integer>"; inherits: true; initial-value: 0; }
+            @property --irq { syntax: "<integer>"; inherits: true; initial-value: 0; }
+            @property --opcode { syntax: "<integer>"; inherits: true; initial-value: 0; }
+            @property --AX { syntax: "<integer>"; inherits: true; initial-value: 0; }
+            :root {
+                --AX: if(
+                    style(--tf: 1): 1000;
+                    style(--irq: 1): 2000;
+                    style(--opcode: 1): 11;
+                    style(--opcode: 2): 22;
+                    style(--opcode: 3): 33;
+                    style(--opcode: 4): 44;
+                    style(--opcode: 5): 55;
+                    style(--opcode: 6): 66;
+                    else: 0
+                );
+            }
+        "#;
+        let dag = build(css);
+
+        // Find the WriteVar terminal and confirm its value is an If
+        // with exactly 2 head branches and a Switch in the fallback.
+        let value_id = match &dag.nodes[dag.terminals[0] as usize] {
+            DagNode::WriteVar { value, .. } => *value,
+            other => panic!("expected WriteVar, got {other:?}"),
+        };
+        let (head_len, fallback) = match &dag.nodes[value_id as usize] {
+            DagNode::If { branches, fallback } => (branches.len(), *fallback),
+            other => panic!("expected If at root, got {other:?}"),
+        };
+        assert_eq!(head_len, 2, "priority head should have 2 branches");
+        let table_len = match &dag.nodes[fallback as usize] {
+            DagNode::Switch { table, .. } => table.len(),
+            other => panic!("expected Switch in fallback, got {other:?}"),
+        };
+        assert_eq!(table_len, 6, "tail Switch should hold the 6 opcode entries");
+    }
+
+    #[test]
+    fn priority_head_short_tail_stays_as_if() {
+        // Tail of only 3 same-key branches is below the dispatch
+        // threshold, so the peel must NOT fire — the whole cascade
+        // stays as one If.
+        let css = r#"
+            @property --tf { syntax: "<integer>"; inherits: true; initial-value: 0; }
+            @property --opcode { syntax: "<integer>"; inherits: true; initial-value: 0; }
+            @property --AX { syntax: "<integer>"; inherits: true; initial-value: 0; }
+            :root {
+                --AX: if(
+                    style(--tf: 1): 1000;
+                    style(--opcode: 1): 11;
+                    style(--opcode: 2): 22;
+                    style(--opcode: 3): 33;
+                    else: 0
+                );
+            }
+        "#;
+        let dag = build(css);
+        for n in &dag.nodes {
+            if matches!(n, DagNode::Switch { .. }) {
+                panic!("3-branch tail should not promote to Switch");
+            }
+        }
+    }
+
+    #[test]
+    fn priority_head_pure_dispatch_still_uses_switch_directly() {
+        // No priority head: the dispatch recogniser fires on the whole
+        // cascade and produces one Switch with no wrapping If.
+        let css = r#"
+            @property --opcode { syntax: "<integer>"; inherits: true; initial-value: 0; }
+            @property --AX { syntax: "<integer>"; inherits: true; initial-value: 0; }
+            :root {
+                --AX: if(
+                    style(--opcode: 1): 11;
+                    style(--opcode: 2): 22;
+                    style(--opcode: 3): 33;
+                    style(--opcode: 4): 44;
+                    style(--opcode: 5): 55;
+                    style(--opcode: 6): 66;
+                    else: 0
+                );
+            }
+        "#;
+        let dag = build(css);
+        let value_id = match &dag.nodes[dag.terminals[0] as usize] {
+            DagNode::WriteVar { value, .. } => *value,
+            other => panic!("expected WriteVar, got {other:?}"),
+        };
+        // Root of the value is a Switch, NOT an If wrapping a Switch.
+        match &dag.nodes[value_id as usize] {
+            DagNode::Switch { .. } => {}
+            other => panic!("expected Switch at root, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn priority_head_compound_condition_breaks_run() {
+        // A priority head followed by a Switch-shaped tail interrupted
+        // by a compound-AND in the middle: the run scan walks back from
+        // the end and stops at the compound branch, so the tail starts
+        // AFTER the compound (only 4 same-key branches), which still
+        // qualifies for the peel. The 3 branches before the compound
+        // (1 priority + compound + 1 same-key) become the head.
+        let css = r#"
+            @property --tf { syntax: "<integer>"; inherits: true; initial-value: 0; }
+            @property --gate { syntax: "<integer>"; inherits: true; initial-value: 0; }
+            @property --opcode { syntax: "<integer>"; inherits: true; initial-value: 0; }
+            @property --AX { syntax: "<integer>"; inherits: true; initial-value: 0; }
+            :root {
+                --AX: if(
+                    style(--tf: 1): 1000;
+                    style(--opcode: 1): 11;
+                    style(--gate: 1) and style(--opcode: 99): 9900;
+                    style(--opcode: 2): 22;
+                    style(--opcode: 3): 33;
+                    style(--opcode: 4): 44;
+                    style(--opcode: 5): 55;
+                    else: 0
+                );
+            }
+        "#;
+        let dag = build(css);
+        let value_id = match &dag.nodes[dag.terminals[0] as usize] {
+            DagNode::WriteVar { value, .. } => *value,
+            other => panic!("expected WriteVar, got {other:?}"),
+        };
+        let (head_len, fallback) = match &dag.nodes[value_id as usize] {
+            DagNode::If { branches, fallback } => (branches.len(), *fallback),
+            other => panic!("expected If at root, got {other:?}"),
+        };
+        assert_eq!(head_len, 3, "head holds 1 priority + compound + 1 same-key");
+        let table_len = match &dag.nodes[fallback as usize] {
+            DagNode::Switch { table, .. } => table.len(),
+            other => panic!("expected Switch in fallback, got {other:?}"),
+        };
+        assert_eq!(table_len, 4, "tail Switch holds opcode 2,3,4,5");
+    }
+
+    fn find_bitfield(dag: &Dag) -> (NodeId, u8, Option<u8>) {
+        for (id, n) in dag.nodes.iter().enumerate() {
+            if let DagNode::BitField { src, shift, width } = n {
+                return (*src, *shift, *width);
+            }
+            let _ = id;
+        }
+        panic!("no BitField node in DAG");
+    }
+
+    #[test]
+    fn lower_bytes_call_lowers_to_bitfield_with_mask() {
+        let css = r#"
+            @property --AX { syntax: "<integer>"; inherits: true; initial-value: 0; }
+            @function --lowerBytes(--a <integer>, --b <integer>) returns <integer> {
+                result: mod(var(--a), pow(2, var(--b)));
+            }
+            :root { --AX: --lowerBytes(4660, 8); }
+        "#;
+        let dag = build(css);
+        let (_src, shift, width) = find_bitfield(&dag);
+        assert_eq!(shift, 0);
+        assert_eq!(width, Some(8));
+    }
+
+    #[test]
+    fn right_shift_call_lowers_to_bitfield_no_mask() {
+        let css = r#"
+            @property --AX { syntax: "<integer>"; inherits: true; initial-value: 0; }
+            @function --rightShift(--a <integer>, --b <integer>) returns <integer> {
+                result: round(down, var(--a) / pow(2, var(--b)));
+            }
+            :root { --AX: --rightShift(4660, 4); }
+        "#;
+        let dag = build(css);
+        let (_src, shift, width) = find_bitfield(&dag);
+        assert_eq!(shift, 4);
+        assert_eq!(width, None);
+    }
+
+    #[test]
+    fn bit_call_lowers_to_bitfield_width_one() {
+        // --bit references --rightShift; the body classifier must
+        // recognise --bit as a Bit slicer because its body is
+        // `mod(Call{rightShift, ...}, 2)` and rightShift was classified
+        // earlier in the same pass.
+        let css = r#"
+            @property --AX { syntax: "<integer>"; inherits: true; initial-value: 0; }
+            @function --rightShift(--a <integer>, --b <integer>) returns <integer> {
+                result: round(down, var(--a) / pow(2, var(--b)));
+            }
+            @function --bit(--val <integer>, --idx <integer>) returns <integer> {
+                result: mod(--rightShift(var(--val), var(--idx)), 2);
+            }
+            :root { --AX: --bit(64, 6); }
+        "#;
+        let dag = build(css);
+        // There may be multiple BitFields (--bit's body inlining +
+        // call-site rewrite); find the call-site one by checking it's
+        // referenced from the WriteVar terminal.
+        let value_id = match &dag.nodes[dag.terminals[0] as usize] {
+            DagNode::WriteVar { value, .. } => *value,
+            other => panic!("expected WriteVar, got {other:?}"),
+        };
+        let (_src, shift, width) = match &dag.nodes[value_id as usize] {
+            DagNode::BitField { src, shift, width } => (*src, *shift, *width),
+            other => panic!("expected BitField at root, got {other:?}"),
+        };
+        assert_eq!(shift, 6);
+        assert_eq!(width, Some(1));
+    }
+
+    #[test]
+    fn slicer_with_dynamic_shift_falls_back_to_call() {
+        // Second arg is a property reference, not a literal — must NOT
+        // collapse to BitField (the shift isn't compile-time known).
+        let css = r#"
+            @property --AX { syntax: "<integer>"; inherits: true; initial-value: 0; }
+            @property --shift { syntax: "<integer>"; inherits: true; initial-value: 4; }
+            @function --rightShift(--a <integer>, --b <integer>) returns <integer> {
+                result: round(down, var(--a) / pow(2, var(--b)));
+            }
+            :root { --AX: --rightShift(4660, var(--shift)); }
+        "#;
+        let dag = build(css);
+        // The terminal's value should be a Call, not a BitField.
+        let value_id = match &dag.nodes[dag.terminals[0] as usize] {
+            DagNode::WriteVar { value, .. } => *value,
+            other => panic!("expected WriteVar, got {other:?}"),
+        };
+        match &dag.nodes[value_id as usize] {
+            DagNode::Call { .. } => {}
+            other => panic!("expected Call (dynamic shift), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slicer_recogniser_is_name_agnostic() {
+        // Same body shape as --lowerBytes but with an arbitrary helper
+        // name. The recogniser matches on body shape, not name, so the
+        // call site must still collapse to BitField. Cardinal-rule
+        // operational test from the catalogue.
+        let css = r#"
+            @property --AX { syntax: "<integer>"; inherits: true; initial-value: 0; }
+            @function --xyzMaskN(--p <integer>, --q <integer>) returns <integer> {
+                result: mod(var(--p), pow(2, var(--q)));
+            }
+            :root { --AX: --xyzMaskN(4660, 4); }
+        "#;
+        let dag = build(css);
+        let (_src, shift, width) = find_bitfield(&dag);
+        assert_eq!(shift, 0);
+        assert_eq!(width, Some(4));
+    }
+
+    #[test]
+    fn dispatch_with_arithmetic_progression_slots_lowers_to_dynamic_load() {
+        // A 4-branch dispatch where each branch reads `var(--__1mK)`
+        // matching the branch's key. Slot for `--mK` is K (the address-
+        // map fallback), so the (key, slot) line is slot = key. The
+        // recogniser should collapse the Switch to a LoadVarDynamic.
+        let css = r#"
+            @property --idx { syntax: "<integer>"; inherits: true; initial-value: 0; }
+            @property --AX  { syntax: "<integer>"; inherits: true; initial-value: 0; }
+            :root {
+                --AX: if(
+                    style(--idx: 0): var(--__1m0);
+                    style(--idx: 1): var(--__1m1);
+                    style(--idx: 2): var(--__1m2);
+                    style(--idx: 3): var(--__1m3);
+                    else: 0
+                );
+            }
+        "#;
+        let dag = build(css);
+        let value_id = match &dag.nodes[dag.terminals[0] as usize] {
+            DagNode::WriteVar { value, .. } => *value,
+            other => panic!("expected WriteVar, got {other:?}"),
+        };
+        let (slot_expr, lo, hi, kind) = match &dag.nodes[value_id as usize] {
+            DagNode::LoadVarDynamic { slot_expr, valid_lo, valid_hi, kind, .. } => {
+                (*slot_expr, *valid_lo, *valid_hi, *kind)
+            }
+            other => panic!("expected LoadVarDynamic, got {other:?}"),
+        };
+        assert_eq!(lo, 0);
+        assert_eq!(hi, 4, "exclusive upper bound = max_slot + 1");
+        assert_eq!(kind, TickPosition::Prev);
+        // Line is slot = key, so slot_expr should be exactly the key
+        // node (the trivial b=1, a=0 specialisation).
+        match &dag.nodes[slot_expr as usize] {
+            DagNode::LoadVar { kind: TickPosition::Current, .. } => {}
+            other => panic!("slot_expr should be the key LoadVar, got {other:?}"),
+        }
+        // No leftover Switch in the DAG for this assignment.
+        for n in &dag.nodes {
+            if matches!(n, DagNode::Switch { .. }) {
+                panic!("Switch should have been replaced");
+            }
+        }
+    }
+
+    #[test]
+    fn dispatch_with_irregular_slots_stays_as_switch() {
+        // Same shape but the bodies don't fit a line: keys are 0..4
+        // but they read --__1m0, --__1m1, --__1m17, --__1m3 — the
+        // third entry breaks the slope. Recogniser must NOT fire.
+        let css = r#"
+            @property --idx { syntax: "<integer>"; inherits: true; initial-value: 0; }
+            @property --AX  { syntax: "<integer>"; inherits: true; initial-value: 0; }
+            :root {
+                --AX: if(
+                    style(--idx: 0): var(--__1m0);
+                    style(--idx: 1): var(--__1m1);
+                    style(--idx: 2): var(--__1m17);
+                    style(--idx: 3): var(--__1m3);
+                    else: 0
+                );
+            }
+        "#;
+        let dag = build(css);
+        let value_id = match &dag.nodes[dag.terminals[0] as usize] {
+            DagNode::WriteVar { value, .. } => *value,
+            other => panic!("expected WriteVar, got {other:?}"),
+        };
+        match &dag.nodes[value_id as usize] {
+            DagNode::Switch { .. } => {}
+            other => panic!("expected Switch (off-line), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_with_mixed_kind_bodies_stays_as_switch() {
+        // All bodies are LoadVars on slots that fit a line, but the
+        // tick-position differs across entries (some Current, some
+        // Prev). The recogniser requires a shared kind across the
+        // table — must stay as a Switch.
+        let css = r#"
+            @property --idx { syntax: "<integer>"; inherits: true; initial-value: 0; }
+            @property --AX  { syntax: "<integer>"; inherits: true; initial-value: 0; }
+            :root {
+                --AX: if(
+                    style(--idx: 0): var(--__1m0);
+                    style(--idx: 1): var(--__1m1);
+                    style(--idx: 2): var(--__1m2);
+                    style(--idx: 3): var(--m3);
+                    else: 0
+                );
+            }
+        "#;
+        let dag = build(css);
+        let value_id = match &dag.nodes[dag.terminals[0] as usize] {
+            DagNode::WriteVar { value, .. } => *value,
+            other => panic!("expected WriteVar, got {other:?}"),
+        };
+        match &dag.nodes[value_id as usize] {
+            DagNode::Switch { .. } => {}
+            other => panic!("expected Switch (mixed kind), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_with_non_loadvar_body_stays_as_switch() {
+        // One body isn't a static LoadVar — it's a calc. Recogniser
+        // requires every entry to be LoadVar; falls through.
+        let css = r#"
+            @property --idx { syntax: "<integer>"; inherits: true; initial-value: 0; }
+            @property --AX  { syntax: "<integer>"; inherits: true; initial-value: 0; }
+            :root {
+                --AX: if(
+                    style(--idx: 0): var(--__1m0);
+                    style(--idx: 1): var(--__1m1);
+                    style(--idx: 2): calc(var(--__1m2) + 1);
+                    style(--idx: 3): var(--__1m3);
+                    else: 0
+                );
+            }
+        "#;
+        let dag = build(css);
+        let value_id = match &dag.nodes[dag.terminals[0] as usize] {
+            DagNode::WriteVar { value, .. } => *value,
+            other => panic!("expected WriteVar, got {other:?}"),
+        };
+        match &dag.nodes[value_id as usize] {
+            DagNode::Switch { .. } => {}
+            other => panic!("expected Switch (non-loadvar body), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_with_offset_arithmetic_slot_line_lowers() {
+        // Keys 0..3, slots 100..103. Line is slot = 100 + 1*key.
+        // The slot 100 here is just a regular memory cell index;
+        // dispatch should still fire and produce slot_expr = a + key.
+        let css = r#"
+            @property --idx { syntax: "<integer>"; inherits: true; initial-value: 0; }
+            @property --AX  { syntax: "<integer>"; inherits: true; initial-value: 0; }
+            :root {
+                --AX: if(
+                    style(--idx: 0): var(--__1m100);
+                    style(--idx: 1): var(--__1m101);
+                    style(--idx: 2): var(--__1m102);
+                    style(--idx: 3): var(--__1m103);
+                    else: 0
+                );
+            }
+        "#;
+        let dag = build(css);
+        let value_id = match &dag.nodes[dag.terminals[0] as usize] {
+            DagNode::WriteVar { value, .. } => *value,
+            other => panic!("expected WriteVar, got {other:?}"),
+        };
+        let (slot_expr, lo, hi) = match &dag.nodes[value_id as usize] {
+            DagNode::LoadVarDynamic { slot_expr, valid_lo, valid_hi, .. } => {
+                (*slot_expr, *valid_lo, *valid_hi)
+            }
+            other => panic!("expected LoadVarDynamic, got {other:?}"),
+        };
+        assert_eq!(lo, 100);
+        assert_eq!(hi, 104);
+        // slot_expr should be Add(Lit(100), key).
+        match &dag.nodes[slot_expr as usize] {
+            DagNode::Calc { op: CalcKind::Add, args } => {
+                assert_eq!(args.len(), 2);
+                match &dag.nodes[args[0] as usize] {
+                    DagNode::Lit(v) => assert_eq!(*v, 100.0),
+                    other => panic!("expected Lit(100), got {other:?}"),
+                }
+            }
+            other => panic!("expected Add at slot_expr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bitwise_decomp_call_lowers_to_bitwise_op() {
+        // A 2-input bit-decomposition body matching the AND shape:
+        // 32 locals (16 per param), result = sum of `ai * bi * 2^i`.
+        // The recogniser is shape-only (uses v1's classifier) — function
+        // name is arbitrary.
+        let css = r#"
+            @property --x { syntax: "<integer>"; inherits: true; initial-value: 12; }
+            @property --y { syntax: "<integer>"; inherits: true; initial-value: 10; }
+            @property --result { syntax: "<integer>"; inherits: true; initial-value: 0; }
+            @function --combine(--a <integer>, --b <integer>) returns <integer> {
+              --a1: mod(var(--a), 2);
+              --a2: mod(round(down, var(--a) / 2), 2);
+              --a3: mod(round(down, var(--a) / 4), 2);
+              --a4: mod(round(down, var(--a) / 8), 2);
+              --a5: mod(round(down, var(--a) / 16), 2);
+              --a6: mod(round(down, var(--a) / 32), 2);
+              --a7: mod(round(down, var(--a) / 64), 2);
+              --a8: mod(round(down, var(--a) / 128), 2);
+              --a9: mod(round(down, var(--a) / 256), 2);
+              --a10: mod(round(down, var(--a) / 512), 2);
+              --a11: mod(round(down, var(--a) / 1024), 2);
+              --a12: mod(round(down, var(--a) / 2048), 2);
+              --a13: mod(round(down, var(--a) / 4096), 2);
+              --a14: mod(round(down, var(--a) / 8192), 2);
+              --a15: mod(round(down, var(--a) / 16384), 2);
+              --a16: mod(round(down, var(--a) / 32768), 2);
+              --b1: mod(var(--b), 2);
+              --b2: mod(round(down, var(--b) / 2), 2);
+              --b3: mod(round(down, var(--b) / 4), 2);
+              --b4: mod(round(down, var(--b) / 8), 2);
+              --b5: mod(round(down, var(--b) / 16), 2);
+              --b6: mod(round(down, var(--b) / 32), 2);
+              --b7: mod(round(down, var(--b) / 64), 2);
+              --b8: mod(round(down, var(--b) / 128), 2);
+              --b9: mod(round(down, var(--b) / 256), 2);
+              --b10: mod(round(down, var(--b) / 512), 2);
+              --b11: mod(round(down, var(--b) / 1024), 2);
+              --b12: mod(round(down, var(--b) / 2048), 2);
+              --b13: mod(round(down, var(--b) / 4096), 2);
+              --b14: mod(round(down, var(--b) / 8192), 2);
+              --b15: mod(round(down, var(--b) / 16384), 2);
+              --b16: mod(round(down, var(--b) / 32768), 2);
+              result: calc(
+                calc(var(--a1) * var(--b1)) +
+                calc(var(--a2) * var(--b2)) * 2 +
+                calc(var(--a3) * var(--b3)) * 4 +
+                calc(var(--a4) * var(--b4)) * 8 +
+                calc(var(--a5) * var(--b5)) * 16 +
+                calc(var(--a6) * var(--b6)) * 32 +
+                calc(var(--a7) * var(--b7)) * 64 +
+                calc(var(--a8) * var(--b8)) * 128 +
+                calc(var(--a9) * var(--b9)) * 256 +
+                calc(var(--a10) * var(--b10)) * 512 +
+                calc(var(--a11) * var(--b11)) * 1024 +
+                calc(var(--a12) * var(--b12)) * 2048 +
+                calc(var(--a13) * var(--b13)) * 4096 +
+                calc(var(--a14) * var(--b14)) * 8192 +
+                calc(var(--a15) * var(--b15)) * 16384 +
+                calc(var(--a16) * var(--b16)) * 32768
+              );
+            }
+            :root { --result: --combine(var(--x), var(--y)); }
+        "#;
+        let dag = build(css);
+        let value_id = match &dag.nodes[dag.terminals[0] as usize] {
+            DagNode::WriteVar { value, .. } => *value,
+            other => panic!("expected WriteVar, got {other:?}"),
+        };
+        match &dag.nodes[value_id as usize] {
+            DagNode::BitwiseOp { kind, args } => {
+                use crate::dag::types::BitwiseKind;
+                assert_eq!(*kind, BitwiseKind::And);
+                assert_eq!(args.len(), 2);
+            }
+            other => panic!("expected BitwiseOp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slicer_lowerbytes_zero_width_falls_through() {
+        // --lowerBytes(X, 0) = mod(X, 1) = 0 for any X. The recogniser
+        // refuses to emit a degenerate BitField with width=0; the
+        // call falls through to a generic Call (which evaluates the
+        // body and gets the same 0).
+        let css = r#"
+            @property --AX { syntax: "<integer>"; inherits: true; initial-value: 0; }
+            @function --lowerBytes(--a <integer>, --b <integer>) returns <integer> {
+                result: mod(var(--a), pow(2, var(--b)));
+            }
+            :root { --AX: --lowerBytes(123, 0); }
+        "#;
+        let dag = build(css);
+        let value_id = match &dag.nodes[dag.terminals[0] as usize] {
+            DagNode::WriteVar { value, .. } => *value,
+            other => panic!("expected WriteVar, got {other:?}"),
+        };
+        match &dag.nodes[value_id as usize] {
+            DagNode::Call { .. } => {}
+            other => panic!("expected fallback Call for width=0, got {other:?}"),
+        }
     }
 }

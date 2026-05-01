@@ -86,16 +86,12 @@ pub enum DagNode {
     Calc { op: CalcKind, args: Vec<NodeId> },
 
     /// Pure user-`@function` call. The function body is its own
-    /// sub-DAG rooted at `Dag::function_results[fn_id]`; this node
+    /// sub-DAG rooted at `Dag::function_roots[fn_id]`; this node
     /// supplies the call-site arguments and triggers a body walk.
     /// At walk time, the walker pushes a call frame containing
     /// `args` (caller-context NodeIds) and walks the body root;
     /// `Param(i)` references in the body resolve to `args[i]`
     /// evaluated in the caller's context.
-    ///
-    /// Replaces the v1-style "delegate to interpreter" `FuncCall` —
-    /// kept that variant name above for callers that haven't migrated;
-    /// new lowering emits `Call`.
     Call { fn_id: u32, args: Vec<NodeId> },
 
     /// Parameter placeholder inside a function body sub-DAG. The body
@@ -103,11 +99,6 @@ pub enum DagNode {
     /// the i-th argument of the enclosing `Call`. Resolved at walk time
     /// against the topmost call frame.
     Param(u32),
-
-    /// Legacy fallback: delegates to v1's `eval_function_call`. Only
-    /// emitted when v2 lowering can't resolve a callee (unknown name,
-    /// recursion guard). Phase 1 default; new lowering emits `Call`.
-    FuncCall { fn_id: u32, args: Vec<NodeId> },
 
     /// `if(cond1: e1; cond2: e2; ...; else: ef)` conditional.
     If {
@@ -144,16 +135,95 @@ pub enum DagNode {
     /// delegates evaluation to v1's executor; Phase 2 promotes this
     /// to a fully self-contained DAG super-node.
     IndirectStore { port_id: u32, packed: bool },
+    /// Bit-field extraction: `(src >> shift) & ((1 << width) - 1)`
+    /// when `width` is `Some`, or just `src >> shift` when `width` is
+    /// `None`. Shift uses arithmetic right shift on `i32` (sign-
+    /// preserving), matching v1's `Op::Bit`. The width-`None` form
+    /// (pure shift) preserves the sign of negative `src`.
+    ///
+    /// Lowered from the bit-slicer family — `--lowerBytes`,
+    /// `--rightShift`, `--bit`, and any other `@function` whose body
+    /// matches one of those structural shapes. Phase 2 idiom 7. The
+    /// recogniser fires on the body shape, not the helper name (per
+    /// catalogue cardinal-rule note).
+    ///
+    /// `width` constraints: `Some(w)` requires `1 <= w <= 32`. `w == 32`
+    /// effectively masks to the full i32 range (no-op mask). `shift`
+    /// is `0..=31` — shifts of 32+ are saturated to 0 by the walker
+    /// (matches v1's `if i >= 32 { 0 } else { (v >> i) & 1 }` guard).
+    BitField {
+        src: NodeId,
+        shift: u8,
+        width: Option<u8>,
+    },
+    /// Dynamic-slot load: evaluate `slot_expr` to a `SlotId` at walk
+    /// time, then read state at that slot with `kind`. If the computed
+    /// slot is outside `valid_range = (lo, hi)` (`lo` inclusive, `hi`
+    /// exclusive), evaluate `fallback` instead.
+    ///
+    /// Lowered from a `Switch` whose every entry body is a static
+    /// `LoadVar { slot: a + b*key, kind }` for table-wide constants
+    /// `a`, `b` and a shared `kind`. The (key, slot) pairs lie on a
+    /// line, so the per-key table is redundant — the slot can be
+    /// computed from the key. The Switch's own fallback becomes this
+    /// node's fallback; `valid_range` is the inclusive/exclusive
+    /// bounds of the slots the original Switch covered, so any key
+    /// that mapped outside still hits `fallback`.
+    ///
+    /// Operational test: the only CSS shape that produces this
+    /// post-lowering form is "an `if(style(--k: K_i): var(--src_i))`
+    /// chain (or its dispatch-table specialisation) where the source
+    /// names form an arithmetic-progression slot mapping in the same
+    /// order as the keys." That holds for any cabinet whose CSS
+    /// expresses a key→slot lookup over a regular naming scheme.
+    LoadVarDynamic {
+        slot_expr: NodeId,
+        valid_lo: SlotId,
+        valid_hi: SlotId,
+        kind: TickPosition,
+        fallback: NodeId,
+    },
+    /// 16-bit native bitwise operation: AND/OR/XOR over two operands,
+    /// or NOT over one. Operands are truncated to their low 16 bits
+    /// before the op, and the result is the low 16 bits as i32.
+    ///
+    /// Lowered from `@function` bodies whose structural shape is the
+    /// per-bit decomposition + reconstruction sum: each input split
+    /// into 16 bits via `mod(round(down, var/2^k), 2)`, then the
+    /// result is `sum_{k=0..16} combine(a_k, b_k) * 2^k` where
+    /// combine ∈ {`a*b`, `min(1,a+b)`, `min(1,a+b) - a*b`, `1-a`} for
+    /// AND/OR/XOR/NOT respectively. v2 reuses v1's
+    /// `classify_bitwise_decomposition` to identify the shape — same
+    /// matcher, both backends. Cardinal-rule clean: the matcher
+    /// looks at body shape only, never the function's name.
+    BitwiseOp {
+        kind: BitwiseKind,
+        args: Vec<NodeId>,
+    },
+}
+
+/// Bitwise operation kinds for `DagNode::BitwiseOp`. Mirrors
+/// `crate::compile::BitwiseKind` (which v2's lowering reuses for the
+/// classifier — see `dag::lowering::lower_call`); a dedicated copy
+/// here keeps the public DAG vocabulary self-contained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BitwiseKind {
+    /// 2-arg AND.
+    And,
+    /// 2-arg OR.
+    Or,
+    /// 2-arg XOR.
+    Xor,
+    /// 1-arg NOT (16-bit complement).
+    Not,
 }
 
 /// V2-native broadcast write: every property reference resolved to a
 /// `SlotId`, and the value expression lowered to a `NodeId` that the
-/// walker evaluates directly. Replaces the runtime `name_to_slot`
-/// lookups + v1-interpreter delegation that the bridge version did.
+/// walker evaluates directly.
 ///
 /// Built at lowering time from `pattern::broadcast_write::BroadcastWrite`
-/// (which carries v1-shaped names + `Expr`); the original is kept on
-/// `Dag::broadcast_writes` until the bridge is fully removed.
+/// (which carries v1-shaped names + `Expr`).
 #[derive(Debug, Clone)]
 pub struct DagBroadcast {
     /// Optional outer gate. The whole port is skipped when the gate's
@@ -225,10 +295,6 @@ pub struct Dag {
     /// `packed_broadcast_ports`. Pure slot resolution (no value
     /// expression to lower).
     pub dag_packed_broadcasts: Vec<DagPackedBroadcast>,
-    /// Property names absorbed into the broadcast lists. The lowering
-    /// loop filters assignments against this set so absorbed cells are
-    /// not double-evaluated as both `WriteVar` and `IndirectStore`.
-    pub absorbed_properties: std::collections::HashSet<String>,
     /// Transient slot count: the number of properties that appear in
     /// assignments but aren't `@property`-declared (don't have a real
     /// state-var slot or memory address). v1's compiler allocates
@@ -242,16 +308,6 @@ pub struct Dag {
     /// by `slot >= TRANSIENT_BASE` and routes reads/writes through a
     /// transient cache that does *not* commit to State.
     pub transient_slot_count: usize,
-    /// Bare-property-name → SlotId for every name the lowering saw.
-    /// Includes both committed slots (from
-    /// `eval::property_to_address`) and transient slots allocated for
-    /// unregistered names. Consumers (e.g. the broadcast executor)
-    /// should consult this map rather than `property_to_address`
-    /// directly, because it reflects v2's view of the slot space —
-    /// in particular, transient slots that v2 allocates for `--opcode`,
-    /// `--_slot0Live`, etc., aren't visible via the global address
-    /// map.
-    pub name_to_slot: std::collections::HashMap<String, SlotId>,
 }
 
 /// Transient-slot encoding base. Memory addresses are <= 0xFFFFFFF

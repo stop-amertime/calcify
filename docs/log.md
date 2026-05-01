@@ -11,6 +11,409 @@ and the Criterion benchmarks.
 
 ---
 
+## 2026-05-01: v2 Phase 3 (c+) — inlined-Rust prototype, coverage is the wall
+
+Per the previous entry, (c+) was framed as a one-week prototype: per
+`WriteVar` terminal, walk its reachable cone, topo-sort it, emit a
+flat op vec over per-terminal locals, run with a `pc++` loop. No
+recursion, no memo, no per-node function pointers. Built as
+`Backend::DagV2Inlined`; terminals whose cones contain unsupported
+nodes fall back to the walker per-terminal.
+
+Op set covered: `Lit`, `LoadVar` (current/prev × scalar/transient),
+all arity-1/2/3 `Calc` (Add/Sub/Mul/Div/Mod/Pow/Sign/Abs/Neg/Min2/
+Max2/Clamp/Round), `BitField`, `BitwiseOp`. Bailed: `Call`/`Param`,
+`If`, `Switch`, `Concat`, `LitStr`, `LoadVarDynamic`, variadic Min/Max.
+
+Correctness: 6/6 differentials green
+(`v2_inlined_differential.rs`) — covers both emit path (simple_calc,
+arith_chain, div_mod) and walker fallback (nested_calls, dispatch,
+mixed_cabinet). Bit-identical to the walker.
+
+Speed (5K bench, 500 warmup, native release, single run):
+
+| Cabinet | Coverage | v1 | walker | closures | inlined |
+|---|---|---|---|---|---|
+| rogue | 36.5% | 152K | 51K | 61K | 54K |
+| zork1 | 39.4% | 203K | 61K | 67K | 60K |
+| bootle | 39.4% | 344K | 101K | 110K | 109K |
+
+Inlined ≈ closures ≈ walker. Same 3-5× gap to v1 as before.
+
+### What this tells us
+
+**Coverage is the binding constraint, not per-op cost.** ~37% of
+`WriteVar` terminals on every tested cabinet. Pushing op coverage up
+(arity-1, BitField, BitwiseOp on top of the initial arity-2 set)
+**doubled emitted-terminal count** (14% → 36%) but didn't move
+ticks/sec — because the missing 63% are the work-bearing terminals.
+Specifically the ones whose cones contain `Switch` (the dispatch
+tables Phase 2 built), `Call` (function bodies), and `If` (branching
+cascades). Those are exactly where the runtime cost lives.
+
+So the (c+) hypothesis "straight-line emission with locals will clear
+v1" is **plausible** (the architecture is correct; emitted terminals
+are bit-identical) but **not demonstrated** (we never ran the
+hot-cone terminals through the straight-line path). To actually clear
+v1, the inlined backend would need:
+
+1. **Switch lowering**: jump-table op + per-branch sub-cones with
+   phi-style merge into the parent cone's locals.
+2. **Call lowering**: per-`fn_id` body programs emitted once,
+   `LoadParam` op, frame stack at runtime.
+3. **If lowering**: short-circuit branches over StyleCondition trees.
+
+Each is several days. Each is structurally close to what wasm
+codegen needs (Switch → `br_table`, Call → wasm `call`, If → `br_if`),
+so doing them in interpreted Rust first and then translating to wasm
+is throwaway work.
+
+### Updated Phase 3 sequence
+
+Old (from prev entry): (c+) inlined-Rust → (a) wasm if (c+) clears v1.
+
+Revised: **skip ahead to (a) wasm.** The inlined prototype already
+tells us what we needed to know — the codegen shape factors (per-
+terminal straight-line ops over locals, walker fallback for
+unsupported), and coverage is what gates the win. Doing Switch/Call/
+If lowering in interpreted Rust first then re-doing them in wasm is
+sunk-cost work; wasm needs the same lowering logic either way.
+
+What we keep from (c+): `inlined_codegen.rs` and the
+`Backend::DagV2Inlined` driver as a Rust-side reference executor for
+the wasm output. Same emitted op vocabulary, run interpretively to
+differential-test wasm against.
+
+What we don't claim: any speedup. Inlined ≈ walker on this cabinet
+set; the prototype's job was to factor the shape, not move the
+needle.
+
+### Artefacts
+
+- `crates/calcite-core/src/dag/inlined_codegen.rs` — emitter +
+  flat-op runner. Per-terminal scratch buffer reused across terminals
+  (topo-order emit guarantees no read-before-write across terminals).
+- `crates/calcite-core/src/eval.rs` — `Backend::DagV2Inlined` variant
+  + `dag_v2_inlined_tick` driver (mirrors `dag_v2_closures_tick`'s
+  phase structure; broadcasts + uncovered terminals delegate to the
+  walker).
+- `crates/calcite-core/tests/v2_inlined_differential.rs` — 6
+  synthetic differentials vs the walker.
+- `crates/calcite-cli/src/bin/probe_v2_inlined.rs` — coverage
+  report + four-backend speed.
+
+---
+
+## 2026-05-01: v2 Phase 3 spike — closure-tree prototype, dispatch isn't the bottleneck
+
+Per `compiler-mission.md` Phase 3, recommended sequence is (c) Rust-
+closure prototype → (a) hand-emitted wasm. This entry covers the (c)
+artefact: a function-pointer-per-node executor, built as
+`Backend::DagV2Closures` so it shares the v2 walker's state model and
+broadcast helpers but replaces the per-node `match`-on-enum dispatch
+with one indirect call through a parallel `Vec<NodeHandler>` table.
+
+Each node lowers to `(handler, payload)` at backend-selection time;
+the run loop is one shared `eval_node` that does memo + dispatch via
+`(cdag.handlers[id])(cdag, id, ctx, state)`. Hot-path arithmetic
+(Add/Sub/Mul/Div/Mod with arity-2) gets specialised handlers; the
+generic Calc handler covers the long tail.
+
+Correctness: 4 synthetic differentials green
+(`v2_closures_differential.rs`) — simple calc, nested function calls,
+literal-key dispatch, BitwiseOp shape. Bit-identical to the v2 walker.
+
+Speed on rogue.css (5-run median, 500 warmup + 4000 bench, native
+release):
+
+| Backend | Ticks/s | vs v1 | vs walker |
+|---|---|---|---|
+| v1 Bytecode | 313K | — | — |
+| v2 walker | 56K | 5.6× slower | — |
+| v2 closures | 64K | 4.9× slower | **1.14× faster** |
+
+Closure dispatch buys ~15% over the walker, well inside the run-to-run
+noise floor on this Windows laptop (±20%). The v1-vs-v2 ratio barely
+moves.
+
+### What the prototype tells us
+
+This was a **measurement spike**, not a shipping path — its job was
+to test whether eliminating per-node enum-tag dispatch recovers a
+meaningful fraction of the v2 interpreter overhead before committing
+to wasm codegen. The answer is **no**.
+
+If dispatch were the bottleneck, replacing the 14-arm `match` with a
+function-pointer table should have moved the needle by 50-200%
+(cf. v1's `BranchIfNotEqLit` and `DispatchChain` wins, both of which
+were dispatch-elimination plays). 15% says dispatch is a small
+slice. The actual cost lives elsewhere — most likely:
+
+- **Per-node memo overhead.** Two array reads + epoch compare on every
+  visit. With ~30K-50K nodes per terminal traversal and broad fan-in,
+  the memo is doing real work — but its per-hit cost is paid even when
+  the underlying compute is one ALU op.
+- **Recursion through `eval_node`.** Rust doesn't inline recursive
+  function calls, so every node visit is a real call frame. The
+  closure version is also recursive through `eval_node`; the
+  vtable swap doesn't change that.
+- **Walking 30K-50K nodes per tick** when v1's bytecode interpreter
+  walks ~35K *flat ops* per tick. Same workload, different
+  granularity — the DAG shape pays an O(node) call-graph traversal
+  where the bytecode pays an O(op) `pc++` step. Most ticks the work
+  per node and the work per op are comparable, but the per-node
+  call/return + memo cost is the constant factor v1 doesn't pay.
+
+### What this means for Phase 3
+
+Hand-emitting wasm with the same shape — one wasm function per node,
+recursion through a shared dispatcher — will produce roughly the same
+result as the closure prototype. The only thing wasm changes vs Rust
+closures is the runtime (browser vs native), not the dispatch shape.
+
+The real Phase 3 win has to come from **codegen that flattens** the
+DAG: emit one straight-line wasm function per terminal that inlines
+the entire backwards reachability cone, dropping the per-node memo
+table and the recursive dispatch entirely. This is the shape v1's
+bytecode interpreter approximates by emitting a single flat
+`Vec<Op>` and walking it with `pc++`. The win mechanism isn't
+"replace match with function pointer", it's "replace 30K function
+calls per terminal with one straight-line emitted function".
+
+That's a much bigger lift than (c) → (a). Concretely:
+
+- Per-terminal scheduling: pick a topological order over the
+  reachable cone, emit each node once into a straight-line block.
+- Shared sub-expressions: when a node is reachable from two
+  terminals, either inline at both sites (size cost) or hoist into a
+  separate wasm function called once and cached in a wasm `local`
+  (memo cost we already pay, but per-terminal not per-node).
+- StyleCondNode and Switch lowering: branch tables and break-blocks,
+  not recursive calls.
+
+The (c) prototype validates that the IR factors: every node lowered
+cleanly to a (handler, payload) pair, no shape needed to fall back
+to the walker. So the IR is right; the issue is the executor model.
+
+### What didn't move
+
+- **Closure dispatch alone**: +15% on rogue, inside noise on
+  zork/bootle.
+- **Hot-path Calc specialisation** (Add2/Sub2/Mul2/Div2/Mod2 each
+  with their own monomorphic handler): folded into the +15% above.
+  Splitting them out vs going through `h_calc_generic` for everything
+  would let us measure that contribution alone, but the headline
+  result wouldn't change.
+
+### What this is NOT
+
+- Not a perf win to ship. The +15% is sometimes +25%, sometimes 0%,
+  inside Windows noise. Closure backend is `#[cfg(test)]`-equivalent
+  diagnostic infrastructure, not a default.
+- Not evidence that v2 is fundamentally slower than v1. v1 has years
+  of peephole work piled on top of `BranchIfNotEqLit` /
+  `DispatchChain` / unchecked indexing. v2's walker is the naive
+  recursive-DAG case; the closure prototype is the same naive case
+  with a different dispatch shape.
+
+### Visit-count breakdown (follow-up profile)
+
+Sampling profilers on Windows native need admin (`xperf` for samply,
+`blondie_dtrace` for cargo-flamegraph). Pivoted to lightweight visit
+counters in `closure_codegen::eval_node` behind an atomic enable
+flag. The closure backend has the same memo + recursion shape as the
+walker, so its visit pattern is the walker's visit pattern.
+
+Result on rogue, deterministic across runs:
+
+```
+visits/tick:         1,243   (every eval_node entry)
+memo hits/tick:        191   (15.4%)
+handler calls/tick:  1,052   (memo misses)
+ns/tick (no stats):  ~16,000
+ns/tick (with stats): ~27,000   (atomic-add overhead)
+```
+
+Compare against v1 bytecode on the same cabinet (`docs/log.md`
+2026-04-14): **~35,000 ops/tick at ~3 µs/tick = ~0.09 ns/op**.
+
+The walker on closures: **1,052 handler calls × ~15 ns/call =
+~15.7 µs/tick** ≈ measured 16 µs.
+
+### What that means: the granularity is right, the per-call cost is wrong
+
+v2 does **33× fewer units of work per tick than v1** (1,052 vs 35,000).
+That's the whole *point* of moving from a flat bytecode interpreter
+to a DAG IR — recognisers collapse 30+ ops into one super-node.
+
+But each v2 unit costs **~167× more than each v1 unit** (15 ns vs
+0.09 ns). Net effect: 167 / 33 ≈ **5.05× slower**. Exactly the gap.
+
+Where the 15 ns goes per handler call (rough split):
+- function-pointer indirect call: ~3-5 ns
+- recursive entry into `eval_node`: ~5 ns
+- memo array reads + epoch compare + write: ~3 ns
+- payload unpack from Vec/HashMap inside payload: ~3 ns
+
+No single dominant component — it's the *whole closure-style runtime*,
+not one piece. Removing the function-pointer indirection (Phase 3 (a)
+hand-emit wasm with the same shape) trims ~5 ns at best; gets us to
+maybe ~10 ns/call = 10.5 µs/tick = ~95K ticks/s. Still 3× slower
+than v1.
+
+### What Phase 3 actually has to do
+
+The v1 bytecode interpreter pays ~0.09 ns/op because each op is a
+match arm with bounds-checks elided, slot indices read from
+contiguous memory, and `pc++` instead of recursive descent. **That's
+the cost ceiling we're shooting for, not the closure-tree's
+~10 ns/call.**
+
+The way to get there from the v2 DAG: **per-terminal codegen with
+inlining**. For each `WriteVar` terminal:
+
+1. Collect the reachable cone (closure-codegen already lowers each
+   node, so we have the per-node payloads).
+2. Topologically order the cone — every node's deps are emitted before
+   it. With topo order, no memo is needed; each node is computed
+   exactly once into a local before its consumers run.
+3. Emit one straight-line block (wasm function or Rust closure):
+   per node, generate "compute X into local L_X" code. Lits become
+   immediate operands. Calc becomes one `i32.add` / `i32.mul` op.
+   LoadVar becomes one `state.read_mem(slot)` call. No recursion,
+   no function pointers, no memo bookkeeping.
+
+Theoretical ceiling under this plan: 1,052 nodes/tick × ~0.5 ns/node
+(closer to v1's per-op cost, accounting for wasm vs native overhead)
+≈ **2 µs/tick** = ~500K ticks/s on rogue. Even capturing 30% of that
+beats v1.
+
+The Phase 3 codegen target is clear now: **straight-line per-terminal
+emission, not per-node functions**. This is what the closure prototype
+ruled out *before* we sank wasm time on the wrong shape.
+
+### Updated Phase 3 sequence
+
+Old (from mission doc): (c) closures → (a) hand-emit wasm.
+Revised based on this measurement:
+
+1. **(c+) Inlined-Rust prototype**: same shape as the wasm endpoint,
+   easier to debug. For each terminal, generate a Rust closure that
+   inlines its reachable cone (no recursion, no memo). Measure
+   ticks/s; should clear v1 if the model is right.
+2. **(a) Hand-emit wasm**: only if (c+) clears v1. Runtime is
+   browser/wasmtime, codegen shape is the same as (c+).
+
+(c+) is a one-week prototype. (a) is the multi-week shipping work.
+The codegen target finally has an honest hypothesis behind it.
+
+### Artefacts
+
+- `crates/calcite-core/src/dag/closure_codegen.rs` — function-pointer
+  executor + visit-count `stats` module.
+- `crates/calcite-core/src/eval.rs` — `Backend::DagV2Closures` variant
+  + `dag_v2_closures_tick` driver (mirrors `dag_v2_tick`'s phase
+  structure; broadcasts delegate to walker helpers).
+- `crates/calcite-core/tests/v2_closures_differential.rs` — 4
+  synthetic differentials vs the v2 walker.
+- `crates/calcite-cli/src/bin/probe_v2_speed.rs` — three-backend speed.
+- `crates/calcite-cli/src/bin/probe_v2_flame.rs` — speed + visit-count
+  breakdown (atomic counters in `closure_codegen::eval_node`,
+  enable/disable via `stats::enable()`).
+
+---
+
+## 2026-05-01: v2 Phase 2 — recognisers landed, gate cleared
+
+Four recognisers on top of the Phase 1 walker. All bit-identical to v1
+on the cabinet differential; conformance suite + smoke tests green;
+wasm-pack clean.
+
+Reachable-node count on rogue/bootle/zork1 drops 98–99% vs the
+unrecognised baseline. `dag.nodes.len()` barely moves (the arena keeps
+unreferenced nodes), but the walker only visits reachable nodes, so
+that's the metric Phase 3 codegen will consume.
+
+| Recogniser | Idiom | What it matches | Real-cabinet firing |
+|---|---|---|---|
+| Priority-head + Switch peel | 9 + 1 | `If` whose tail is a same-key integer-literal cascade | +14 Switches/cabinet, max single-If branches 60→14 |
+| `BitField` super-node | 7 | `@function` body shape `mod`/`pow2`/`round-down`-`div` | 964–1042 BitFields/cabinet (~40% of Calls collapse) |
+| `LoadVarDynamic` peel | 12 (read side) | `Switch` with ≥4 LoadVar bodies on one (key, slot) line | 3 LoadVarDynamics/cabinet, Switch entry total 430K→63K (rogue), 795K→3.5K (bootle/zork) |
+| `BitwiseOp` super-node | 8 | `@function` body shape: 16-bit decomposition + reconstruction sum | 259–282 BitwiseOps/cabinet |
+
+Speed sanity (rogue.css, 500 warmup + 2K bench):
+- v1 (Bytecode):  ~315K ticks/s — fully-optimised interpreter, baseline.
+- v2 after Phase 1: ~44K ticks/s (7.3× slower than v1).
+- v2 after Phase 2: ~93K ticks/s (3.4× slower than v1).
+
+Per the mission doc Phase 2 has no perf gate (perf wins live in Phase 3
+codegen), but the ~2× v2 speedup from BitwiseOp alone is a useful
+signal that the recognisers are doing real work, not just shuffling
+node IDs.
+
+### Not accidentally cheating
+
+The catalogue's cardinal rule (calcite knows nothing above the CSS
+layer) is easy to violate by accident when writing recognisers. One
+near-miss this session: the LoadVarDynamic peel was originally drafted
+with a doc-comment that named kiln, "memory cells", and "Doom-class
+cabinets" as motivation, and would have been gated on a >99% LoadVar-
+fraction threshold tuned to what the cabinets in `output/` happen to
+emit. That's overfitting to the emitter, not a structural recogniser.
+
+The version that landed describes the structural shape only —
+"`Switch` whose entry bodies are arithmetic-progression `LoadVar`s" —
+and uses the same ≥4-entry threshold the rest of the dispatch
+recogniser uses. Threshold isn't tuned to cabinet size; the peel
+fires on any size that meets the dispatch minimum. The doc-comment
+describes the CSS shape, not what kiln does with it.
+
+Operational test that caught it: imagine a brainfuck cabinet, a 6502
+cabinet, a calculator cabinet, a rules-engine cabinet. If the
+recogniser only makes sense for "the thing kiln emits for the 8086
+cabinet's `--readMem`", it's encoding a cabinet into calcite. If the
+shape is something a 6502 cabinet's `--readByte` would also produce
+(yes, because there's no other CSS shape for an address-keyed lookup),
+the recogniser is structural and ships.
+
+Worth re-reading the catalogue's per-idiom Genericity Probe before any
+future Phase 2 work — the failure mode is naming what kiln does in
+your head and writing the recogniser around that, even when the code
+looks shape-only.
+
+### Stopping point for Phase 2
+
+Reasonable place to pause and start a Phase 3 codegen spike. The
+remaining catalogue idioms split into:
+- Already absorbed: idioms 3, 4 (broadcast/packed broadcast) via v1
+  pattern recognisers feeding `IndirectStore`/`DagBroadcast`.
+- Trivially absorbed or low-value: idioms 2 (self-hold), 5 (compound-
+  AND), 6 (wide-value split residue after kiln's emit-time fuser).
+- Phase 3 codegen passes, not Phase 2 shape-matchers: idioms 11
+  (pure-region tagging for CSE), 14 (constant fold).
+
+The ≥30% node-count gate from the mission doc is met (98–99% reachable-
+node reduction on the cabinets measured). Whether more recognisers
+are needed is best answered by a Phase 3 wasm codegen prototype: if
+specific shapes blow up the wasm size or codegen time, those tell us
+which Phase 2 work is still owed. Adding more recognisers without a
+codegen target to inform them is guessing.
+
+Artefacts:
+- `crates/calcite-core/src/dag/types.rs` — `BitField`, `LoadVarDynamic`,
+  `BitwiseOp` super-nodes.
+- `crates/calcite-core/src/dag/lowering.rs` — recognisers + body
+  classifiers; reuses v1's `classify_bitwise_decomposition`.
+- `crates/calcite-core/src/eval.rs` — three new walker arms.
+- `crates/calcite-core/tests/v2_cabinet_differential.rs` — synthetic
+  v1-vs-v2 differentials for each recogniser.
+- `crates/calcite-cli/src/bin/probe_dag_node_counts.rs` — node-kind
+  bucketing + reachability sweep.
+- `crates/calcite-cli/src/bin/probe_v2_speed.rs` — v1-vs-v2 throughput
+  comparison.
+
+---
+
 ## 2026-04-30: v2 DAG backend — Phase 1 correctness landed
 
 v2 produces identical state to v1 for ≥2000 ticks on `hello-text.css`,

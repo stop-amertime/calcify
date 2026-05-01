@@ -33,6 +33,21 @@ pub enum Backend {
     Bytecode,
     /// v2: walk the per-tick DAG.
     DagV2,
+    /// Phase 3 spike: function-pointer-per-node DAG executor. Same
+    /// semantics as `DagV2`, different dispatch shape — measurement
+    /// vehicle for whether eliminating per-node enum-tag dispatch
+    /// recovers a meaningful fraction of interpreter overhead before
+    /// committing to wasm codegen.
+    DagV2Closures,
+    /// Phase 3 (c+) prototype: per-terminal straight-line emission.
+    /// Each `WriteVar` terminal lowers (when its cone is fully covered
+    /// by the prototype's op set) to a flat topo-ordered op vec over
+    /// per-terminal local slots; the executor is a `pc++` loop with
+    /// no recursion, no memo, no per-node function pointers.
+    /// Terminals whose cones contain unsupported nodes (Call, If,
+    /// Switch, BitField, BitwiseOp, LoadVarDynamic, Concat) fall back
+    /// to the walker on a per-terminal basis.
+    DagV2Inlined,
 }
 
 /// A value produced by expression evaluation — either numeric or string.
@@ -154,6 +169,18 @@ pub struct Evaluator {
     /// Function recursion is forbidden in CSS @function so depth is
     /// bounded by the call graph (typically 3-4).
     dag_v2_call_stack: Vec<Vec<i32>>,
+    /// Phase 3 spike: handler-pointer-per-node compiled DAG. `Some`
+    /// after `set_backend(DagV2Closures)` is first called; the source
+    /// `Dag` is moved into the `CompiledDag` and consumed.
+    dag_v2_closures: Option<crate::dag::CompiledDag>,
+    /// Phase 3 (c+) prototype: per-terminal straight-line emission.
+    /// `Some` after `set_backend(DagV2Inlined)` is first called; the
+    /// source `Dag` is moved into the `InlinedDag` and consumed.
+    dag_v2_inlined: Option<crate::dag::InlinedDag>,
+    /// Per-terminal scratch buffer for the inlined backend. Sized to
+    /// the max `local_count` across all emitted terminals at backend-
+    /// switch time. Reused across ticks; never grows.
+    dag_v2_inlined_locals: Vec<i32>,
 }
 
 /// Granular timing breakdown from [`Evaluator::tick_profiled`].
@@ -570,6 +597,9 @@ impl Evaluator {
             dag_v2_memory_cache: HashMap::new(),
             dag_v2_transient_cache: Vec::new(),
             dag_v2_call_stack: Vec::new(),
+            dag_v2_closures: None,
+            dag_v2_inlined: None,
+            dag_v2_inlined_locals: Vec::new(),
         }
     }
 
@@ -588,11 +618,32 @@ impl Evaluator {
     /// expensive on large cabinets, but only paid by callers that
     /// actually use v2.
     pub fn set_backend(&mut self, backend: Backend) {
-        if matches!(backend, Backend::DagV2) && !self.dag_v2_ready {
+        if matches!(
+            backend,
+            Backend::DagV2 | Backend::DagV2Closures | Backend::DagV2Inlined
+        ) && !self.dag_v2_ready
+        {
             if let Some(program) = self.pending_parsed.take() {
                 self.dag_v2 = crate::dag::build_dag(&program);
                 self.dag_v2_ready = true;
             }
+        }
+        // Materialise the closure-codegen compiled DAG on first switch
+        // into that backend. Clones the source DAG (one-time at backend
+        // selection) so the walker also remains usable — the prototype
+        // delegates broadcasts to the walker rather than reimplementing
+        // them. DAG memory is small relative to the cabinet's CSS bulk.
+        if matches!(backend, Backend::DagV2Closures) && self.dag_v2_closures.is_none() {
+            self.dag_v2_closures = Some(crate::dag::CompiledDag::build(self.dag_v2.clone()));
+        }
+        // Materialise the inlined-codegen compiled DAG on first switch
+        // into that backend. Same shape as closures: clone source DAG
+        // (small relative to CSS bulk), keep walker usable for
+        // unsupported terminals + broadcasts.
+        if matches!(backend, Backend::DagV2Inlined) && self.dag_v2_inlined.is_none() {
+            let inlined = crate::dag::InlinedDag::build(self.dag_v2.clone());
+            self.dag_v2_inlined_locals.resize(inlined.max_locals.max(1), 0);
+            self.dag_v2_inlined = Some(inlined);
         }
         self.backend = backend;
     }
@@ -619,6 +670,12 @@ impl Evaluator {
             }
             Backend::DagV2 => {
                 self.dag_v2_tick(state);
+            }
+            Backend::DagV2Closures => {
+                self.dag_v2_closures_tick(state);
+            }
+            Backend::DagV2Inlined => {
+                self.dag_v2_inlined_tick(state);
             }
         }
 
@@ -754,6 +811,12 @@ impl Evaluator {
             }
             Backend::DagV2 => {
                 self.dag_v2_tick(state);
+            }
+            Backend::DagV2Closures => {
+                self.dag_v2_closures_tick(state);
+            }
+            Backend::DagV2Inlined => {
+                self.dag_v2_inlined_tick(state);
             }
         }
         if !self.string_assignments.is_empty() {
@@ -1780,15 +1843,15 @@ impl Evaluator {
     /// writes. See `docs/v2-rewrite-design.md` § State model.
     ///
     /// Phase 1 implementation: pure expression nodes are walked
-    /// directly; `FuncCall` delegates to v1's `eval_function_call`
-    /// (Phase 2 inlines); `IndirectStore` is a stub (Phase 2 promotes
-    /// to a self-contained DAG super-node).
+    /// directly; `Call` evaluates the shared function body sub-DAG
+    /// against a per-call frame of arg values; `IndirectStore` runs
+    /// a v2-native broadcast executor.
     fn dag_v2_tick(&mut self, state: &mut State) {
         // Take ownership of the DAG and walker scratch buffers
-        // temporarily so we can mutate self (eval_function_call needs
-        // &mut self) while walking. Vec swaps are pointer-copies — no
-        // allocation. Buffers persist across ticks; we just resize on
-        // first use and clear cascade caches per tick.
+        // temporarily so the eval methods can borrow &mut self for the
+        // memo + epoch counter while walking. Vec swaps are pointer-
+        // copies — no allocation. Buffers persist across ticks; we just
+        // resize on first use and clear cascade caches per tick.
         let dag = std::mem::take(&mut self.dag_v2);
         let mut memo = std::mem::take(&mut self.dag_v2_memo);
         let mut memo_epoch = std::mem::take(&mut self.dag_v2_memo_epoch);
@@ -1925,6 +1988,302 @@ impl Evaluator {
         self.dag_v2_transient_cache = transient_cache;
     }
 
+    /// Phase 3 spike: tick using the function-pointer-per-node compiled
+    /// DAG. Same phase structure as `dag_v2_tick`; the only difference
+    /// is that scalar `WriteVar` value evaluation goes through
+    /// `closure_codegen::eval_node` (one indirect call per node) instead
+    /// of `dag_eval_node` (match-on-enum dispatch).
+    ///
+    /// Broadcasts (`IndirectStore` terminals) still go through the
+    /// walker's `dag_exec_*` helpers — those touch `state.read_mem` /
+    /// `state.write_mem` directly and don't dominate any cabinet's
+    /// per-tick budget. Reimplementing them in the closure form would
+    /// be a larger change than the spike justifies.
+    fn dag_v2_closures_tick(&mut self, state: &mut State) {
+        // Take ownership of the compiled DAG and walker scratch
+        // buffers so handlers can borrow `&mut DagCtx` while the
+        // compiled DAG is borrowed `&CompiledDag`.
+        let cdag = self.dag_v2_closures.take().expect("dag_v2_closures must be set");
+        let mut memo = std::mem::take(&mut self.dag_v2_memo);
+        let mut memo_epoch = std::mem::take(&mut self.dag_v2_memo_epoch);
+        let mut state_var_cache = std::mem::take(&mut self.dag_v2_state_var_cache);
+        let mut memory_cache = std::mem::take(&mut self.dag_v2_memory_cache);
+        let mut transient_cache = std::mem::take(&mut self.dag_v2_transient_cache);
+        let mut call_stack = std::mem::take(&mut self.dag_v2_call_stack);
+
+        let n_state_vars = state.state_var_count();
+        let n_nodes = cdag.node_count();
+        let n_transients = cdag.dag.transient_slot_count;
+
+        if state_var_cache.len() != n_state_vars {
+            state_var_cache.clear();
+            state_var_cache.resize(n_state_vars, None);
+        } else {
+            state_var_cache.fill(None);
+        }
+        if transient_cache.len() != n_transients {
+            transient_cache.clear();
+            transient_cache.resize(n_transients, None);
+        } else {
+            transient_cache.fill(None);
+        }
+        memory_cache.clear();
+        if memo.len() != n_nodes {
+            memo.resize(n_nodes, 0);
+            memo_epoch.clear();
+            memo_epoch.resize(n_nodes, 0);
+        }
+        if self.dag_v2_epoch == u32::MAX {
+            memo_epoch.fill(0);
+            self.dag_v2_epoch = 0;
+        }
+
+        // Phase 1: scalar WriteVars via the closure executor.
+        let terminals = cdag.dag.terminals.clone();
+        for term_id in &terminals {
+            if let crate::dag::DagNode::WriteVar { slot, value } = &cdag.dag.nodes[*term_id as usize] {
+                let slot = *slot;
+                let value_id = *value;
+                self.dag_v2_epoch = self.dag_v2_epoch.wrapping_add(1);
+                let mut ctx = crate::dag::closure_codegen::DagCtx {
+                    memo: &mut memo,
+                    memo_epoch: &mut memo_epoch,
+                    epoch: self.dag_v2_epoch,
+                    state_var_cache: &state_var_cache,
+                    memory_cache: &memory_cache,
+                    transient_cache: &transient_cache,
+                    call_stack: &mut call_stack,
+                    epoch_counter: &mut self.dag_v2_epoch,
+                };
+                let v = crate::dag::closure_codegen::eval_node(&cdag, value_id, &mut ctx, state);
+                if slot < 0 {
+                    let idx = (-slot - 1) as usize;
+                    if idx < state_var_cache.len() {
+                        state_var_cache[idx] = Some(v);
+                    }
+                } else if slot >= crate::dag::TRANSIENT_BASE {
+                    let idx = (slot - crate::dag::TRANSIENT_BASE) as usize;
+                    if idx < transient_cache.len() {
+                        transient_cache[idx] = Some(v);
+                    }
+                } else {
+                    memory_cache.insert(slot, v);
+                }
+            }
+        }
+
+        // Phase 2: writeback.
+        for (idx, slot_value) in state_var_cache.iter().enumerate() {
+            if let Some(v) = *slot_value {
+                let slot = -(idx as i32) - 1;
+                state.write_mem(slot, v);
+            }
+        }
+        for (&slot, &v) in memory_cache.iter() {
+            state.write_mem(slot, v);
+        }
+
+        // Phase 3: broadcasts. Delegate to the walker's helpers
+        // operating on `cdag.dag` directly. The walker borrows the DAG
+        // immutably while it borrows `&mut self` for memo + epoch.
+        // `cdag` is a local owned variable here (not borrowed from
+        // `self`), so the borrow checker accepts &cdag.dag alongside
+        // `&mut self`.
+        let dag_for_broadcasts: &crate::dag::Dag = &cdag.dag;
+        for term_id in &terminals {
+            if let crate::dag::DagNode::IndirectStore { port_id, packed } =
+                &dag_for_broadcasts.nodes[*term_id as usize]
+            {
+                let port_id = *port_id;
+                let packed = *packed;
+                self.dag_v2_epoch = self.dag_v2_epoch.wrapping_add(1);
+                if packed {
+                    self.dag_exec_packed_broadcast(
+                        dag_for_broadcasts,
+                        port_id,
+                        state,
+                        &transient_cache,
+                    );
+                } else {
+                    let bcast_epoch_base = self.dag_v2_epoch;
+                    self.dag_v2_epoch = self.dag_v2_epoch.wrapping_add(1);
+                    self.dag_exec_broadcast_with(
+                        dag_for_broadcasts,
+                        port_id,
+                        state,
+                        &mut memo,
+                        &mut memo_epoch,
+                        bcast_epoch_base,
+                        &mut call_stack,
+                        &transient_cache,
+                    );
+                }
+            }
+        }
+
+        // Restore.
+        self.dag_v2_closures = Some(cdag);
+        self.dag_v2_memo = memo;
+        self.dag_v2_memo_epoch = memo_epoch;
+        self.dag_v2_state_var_cache = state_var_cache;
+        self.dag_v2_memory_cache = memory_cache;
+        self.dag_v2_call_stack = call_stack;
+        self.dag_v2_transient_cache = transient_cache;
+    }
+
+    /// Phase 3 (c+) prototype tick: per-terminal straight-line emission
+    /// where supported, walker fallback otherwise. Same phase ordering
+    /// as `dag_v2_tick` and `dag_v2_closures_tick`.
+    ///
+    /// Per-terminal locals are reused across terminals (same scratch
+    /// buffer); we never read locals from a previous terminal because
+    /// the emitted program writes every local it reads from before it
+    /// reads it (topo order guarantees this).
+    fn dag_v2_inlined_tick(&mut self, state: &mut State) {
+        // Take ownership of the inlined-compiled DAG and walker scratch.
+        let idag = self.dag_v2_inlined.take().expect("dag_v2_inlined must be set");
+        let mut locals = std::mem::take(&mut self.dag_v2_inlined_locals);
+        let mut memo = std::mem::take(&mut self.dag_v2_memo);
+        let mut memo_epoch = std::mem::take(&mut self.dag_v2_memo_epoch);
+        let mut state_var_cache = std::mem::take(&mut self.dag_v2_state_var_cache);
+        let mut memory_cache = std::mem::take(&mut self.dag_v2_memory_cache);
+        let mut transient_cache = std::mem::take(&mut self.dag_v2_transient_cache);
+        let mut call_stack = std::mem::take(&mut self.dag_v2_call_stack);
+
+        let n_state_vars = state.state_var_count();
+        let n_nodes = idag.node_count();
+        let n_transients = idag.dag.transient_slot_count;
+
+        if state_var_cache.len() != n_state_vars {
+            state_var_cache.clear();
+            state_var_cache.resize(n_state_vars, None);
+        } else {
+            state_var_cache.fill(None);
+        }
+        if transient_cache.len() != n_transients {
+            transient_cache.clear();
+            transient_cache.resize(n_transients, None);
+        } else {
+            transient_cache.fill(None);
+        }
+        memory_cache.clear();
+        if memo.len() != n_nodes {
+            memo.resize(n_nodes, 0);
+            memo_epoch.clear();
+            memo_epoch.resize(n_nodes, 0);
+        }
+        if locals.len() < idag.max_locals {
+            locals.resize(idag.max_locals, 0);
+        }
+        if self.dag_v2_epoch == u32::MAX {
+            memo_epoch.fill(0);
+            self.dag_v2_epoch = 0;
+        }
+
+        // Phase 1: scalar WriteVars. For each terminal, run the emitted
+        // straight-line program if it exists; else fall back to the
+        // walker (which uses the per-walk memo).
+        for (i, &term_id) in idag.dag.terminals.iter().enumerate() {
+            let crate::dag::DagNode::WriteVar { slot, value } =
+                &idag.dag.nodes[term_id as usize]
+            else {
+                continue;
+            };
+            let slot = *slot;
+            let value_id = *value;
+            let v = if let Some(emitted) = &idag.emitted[i] {
+                crate::dag::inlined_codegen::run_terminal(
+                    emitted,
+                    &mut locals,
+                    &state_var_cache,
+                    &memory_cache,
+                    &transient_cache,
+                    state,
+                )
+            } else {
+                // Walker fallback for unsupported cones.
+                self.dag_v2_epoch = self.dag_v2_epoch.wrapping_add(1);
+                let mut buf = DagWalkBuf {
+                    memo: &mut memo,
+                    memo_epoch: &mut memo_epoch,
+                    epoch: self.dag_v2_epoch,
+                    state_var_cache: &state_var_cache,
+                    memory_cache: &memory_cache,
+                    transient_cache: &transient_cache,
+                    call_stack: &mut call_stack,
+                };
+                self.dag_eval_node(&idag.dag, value_id, &mut buf, state)
+            };
+            if slot < 0 {
+                let idx = (-slot - 1) as usize;
+                if idx < state_var_cache.len() {
+                    state_var_cache[idx] = Some(v);
+                }
+            } else if slot >= crate::dag::TRANSIENT_BASE {
+                let idx = (slot - crate::dag::TRANSIENT_BASE) as usize;
+                if idx < transient_cache.len() {
+                    transient_cache[idx] = Some(v);
+                }
+            } else {
+                memory_cache.insert(slot, v);
+            }
+        }
+
+        // Phase 2: writeback.
+        for (idx, slot_value) in state_var_cache.iter().enumerate() {
+            if let Some(v) = *slot_value {
+                let slot = -(idx as i32) - 1;
+                state.write_mem(slot, v);
+            }
+        }
+        for (&slot, &v) in memory_cache.iter() {
+            state.write_mem(slot, v);
+        }
+
+        // Phase 3: broadcasts via the walker, same as closures_tick.
+        let dag_for_broadcasts: &crate::dag::Dag = &idag.dag;
+        for &term_id in &idag.dag.terminals {
+            if let crate::dag::DagNode::IndirectStore { port_id, packed } =
+                &dag_for_broadcasts.nodes[term_id as usize]
+            {
+                let port_id = *port_id;
+                let packed = *packed;
+                self.dag_v2_epoch = self.dag_v2_epoch.wrapping_add(1);
+                if packed {
+                    self.dag_exec_packed_broadcast(
+                        dag_for_broadcasts,
+                        port_id,
+                        state,
+                        &transient_cache,
+                    );
+                } else {
+                    let bcast_epoch_base = self.dag_v2_epoch;
+                    self.dag_v2_epoch = self.dag_v2_epoch.wrapping_add(1);
+                    self.dag_exec_broadcast_with(
+                        dag_for_broadcasts,
+                        port_id,
+                        state,
+                        &mut memo,
+                        &mut memo_epoch,
+                        bcast_epoch_base,
+                        &mut call_stack,
+                        &transient_cache,
+                    );
+                }
+            }
+        }
+
+        // Restore.
+        self.dag_v2_inlined = Some(idag);
+        self.dag_v2_inlined_locals = locals;
+        self.dag_v2_memo = memo;
+        self.dag_v2_memo_epoch = memo_epoch;
+        self.dag_v2_state_var_cache = state_var_cache;
+        self.dag_v2_memory_cache = memory_cache;
+        self.dag_v2_call_stack = call_stack;
+        self.dag_v2_transient_cache = transient_cache;
+    }
+
     /// Evaluate a single DAG node to an `i32`, with per-walk memoization.
     ///
     /// Memoization uses epoch-tagged entries: `memo_epoch[id] == epoch`
@@ -1987,9 +2346,56 @@ impl Evaluator {
             DagNode::WriteVar { .. } | DagNode::IndirectStore { .. } => 0,
             DagNode::Calc { .. } => self.dag_eval_calc(dag, node_id, buf, state),
             DagNode::Call { .. } => self.dag_eval_call(dag, node_id, buf, state),
-            DagNode::FuncCall { .. } => self.dag_eval_funccall(dag, node_id, buf, state),
             DagNode::If { .. } => self.dag_eval_if(dag, node_id, buf, state),
             DagNode::Switch { .. } => self.dag_eval_switch(dag, node_id, buf, state),
+            &DagNode::BitField { src, shift, width } => {
+                let v = self.dag_eval_node(dag, src, buf, state);
+                let shifted = if shift >= 32 { 0 } else { v >> shift };
+                match width {
+                    None => shifted,
+                    Some(w) if w >= 32 => shifted,
+                    Some(w) => shifted & ((1i32 << w) - 1),
+                }
+            }
+            &DagNode::LoadVarDynamic { slot_expr, valid_lo, valid_hi, kind, fallback } => {
+                let slot = self.dag_eval_node(dag, slot_expr, buf, state);
+                if slot >= valid_lo && slot < valid_hi {
+                    self.dag_read_slot(
+                        slot,
+                        kind,
+                        buf.state_var_cache,
+                        buf.memory_cache,
+                        buf.transient_cache,
+                        state,
+                    )
+                } else {
+                    self.dag_eval_node(dag, fallback, buf, state)
+                }
+            }
+            DagNode::BitwiseOp { kind, args } => {
+                use crate::dag::types::BitwiseKind;
+                // Snapshot the kind + arg ids so we don't keep the borrow
+                // on dag.nodes alive across the recursive eval calls.
+                let kind = *kind;
+                let arg0 = args.first().copied().unwrap_or(0);
+                let arg1 = args.get(1).copied().unwrap_or(0);
+                match kind {
+                    BitwiseKind::Not => {
+                        let a = self.dag_eval_node(dag, arg0, buf, state) as u32 & 0xFFFF;
+                        ((!a) & 0xFFFF) as i32
+                    }
+                    _ => {
+                        let a = self.dag_eval_node(dag, arg0, buf, state) as u32 & 0xFFFF;
+                        let b = self.dag_eval_node(dag, arg1, buf, state) as u32 & 0xFFFF;
+                        match kind {
+                            BitwiseKind::And => (a & b) as i32,
+                            BitwiseKind::Or => (a | b) as i32,
+                            BitwiseKind::Xor => (a ^ b) as i32,
+                            BitwiseKind::Not => unreachable!(),
+                        }
+                    }
+                }
+            }
         };
 
         buf.memo[idx] = result;
@@ -2109,58 +2515,6 @@ impl Evaluator {
             CalcKind::Neg => -walk(self, buf, a0),
         };
         result as i32
-    }
-
-    fn dag_eval_funccall(
-        &mut self,
-        dag: &crate::dag::Dag,
-        node_id: crate::dag::NodeId,
-        buf: &mut DagWalkBuf<'_>,
-        state: &State,
-    ) -> i32 {
-        use crate::dag::DagNode;
-
-        let (fn_id, args) = match &dag.nodes[node_id as usize] {
-            // args is small (one per param) and FuncCall is the cold
-            // path (Phase 2 inlines every callable function); the clone
-            // here is acceptable.
-            DagNode::FuncCall { fn_id, args } => (*fn_id, args.clone()),
-            _ => unreachable!(),
-        };
-        let name = dag
-            .function_names
-            .iter()
-            .find(|(_, &id)| id == fn_id)
-            .map(|(n, _)| n.clone());
-        let Some(name) = name else {
-            log::warn!("v2 walker: FuncCall fn_id={fn_id} has no name");
-            return 0;
-        };
-        let evaluated_args: Vec<Expr> = args
-            .iter()
-            .map(|&a| {
-                let v = self.dag_eval_node(dag, a, buf, state);
-                Expr::Literal(v as f64)
-            })
-            .collect();
-        // Bridge v2 transient cache → v1 self.properties so the
-        // function body's `var(--transient)` reads can find the value.
-        let mut populated_names: Vec<String> = Vec::new();
-        for (bare, &slot) in &dag.name_to_slot {
-            if slot >= crate::dag::TRANSIENT_BASE {
-                let idx = (slot - crate::dag::TRANSIENT_BASE) as usize;
-                if let Some(Some(v)) = buf.transient_cache.get(idx) {
-                    self.properties
-                        .insert(format!("--{bare}"), Value::Number(*v as f64));
-                    populated_names.push(format!("--{bare}"));
-                }
-            }
-        }
-        let result = self.eval_function_call(&name, &evaluated_args, state).as_number() as i32;
-        for n in &populated_names {
-            self.properties.remove(n);
-        }
-        result
     }
 
     /// Evaluate a `Call { fn_id, args }` node. Pre-evaluate every arg
@@ -3065,6 +3419,9 @@ mod tests {
             dag_v2_memory_cache: HashMap::new(),
             dag_v2_transient_cache: Vec::new(),
             dag_v2_call_stack: Vec::new(),
+            dag_v2_closures: None,
+            dag_v2_inlined: None,
+            dag_v2_inlined_locals: Vec::new(),
         };
         (evaluator, state)
     }

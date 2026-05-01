@@ -10,11 +10,15 @@
 pub mod types;
 pub mod lowering;
 pub mod walker;
+pub mod closure_codegen;
+pub mod inlined_codegen;
 
 pub use types::{
     Dag, DagBroadcast, DagNode, DagPackedBroadcast, NodeId, SlotId, StyleCondNode, TickPosition,
     TRANSIENT_BASE,
 };
+pub use closure_codegen::CompiledDag;
+pub use inlined_codegen::InlinedDag;
 
 use crate::types::ParsedProgram;
 

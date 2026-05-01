@@ -310,6 +310,306 @@ fn v2_register_dispatch_shape() {
     }
 }
 
+/// Bit-slicer call sites (idiom 7) lower to BitField super-nodes in
+/// v2. Verifies the rewrite is bit-identical to v1's body-walking
+/// evaluation across the cases that exercise the corner semantics:
+/// non-negative source, negative source, max width, single-bit pick.
+#[test]
+fn v2_bit_slicers_match_v1_across_signs_and_widths() {
+    let css = r#"
+        @property --srcPos { syntax: "<integer>"; inherits: true; initial-value: 49350; }
+        @property --srcNeg { syntax: "<integer>"; inherits: true; initial-value: -3; }
+        @property --lo8         { syntax: "<integer>"; inherits: true; initial-value: 0; }
+        @property --hi8         { syntax: "<integer>"; inherits: true; initial-value: 0; }
+        @property --shifted4    { syntax: "<integer>"; inherits: true; initial-value: 0; }
+        @property --bit6        { syntax: "<integer>"; inherits: true; initial-value: 0; }
+        @property --negShifted1 { syntax: "<integer>"; inherits: true; initial-value: 0; }
+        @property --negLo8      { syntax: "<integer>"; inherits: true; initial-value: 0; }
+
+        @function --lowerBytes(--a <integer>, --b <integer>) returns <integer> {
+          result: mod(var(--a), pow(2, var(--b)));
+        }
+        @function --rightShift(--a <integer>, --b <integer>) returns <integer> {
+          result: round(down, var(--a) / pow(2, var(--b)));
+        }
+        @function --bit(--val <integer>, --idx <integer>) returns <integer> {
+          result: mod(--rightShift(var(--val), var(--idx)), 2);
+        }
+
+        :root {
+          --lo8:         --lowerBytes(var(--srcPos), 8);
+          --hi8:         --rightShift(var(--srcPos), 8);
+          --shifted4:    --rightShift(var(--srcPos), 4);
+          --bit6:        --bit(var(--srcPos), 6);
+          --negShifted1: --rightShift(var(--srcNeg), 1);
+          --negLo8:      --lowerBytes(var(--srcNeg), 8);
+        }
+    "#;
+    let parsed = parse_css(css).expect("parse");
+
+    let mut s1 = State::default();
+    s1.load_properties(&parsed.properties);
+    let mut e1 = Evaluator::from_parsed(&parsed);
+    e1.set_backend(Backend::Bytecode);
+    e1.tick(&mut s1);
+
+    let mut s2 = State::default();
+    s2.load_properties(&parsed.properties);
+    let mut e2 = Evaluator::from_parsed(&parsed);
+    e2.set_backend(Backend::DagV2);
+    e2.tick(&mut s2);
+
+    for name in [
+        "lo8", "hi8", "shifted4", "bit6", "negShifted1", "negLo8",
+    ] {
+        let v1 = s1.get_var(name).unwrap();
+        let v2 = s2.get_var(name).unwrap();
+        assert_eq!(v1, v2, "{name}: v1={v1} v2={v2}");
+    }
+
+    // Sanity-pin the reference values so a v1 regression doesn't
+    // silently get rubber-stamped as "v2 matches v1." 49350 = 0xC0C6.
+    assert_eq!(s2.get_var("lo8").unwrap(), 198, "0xC0C6 & 0xFF");
+    assert_eq!(s2.get_var("hi8").unwrap(), 192, "0xC0C6 >> 8");
+    assert_eq!(s2.get_var("shifted4").unwrap(), 3084, "0xC0C6 >> 4");
+    assert_eq!(s2.get_var("bit6").unwrap(), 1, "(0xC0C6 >> 6) & 1");
+    // floor(-3 / 2) = -2, NOT -1 (Rust integer div rounds toward zero,
+    // CSS round(down,…) is floor). Any future change to the BitField
+    // walker that breaks this is a real semantic regression.
+    assert_eq!(s2.get_var("negShifted1").unwrap(), -2, "floor(-3/2)");
+    // -3 mod 256 = 253 (mathematical mod, not Rust %).
+    assert_eq!(s2.get_var("negLo8").unwrap(), 253, "(-3) mod 256");
+}
+
+/// All four 16-bit bitwise functions (idiom 8: AND/OR/XOR/NOT lowered
+/// from bit-decomposition function bodies) match v1 across signed and
+/// unsigned inputs, including high-bit-set values. v1 uses BitAnd16
+/// etc. on the same inputs, so equality is the contract here.
+#[test]
+fn v2_bitwise_decomp_functions_match_v1() {
+    // Build the four canonical bitwise helpers exactly as CSS-DOS
+    // emits them (see css-lib:198-269). Hand-written here so the test
+    // doesn't depend on external CSS files.
+    let mut css = String::new();
+    css.push_str(r#"
+        @property --x { syntax: "<integer>"; inherits: true; initial-value: 49350; }
+        @property --y { syntax: "<integer>"; inherits: true; initial-value: 21845; }
+        @property --andResult { syntax: "<integer>"; inherits: true; initial-value: 0; }
+        @property --orResult  { syntax: "<integer>"; inherits: true; initial-value: 0; }
+        @property --xorResult { syntax: "<integer>"; inherits: true; initial-value: 0; }
+        @property --notResult { syntax: "<integer>"; inherits: true; initial-value: 0; }
+    "#);
+
+    // Helper: emit a 2-input combiner with the given per-bit combine
+    // expression. The recogniser matches on body shape, not name.
+    fn emit_2input(name: &str, combine: impl Fn(usize) -> String) -> String {
+        let mut s = String::new();
+        s.push_str(&format!(
+            "@function --{name}(--a <integer>, --b <integer>) returns <integer> {{\n"
+        ));
+        for i in 1..=16 {
+            let div = 1u64 << (i - 1);
+            if div == 1 {
+                s.push_str(&format!("  --a{i}: mod(var(--a), 2);\n"));
+                s.push_str(&format!("  --b{i}: mod(var(--b), 2);\n"));
+            } else {
+                s.push_str(&format!("  --a{i}: mod(round(down, var(--a) / {div}), 2);\n"));
+            }
+        }
+        for i in 1..=16 {
+            let div = 1u64 << (i - 1);
+            if div == 1 { continue; }
+            s.push_str(&format!("  --b{i}: mod(round(down, var(--b) / {div}), 2);\n"));
+        }
+        s.push_str("  result: calc(\n");
+        for i in 1..=16 {
+            let factor = 1u64 << (i - 1);
+            let term = combine(i);
+            if i == 1 {
+                s.push_str(&format!("    calc({term})"));
+            } else {
+                s.push_str(&format!(" +\n    calc({term}) * {factor}"));
+            }
+        }
+        s.push_str("\n  );\n}\n");
+        s
+    }
+
+    css.push_str(&emit_2input("and", |i| format!("var(--a{i}) * var(--b{i})")));
+    css.push_str(&emit_2input("or", |i| format!("min(1, var(--a{i}) + var(--b{i}))")));
+    css.push_str(&emit_2input("xor", |i| {
+        format!("min(1, var(--a{i}) + var(--b{i})) - var(--a{i}) * var(--b{i})")
+    }));
+
+    // 1-input NOT: 16 a-locals, result = sum of (1-ai) * 2^(i-1).
+    let mut not_body = String::from(
+        "@function --not(--a <integer>) returns <integer> {\n  --a1: mod(var(--a), 2);\n",
+    );
+    for i in 2..=16 {
+        let div = 1u64 << (i - 1);
+        not_body.push_str(&format!("  --a{i}: mod(round(down, var(--a) / {div}), 2);\n"));
+    }
+    not_body.push_str("  result: calc(\n");
+    for i in 1..=16 {
+        let factor = 1u64 << (i - 1);
+        if i == 1 {
+            not_body.push_str(&format!("    calc(1 - var(--a{i}))"));
+        } else {
+            not_body.push_str(&format!(" +\n    calc(1 - var(--a{i})) * {factor}"));
+        }
+    }
+    not_body.push_str("\n  );\n}\n");
+    css.push_str(&not_body);
+
+    css.push_str(r#"
+        :root {
+          --andResult: --and(var(--x), var(--y));
+          --orResult:  --or(var(--x), var(--y));
+          --xorResult: --xor(var(--x), var(--y));
+          --notResult: --not(var(--x));
+        }
+    "#);
+
+    let parsed = parse_css(&css).expect("parse");
+
+    let mut s1 = State::default();
+    s1.load_properties(&parsed.properties);
+    let mut e1 = Evaluator::from_parsed(&parsed);
+    e1.set_backend(Backend::Bytecode);
+    e1.tick(&mut s1);
+
+    let mut s2 = State::default();
+    s2.load_properties(&parsed.properties);
+    let mut e2 = Evaluator::from_parsed(&parsed);
+    e2.set_backend(Backend::DagV2);
+    e2.tick(&mut s2);
+
+    for name in ["andResult", "orResult", "xorResult", "notResult"] {
+        let v1 = s1.get_var(name).unwrap();
+        let v2 = s2.get_var(name).unwrap();
+        assert_eq!(v1, v2, "{name}: v1={v1} v2={v2}");
+    }
+
+    // Pin the reference values. 49350 = 0xC0C6, 21845 = 0x5555.
+    assert_eq!(s2.get_var("andResult").unwrap(), 0xC0C6 & 0x5555, "AND of 0xC0C6 & 0x5555");
+    assert_eq!(s2.get_var("orResult").unwrap(),  0xC0C6 | 0x5555, "OR");
+    assert_eq!(s2.get_var("xorResult").unwrap(), 0xC0C6 ^ 0x5555, "XOR");
+    // 16-bit complement of 0xC0C6 = 0x3F39.
+    assert_eq!(s2.get_var("notResult").unwrap(), (!0xC0C6u16) as i32, "NOT (16-bit)");
+}
+
+/// Sanity probe of v1's dispatch-fallback behaviour. A 5-entry literal
+/// dispatch with `else: -1`; called with an out-of-range key. If v1's
+/// dispatch fallback honours the explicit else, both backends return
+/// -1; if v1 swallows the fallback and returns 0, v2 (which matches
+/// Chrome's spec) returns -1 and they diverge. This pins which one
+/// v1 does so the LoadVarDynamic differential below can phrase its
+/// assertion correctly.
+#[test]
+#[ignore = "v1 dispatch-fallback probe — informational only"]
+fn v1_literal_dispatch_else_branch_with_out_of_range_key() {
+    let css = r#"
+        @property --idx { syntax: "<integer>"; inherits: true; initial-value: 999; }
+        @property --result { syntax: "<integer>"; inherits: true; initial-value: 0; }
+        @function --pick(--k <integer>) returns <integer> {
+          result: if(
+            style(--k: 100): 11;
+            style(--k: 101): 22;
+            style(--k: 102): 33;
+            style(--k: 103): 44;
+            style(--k: 104): 55;
+            else: -1
+          );
+        }
+        :root { --result: --pick(var(--idx)); }
+    "#;
+    let parsed = parse_css(css).expect("parse");
+
+    let mut s1 = State::default();
+    s1.load_properties(&parsed.properties);
+    let mut e1 = Evaluator::from_parsed(&parsed);
+    e1.set_backend(Backend::Bytecode);
+    e1.tick(&mut s1);
+
+    let mut s2 = State::default();
+    s2.load_properties(&parsed.properties);
+    let mut e2 = Evaluator::from_parsed(&parsed);
+    e2.set_backend(Backend::DagV2);
+    e2.tick(&mut s2);
+
+    let r1 = s1.get_var("result").unwrap();
+    let r2 = s2.get_var("result").unwrap();
+    eprintln!("v1={r1} v2={r2}");
+}
+
+/// A dispatch whose every entry reads `var(--__1mK)` for the entry's
+/// key K matches the LoadVarDynamic shape (idiom 12 from the read
+/// side). Verifies bit-identical evaluation across the in-range, just-
+/// past-the-edge, and well-out-of-range key cases — the LoadVarDynamic
+/// walker computes the slot itself and bounds-checks against the
+/// table's covered range, so each of those cases exercises a
+/// different branch of the new walker arm.
+#[test]
+fn v2_arithmetic_progression_dispatch_matches_v1() {
+    let css = r#"
+        @property --m100 { syntax: "<integer>"; inherits: true; initial-value: 11; }
+        @property --m101 { syntax: "<integer>"; inherits: true; initial-value: 22; }
+        @property --m102 { syntax: "<integer>"; inherits: true; initial-value: 33; }
+        @property --m103 { syntax: "<integer>"; inherits: true; initial-value: 44; }
+        @property --m104 { syntax: "<integer>"; inherits: true; initial-value: 55; }
+        @property --inRange   { syntax: "<integer>"; inherits: true; initial-value: 102; }
+        @property --justOver  { syntax: "<integer>"; inherits: true; initial-value: 105; }
+        @property --wayOff    { syntax: "<integer>"; inherits: true; initial-value: 9999; }
+        @property --hitInside { syntax: "<integer>"; inherits: true; initial-value: 0; }
+        @property --hitEdge   { syntax: "<integer>"; inherits: true; initial-value: 0; }
+        @property --hitOff    { syntax: "<integer>"; inherits: true; initial-value: 0; }
+        @function --readAt(--at <integer>) returns <integer> {
+          result: if(
+            style(--at: 100): var(--__1m100);
+            style(--at: 101): var(--__1m101);
+            style(--at: 102): var(--__1m102);
+            style(--at: 103): var(--__1m103);
+            style(--at: 104): var(--__1m104);
+            else: -1
+          );
+        }
+        :root {
+          --hitInside: --readAt(var(--inRange));
+          --hitEdge:   --readAt(var(--justOver));
+          --hitOff:    --readAt(var(--wayOff));
+        }
+    "#;
+    let parsed = parse_css(css).expect("parse");
+
+    let mut s1 = State::default();
+    s1.load_properties(&parsed.properties);
+    let mut e1 = Evaluator::from_parsed(&parsed);
+    e1.set_backend(Backend::Bytecode);
+    e1.tick(&mut s1);
+
+    let mut s2 = State::default();
+    s2.load_properties(&parsed.properties);
+    let mut e2 = Evaluator::from_parsed(&parsed);
+    e2.set_backend(Backend::DagV2);
+    e2.tick(&mut s2);
+
+    // In-range hit: v1 and v2 must agree, and the answer is the
+    // initial-value of --m102 (33).
+    assert_eq!(s1.get_var("hitInside").unwrap(), s2.get_var("hitInside").unwrap());
+    assert_eq!(s2.get_var("hitInside").unwrap(), 33);
+
+    // Out-of-range cases: v1 returns 0 (its dispatch swallows the
+    // explicit `else: -1` when the entry bodies are LoadVars — a v1
+    // specialisation, not the CSS contract). v2's LoadVarDynamic
+    // bounds-checks against the original Switch's slot range and falls
+    // through to `else: -1`, matching what Chrome would compute.
+    // Per the mission doc, Chrome is the contract; v1 is a fast proxy.
+    // We pin v2 to the spec-correct answer and don't require v1 to
+    // match.
+    assert_eq!(s2.get_var("hitEdge").unwrap(), -1, "v2 spec: cascade else fires");
+    assert_eq!(s2.get_var("hitOff").unwrap(), -1, "v2 spec: cascade else fires");
+}
+
 // ----- Cabinet differential (gated, large parse) -------------------
 
 fn cabinet_path() -> Option<PathBuf> {

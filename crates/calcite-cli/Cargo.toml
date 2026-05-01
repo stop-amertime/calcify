@@ -65,3 +65,11 @@ path = "src/bin/probe_cell_template.rs"
 [[bin]]
 name = "probe-pack-diff"
 path = "src/bin/probe_pack_diff.rs"
+
+[[bin]]
+name = "probe-v2-flame"
+path = "src/bin/probe_v2_flame.rs"
+
+[[bin]]
+name = "probe-v2-inlined"
+path = "src/bin/probe_v2_inlined.rs"
