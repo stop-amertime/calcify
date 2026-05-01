@@ -6,6 +6,9 @@
 
 use wasm_bindgen::prelude::*;
 
+use calcite_core::script::MeasurementEvent;
+use calcite_core::script_spec::parse_watch;
+
 /// Initialise the WASM module (sets up logging, etc.).
 #[wasm_bindgen(start)]
 pub fn init() {
@@ -34,6 +37,12 @@ pub struct CalciteEngine {
     // require reparsing + recompiling the CSS — expensive for large
     // cabinets).
     initial_properties: Vec<calcite_core::types::PropertyDef>,
+    /// Optional script-primitive registry the host configures via
+    /// `register_watch`. When non-empty, `tick_batch` / `run_batch_silent`
+    /// will additionally poll the registry at chunk boundaries (every
+    /// `WATCH_CHUNK_TICKS` ticks) and the host drains events via
+    /// `drain_measurements`.
+    watch_registry: calcite_core::script::WatchRegistry,
 }
 
 #[wasm_bindgen]
@@ -96,7 +105,12 @@ impl CalciteEngine {
         evaluator.wire_state_for_windowed_byte_array(&mut state);
 
         let initial_properties = parsed.properties;
-        Ok(CalciteEngine { state, evaluator, initial_properties })
+        // Wasm builds use the in-memory dump sink because the SW /
+        // worker has no filesystem access; payloads ride out on
+        // MeasurementEvents that the host drains.
+        let mut watch_registry = calcite_core::script::WatchRegistry::new();
+        watch_registry.set_dump_sink(calcite_core::script::DumpSink::Memory);
+        Ok(CalciteEngine { state, evaluator, initial_properties, watch_registry })
     }
 
     /// Diagnostic: number of recognised packed-broadcast ports.
@@ -129,6 +143,11 @@ impl CalciteEngine {
         }
         self.evaluator.wire_state_for_packed_memory(&mut self.state);
         self.evaluator.wire_state_for_windowed_byte_array(&mut self.state);
+        // Watch registry: drop every registered watch and any pending
+        // events. Hosts re-register after reset() if they want them.
+        let mut new_reg = calcite_core::script::WatchRegistry::new();
+        new_reg.set_dump_sink(calcite_core::script::DumpSink::Memory);
+        self.watch_registry = new_reg;
     }
 
     /// Run a batch of ticks and return the property changes as a JSON string.
@@ -197,6 +216,89 @@ impl CalciteEngine {
         // directly; once corduroy installed an INT 09h handler that also
         // pushes, every press doubled (zork "G" → "gg").
         self.state.set_var("keyboard", key & 0xFFFF);
+    }
+
+    /// Register a watch (script-primitive) with the engine. The spec
+    /// uses the same string format as calcite-cli's `--watch` flag —
+    /// see `crates/calcite-core/src/script.rs` for the full grammar.
+    /// Examples (`spec`):
+    ///
+    /// * `"poll:stride:every=50000"` — a cheap stride that ticks every
+    ///   50K engine ticks. Suitable as a `gate=` target for expensive
+    ///   watches.
+    /// * `"ingame:cond:0x3a3c4=0:gate=poll:then=emit+halt"` — fire +
+    ///   halt when the byte at linear 0x3a3c4 is zero, evaluated only
+    ///   on `poll` fires.
+    /// * `"vram_dump:at:tick=2000000:then=dump=0xb8000,4000"` — capture
+    ///   text VRAM at tick 2M; the bytes attach to the emitted event.
+    ///
+    /// Returns the watch's index on success. Throws on parse error.
+    pub fn register_watch(&mut self, spec: &str) -> Result<u32, JsError> {
+        let parsed = parse_watch(spec).map_err(|e| JsError::new(&e))?;
+        Ok(self.watch_registry.register(parsed) as u32)
+    }
+
+    /// Number of registered watches.
+    pub fn watch_count(&self) -> u32 {
+        self.watch_registry.len() as u32
+    }
+
+    /// Discard all registered watches (and pending events) without
+    /// touching the engine state. Call this between bench profile
+    /// stages to start fresh; `reset()` does this implicitly along
+    /// with rebuilding state.
+    pub fn clear_watches(&mut self) {
+        let mut new_reg = calcite_core::script::WatchRegistry::new();
+        new_reg.set_dump_sink(calcite_core::script::DumpSink::Memory);
+        self.watch_registry = new_reg;
+    }
+
+    /// Run `count` ticks while polling the watch registry every
+    /// `chunk_ticks` ticks. Returns true if a watch requested halt
+    /// before `count` ticks elapsed; false otherwise. The host drains
+    /// events via `drain_measurements` after this returns.
+    ///
+    /// Use `chunk_ticks = 0` to disable chunking (single big batch with
+    /// one final poll).
+    pub fn run_batch_watched(&mut self, count: u32, chunk_ticks: u32) -> bool {
+        if self.watch_registry.is_empty() {
+            // No watches: degenerate to a plain run_batch.
+            self.evaluator.run_batch_silent(&mut self.state, count);
+            return false;
+        }
+        let chunk = if chunk_ticks == 0 { count.max(1) } else { chunk_ticks };
+        let mut remaining = count;
+        let mut tick_now: u32 = self.state.frame_counter;
+        while remaining > 0 {
+            let n = remaining.min(chunk);
+            self.evaluator.run_batch_silent(&mut self.state, n);
+            tick_now = tick_now.saturating_add(n);
+            calcite_core::script_eval::poll(
+                &mut self.watch_registry,
+                &mut self.state,
+                tick_now,
+            );
+            if self.watch_registry.halt_requested() {
+                return true;
+            }
+            remaining = remaining.saturating_sub(n);
+        }
+        false
+    }
+
+    /// Drain pending measurement events, returning them as a JSON
+    /// string. Each event is a JSON object with shape
+    /// `{tick, watch, halted, vars:[[name,val]...], dumps:[{tag,addr,len,bytes}]}`.
+    /// `bytes` is a base64 string when the dump sink is Memory.
+    pub fn drain_measurements(&mut self) -> String {
+        let events = self.watch_registry.drain_events();
+        let parts: Vec<String> = events.iter().map(measurement_to_json).collect();
+        format!("[{}]", parts.join(","))
+    }
+
+    /// Has any watch requested a halt during the most recent poll?
+    pub fn watch_halt_requested(&self) -> bool {
+        self.watch_registry.halt_requested()
     }
 
     /// Get the current value of a register (for debugging).
@@ -449,6 +551,85 @@ impl CalciteEngine {
             .collect();
         format!("{{{}}}", pairs.join(","))
     }
+}
+
+/// Serialise a [`MeasurementEvent`] to a JSON object string. `bytes`
+/// payloads (from in-memory `DumpMemRange` / `Snapshot` actions) are
+/// base64-encoded so the payload survives the JS string boundary; the
+/// host decodes if it cares.
+fn measurement_to_json(ev: &MeasurementEvent) -> String {
+    let mut s = String::with_capacity(128);
+    s.push('{');
+    s.push_str(&format!("\"tick\":{}", ev.tick));
+    let escaped_name = json_escape(&ev.watch_name);
+    s.push_str(&format!(",\"watch\":\"{escaped_name}\""));
+    s.push_str(&format!(",\"halted\":{}", ev.halted));
+    s.push_str(",\"vars\":[");
+    for (i, (n, v)) in ev.sampled_vars.iter().enumerate() {
+        if i > 0 { s.push(','); }
+        let n = json_escape(n);
+        s.push_str(&format!("[\"{n}\",{v}]"));
+    }
+    s.push_str("],\"dumps\":[");
+    for (i, d) in ev.dumps.iter().enumerate() {
+        if i > 0 { s.push(','); }
+        let path = match &d.path {
+            Some(p) => format!("\"{}\"", json_escape(p)),
+            None => "null".to_string(),
+        };
+        let b64 = if d.bytes.is_empty() {
+            "\"\"".to_string()
+        } else {
+            format!("\"{}\"", base64_encode(&d.bytes))
+        };
+        s.push_str(&format!(
+            "{{\"tag\":\"{}\",\"addr\":{},\"path\":{},\"bytes\":{}}}",
+            d.tag, d.addr, path, b64
+        ));
+    }
+    s.push_str("]}");
+    s
+}
+
+fn json_escape(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
+}
+
+/// Minimal base64 encoder (no external dep). Used to ferry dump bytes
+/// out via the JSON measurement stream.
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    let mut i = 0;
+    while i + 3 <= bytes.len() {
+        let b = &bytes[i..i + 3];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | (b[2] as u32);
+        out.push(ALPHABET[((n >> 18) & 0x3F) as usize] as char);
+        out.push(ALPHABET[((n >> 12) & 0x3F) as usize] as char);
+        out.push(ALPHABET[((n >> 6) & 0x3F) as usize] as char);
+        out.push(ALPHABET[(n & 0x3F) as usize] as char);
+        i += 3;
+    }
+    let rem = bytes.len() - i;
+    if rem == 1 {
+        let n = (bytes[i] as u32) << 16;
+        out.push(ALPHABET[((n >> 18) & 0x3F) as usize] as char);
+        out.push(ALPHABET[((n >> 12) & 0x3F) as usize] as char);
+        out.push('=');
+        out.push('=');
+    } else if rem == 2 {
+        let n = ((bytes[i] as u32) << 16) | ((bytes[i + 1] as u32) << 8);
+        out.push(ALPHABET[((n >> 18) & 0x3F) as usize] as char);
+        out.push(ALPHABET[((n >> 12) & 0x3F) as usize] as char);
+        out.push(ALPHABET[((n >> 6) & 0x3F) as usize] as char);
+        out.push('=');
+    }
+    out
 }
 
 /// Resolve a single byte at `addr` through the packed cell table, falling

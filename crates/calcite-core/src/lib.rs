@@ -26,6 +26,10 @@ pub mod script;
 /// Evaluator for the [`script`] layer — kept separate from the surface
 /// declaration so the surface stays readable.
 pub mod script_eval;
+/// Text-format parser for [`script::WatchSpec`] strings. Used by both
+/// calcite-cli (`--watch`) and calcite-wasm (`engine.register_watch`)
+/// so the syntax stays in one place.
+pub mod script_spec;
 /// Machine state — registers and memory.
 pub mod state;
 /// Runtime loop-period detector and affine projector.

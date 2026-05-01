@@ -32,7 +32,7 @@
 //!
 //! Numbers may be decimal or `0x`-prefixed.
 
-use calcite_core::script::*;
+use crate::script::*;
 use std::cell::Cell;
 
 fn parse_int(s: &str, what: &str) -> Result<i64, String> {

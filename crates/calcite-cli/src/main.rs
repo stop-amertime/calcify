@@ -8,7 +8,8 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 mod calcite_logo;
 mod cssdos_logo;
 mod menu;
-mod watch_spec;
+
+use calcite_core::script_spec as watch_spec;
 
 /// calc(ite) — JIT compiler for computational CSS.
 ///
