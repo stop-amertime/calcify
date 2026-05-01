@@ -4,11 +4,10 @@ REM
 REM The daemon listens on 127.0.0.1:3334 (override with CALCITE_DEBUGGER_ADDR)
 REM and keeps in-memory session state across MCP client reconnects.
 REM
-REM mcp-shim.mjs auto-starts the daemon on first client connect, so you
-REM rarely need to run this manually. Use it when you want to:
-REM   - pre-warm the daemon before launching a client
-REM   - verify the daemon is reachable without attaching a client
-REM   - run the daemon with custom args (e.g. a different port)
+REM mcp-shim.mjs does NOT autostart the daemon — start it explicitly
+REM with this script before connecting an MCP client. (Autostart was
+REM removed because it caused ghost-daemon races; see the comment at
+REM the top of tools/mcp-shim.mjs.)
 REM
 REM To stop: taskkill /F /IM calcite-debugger.exe
 REM (or use kill-and-rebuild.bat which kills + rebuilds).

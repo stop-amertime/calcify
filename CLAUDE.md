@@ -34,6 +34,20 @@ reference. `docs/debugger.md` covers the HTTP debug server.
 `docs/compiler-mission.md` and `docs/v2-rewrite-design.md` cover the
 v2 DAG walker (mandatory reading per the v2 rule above).
 
+### Logbook discipline (which logbook for what)
+
+- **Calcite engine work** (anything in `crates/`) → log here in
+  `docs/log.md`.
+- **CSS-DOS platform / harness / bench / kiln / builder / BIOS work**
+  → log in the sibling repo at `../CSS-DOS/docs/logbook/LOGBOOK.md`.
+- **Cross-cutting** work that touches both repos → log in both, with a
+  cross-link from each to the other.
+
+CSS-DOS's CLAUDE.md auto-loads its own LOGBOOK on every session, so the
+natural default for an agent walking in cold is to write back there.
+Calcite engine work belongs in `docs/log.md`; if your changes are in
+`crates/`, log here.
+
 
 ## Web is the only delivery method
 
