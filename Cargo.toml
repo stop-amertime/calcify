@@ -18,6 +18,12 @@ calcite-core = { path = "crates/calcite-core" }
 cssparser = "0.37"
 log = "0.4"
 thiserror = "2"
+# Phase 3 (a) wasm codegen. Encoder builds for both native and
+# wasm32-unknown-unknown (no_std-friendly); used inside calcite-core to
+# emit one wasm module per cabinet. Host runtime (wasmtime) is
+# native-only and lives behind a cfg gate in eval.rs.
+wasm-encoder = "0.224"
+wasmtime = { version = "27", default-features = false, features = ["cranelift", "runtime"] }
 
 # Enable debug symbols in release builds for profiling (flamegraphs, perf, etc.)
 [profile.release]

@@ -11,6 +11,137 @@ and the Criterion benchmarks.
 
 ---
 
+## 2026-05-01: v2 Phase 3 (a) — wasm codegen baseline, end-to-end working
+
+Per the (c+) finding ("coverage is the binding constraint, not per-op
+cost; skip ahead to wasm because Switch/Call/If lowering translates
+directly to wasm br_table/call/br_if"), this entry covers the wasm-
+codegen baseline: the codegen module, the native host, the driver,
+the differential, the probe. Coverage extension (Switch/Call/If) is
+the next entry — that's where the win lives.
+
+### Architecture
+
+One per-cabinet wasm module (one `WasmDag`) instantiated against a
+host runtime (wasmtime on native, browser engine in production —
+browser path is a follow-up). Per `WriteVar` terminal whose cone is
+covered by the lowering, one wasm function inside the module; the
+driver calls them in topo order each tick. Walker fallback per
+terminal for uncovered cones, same shape as the inlined backend.
+
+State stays in the host. Wasm reads it via host imports
+(`host_read_state_var/memory/transient/prev`); arithmetic that has
+to match the walker's f64 semantics exactly (Mul/Div/Mod/Pow/
+Min2/Max2/Round/Clamp/Neg/Abs/Sign) goes through a host trampoline
+(`host_calc_*`) that calls back into Rust. Pure-i32 ops (Add/Sub/
+BitField/BitwiseOp) execute as native wasm with no host crossing.
+
+The host-import design trades some per-op crossing cost for day-one
+correctness — pure-wasm i64-based implementations of the f64-rounded
+ops can land in a follow-up if the profile motivates it.
+
+### Op coverage (matches inlined)
+
+`Lit`, `LoadVar` (current/prev × scalar/transient/memory), arity-1/2/3
+`Calc` (Add/Sub/Mul/Div/Mod/Pow/Sign/Abs/Neg/Min2/Max2/Clamp/Round),
+`BitField`, `BitwiseOp`. Bailed: `Call`/`Param`, `If`, `Switch`,
+`Concat`, `LitStr`, `LoadVarDynamic`, variadic Min/Max — same set the
+inlined prototype bails on. Each one is a follow-up entry; the
+codegen-shape work (Switch → `br_table`, Call → wasm `call`, If →
+`br_if`) is exactly what motivated doing this in wasm rather than
+extending interpreted Rust.
+
+### Correctness
+
+7/7 differentials green (`v2_wasm_differential.rs`):
+- emit path: `simple_calc`, `arith_chain`, `div_mod_via_host_trampoline`
+- walker fallback: `nested_calls`, `dispatch`, `mixed_cabinet`
+- multi-tick: `multi_tick_state_evolution` (exercises `host_read_prev`
+  + writeback across 100 ticks)
+
+All bit-identical to the walker. The host-trampoline path (Mul/Div/
+Mod through `host_calc_binary`) round-trips f64 exactly the same as
+the walker.
+
+### Speed (5K bench, 500 warmup, native release, single run)
+
+| Cabinet | Coverage | v1 | walker | closures | inlined | wasm |
+|---|---|---|---|---|---|---|
+| rogue | 36.5% | 208K | 53K | 54K | 62K | 52K |
+| zork1 | 39.4% | 189K | 67K | 73K | 71K | 50K |
+| bootle | 39.4% | 162K | 46K | 58K | 58K | 54K |
+
+**Wasm ≈ walker, slightly under inlined**, exactly as the (c+) data
+predicted. At 37% terminal coverage of mostly-light terminals
+(Lit/Add/Sub-shaped cones), the per-call wasmtime boundary cost
+(~5-10ns × ~50 emitted terminals) plus the host-trampoline
+crossings on Mul/Div/Mod outweigh the JIT-native speedup on the
+emitted functions. The same nodes the inlined backend executes as
+straight-line `match`-arm code, the wasm path executes through
+JIT'd native code minus a per-terminal trampoline — and the
+trampoline wins at this coverage level.
+
+This isn't a problem to solve at the codegen layer. It's the
+predicted result of the (c+) finding: covered terminals are the
+cheap ones, work-bearing terminals (Switch / Call / If) are
+walker-fallback and pay the walker's cost. The wasm shape only
+starts beating the walker once those terminals lower into wasm too.
+
+### What this baseline establishes
+
+- Toolchain works end-to-end: build wasm bytes from a real cabinet
+  (rogue: 374K nodes, 156 terminals, 2482 wasm bytes), instantiate
+  in wasmtime, call per-terminal functions across 5000 ticks
+  bit-identically to the walker.
+- The "wasm-encoder produces, wasmtime consumes" loop is closed
+  with no toolchain-level surprises.
+- The host import + raw-pointer ctx pattern works across multi-tick
+  state evolution including prev-tick reads.
+- The `Backend::DagV2Wasm` variant + cfg-gated wiring leaves both
+  wasm32 and native builds compiling clean — calcite-wasm continues
+  to build, just doesn't yet expose the new backend to JS.
+
+### What's next
+
+Switch/Call/If lowering. Each one is the kind of lowering that wasm
+has dedicated instructions for:
+
+- `Switch { key, table, fallback }` → `br_table` over a wasm block
+  structure. One indexed jump, no dispatch loop.
+- `Call { fn_id, args }` → wasm `call` to a per-`@function` body
+  emitted once. Param(i) → `local.get` on the body's i-th param.
+- `If { branches, fallback }` → nested wasm `if`/`else` over
+  StyleCondNode predicates.
+
+Those are exactly the work-bearing terminals from the (c+) data,
+so coverage extension should move the speed line. The keep-from-
+baseline hypothesis: once Switch/Call/If lower, the per-call
+boundary cost gets amortised across larger emitted bodies and
+the wasm path clears v1.
+
+### Artefacts
+
+- `crates/calcite-core/src/dag/wasm_codegen.rs` — emitter (wasm-encoder
+  builds the module bytes). Portable: builds for both native and
+  `wasm32-unknown-unknown`. Pure data manipulation, no I/O.
+- `crates/calcite-core/src/dag/wasm_host.rs` — native host runtime
+  (wasmtime). Native-only, gated `#[cfg(not(target_arch =
+  "wasm32"))]`. Owns the `Engine`, `Store`, `Instance`, and a
+  per-terminal `TypedFunc<(), i32>` cache. Per-tick cache binding via
+  raw pointers in `Store` data, cleared after each call.
+- `crates/calcite-core/src/eval.rs` — `Backend::DagV2Wasm` variant +
+  `dag_v2_wasm_tick` driver (mirrors `dag_v2_inlined_tick`'s phase
+  structure; broadcasts + uncovered terminals delegate to the walker).
+- `crates/calcite-core/tests/v2_wasm_differential.rs` — 7 synthetic
+  differentials vs the walker.
+- `crates/calcite-cli/src/bin/probe_v2_wasm.rs` — coverage report +
+  five-backend speed comparison.
+- `Cargo.toml` (workspace) + `crates/calcite-core/Cargo.toml` —
+  `wasm-encoder` (workspace dep, both targets) + `wasmtime`
+  (native-only target dep on calcite-core).
+
+---
+
 ## 2026-05-01: v2 Phase 3 (c+) — inlined-Rust prototype, coverage is the wall
 
 Per the previous entry, (c+) was framed as a one-week prototype: per

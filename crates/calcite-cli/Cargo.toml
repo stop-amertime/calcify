@@ -73,3 +73,7 @@ path = "src/bin/probe_v2_flame.rs"
 [[bin]]
 name = "probe-v2-inlined"
 path = "src/bin/probe_v2_inlined.rs"
+
+[[bin]]
+name = "probe-v2-wasm"
+path = "src/bin/probe_v2_wasm.rs"

@@ -16,6 +16,16 @@ thiserror = { workspace = true }
 web-time = "1"
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
+# Phase 3 (a) wasm codegen: emit one wasm module per cabinet. Builds
+# for both native and wasm32-unknown-unknown.
+wasm-encoder = { workspace = true }
+
+# Native-only host runtime for executing the emitted wasm module. The
+# browser uses its built-in WebAssembly engine (handed bytes via
+# wasm-bindgen → JS → WebAssembly.instantiate); native test/bench paths
+# need a runtime in-process so this dep is gated to non-wasm targets.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+wasmtime = { workspace = true }
 
 [dev-dependencies]
 env_logger = "0.11"

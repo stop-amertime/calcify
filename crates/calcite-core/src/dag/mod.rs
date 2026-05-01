@@ -12,6 +12,13 @@ pub mod lowering;
 pub mod walker;
 pub mod closure_codegen;
 pub mod inlined_codegen;
+pub mod wasm_codegen;
+// Native-only: the wasm host (wasmtime) doesn't compile for
+// wasm32-unknown-unknown. The browser executes the codegen output
+// via its built-in WebAssembly engine; that wiring lives in the
+// calcite-wasm crate as a follow-up.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod wasm_host;
 
 pub use types::{
     Dag, DagBroadcast, DagNode, DagPackedBroadcast, NodeId, SlotId, StyleCondNode, TickPosition,
@@ -19,6 +26,9 @@ pub use types::{
 };
 pub use closure_codegen::CompiledDag;
 pub use inlined_codegen::InlinedDag;
+pub use wasm_codegen::WasmDag;
+#[cfg(not(target_arch = "wasm32"))]
+pub use wasm_host::WasmHost;
 
 use crate::types::ParsedProgram;
 

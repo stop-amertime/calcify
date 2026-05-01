@@ -48,6 +48,16 @@ pub enum Backend {
     /// Switch, BitField, BitwiseOp, LoadVarDynamic, Concat) fall back
     /// to the walker on a per-terminal basis.
     DagV2Inlined,
+    /// Phase 3 (a): hand-emitted wasm. The cabinet is compiled to one
+    /// wasm module at backend-select time; each emitted terminal is
+    /// one wasm function executed by a host runtime (wasmtime on
+    /// native, browser engine in production). Walker fallback per
+    /// terminal for cones not yet covered, same as `DagV2Inlined`.
+    /// Native-only at the moment; the browser execution path is a
+    /// follow-up (calcite-wasm crate has to thread the bytes to
+    /// `WebAssembly.instantiate`).
+    #[cfg(not(target_arch = "wasm32"))]
+    DagV2Wasm,
 }
 
 /// A value produced by expression evaluation — either numeric or string.
@@ -181,6 +191,15 @@ pub struct Evaluator {
     /// the max `local_count` across all emitted terminals at backend-
     /// switch time. Reused across ticks; never grows.
     dag_v2_inlined_locals: Vec<i32>,
+    /// Phase 3 (a): per-cabinet wasm DAG (the codegen output) plus
+    /// the host runtime that executes it. Both are `Some` after
+    /// `set_backend(DagV2Wasm)` is first called. `dag_v2_wasm` owns
+    /// the source `Dag` for walker-fallback dispatch; `dag_v2_wasm_host`
+    /// owns the wasmtime engine + instance.
+    #[cfg(not(target_arch = "wasm32"))]
+    dag_v2_wasm: Option<crate::dag::WasmDag>,
+    #[cfg(not(target_arch = "wasm32"))]
+    dag_v2_wasm_host: Option<crate::dag::WasmHost>,
 }
 
 /// Granular timing breakdown from [`Evaluator::tick_profiled`].
@@ -600,6 +619,10 @@ impl Evaluator {
             dag_v2_closures: None,
             dag_v2_inlined: None,
             dag_v2_inlined_locals: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            dag_v2_wasm: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            dag_v2_wasm_host: None,
         }
     }
 
@@ -618,11 +641,16 @@ impl Evaluator {
     /// expensive on large cabinets, but only paid by callers that
     /// actually use v2.
     pub fn set_backend(&mut self, backend: Backend) {
-        if matches!(
-            backend,
-            Backend::DagV2 | Backend::DagV2Closures | Backend::DagV2Inlined
-        ) && !self.dag_v2_ready
-        {
+        // Gate v2 readiness on every v2-flavour backend, including the
+        // native-only DagV2Wasm. The cfg-gated arm collapses to nothing
+        // on wasm32 builds.
+        let needs_dag = match backend {
+            Backend::DagV2 | Backend::DagV2Closures | Backend::DagV2Inlined => true,
+            #[cfg(not(target_arch = "wasm32"))]
+            Backend::DagV2Wasm => true,
+            _ => false,
+        };
+        if needs_dag && !self.dag_v2_ready {
             if let Some(program) = self.pending_parsed.take() {
                 self.dag_v2 = crate::dag::build_dag(&program);
                 self.dag_v2_ready = true;
@@ -644,6 +672,25 @@ impl Evaluator {
             let inlined = crate::dag::InlinedDag::build(self.dag_v2.clone());
             self.dag_v2_inlined_locals.resize(inlined.max_locals.max(1), 0);
             self.dag_v2_inlined = Some(inlined);
+        }
+        // Materialise the wasm DAG + host on first switch into the
+        // wasm backend. Same DAG-clone shape; the host owns a
+        // wasmtime engine + instance + per-terminal TypedFunc cache.
+        // Failure to instantiate (e.g. malformed emit, host import
+        // wiring drift) is caught at backend-switch time, not at
+        // first tick.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if matches!(backend, Backend::DagV2Wasm) && self.dag_v2_wasm.is_none() {
+                let wasm_dag = crate::dag::WasmDag::build(self.dag_v2.clone());
+                let host = crate::dag::WasmHost::instantiate(
+                    &wasm_dag.wasm_bytes,
+                    &wasm_dag.emitted,
+                )
+                .expect("wasm host instantiate (codegen drift?)");
+                self.dag_v2_wasm = Some(wasm_dag);
+                self.dag_v2_wasm_host = Some(host);
+            }
         }
         self.backend = backend;
     }
@@ -676,6 +723,10 @@ impl Evaluator {
             }
             Backend::DagV2Inlined => {
                 self.dag_v2_inlined_tick(state);
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            Backend::DagV2Wasm => {
+                self.dag_v2_wasm_tick(state);
             }
         }
 
@@ -817,6 +868,10 @@ impl Evaluator {
             }
             Backend::DagV2Inlined => {
                 self.dag_v2_inlined_tick(state);
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            Backend::DagV2Wasm => {
+                self.dag_v2_wasm_tick(state);
             }
         }
         if !self.string_assignments.is_empty() {
@@ -2284,6 +2339,154 @@ impl Evaluator {
         self.dag_v2_transient_cache = transient_cache;
     }
 
+    /// Phase 3 (a) tick: per-terminal wasm where supported, walker
+    /// fallback otherwise. Same phase ordering as the inlined backend.
+    ///
+    /// Per-terminal wasm functions read state through host imports
+    /// bound to the per-tick caches via `WasmHost::run_terminal`. The
+    /// host clears its raw-pointer ctx after each call so a stray
+    /// reentry would NPE rather than read stale memory.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn dag_v2_wasm_tick(&mut self, state: &mut State) {
+        let wdag = self.dag_v2_wasm.take().expect("dag_v2_wasm must be set");
+        let host = self
+            .dag_v2_wasm_host
+            .take()
+            .expect("dag_v2_wasm_host must be set");
+        let mut memo = std::mem::take(&mut self.dag_v2_memo);
+        let mut memo_epoch = std::mem::take(&mut self.dag_v2_memo_epoch);
+        let mut state_var_cache = std::mem::take(&mut self.dag_v2_state_var_cache);
+        let mut memory_cache = std::mem::take(&mut self.dag_v2_memory_cache);
+        let mut transient_cache = std::mem::take(&mut self.dag_v2_transient_cache);
+        let mut call_stack = std::mem::take(&mut self.dag_v2_call_stack);
+
+        let n_state_vars = state.state_var_count();
+        let n_nodes = wdag.dag.nodes.len();
+        let n_transients = wdag.dag.transient_slot_count;
+
+        if state_var_cache.len() != n_state_vars {
+            state_var_cache.clear();
+            state_var_cache.resize(n_state_vars, None);
+        } else {
+            state_var_cache.fill(None);
+        }
+        if transient_cache.len() != n_transients {
+            transient_cache.clear();
+            transient_cache.resize(n_transients, None);
+        } else {
+            transient_cache.fill(None);
+        }
+        memory_cache.clear();
+        if memo.len() != n_nodes {
+            memo.resize(n_nodes, 0);
+            memo_epoch.clear();
+            memo_epoch.resize(n_nodes, 0);
+        }
+        if self.dag_v2_epoch == u32::MAX {
+            memo_epoch.fill(0);
+            self.dag_v2_epoch = 0;
+        }
+
+        // Phase 1: scalar WriteVars. For each terminal: if it has a
+        // wasm function, call it; otherwise walker fallback.
+        for (i, &term_id) in wdag.dag.terminals.iter().enumerate() {
+            let crate::dag::DagNode::WriteVar { slot, value } = &wdag.dag.nodes[term_id as usize]
+            else {
+                continue;
+            };
+            let slot = *slot;
+            let value_id = *value;
+            let v = if wdag.emitted[i].is_some() {
+                host.run_terminal(
+                    i,
+                    state,
+                    &state_var_cache,
+                    &memory_cache,
+                    &transient_cache,
+                )
+            } else {
+                self.dag_v2_epoch = self.dag_v2_epoch.wrapping_add(1);
+                let mut buf = DagWalkBuf {
+                    memo: &mut memo,
+                    memo_epoch: &mut memo_epoch,
+                    epoch: self.dag_v2_epoch,
+                    state_var_cache: &state_var_cache,
+                    memory_cache: &memory_cache,
+                    transient_cache: &transient_cache,
+                    call_stack: &mut call_stack,
+                };
+                self.dag_eval_node(&wdag.dag, value_id, &mut buf, state)
+            };
+            if slot < 0 {
+                let idx = (-slot - 1) as usize;
+                if idx < state_var_cache.len() {
+                    state_var_cache[idx] = Some(v);
+                }
+            } else if slot >= crate::dag::TRANSIENT_BASE {
+                let idx = (slot - crate::dag::TRANSIENT_BASE) as usize;
+                if idx < transient_cache.len() {
+                    transient_cache[idx] = Some(v);
+                }
+            } else {
+                memory_cache.insert(slot, v);
+            }
+        }
+
+        // Phase 2: writeback.
+        for (idx, slot_value) in state_var_cache.iter().enumerate() {
+            if let Some(v) = *slot_value {
+                let slot = -(idx as i32) - 1;
+                state.write_mem(slot, v);
+            }
+        }
+        for (&slot, &v) in memory_cache.iter() {
+            state.write_mem(slot, v);
+        }
+
+        // Phase 3: broadcasts via the walker, same as inlined_tick.
+        let dag_for_broadcasts: &crate::dag::Dag = &wdag.dag;
+        for &term_id in &wdag.dag.terminals {
+            if let crate::dag::DagNode::IndirectStore { port_id, packed } =
+                &dag_for_broadcasts.nodes[term_id as usize]
+            {
+                let port_id = *port_id;
+                let packed = *packed;
+                self.dag_v2_epoch = self.dag_v2_epoch.wrapping_add(1);
+                if packed {
+                    self.dag_exec_packed_broadcast(
+                        dag_for_broadcasts,
+                        port_id,
+                        state,
+                        &transient_cache,
+                    );
+                } else {
+                    let bcast_epoch_base = self.dag_v2_epoch;
+                    self.dag_v2_epoch = self.dag_v2_epoch.wrapping_add(1);
+                    self.dag_exec_broadcast_with(
+                        dag_for_broadcasts,
+                        port_id,
+                        state,
+                        &mut memo,
+                        &mut memo_epoch,
+                        bcast_epoch_base,
+                        &mut call_stack,
+                        &transient_cache,
+                    );
+                }
+            }
+        }
+
+        // Restore.
+        self.dag_v2_wasm = Some(wdag);
+        self.dag_v2_wasm_host = Some(host);
+        self.dag_v2_memo = memo;
+        self.dag_v2_memo_epoch = memo_epoch;
+        self.dag_v2_state_var_cache = state_var_cache;
+        self.dag_v2_memory_cache = memory_cache;
+        self.dag_v2_call_stack = call_stack;
+        self.dag_v2_transient_cache = transient_cache;
+    }
+
     /// Evaluate a single DAG node to an `i32`, with per-walk memoization.
     ///
     /// Memoization uses epoch-tagged entries: `memo_epoch[id] == epoch`
@@ -3422,6 +3625,10 @@ mod tests {
             dag_v2_closures: None,
             dag_v2_inlined: None,
             dag_v2_inlined_locals: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            dag_v2_wasm: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            dag_v2_wasm_host: None,
         };
         (evaluator, state)
     }
