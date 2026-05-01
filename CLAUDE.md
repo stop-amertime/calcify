@@ -137,11 +137,10 @@ crates/
   calcite-wasm/      wasm-bindgen layer for the browser Web Worker
 docs/                Architecture, perf logbook, debugger, benchmarking,
                        v2-rewrite docs
-output/              Pre-built `.css` cabinets (run directly, no rebuild)
-tools/               Mostly retired; `js8086.js` still useful as
-                       reference 8086 emulator. The old `fulldiff.mjs`
-                       / `ref-dos.mjs` / `diagnose.mjs` scripts no
-                       longer work — use the CSS-DOS harness instead.
+tools/               Mostly retired; `js8086.js` still useful as a
+                       reference 8086 emulator. Older `.mjs` scripts
+                       have been moved to `tools/archive/` — use the
+                       CSS-DOS harness instead.
 tests/
   conformance/       Primitive .css unit fixtures
   fixtures/          Pre-compiled CSS imported from CSS-DOS
@@ -161,7 +160,7 @@ cargo clippy --workspace                  # lint
 cargo fmt --all                           # format
 just check                                # all three
 
-cargo run --release --bin calcite-bench -- -i output/rogue.css \
+cargo run --release --bin calcite-bench -- -i path/to/cabinet.css \
                   -n 5000 --warmup 500    # native bench (debug telemetry)
 cargo bench -p calcite-core               # criterion benches (fixture needed)
 
@@ -174,7 +173,7 @@ node ../CSS-DOS/tests/harness/bench-web.mjs --runs=3
 node ../CSS-DOS/tests/harness/bench-web.mjs --cart=doom8088
 
 # Native CLI for ad-hoc runs (test harness, not the product):
-target/release/calcite-cli.exe -i ../CSS-DOS/output/rogue.css
+target/release/calcite-cli.exe -i path/to/cabinet.css
 
 # Debugger
 cargo run --release -p calcite-debugger -- -i program.css

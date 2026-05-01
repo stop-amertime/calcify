@@ -11,6 +11,44 @@ and the Criterion benchmarks.
 
 ---
 
+## 2026-05-01: Repo cleanup: Chunk B — CSS-DOS-shaped code removed
+
+Per `../CSS-DOS/docs/audit-summary-and-plan.md` Chunk B. Calcite is a
+generic CSS evaluator; CSS-DOS-the-platform's cabinet sources, dev
+server, and BIOS-test harness should not live here.
+
+Deleted:
+- `site/`, `programs/`, `output/`, `serve.mjs`, `serve.py` — CSS-DOS-
+  shaped infrastructure (cabinet sources, dev server, pre-built outputs).
+- `target/release/calcite-debugger.exe.old` — debris left by
+  `kill-and-rebuild.bat`.
+- `bench-splash.bat`, `run-bios-test.bat`, `run-oldbios-test.bat`,
+  `run-splash.bat`, `run-web.bat`, `run-js.bat` — all driven by
+  CSS-DOS-the-platform concerns.
+- `tools/fulldiff.mjs`, `tools/ref-dos.mjs` — both BROKEN (import
+  the deleted `transpiler/` directory). Replacement is
+  `tests/harness/pipeline.mjs fulldiff` in CSS-DOS.
+
+Archived (moved to `tools/archive/`, history preserved):
+`diagnose.mjs`, `codebug.mjs`, `boot-trace.mjs`, `calc-mem.mjs`,
+`ref-emu.mjs`, `compare.mjs`, `serve-js8086.mjs`, `serve-web.mjs`,
+`test-daemon-smoke.mjs` — all shell out to `../CSS-DOS/builder/build.mjs`,
+which assumes a sibling repo we don't own. Reversible if anything
+turns out to be load-bearing.
+
+Modified:
+- `crates/calcite-cli/src/menu.rs` — stripped the `node ../CSS-DOS/
+  builder/build.mjs` shell-out. The interactive picker now only lists
+  pre-built `.css` cabinets in the calcite root and `./cabinets/`.
+- `CLAUDE.md` — removed references to deleted things and the
+  "Pre-built `.css` cabinets in `output/`" framing.
+
+Verification: `cargo test --workspace` and `wasm-pack build
+crates/calcite-wasm --target web` both pass. Branch
+`cleanup-2026-05-01`, not yet pushed.
+
+---
+
 ## 2026-04-16: big round of peephole/specialization wins
 
 Cumulative commits:
