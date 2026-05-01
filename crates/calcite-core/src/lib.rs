@@ -18,6 +18,14 @@ pub mod eval;
 pub mod parser;
 /// Pattern recognition — dispatch tables, broadcast writes.
 pub mod pattern;
+/// Generic script-primitive layer: stride / burst / at / edge / cond /
+/// halt watches with emit / dump / snapshot / set-var actions. See
+/// [`script`] for the design and [`script_eval::poll`] for the
+/// evaluator.
+pub mod script;
+/// Evaluator for the [`script`] layer — kept separate from the surface
+/// declaration so the surface stays readable.
+pub mod script_eval;
 /// Machine state — registers and memory.
 pub mod state;
 /// Runtime loop-period detector and affine projector.
