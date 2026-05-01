@@ -58,7 +58,11 @@ pub struct State {
     /// Extended properties: full-width i32 storage for addresses above the byte
     /// memory range (e.g., file I/O counters at 0xFFFF0+). Reads/writes bypass
     /// the u8 truncation of the memory array.
-    pub extended: std::collections::HashMap<i32, i32>,
+    ///
+    /// FxHashMap (not std::HashMap) — `read_mem` falls through here for the
+    /// >0xF0000 region on every miss, and SipHash showed up as ~9% of worker
+    /// CPU on the doom8088 flamegraph. FxHash is faster on small integer keys.
+    pub extended: rustc_hash::FxHashMap<i32, i32>,
     /// String property values (e.g., `--textBuffer` for text output).
     pub string_properties: std::collections::HashMap<String, String>,
     /// Tick counter (incremented each evaluation cycle).
@@ -136,7 +140,7 @@ impl State {
             state_var_names: Vec::new(),
             state_var_index: std::collections::HashMap::new(),
             memory: vec![0; mem_size],
-            extended: std::collections::HashMap::new(),
+            extended: rustc_hash::FxHashMap::default(),
             string_properties: std::collections::HashMap::new(),
             frame_counter: 0,
             read_log: std::cell::RefCell::new(None),
@@ -250,11 +254,13 @@ impl State {
     /// for this byte) do we fall back to the flat `self.memory[]` shadow.
     /// On unpacked cabinets `packed_cell_table` is empty and the shadow is
     /// authoritative.
+    #[inline]
     pub fn read_mem(&self, addr: i32) -> i32 {
         let v = if addr < 0 {
             let idx = (-addr - 1) as usize;
             if idx < self.state_vars.len() {
-                self.state_vars[idx]
+                // SAFETY: idx < state_vars.len() checked on the line above.
+                unsafe { *self.state_vars.get_unchecked(idx) }
             } else {
                 0
             }
@@ -272,11 +278,13 @@ impl State {
                 let pack = self.packed_cell_size as usize;
                 let cell_idx = addr_u / pack;
                 if cell_idx < self.packed_cell_table.len() {
-                    let cell_addr = self.packed_cell_table[cell_idx];
+                    // SAFETY: cell_idx < packed_cell_table.len() checked above.
+                    let cell_addr = unsafe { *self.packed_cell_table.get_unchecked(cell_idx) };
                     if cell_addr < 0 {
                         let sidx = (-cell_addr - 1) as usize;
                         if sidx < self.state_vars.len() {
-                            let cell = self.state_vars[sidx];
+                            // SAFETY: sidx < state_vars.len() checked above.
+                            let cell = unsafe { *self.state_vars.get_unchecked(sidx) };
                             let off = addr_u % pack;
                             return ((cell >> (8 * off as u32)) & 0xFF) as i32;
                         }
@@ -343,7 +351,41 @@ impl State {
     }
 
     /// Read a 16-bit little-endian word from memory.
+    #[inline]
     pub fn read_mem16(&self, addr: i32) -> i32 {
+        // Fast path: when both bytes land in the same packed cell, one
+        // state-var read + one 16-bit extract replaces two full read_mem
+        // traversals. This requires addr >= 0, an active packed layout,
+        // pack == 2 (the only value emitted today), and addr aligned to
+        // the cell boundary so addr and addr+1 share a cell.
+        if addr >= 0 && self.packed_cell_size == 2 && (addr & 1) == 0 {
+            let addr_u = addr as usize;
+            let cell_idx = addr_u >> 1;
+            if cell_idx < self.packed_cell_table.len() {
+                // SAFETY: cell_idx < packed_cell_table.len() checked above.
+                let cell_addr = unsafe { *self.packed_cell_table.get_unchecked(cell_idx) };
+                if cell_addr < 0 {
+                    let sidx = (-cell_addr - 1) as usize;
+                    if sidx < self.state_vars.len() {
+                        // SAFETY: sidx < state_vars.len() checked above.
+                        let cell = unsafe { *self.state_vars.get_unchecked(sidx) };
+                        let lo_hi = cell & 0xFFFF;
+                        // Optional read log: append both bytes to mirror the
+                        // two-call path's behaviour for memoisation probes.
+                        if let Ok(mut borrow) = self.read_log.try_borrow_mut() {
+                            if let Some(ref mut log) = *borrow {
+                                log.push((addr, lo_hi & 0xFF));
+                                log.push((addr + 1, (lo_hi >> 8) & 0xFF));
+                            }
+                        }
+                        return lo_hi;
+                    }
+                }
+            }
+            // Cell-table miss for this packed-aligned address — fall through
+            // to the two-call path so the windowed-byte-array / extended /
+            // shadow-memory fallbacks all run as before.
+        }
         let lo = self.read_mem(addr);
         let hi = self.read_mem(addr + 1);
         lo + hi * 256

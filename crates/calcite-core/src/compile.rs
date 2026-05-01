@@ -10,6 +10,19 @@
 
 use std::collections::HashMap;
 
+// FxHashMap for the runtime hot-path dispatch tables and broadcast-write
+// address maps. These are integer-keyed and looked up per-dispatched-op
+// (Op::Dispatch / Op::DispatchChain) or per-tick (broadcast writes), so
+// hashing cost is on the critical path. SipHash, the std default, takes
+// ~30 cycles per i32 key; FxHasher is essentially `multiply + xor` and
+// runs in ~3 cycles. Flamegraph (LOGBOOK 2026-04-30) showed SipHash-related
+// frames at ~17% of worker CPU on doom8088 LOAD/INGAME.
+//
+// Compile-time HashMaps (string-keyed dispatch_tables, function maps,
+// caches in CompilerCtx, etc.) are NOT swapped — they're hit once at
+// load and the swap would ripple through every cross-crate API.
+type FxMap<K, V> = rustc_hash::FxHashMap<K, V>;
+
 use crate::eval::property_to_address;
 use crate::pattern::broadcast_write::BroadcastWrite;
 use crate::pattern::dispatch_table::{self, DispatchTable};
@@ -588,7 +601,7 @@ pub struct CompiledFunction {
 #[derive(Debug, Default)]
 pub struct DispatchChainTable {
     /// Key → target op index (body start).
-    pub entries: HashMap<i32, u32>,
+    pub entries: FxMap<i32, u32>,
     /// Optional dense-array fast path. When the key range is contiguous (or
     /// nearly so), we populate a `Vec<u32>` indexed by `key - flat_base`.
     /// `u32::MAX` sentinel means "no entry — fall through to HashMap or miss".
@@ -613,7 +626,7 @@ pub struct CompiledBroadcastWrite {
     /// Slot holding the evaluated value.
     pub value_slot: Slot,
     /// Address → state address mapping for the broadcast.
-    pub address_map: HashMap<i64, i32>,
+    pub address_map: FxMap<i64, i32>,
     /// Spillover ops (for word writes).
     pub spillover: Option<CompiledSpillover>,
     /// Optional "outer gate" slot: if set, the broadcast only fires when
@@ -628,7 +641,7 @@ pub struct CompiledSpillover {
     /// Slot holding the guard property value.
     pub guard_slot: Slot,
     /// Map from dest address → (ops to compute high byte, result slot).
-    pub entries: HashMap<i64, (Vec<Op>, Slot)>,
+    pub entries: FxMap<i64, (Vec<Op>, Slot)>,
 }
 
 /// A compiled packed-broadcast write port — one per memory write slot.
@@ -681,7 +694,7 @@ pub struct FlatDispatchArray {
 pub struct CompiledDispatchTable {
     /// Compiled ops for each dispatch entry, keyed by the dispatch value.
     /// Each entry is (ops, result_slot).
-    pub entries: HashMap<i64, (Vec<Op>, Slot)>,
+    pub entries: FxMap<i64, (Vec<Op>, Slot)>,
     /// Compiled ops for the fallback expression.
     pub fallback_ops: Vec<Op>,
     /// Slot holding the fallback result.
@@ -1918,7 +1931,7 @@ impl<'a> Compiler<'a> {
         let _dt = web_time::Instant::now();
         let key_slot = self.compile_var(&table.key_property, None, ops);
 
-        let mut compiled_entries = HashMap::new();
+        let mut compiled_entries: FxMap<i64, (Vec<Op>, Slot)> = FxMap::default();
         for (&key_val, entry_expr) in &table.entries {
             let mut entry_ops = Vec::new();
             let result = self.compile_expr(entry_expr, &mut entry_ops);
@@ -2943,7 +2956,7 @@ impl<'a> Compiler<'a> {
         } else {
             // Compile each dispatch entry into its own op sequence (body uses
             // reserved param slots, so entries' var() refs resolve correctly).
-            let mut compiled_entries = HashMap::new();
+            let mut compiled_entries: FxMap<i64, (Vec<Op>, Slot)> = FxMap::default();
             for (&key_val, entry_expr) in &table.entries {
                 let mut entry_ops = Vec::new();
                 let result = self.compile_expr(entry_expr, &mut entry_ops);
@@ -5388,7 +5401,8 @@ fn compile_broadcast_write(bw: &BroadcastWrite, compiler: &mut Compiler) -> Comp
     // Build address map: address → state address (for direct write_mem)
     // Optimised: broadcast entries are bare names like "m12345" or "AX".
     // Parse directly instead of allocating format!("--{name}") for each of 1M entries.
-    let mut address_map = HashMap::with_capacity(bw.address_map.len());
+    let mut address_map: FxMap<i64, i32> =
+        FxMap::with_capacity_and_hasher(bw.address_map.len(), Default::default());
     for (&addr, var_name) in &bw.address_map {
         let state_addr = if let Some(rest) = var_name.strip_prefix('m') {
             rest.parse::<i32>().ok()
@@ -5409,7 +5423,7 @@ fn compile_broadcast_write(bw: &BroadcastWrite, compiler: &mut Compiler) -> Comp
     let spillover = if !bw.spillover_map.is_empty() {
         bw.spillover_guard.as_ref().map(|guard| {
             let guard_slot = compiler.compile_var(guard, None, &mut Vec::new());
-            let mut entries = HashMap::new();
+            let mut entries: FxMap<i64, (Vec<Op>, Slot)> = FxMap::default();
             for (&addr, (_var_name, val_expr)) in &bw.spillover_map {
                 let mut spill_ops = Vec::new();
                 let spill_slot = compiler.compile_expr(val_expr, &mut spill_ops);
@@ -5558,8 +5572,20 @@ pub fn execute(program: &CompiledProgram, state: &mut State, slots: &mut Vec<i32
         slots.resize(program.slot_count as usize, 0);
     }
 
-    // Execute main ops
-    exec_ops(&program.ops, &program.dispatch_tables, &program.chain_tables, &program.flat_dispatch_arrays, &program.functions, &program.packed_cell_tables, &program.packed_exception_tables, state, slots);
+    // Op-adjacency profile: when enabled, dispatch through the profiling
+    // variant. The check is one TLS Cell::get per tick (negligible). When
+    // disabled, the production path runs unchanged with zero overhead.
+    let op_profile_active = crate::pattern::op_profile::op_profile_is_enabled();
+
+    if op_profile_active {
+        // Reset prev-op tracker at tick boundaries — dispatched-op pairs
+        // shouldn't span ticks (each tick is a logical sequence).
+        crate::pattern::op_profile::op_profile_break_sequence();
+        exec_ops_with_op_profile(&program.ops, &program.dispatch_tables, &program.chain_tables, &program.flat_dispatch_arrays, &program.functions, &program.packed_cell_tables, &program.packed_exception_tables, state, slots);
+    } else {
+        // Execute main ops
+        exec_ops(&program.ops, &program.dispatch_tables, &program.chain_tables, &program.flat_dispatch_arrays, &program.functions, &program.packed_cell_tables, &program.packed_exception_tables, state, slots);
+    }
 
     // Writeback: apply computed values to state
     for &(slot, addr) in &program.writeback {
@@ -5582,7 +5608,11 @@ pub fn execute(program: &CompiledProgram, state: &mut State, slots: &mut Vec<i32
         let dest = slots[bw.dest_slot as usize];
         let dest_i64 = dest as i64;
         if bw.address_map.contains_key(&dest_i64) {
-            exec_ops(&bw.value_ops, &program.dispatch_tables, &program.chain_tables, &program.flat_dispatch_arrays, &program.functions, &program.packed_cell_tables, &program.packed_exception_tables, state, slots);
+            if op_profile_active {
+                exec_ops_with_op_profile(&bw.value_ops, &program.dispatch_tables, &program.chain_tables, &program.flat_dispatch_arrays, &program.functions, &program.packed_cell_tables, &program.packed_exception_tables, state, slots);
+            } else {
+                exec_ops(&bw.value_ops, &program.dispatch_tables, &program.chain_tables, &program.flat_dispatch_arrays, &program.functions, &program.packed_cell_tables, &program.packed_exception_tables, state, slots);
+            }
             let value = slots[bw.value_slot as usize];
             state.write_mem(dest, value);
         }
@@ -5591,7 +5621,11 @@ pub fn execute(program: &CompiledProgram, state: &mut State, slots: &mut Vec<i32
             let guard = slots[spillover.guard_slot as usize];
             if guard == 1 {
                 if let Some((ref spill_ops, spill_slot)) = spillover.entries.get(&dest_i64) {
-                    exec_ops(spill_ops, &program.dispatch_tables, &program.chain_tables, &program.flat_dispatch_arrays, &program.functions, &program.packed_cell_tables, &program.packed_exception_tables, state, slots);
+                    if op_profile_active {
+                        exec_ops_with_op_profile(spill_ops, &program.dispatch_tables, &program.chain_tables, &program.flat_dispatch_arrays, &program.functions, &program.packed_cell_tables, &program.packed_exception_tables, state, slots);
+                    } else {
+                        exec_ops(spill_ops, &program.dispatch_tables, &program.chain_tables, &program.flat_dispatch_arrays, &program.functions, &program.packed_cell_tables, &program.packed_exception_tables, state, slots);
+                    }
                     let value = slots[*spill_slot as usize];
                     state.write_mem(dest + 1, value);
                 }
@@ -6841,11 +6875,12 @@ fn exec_ops(
                     let table = &packed_cell_tables[tid];
                     let cell_addr = if n < table.len() { table[n] } else { 0 };
                     let cell = if cell_addr == 0 { 0 } else { state.read_mem(cell_addr) };
-                    if off == 0 {
-                        cell.rem_euclid(256)
-                    } else {
-                        cell.div_euclid(256).rem_euclid(256)
-                    }
+                    // (cell >> (off*8)) & 0xFF — matches Op::LoadPackedByte's
+                    // documented semantics, equivalent to the prior
+                    // rem_euclid/div_euclid pair for off∈{0,1} (pack=2 today).
+                    // Two's-complement byte extraction works for negative cells
+                    // because the arithmetic-shift sign extension is masked off.
+                    (cell >> (off * 8)) & 0xFF
                 };
                 sstore!(*dst, v);
             }
@@ -7112,6 +7147,382 @@ fn exec_ops(
     }
 }
 
+/// Op-adjacency-profiling variant of `exec_ops`. Byte-for-byte equivalent
+/// behaviour to `exec_ops` plus a `pattern::op_profile::op_profile_tick`
+/// call per dispatch. Recurses into itself for Dispatch entries / fallback
+/// and Call bodies so adjacency captures pairs that cross those boundaries
+/// — matches the comment on `LAST_OP_KIND` in `pattern/op_profile.rs`.
+///
+/// Only entered from `execute` (and the parallel broadcast/spillover paths)
+/// when `op_profile_is_enabled()` is true. Cold-path duplicate of the
+/// production loop — see `execute` for the dispatch.
+#[allow(clippy::too_many_arguments)]
+fn exec_ops_with_op_profile(
+    ops: &[Op],
+    dispatch_tables: &[CompiledDispatchTable],
+    chain_tables: &[DispatchChainTable],
+    flat_dispatch_arrays: &[FlatDispatchArray],
+    functions: &[CompiledFunction],
+    packed_cell_tables: &[Vec<i32>],
+    packed_exception_tables: &[PackedExceptionTable],
+    state: &mut State,
+    slots: &mut [i32],
+) {
+    use crate::pattern::op_profile::{op_kind_index, op_profile_tick};
+
+    let len = ops.len();
+    let mut pc: usize = 0;
+
+    macro_rules! sload {
+        ($i:expr) => {{
+            let idx = $i as usize;
+            debug_assert!(idx < slots.len());
+            unsafe { *slots.get_unchecked(idx) }
+        }};
+    }
+    macro_rules! sstore {
+        ($i:expr, $v:expr) => {{
+            let idx = $i as usize;
+            let v = $v;
+            debug_assert!(idx < slots.len());
+            unsafe { *slots.get_unchecked_mut(idx) = v; }
+        }};
+    }
+
+    while pc < len {
+        let op = unsafe { ops.get_unchecked(pc) };
+        op_profile_tick(op_kind_index(op));
+        match op {
+            Op::BranchIfNotEqLit { a, val, target } => {
+                if sload!(*a) != *val {
+                    pc = *target as usize;
+                    continue;
+                }
+            }
+            Op::LoadStateAndBranchIfNotEqLit { dst, addr, val, target } => {
+                let v = state.read_mem(*addr);
+                sstore!(*dst, v);
+                if v != *val {
+                    pc = *target as usize;
+                    continue;
+                }
+            }
+            Op::BranchIfNotEqLit2 { a1, val1, a2, val2, target } => {
+                if sload!(*a1) != *val1 || sload!(*a2) != *val2 {
+                    pc = *target as usize;
+                    continue;
+                }
+                // Skip the dead BIfNEL at i+1 left for external-jump safety.
+                // The natural `pc += 1` at end-of-loop will advance the rest.
+                pc += 1;
+            }
+            Op::LoadLit { dst, val } => {
+                sstore!(*dst, *val);
+            }
+            Op::LoadSlot { dst, src } => {
+                sstore!(*dst, sload!(*src));
+            }
+            Op::LoadState { dst, addr } => {
+                sstore!(*dst, state.read_mem(*addr));
+            }
+            Op::LoadMem { dst, addr_slot } => {
+                let addr = sload!(*addr_slot);
+                sstore!(*dst, state.read_mem(addr));
+            }
+            Op::LoadMem16 { dst, addr_slot } => {
+                let addr = sload!(*addr_slot);
+                let v = if addr < 0 { state.read_mem(addr) } else { state.read_mem16(addr) };
+                sstore!(*dst, v);
+            }
+            Op::LoadPackedByte { dst, key_slot, table_id, pack } => {
+                let key = sload!(*key_slot);
+                let tid = *table_id as usize;
+                let v = if key < 0 {
+                    0
+                } else if let Some(lit) = packed_exception_tables[tid].get(key) {
+                    lit
+                } else {
+                    let pack_i = *pack as i32;
+                    let n = (key / pack_i) as usize;
+                    let off = key % pack_i;
+                    let table = &packed_cell_tables[tid];
+                    let cell_addr = if n < table.len() { table[n] } else { 0 };
+                    let cell = if cell_addr == 0 { 0 } else { state.read_mem(cell_addr) };
+                    (cell >> (off * 8)) & 0xFF
+                };
+                sstore!(*dst, v);
+            }
+            Op::Add { dst, a, b } => {
+                sstore!(*dst, sload!(*a).wrapping_add(sload!(*b)));
+            }
+            Op::AddLit { dst, a, val } => {
+                sstore!(*dst, sload!(*a).wrapping_add(*val));
+            }
+            Op::Sub { dst, a, b } => {
+                sstore!(*dst, sload!(*a).wrapping_sub(sload!(*b)));
+            }
+            Op::SubLit { dst, a, val } => {
+                sstore!(*dst, sload!(*a).wrapping_sub(*val));
+            }
+            Op::Mul { dst, a, b } => {
+                sstore!(*dst, sload!(*a).wrapping_mul(sload!(*b)));
+            }
+            Op::MulLit { dst, a, val } => {
+                sstore!(*dst, sload!(*a).wrapping_mul(*val));
+            }
+            Op::Div { dst, a, b } => {
+                let divisor = sload!(*b);
+                let v = if divisor == 0 { 0 } else { sload!(*a) / divisor };
+                sstore!(*dst, v);
+            }
+            Op::Mod { dst, a, b } => {
+                let divisor = sload!(*b);
+                let v = if divisor == 0 { 0 } else { sload!(*a) % divisor };
+                sstore!(*dst, v);
+            }
+            Op::Neg { dst, src } => {
+                sstore!(*dst, sload!(*src).wrapping_neg());
+            }
+            Op::Abs { dst, src } => {
+                sstore!(*dst, sload!(*src).wrapping_abs());
+            }
+            Op::Sign { dst, src } => {
+                let v = sload!(*src);
+                sstore!(*dst, if v > 0 { 1 } else if v < 0 { -1 } else { 0 });
+            }
+            Op::Pow { dst, base, exp } => {
+                let b = sload!(*base);
+                let e = sload!(*exp);
+                sstore!(*dst, if e < 0 { 0 } else { b.wrapping_pow(e as u32) });
+            }
+            Op::Min { dst, args } => {
+                let mut v = i32::MAX;
+                for &a in args {
+                    v = v.min(sload!(a));
+                }
+                sstore!(*dst, v);
+            }
+            Op::Max { dst, args } => {
+                let mut v = i32::MIN;
+                for &a in args {
+                    v = v.max(sload!(a));
+                }
+                sstore!(*dst, v);
+            }
+            Op::Clamp { dst, min, val, max } => {
+                let min_v = sload!(*min);
+                let val_v = sload!(*val);
+                let max_v = sload!(*max);
+                sstore!(*dst, val_v.clamp(min_v, max_v));
+            }
+            Op::Round { dst, strategy, val, interval } => {
+                let v = sload!(*val);
+                let i = sload!(*interval);
+                let r = if i == 0 {
+                    v
+                } else {
+                    match strategy {
+                        RoundStrategy::Down => v.div_euclid(i) * i,
+                        RoundStrategy::Up => (v + i - 1).div_euclid(i) * i,
+                        RoundStrategy::Nearest => ((v + i / 2).div_euclid(i)) * i,
+                        RoundStrategy::ToZero => (v / i) * i,
+                    }
+                };
+                sstore!(*dst, r);
+            }
+            Op::Floor { dst, src } => {
+                sstore!(*dst, sload!(*src));
+            }
+            Op::And { dst, a, b } => {
+                let av = sload!(*a);
+                let bv = sload!(*b) as u32;
+                sstore!(*dst, if bv >= 32 { av } else { av & ((1i32 << bv) - 1) });
+            }
+            Op::AndLit { dst, a, val } => {
+                sstore!(*dst, sload!(*a) & *val);
+            }
+            Op::Shr { dst, a, b } => {
+                let av = sload!(*a);
+                let bv = sload!(*b) as u32;
+                sstore!(*dst, if bv >= 32 { 0 } else { av >> bv });
+            }
+            Op::ShrLit { dst, a, val } => {
+                sstore!(*dst, sload!(*a) >> *val);
+            }
+            Op::Shl { dst, a, b } => {
+                let av = sload!(*a);
+                let bv = sload!(*b) as u32;
+                sstore!(*dst, if bv >= 32 { 0 } else { av << bv });
+            }
+            Op::ShlLit { dst, a, val } => {
+                sstore!(*dst, sload!(*a) << *val);
+            }
+            Op::ModLit { dst, a, val } => {
+                let divisor = *val;
+                sstore!(*dst, if divisor == 0 { 0 } else { sload!(*a) % divisor });
+            }
+            Op::Bit { dst, val, idx } => {
+                let v = sload!(*val);
+                let i = sload!(*idx) as u32;
+                sstore!(*dst, if i >= 32 { 0 } else { (v >> i) & 1 });
+            }
+            Op::BitAnd16 { dst, a, b } => {
+                let av = sload!(*a) as u32 & 0xFFFF;
+                let bv = sload!(*b) as u32 & 0xFFFF;
+                sstore!(*dst, (av & bv) as i32);
+            }
+            Op::BitOr16 { dst, a, b } => {
+                let av = sload!(*a) as u32 & 0xFFFF;
+                let bv = sload!(*b) as u32 & 0xFFFF;
+                sstore!(*dst, (av | bv) as i32);
+            }
+            Op::BitXor16 { dst, a, b } => {
+                let av = sload!(*a) as u32 & 0xFFFF;
+                let bv = sload!(*b) as u32 & 0xFFFF;
+                sstore!(*dst, (av ^ bv) as i32);
+            }
+            Op::BitNot16 { dst, a } => {
+                let av = sload!(*a) as u32 & 0xFFFF;
+                sstore!(*dst, ((!av) & 0xFFFF) as i32);
+            }
+            Op::CmpEq { dst, a, b } => {
+                sstore!(*dst, if sload!(*a) == sload!(*b) { 1 } else { 0 });
+            }
+            Op::BranchIfZero { cond, target } => {
+                if sload!(*cond) == 0 {
+                    pc = *target as usize;
+                    continue;
+                }
+            }
+            Op::Jump { target } => {
+                pc = *target as usize;
+                continue;
+            }
+            Op::DispatchChain { a, chain_id, miss_target } => {
+                let key = sload!(*a);
+                let table = unsafe { chain_tables.get_unchecked(*chain_id as usize) };
+                if let Some(ref flat) = table.flat_table {
+                    let idx = key.wrapping_sub(flat.base);
+                    if (idx as u32) < flat.targets.len() as u32 {
+                        let t = unsafe { *flat.targets.get_unchecked(idx as usize) };
+                        if t != u32::MAX {
+                            pc = t as usize;
+                            continue;
+                        }
+                    }
+                    pc = *miss_target as usize;
+                    continue;
+                }
+                match table.entries.get(&key) {
+                    Some(&body_pc) => { pc = body_pc as usize; }
+                    None => { pc = *miss_target as usize; }
+                }
+                continue;
+            }
+            Op::Dispatch { dst, key, table_id, .. } => {
+                let key_val = sload!(*key) as i64;
+                let table = unsafe { dispatch_tables.get_unchecked(*table_id as usize) };
+                if let Some((entry_ops, result_slot)) = table.entries.get(&key_val) {
+                    exec_ops_with_op_profile(entry_ops, dispatch_tables, chain_tables, flat_dispatch_arrays, functions, packed_cell_tables, packed_exception_tables, state, slots);
+                    sstore!(*dst, sload!(*result_slot));
+                } else {
+                    exec_ops_with_op_profile(&table.fallback_ops, dispatch_tables, chain_tables, flat_dispatch_arrays, functions, packed_cell_tables, packed_exception_tables, state, slots);
+                    sstore!(*dst, sload!(table.fallback_slot));
+                }
+            }
+            Op::DispatchFlatArray { dst, key, array_id, base_key, default } => {
+                let key_val = sload!(*key);
+                let arr = unsafe { flat_dispatch_arrays.get_unchecked(*array_id as usize) };
+                let idx = key_val.wrapping_sub(*base_key);
+                let v = if idx < 0 || (idx as usize) >= arr.values.len() {
+                    *default
+                } else {
+                    unsafe { *arr.values.get_unchecked(idx as usize) }
+                };
+                sstore!(*dst, v);
+            }
+            Op::Call { dst, fn_id, arg_slots } => {
+                let func = unsafe { functions.get_unchecked(*fn_id as usize) };
+                for (arg, &param) in arg_slots.iter().zip(func.param_slots.iter()) {
+                    sstore!(param, sload!(*arg));
+                }
+                exec_ops_with_op_profile(&func.body_ops, dispatch_tables, chain_tables, flat_dispatch_arrays, functions, packed_cell_tables, packed_exception_tables, state, slots);
+                sstore!(*dst, sload!(func.result_slot));
+            }
+            Op::StoreState { addr, src } => {
+                state.write_mem(*addr, sload!(*src));
+            }
+            Op::StoreMem { addr_slot, src } => {
+                state.write_mem(sload!(*addr_slot), sload!(*src));
+            }
+            Op::MemoryFill { dst_slot, val_slot, count_slot, exit_target } => {
+                let dst = sload!(*dst_slot);
+                let count = sload!(*count_slot);
+                let val_byte = (sload!(*val_slot) & 0xFF) as u8;
+                let mem_len = effective_guest_mem_end(state);
+                if count > 0 && dst >= 0 && (dst as usize) < mem_len {
+                    let lo = dst as usize;
+                    let hi = (dst as i64 + count as i64).min(mem_len as i64) as usize;
+                    if hi > lo {
+                        state.bulk_fill_byte(lo, hi - lo, val_byte);
+                    }
+                }
+                sstore!(*dst_slot, dst.wrapping_add(count));
+                sstore!(*count_slot, 0i32);
+                pc = *exit_target as usize;
+                continue;
+            }
+            Op::MemoryCopy { src_slot, dst_slot, count_slot, exit_target } => {
+                let src = sload!(*src_slot);
+                let dst = sload!(*dst_slot);
+                let count = sload!(*count_slot);
+                let mem_len = effective_guest_mem_end(state);
+                if count > 0 && src >= 0 && dst >= 0
+                    && (src as usize) < mem_len && (dst as usize) < mem_len
+                {
+                    let max_by_src = (mem_len as i64) - src as i64;
+                    let max_by_dst = (mem_len as i64) - dst as i64;
+                    let n = (count as i64).min(max_by_src).min(max_by_dst) as usize;
+                    if n > 0 {
+                        let s = src as usize;
+                        let d = dst as usize;
+                        state.bulk_copy_bytes(s, d, n);
+                    }
+                }
+                sstore!(*src_slot, src.wrapping_add(count));
+                sstore!(*dst_slot, dst.wrapping_add(count));
+                sstore!(*count_slot, 0i32);
+                pc = *exit_target as usize;
+                continue;
+            }
+            Op::ReplicatedBody { body, strides, reps } => {
+                // Replicated bodies execute via exec_replicated_body, which
+                // calls back into exec_ops (not the profiled variant). For
+                // op-profile correctness we re-implement the rep loop here
+                // to dispatch through the profiled path. Bodies are small
+                // (<= 16 ops typical) and contain no branches/dispatches/
+                // bulk-mem ops by recogniser invariant.
+                use crate::pattern::replicated_body::apply_strides;
+                debug_assert_eq!(body.len(), strides.len());
+                let mut scratch: Vec<Op> = Vec::with_capacity(body.len());
+                for k in 0..*reps {
+                    scratch.clear();
+                    for (template, op_strides) in body.iter().zip(strides.iter()) {
+                        scratch.push(apply_strides(template, k, op_strides));
+                    }
+                    exec_ops_with_op_profile(
+                        &scratch,
+                        dispatch_tables, chain_tables, flat_dispatch_arrays,
+                        functions, packed_cell_tables, packed_exception_tables,
+                        state, slots,
+                    );
+                }
+            }
+        }
+        pc += 1;
+    }
+}
+
 /// Execute a replicated-body op: for each rep `k` in `0..reps`, apply the
 /// per-op strides to materialise the rep's ops, then run them.
 ///
@@ -7326,11 +7737,7 @@ fn exec_ops_profiled(
                     let table = &packed_cell_tables[tid];
                     let cell_addr = if n < table.len() { table[n] } else { 0 };
                     let cell = if cell_addr == 0 { 0 } else { state.read_mem(cell_addr) };
-                    if off == 0 {
-                        cell.rem_euclid(256)
-                    } else {
-                        cell.div_euclid(256).rem_euclid(256)
-                    }
+                    (cell >> (off * 8)) & 0xFF
                 };
                 slots[*dst as usize] = v;
             }
@@ -7811,7 +8218,7 @@ pub fn exec_ops_traced(
                     let table = &packed_cell_tables[tid];
                     let cell_addr = if n < table.len() { table[n] } else { 0 };
                     let cell = if cell_addr == 0 { 0 } else { state.read_mem(cell_addr) };
-                    if off == 0 { cell.rem_euclid(256) } else { cell.div_euclid(256).rem_euclid(256) }
+                    (cell >> (off * 8)) & 0xFF
                 };
                 slots[*dst as usize] = val;
                 if should_trace {
