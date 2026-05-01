@@ -736,16 +736,10 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            // Clear after the menu exits so the generator output starts fresh.
+            // Clear after the menu exits so the runner output starts fresh.
             print!("\x1b[2J\x1b[H");
             cssdos_logo::print();
-            match menu::resolve_to_css(&entries[selected], &root) {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!("Failed to generate CSS: {e}");
-                    std::process::exit(1);
-                }
-            }
+            menu::resolve_to_css(&entries[selected])
         }
     };
 

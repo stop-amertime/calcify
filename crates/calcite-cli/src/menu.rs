@@ -1,18 +1,15 @@
-//! Interactive program picker.
+//! Interactive cabinet picker.
 //!
-//! When `calcite` is invoked without `-i`, this shows a grid of available
-//! programs (pre-built `.css` in `output/`, plus every top-level `.com`/`.exe`
-//! and every cart subdirectory under `programs/`). Arrow keys to navigate,
-//! Enter to select, Q / Esc / Ctrl+C to quit.
+//! When `calcite` is invoked without `-i`, this shows a grid of `.css`
+//! cabinets available to run. Arrow keys to navigate, Enter to select,
+//! Q / Esc / Ctrl+C to quit.
 //!
-//! Selecting a pre-built `.css` returns its path directly.
-//! Selecting a program invokes `node ../CSS-DOS/builder/build.mjs` with the
-//! cart path (either the loose .com/.exe or the subdir), streaming its output
-//! below the CSS-DOS logo, then returns the generated `.css` path.
+//! The picker scans `calcite_root` and `calcite_root/cabinets/` for
+//! `.css` files. Cabinets are produced upstream (e.g. CSS-DOS's
+//! `builder/build.mjs`); calcite-cli does not build them.
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal;
@@ -20,39 +17,15 @@ use crossterm::terminal;
 use crate::cssdos_logo;
 
 #[derive(Debug, Clone)]
-pub enum Entry {
-    /// Pre-built CSS in `output/`.
-    PrebuiltCss { name: String, path: PathBuf, bytes: u64 },
-    /// A cart to build: either a loose .com/.exe or a subdirectory.
-    Program {
-        name: String,
-        /// Path handed to build.mjs — a loose file or a directory.
-        cart: PathBuf,
-        bytes: u64,
-        /// True if `cart` points at a directory cart.
-        is_dir: bool,
-    },
+pub struct Entry {
+    pub name: String,
+    pub path: PathBuf,
+    pub bytes: u64,
 }
 
 impl Entry {
     pub fn label(&self) -> String {
-        match self {
-            Entry::PrebuiltCss { name, bytes, .. } => {
-                format!("{name}.css ({})", human_size(*bytes))
-            }
-            Entry::Program { name, cart, bytes, is_dir } => {
-                if *is_dir {
-                    format!("{name}/ ({})", human_size(*bytes))
-                } else {
-                    let ext = cart
-                        .extension()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("")
-                        .to_lowercase();
-                    format!("{name}.{ext} ({})", human_size(*bytes))
-                }
-            }
-        }
+        format!("{}.css ({})", self.name, human_size(self.bytes))
     }
 }
 
@@ -66,124 +39,42 @@ fn human_size(bytes: u64) -> String {
     }
 }
 
-/// Discover all menu entries. `calcite_root` is the directory containing
-/// `output/`, `programs/`, and (as sibling) `../CSS-DOS/`.
+/// Discover all `.css` cabinets under `calcite_root` and
+/// `calcite_root/cabinets/`. Sorted by label.
 pub fn discover(calcite_root: &Path) -> Vec<Entry> {
     let mut out = Vec::new();
-
-    // Pre-built CSS files.
-    let output_dir = calcite_root.join("output");
-    if output_dir.is_dir() {
-        if let Ok(rd) = std::fs::read_dir(&output_dir) {
-            let mut css: Vec<_> = rd
-                .flatten()
-                .filter_map(|e| {
-                    let p = e.path();
-                    if p.extension().and_then(|s| s.to_str()) == Some("css") {
-                        let name = p.file_stem()?.to_string_lossy().into_owned();
-                        let bytes = p.metadata().ok().map(|m| m.len()).unwrap_or(0);
-                        Some(Entry::PrebuiltCss { name, path: p, bytes })
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            css.sort_by(|a, b| a.label().cmp(&b.label()));
-            out.extend(css);
-        }
+    collect_css(calcite_root, &mut out);
+    let cabinets = calcite_root.join("cabinets");
+    if cabinets.is_dir() {
+        collect_css(&cabinets, &mut out);
     }
-
-    // Every .com / .exe under programs/ recursively.
-    let programs_dir = calcite_root.join("programs");
-    let mut progs = Vec::new();
-    if programs_dir.is_dir() {
-        collect_programs(&programs_dir, &programs_dir, &mut progs);
-    }
-    progs.sort_by(|a, b| a.label().cmp(&b.label()));
-    out.extend(progs);
-
+    out.sort_by(|a, b| a.label().cmp(&b.label()));
     out
 }
 
-fn collect_programs(root: &Path, dir: &Path, out: &mut Vec<Entry>) {
+fn collect_css(dir: &Path, out: &mut Vec<Entry>) {
     let rd = match std::fs::read_dir(dir) {
         Ok(rd) => rd,
         Err(_) => return,
     };
     for entry in rd.flatten() {
         let p = entry.path();
-        if p.is_dir() {
-            let dname = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            if dname == ".cache" {
-                continue;
-            }
-            // Only surface subdirs that actually contain a runnable.
-            if !has_runnable(&p) {
-                continue;
-            }
-            let bytes = dir_size(&p);
-            let rel = p.strip_prefix(root).unwrap_or(&p);
-            let name = rel.to_string_lossy().replace('\\', "/");
-            out.push(Entry::Program { name, cart: p, bytes, is_dir: true });
-        } else {
-            let ext = p
-                .extension()
-                .and_then(|s| s.to_str())
-                .map(|s| s.to_ascii_lowercase())
-                .unwrap_or_default();
-            if ext == "com" || ext == "exe" {
-                let bytes = p.metadata().ok().map(|m| m.len()).unwrap_or(0);
-                let rel = p.strip_prefix(root).unwrap_or(&p);
-                let name = rel.with_extension("").to_string_lossy().replace('\\', "/");
-                out.push(Entry::Program { name, cart: p, bytes, is_dir: false });
-            }
-        }
-    }
-}
-
-fn has_runnable(dir: &Path) -> bool {
-    let rd = match std::fs::read_dir(dir) {
-        Ok(rd) => rd,
-        Err(_) => return false,
-    };
-    for entry in rd.flatten() {
-        let p = entry.path();
         if !p.is_file() {
             continue;
         }
-        let ext = p
-            .extension()
-            .and_then(|s| s.to_str())
-            .map(|s| s.to_ascii_lowercase())
-            .unwrap_or_default();
-        if ext == "com" || ext == "exe" {
-            return true;
+        if p.extension().and_then(|s| s.to_str()) != Some("css") {
+            continue;
         }
+        let Some(name) = p.file_stem().and_then(|s| s.to_str()) else { continue };
+        let bytes = p.metadata().ok().map(|m| m.len()).unwrap_or(0);
+        out.push(Entry { name: name.to_string(), path: p.clone(), bytes });
     }
-    false
 }
 
-fn dir_size(dir: &Path) -> u64 {
-    let rd = match std::fs::read_dir(dir) {
-        Ok(rd) => rd,
-        Err(_) => return 0,
-    };
-    let mut total = 0u64;
-    for entry in rd.flatten() {
-        let p = entry.path();
-        if p.is_dir() {
-            total = total.saturating_add(dir_size(&p));
-        } else if let Ok(md) = p.metadata() {
-            total = total.saturating_add(md.len());
-        }
-    }
-    total
-}
-
-/// Show the menu, return the selected entry or None if cancelled.
+/// Show the menu, return the selected entry index or None if cancelled.
 pub fn run(entries: &[Entry]) -> io::Result<Option<usize>> {
     if entries.is_empty() {
-        eprintln!("\nNo programs found. Drop .com/.exe into programs/ or .css into output/.");
+        eprintln!("\nNo .css cabinets found. Drop one into the calcite root or cabinets/.");
         return Ok(None);
     }
 
@@ -246,14 +137,13 @@ fn handle_key(k: KeyEvent, cursor: usize, total: usize, cols: usize) -> KeyActio
 }
 
 fn draw(entries: &[Entry], cursor: usize, cols: usize, cell_w: usize) -> io::Result<()> {
-    // Home + clear-from-cursor (not full screen: logo stays put above).
     let mut out = String::new();
     // Full clear + home, then logo + menu every redraw. This way the logo
     // always anchors the top of the screen, no matter how tall the menu is.
     out.push_str("\x1b[2J\x1b[H");
     cssdos_logo::append(&mut out);
     out.push('\n');
-    out.push_str("  Pick a program — arrows move, enter runs, q/esc/ctrl-c exits.\n\n");
+    out.push_str("  Pick a cabinet — arrows move, enter runs, q/esc/ctrl-c exits.\n\n");
 
     for (i, e) in entries.iter().enumerate() {
         let label = ellipsize(&e.label(), cell_w.saturating_sub(2));
@@ -291,48 +181,8 @@ fn ellipsize(s: &str, max: usize) -> String {
     }
 }
 
-/// Resolve an entry to a `.css` path, invoking CSS-DOS's builder if needed.
-/// Streams the builder's output to stderr. `calcite_root` is the directory
-/// containing `output/` and `programs/`.
-pub fn resolve_to_css(entry: &Entry, calcite_root: &Path) -> io::Result<PathBuf> {
-    match entry {
-        Entry::PrebuiltCss { path, .. } => Ok(path.clone()),
-        Entry::Program { name, cart, .. } => {
-            let output_dir = calcite_root.join("output");
-            let _ = std::fs::create_dir_all(&output_dir);
-            // Sanitise name for the output file (replace path separators).
-            let safe = name.replace(['/', '\\'], "_");
-            let out_css = output_dir.join(format!("{safe}.css"));
-
-            // builder/build.mjs lives in the sibling CSS-DOS repo.
-            let builder = calcite_root
-                .parent()
-                .map(|p| p.join("CSS-DOS").join("builder").join("build.mjs"))
-                .unwrap_or_else(|| PathBuf::from("../CSS-DOS/builder/build.mjs"));
-
-            eprintln!(
-                "\n  Building {} → {} …",
-                cart.display(),
-                out_css.display()
-            );
-
-            let status = Command::new("node")
-                .arg("--max-old-space-size=8192")
-                .arg(&builder)
-                .arg(cart)
-                .arg("-o")
-                .arg(&out_css)
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit())
-                .status()?;
-            if !status.success() {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("build.mjs exited with {status}"),
-                ));
-            }
-
-            Ok(out_css)
-        }
-    }
+/// Resolve an entry to a `.css` path. Trivial now that the menu only
+/// surfaces pre-built cabinets, but kept as a stable API for `main.rs`.
+pub fn resolve_to_css(entry: &Entry) -> PathBuf {
+    entry.path.clone()
 }
