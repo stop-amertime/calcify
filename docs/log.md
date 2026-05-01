@@ -11,6 +11,107 @@ and the Criterion benchmarks.
 
 ---
 
+## 2026-05-01 — Repo cleanup: Chunk D — script-primitive layer landed
+
+Per `../CSS-DOS/docs/audit-summary-and-plan.md` Chunk D. Three legacy
+DSLs (calcite-cli's `--cond`, `--poll-stride`, `--script-event`) are
+collapsed into one generic measurement-primitive substrate in
+calcite-core. Same syntax surface on calcite-cli (`--watch`) and
+calcite-wasm (`engine.register_watch`).
+
+**What's new in calcite-core**
+
+- `script::WatchRegistry` + `script_eval::poll`. Hosts register
+  watches; per-tick (or per chunk) call `poll` with the current state
+  and tick. Events accumulate; host drains.
+- Primitives: `Stride { every }`, `Burst { every, count }`,
+  `At { tick }`, `Edge { addr }`, `Cond { tests, repeat }`,
+  `Halt { addr }`. Cheap (Stride/Burst/At/Halt) vs expensive
+  (Edge/Cond) split is structural — expensive watches name a `gate`
+  watch and only evaluate on ticks where the gate fired (two-phase
+  poll).
+- Predicates: `ByteEq`, `ByteNe`, `BytePatternAt { base, stride,
+  max_window, needle }`. The third replaces the old
+  `vram_text:NEEDLE` helper — the upstream-knowledge constants
+  (text VRAM at 0xB8000, stride 2) live in CSS-DOS-side profiles
+  now, NOT in calcite. Generic across any cabinet whose layout puts
+  bytes at a known stride.
+- Actions: `Emit`, `DumpMemRange { addr, len, path_template }`,
+  `Snapshot { path_template }`, `SetVar { name, value }`, `Halt`.
+  Path templates support `{tick}` and `{name}` substitution.
+- `DumpSink` chooses `File` (native CLIs; bytes written to disk) vs
+  `Memory` (wasm; bytes ride out on `MeasurementEvent.dumps`).
+- Text-format parser in `script_spec::parse_watch` shared by both
+  calcite-cli and calcite-wasm.
+
+**calcite-cli changes**
+
+- New flags: `--watch NAME:KIND:SPEC[:gate=NAME][:sample=VAR1,VAR2][:then=ACTIONS]`
+  (repeatable) and `--measure-out=PATH` (JSON Lines stream).
+- Removed: `--cond`, `--poll-stride`, `--script-event`,
+  `--script-file`. **No back-compat alias**, per the audit plan.
+  ~280 lines of legacy parser + scheduler glue deleted.
+- Migration map for the only remaining consumer
+  (`tests/harness/bench-doom-stages-cli.mjs` in CSS-DOS, which gets
+  rewired in Chunk E):
+  - `--poll-stride=N` → `--watch poll:stride:every=N`
+  - `--cond=ingame:ADDR=VAL:then=halt` →
+    `--watch ingame:cond:ADDR=VAL:gate=poll:then=halt`
+  - `--script-event=TICK:tap:VALUE` →
+    `--watch <name>:at:tick=TICK:then=setvar=keyboard,VALUE`
+    (paired release event registered separately if needed; the
+    cabinet's edge detector handles the make/break itself)
+
+**calcite-wasm surface**
+
+- `register_watch(spec)`, `watch_count()`, `clear_watches()`,
+  `run_batch_watched(count, chunk_ticks)`, `drain_measurements()`,
+  `watch_halt_requested()`. `reset()` also clears the registry.
+- `drain_measurements()` returns JSON. Dump bytes are base64-encoded
+  so the payload survives the JS string boundary; bench JS decodes
+  if it cares. Tiny built-in base64 encoder, no new dep.
+
+**Tests**
+
+- 7 unit tests in `script_eval` (registry smoke, stride/burst/At
+  cadence, edge priming, byte-pattern matching, template
+  substitution).
+- 7 integration tests in `tests/script_primitives.rs` exercising
+  every primitive end-to-end through real Evaluator + State on
+  trivial 1-property non-x86 cabinets.
+- 6 parser tests in `script_spec` (stride, burst, cond+pattern,
+  dump-with-template-path, setvar, sample-vars).
+
+**Verification**
+
+- `cargo test --workspace`: 161 passed, 4 pre-existing failures
+  (`compile_full_program`, `compile_dispatch_table`,
+  `compile_value_forwarding`, `eval::tick_applies_assignments` —
+  all panic in `rep_fast_forward` with "no-opcode" on cabinets that
+  don't expose `--opcode`; documented in CSS-DOS LOGBOOK 2026-05-01,
+  out of scope for Chunk D). All new tests pass.
+- `wasm-pack build crates/calcite-wasm --target web --release`
+  succeeds; ~33s including wasm-opt.
+
+**What this enables (Chunk E preview)**
+
+The same watch spec drives doom-stages bench (web AND native) without
+the harness having to know about poll-stride / script-event /
+condition syntax. CSS-DOS-side bench profiles compose the generic
+primitives with their own constants for upstream layer (e.g.
+`pattern@0xb8000:2:4000=DR-DOS` rather than `vram_text:DR-DOS` —
+calcite never sees the meaning of 0xB8000). The cardinal rule holds:
+calcite knows only structural CSS-shape predicates over guest memory;
+upstream knowledge lives in the host that registers them.
+
+Files touched: `crates/calcite-core/src/{lib,script,script_eval,
+script_spec}.rs`, `crates/calcite-core/tests/script_primitives.rs`,
+`crates/calcite-cli/src/main.rs`,
+`crates/calcite-wasm/src/lib.rs`. Branch
+`cleanup-2026-05-01`, not pushed.
+
+---
+
 ## 2026-05-01 — LoadPackedByte: euclid → bitwise byte extract
 
 3 exec arms (production, profiled, traced) of `Op::LoadPackedByte`
