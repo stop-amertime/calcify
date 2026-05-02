@@ -11,6 +11,48 @@ and the Criterion benchmarks.
 
 ---
 
+## 2026-05-02 — script: setvar_pulse + cond:repeat sustain mode
+
+Closes the first follow-up from the 2026-05-01 chunk D entry: the
+script primitives didn't drive cabinet keyboard handlers (which need
+make/break edge pairs) when used as a sustain-cond + setvar_pulse
+spam loop. Three coupled fixes:
+
+1. **New action `Action::SetVarPulse { name, value, hold_ticks }`.**
+   Writes value now, schedules a write-of-0 release after `hold_ticks`
+   ticks. The release is dispatched at the top of the next `poll()`
+   that crosses the release tick. Pulses queued while a release is
+   still pending — or that fires THIS poll — are skipped, so the
+   engine sees a clean make/break/make/break alternation at twice
+   the gating poll stride. CLI flag:
+   `setvar_pulse=NAME,VALUE,HOLD_TICKS`.
+
+2. **`cond:repeat` is sustain mode now.** It fires on every gated
+   poll while the predicate holds, matching the doc that's been
+   there since chunk D. The original rising-edge-only implementation
+   was overfitted to a use case nobody's exercising and broke the
+   spam pattern the new primitives are meant to replace.
+
+3. **Registry tracks `pending_releases` + `released_this_poll`.** The
+   action dispatch consults both to decide whether to skip a pulse.
+   No change to the hot eval path for non-pulse actions.
+
+Tests: 9 → 10 integration. New `sustain_cond_pulse_alternates_make_
+and_break_at_2x_poll_stride` proves the cadence. The chunk D-era
+`setvar_pulse_re_arm_extends_release` test was renamed to
+`setvar_pulse_skips_when_release_pending` — the re-arm semantic was
+theoretical; skip-while-pending is what cabinets need.
+
+End-to-end: doom8088 CLI bench (CSS-DOS-side) reaches in_game in
+145.8 s / 34.65 M ticks (Chunk A baseline 119 s / 35 M ticks). +22 %
+wall covers the watch-poll overhead; engine work essentially
+identical. See CSS-DOS LOGBOOK 2026-05-02.
+
+Cardinal-rule check: still zero upstream knowledge in calcite-core.
+The fact that "keyboard" is the var being pulsed lives in the bench
+profile (CSS-DOS-side). The action knows only "set var X to value
+Y, write 0 to X after N ticks."
+
 ## 2026-05-01 — Repo cleanup: Chunk D — script-primitive layer landed
 
 Per `../CSS-DOS/docs/audit-summary-and-plan.md` Chunk D. Three legacy
