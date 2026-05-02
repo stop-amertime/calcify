@@ -64,7 +64,9 @@ struct Args {
     #[arg(long, value_name = "PATH")]
     restore: Option<PathBuf>,
 
-    /// Evaluator backend: `bytecode` (v1, default) or `dag-v2`.
+    /// Evaluator backend: `bytecode` (v1, default), `dag-v2` (walker),
+    /// `dag-v2-inlined` (per-terminal Rust ops), or `dag-v2-wasm`
+    /// (per-terminal wasm). The latter two are Phase 3 (a) prototypes.
     #[arg(long, default_value = "bytecode")]
     backend: String,
 
@@ -485,8 +487,13 @@ fn main() {
     let backend = match args.backend.as_str() {
         "bytecode" | "v1" => calcite_core::Backend::Bytecode,
         "dag-v2" | "v2" => calcite_core::Backend::DagV2,
+        "dag-v2-inlined" | "v2-inlined" => calcite_core::Backend::DagV2Inlined,
+        #[cfg(not(target_arch = "wasm32"))]
+        "dag-v2-wasm" | "v2-wasm" => calcite_core::Backend::DagV2Wasm,
         other => {
-            eprintln!("--backend: unknown value '{other}' (expected 'bytecode' or 'dag-v2')");
+            eprintln!(
+                "--backend: unknown value '{other}' (expected bytecode | dag-v2 | dag-v2-inlined | dag-v2-wasm)"
+            );
             std::process::exit(2);
         }
     };
