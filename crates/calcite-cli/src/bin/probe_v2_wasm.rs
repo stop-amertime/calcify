@@ -50,7 +50,8 @@ fn main() {
     let mut tmp_state = State::default();
     tmp_state.load_properties(&parsed.properties);
     let n_state_vars = tmp_state.state_var_count() as u32;
-    let wasm_dag = WasmDag::build(dag, n_state_vars);
+    let mc_capacity = 0u32; // memory cells trampoline through host (see eval driver)
+    let wasm_dag = WasmDag::build(dag, n_state_vars, mc_capacity);
     let (total, covered) = wasm_dag.coverage();
     println!("=== wasm-codegen coverage ===");
     println!("  total nodes:         {n_nodes}");
@@ -66,6 +67,16 @@ fn main() {
         100.0 * covered as f64 / n_write_terms.max(1) as f64
     );
     println!("  wasm bytes:          {}", wasm_dag.wasm_bytes.len());
+    println!("  slabs:               {}", wasm_dag.slab_count());
+    if !wasm_dag.slabs.is_empty() {
+        let avg = wasm_dag.slabs.iter().map(|s| s.term_indices.len()).sum::<usize>() as f64
+            / wasm_dag.slabs.len() as f64;
+        let max = wasm_dag.slabs.iter().map(|s| s.term_indices.len()).max().unwrap_or(0);
+        let max_locals = wasm_dag.slabs.iter().map(|s| s.local_count).max().unwrap_or(0);
+        println!("    avg terms/slab:    {avg:.1}");
+        println!("    max terms/slab:    {max}");
+        println!("    max locals/slab:   {max_locals}");
+    }
 
     println!();
     println!("=== speed ===");

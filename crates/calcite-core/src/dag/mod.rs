@@ -26,7 +26,7 @@ pub use types::{
 };
 pub use closure_codegen::CompiledDag;
 pub use inlined_codegen::InlinedDag;
-pub use wasm_codegen::WasmDag;
+pub use wasm_codegen::{TermDispatch, WasmDag, WasmSlab};
 #[cfg(not(target_arch = "wasm32"))]
 pub use wasm_host::WasmHost;
 

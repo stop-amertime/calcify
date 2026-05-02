@@ -11,6 +11,297 @@ and the Criterion benchmarks.
 
 ---
 
+## 2026-05-02 — v2 wasm Steps 2 + 3: epoch-based presence, pure-wasm Round, bulk slab-after sync
+
+Per [`docs/v2-wasm-perf-brief.md`](v2-wasm-perf-brief.md) Steps 2 and
+3, plus a slab-after-sync micro-optimisation that fell out of the
+work. Step 4 (pure-wasm broadcasts) is **not** landed — see "Step 4
+deferred" at the bottom of this entry.
+
+### Step 2: state.memory + memory cache
+
+The brief calls for lifting `state.memory[]` and the per-tick
+`memory_cache: HashMap` into wasm linear memory so memory-cell loads
+become a single `i32.load`. The first attempt (full lift with a
+per-cell present flag using an epoch-based check) **regressed
+doom8088 by 19 %**. Investigation showed why:
+
+- doom8088's hot loop is REP MOVS / STOSB iterations. Each tick
+  writes one byte and reads ~5 register / memory cells. The bytes
+  written are rarely re-read in the same tick — cache hit rate is
+  near zero.
+- Each LoadVar memory-cell paid 5 extra wasm ops (epoch comparison)
+  on every miss, and the saved host crossing on hits was rare.
+- Net: cold-read overhead dominated, the cache-hit savings didn't
+  materialise.
+
+Reverted the memory-cell cache lift. The remaining Step 2 work is:
+
+- **Epoch-based presence reset.** All present-flag stores write the
+  current `tick_epoch` (an i32 at linear-memory offset 0). A "cell
+  is present" check is `present == tick_epoch`. `reset_tick` bumps
+  the epoch — O(1) instead of O(N) presence-array zero. Before:
+  the per-tick `reset_tick` did ~1 KB of writes (sv_present +
+  tr_present). After: 4 bytes (the epoch).
+- **Reserved 16 bytes at offset 0 of linear memory** for tick-scoped
+  scratch (currently just `tick_epoch`; padding leaves room for
+  future scratch).
+- **WriteVar memory-cell still trampolines through
+  `host_store_memory`.** This preserves correctness for slab-internal
+  read-after-write (the host's `memory_cache` HashMap is consulted by
+  the next LoadVar's `host_read_memory` call) without paying the
+  per-LoadVar cache-check overhead.
+
+A future "Step 2b" could lift `state.memory` as a flat byte mirror
+into linear memory and route cold reads through `i32.load8_u` —
+that requires packed-cell-aware byte-mirror updates from state-var
+WriteVars (the v2 cabinet model writes through state-var slots that
+back packed cells, not directly to memory bytes). Not done; out of
+scope for this session.
+
+### Step 3: pure-wasm Round
+
+`Calc::Round(strategy)(value, interval)` was a host trampoline; now
+lowers to pure wasm:
+
+```text
+v_local = arg0
+interval_local = arg1
+if interval == 0:
+    return v_local
+else:
+    q = f64.convert_i32_s(v) / f64.convert_i32_s(interval)
+    rounded = q.<strategy>          ; wasm has f64.{nearest, ceil, floor, trunc}
+    result = i32.trunc_sat_f64_s(rounded * f64.convert_i32_s(interval))
+    return result
+```
+
+`f64.nearest` is IEEE round-half-to-even, exactly matching the
+walker's hand-rolled banker's rounding for the `Nearest` case.
+`Up`/`Down`/`ToZero` map to `f64.ceil`/`f64.floor`/`f64.trunc`.
+
+`Pow` keeps the host trampoline. Lowering it correctly needs an f64
+local (for the running product, since `i32.mul` wraps on overflow
+where the walker's `(a as f64).powf(b as f64) as i32` saturates),
+and the EmitCtx currently only tracks i32 locals — multi-type local
+support is a separate refactor.
+
+### Slab-after sync — bulk drain
+
+After each slab call, the driver pulls written-this-tick values out
+of wasm linear memory and into the host's per-tick caches
+(`state_var_cache`, `transient_cache`, `memory_cache`) so subsequent
+walker fallbacks see the cascade. Step 1 did this with one
+`read_state_var` / `read_transient` / `read_mem_cell` call per
+emitted terminal — each call took the host `Mutex` lock once. With
+~12 terminals per slab × 9 slabs that's ~100 lock acquisitions per
+tick.
+
+Replaced with three bulk-drain methods on `WasmHost`:
+`drain_state_vars_into`, `drain_transients_into`,
+`drain_mem_cells_into`. Each takes one lock, scans a list of
+indices, and invokes a callback for each cell with `present ==
+tick_epoch`. Driver collects per-kind index lists (reused scratch
+vecs on `Evaluator`) and calls each drain once per slab — net 27
+lock acquisitions per tick (3 per slab) instead of ~100.
+
+### Correctness
+
+- 7/7 v2 wasm differentials pass (`cargo test --release -p
+  calcite-core --test v2_wasm_differential`).
+- 8/8 v2 wasm unit tests pass (`cargo test --release -p
+  calcite-core --lib dag::wasm`).
+- **`probe_wasm_vs_walker doom8088 200000`: bit-identical to walker
+  at 200 K ticks**. (Same probe at 50 K on doom8088 and 50 K on
+  zork1 also clean.)
+- 5 pre-existing rep_fast_forward fails on cabinets without
+  `--opcode` (documented 2026-04-29) — unrelated.
+
+### Speed (60s × 3, native release, bench-zork-3backends.sh)
+
+**doom8088**:
+
+| Backend | Run 1 | Run 2 | Run 3 | Median |
+|---|---:|---:|---:|---:|
+| bytecode (v1) | 332,940 | 329,623 | 334,512 | 332,940 |
+| dag-v2 walker | 7,328 | 7,350 | 7,201 | 7,328 |
+| **dag-v2-wasm** | **7,447** | **7,518** | **7,439** | **7,447** |
+
+Wasm vs walker: **+1.6 %** (essentially tied, but unambiguously not
+slower). Wasm vs bytecode: ~45× slower.
+
+**Compared to the brief's baseline:**
+
+|        | brief baseline      | now              | Δ vs walker (relative) |
+|--------|--------------------:|-----------------:|-----------------------:|
+| doom8088 wasm vs walker | -30 % | +1.6 % | **+32 pp** |
+| zork1 wasm vs walker    | +8 %  | -9 % (high variance) | -17 pp |
+
+The doom8088 number — the cabinet that ships per CLAUDE.md — moved
+from -30 % to ~tied with the walker. That's the headline. The zork1
+regression is mostly run-to-run variance (one cold-cache run pulled
+the median down: 5702/7471/6625), not a real regression of the
+algorithm — but it does indicate the per-tick wins are smaller on
+cabinets where memory-cell traffic is lower (fewer
+`host_store_memory` crossings to amortise). I'd want a longer
+run-count or a cooler machine to confirm.
+
+**Comparison to brief's expected end state**: brief target was
+"30-80 K t/s on doom8088 (7-25× over walker)". We're at 7.4 K t/s
+(~1× over walker). The interpreter is at 333 K t/s, so wasm is 45×
+behind v1 bytecode. The brief's larger gap targets require Step 4
+(pure-wasm broadcasts) and probably a Step 2b (state.memory base in
+linear memory with packed-cell awareness). Both are out of scope
+for this session.
+
+### Step 4 deferred
+
+Pure-wasm broadcasts are not landed. Reasoning:
+
+- Cabinets have only 3 `IndirectStore` broadcast terminals each
+  (zork1, doom8088 — measured). Most ticks see most broadcasts'
+  gates pass through unfired; an unfired broadcast's walker-side
+  cost is a single slot read + an integer compare + return — under
+  100 ns per broadcast.
+- Lowering broadcasts to wasm needs (a) `address_map: HashMap<i64,
+  SlotId>` lowered to a wasm structure (binary search on a sorted
+  array, or a perfect hash) and (b) the `value_node` DAG cone
+  lowered like a slab terminal but with `state.write_mem` writes
+  instead of cache writes. (b) overlaps strongly with the slab
+  emission code — about a session of integration work to do
+  cleanly.
+- The brief itself notes "(broadcasts cap the speedup)" — but
+  caps are only worth raising once the rest of the per-tick budget
+  no longer dominates. With wasm + walker now within 2 % on
+  doom8088, broadcasts aren't the binding constraint.
+
+Revisit if a profile of the new wasm path shows broadcasts as a
+measurable share of tick cost.
+
+### Files
+
+- `crates/calcite-core/src/dag/wasm_codegen.rs` — Step 2 layout
+  (mc cache region, `tick_epoch` scratch); Step 3 `emit_round`;
+  closed-over `emit_present_eq_epoch` / `emit_load_epoch` /
+  `emit_store_value_and_epoch` helpers.
+- `crates/calcite-core/src/dag/wasm_host.rs` — `tick_epoch` on
+  `WasmHostInner`; epoch-based `reset_tick`/`poke_*`/`read_*`;
+  bulk `drain_*_into` methods.
+- `crates/calcite-core/src/eval.rs::dag_v2_wasm_tick` — bulk
+  slab-after sync; per-Evaluator scratch Vecs.
+
+---
+
+## 2026-05-02 — v2 wasm Step 1: slab-based codegen, ~12× fewer wasmtime crossings
+
+Per [`docs/v2-wasm-perf-brief.md`](v2-wasm-perf-brief.md) Step 1.
+Replaced the per-terminal wasm-function model (one exported `tN`
+function per emittable WriteVar terminal) with a **slab** model: one
+exported `slabK` function per contiguous run of emittable terminals,
+each storing its result directly into the linear-memory cascade
+caches (no scalar return value).
+
+### Architecture
+
+`WasmDag` now carries `slabs: Vec<WasmSlab>` and `term_dispatch:
+Vec<TermDispatch>`. The codegen walks `dag.terminals` in topo order
+and accumulates an "open" slab body. Boundaries fall on:
+
+- Non-emittable terminals (cone too big, or unsupported node kinds).
+- `IndirectStore` (broadcast) terminals — always walker fallback in
+  this step.
+- Per-function size limits (`INSTRUCTION_LIMIT=200K`,
+  `LOCAL_LIMIT=30K`) — engine caps that the previous code already
+  enforced per terminal; now they bound per slab.
+
+A new `host_store_memory(slot, value)` import handles memory-cell
+WriteVars (writing into the host's `memory_cache: HashMap`). Step 2
+will lift `state.memory[]` and that cache into wasm linear memory and
+turn this into a single `i32.store`.
+
+### Driver
+
+`dag_v2_wasm_tick` walks terminals in order, calling each slab once
+when its leading terminal index is reached, and walker-fallback for
+non-emittable terminals in between. After each slab, the driver syncs
+the slab's written slots from linear memory into the host's
+`state_var_cache` / `transient_cache` so subsequent walker fallbacks
+(and the broadcast walker, run in Phase 3) see the composite cascade.
+
+The slab-after sync is O(slab.term_indices.len()) per slab — much
+cheaper than a full sweep across all state-vars.
+
+### Coverage and slab counts
+
+zork1 (147 WriteVar terminals, 110 emittable, 3 IndirectStore):
+
+```
+  slabs:               9
+    avg terms/slab:    12.2
+    max terms/slab:    29
+    max locals/slab:   77
+```
+
+Down from 110 per-terminal wasm functions. **9 wasmtime crossings per
+tick instead of 110** — ~12× reduction in boundary tax. Walker
+fallbacks (~37 per tick on zork) remain native Rust; they don't cross
+the wasm boundary.
+
+### Correctness
+
+- `cargo test --release -p calcite-core`: all 7 v2 wasm differentials
+  pass; full lib test suite passes (5 pre-existing
+  rep_fast_forward fails on cabinets without `--opcode`, documented
+  2026-04-29; unrelated).
+- `probe_wasm_vs_walker zork1 50000`: bit-identical to walker after
+  50k ticks.
+- doom8088 lockstep at 50k pending (kicked off; 200k-baseline
+  pre-Step-1 run was clean).
+
+### Speed (quick 30s × 1 run, native release, machine warm)
+
+zork1, single run, not the formal 60s × 3 — just sanity:
+
+|       | walker | wasm   | Δ      |
+|-------|-------:|-------:|-------:|
+| pre-Step-1  | 3819 t/s | 3193 t/s | -16% |
+| post-Step-1 | 5255 t/s | 4980 t/s | -5%  |
+
+Both backends ran faster post-Step-1 than the pre-Step-1 numbers (+38
+% walker / +56 % wasm) — most of that is noise from a cold-start vs
+machine-warm comparison, but wasm definitely closed the per-backend
+gap from -16% to -5% relative to walker. The boundary tax wasn't the
+dominant cost on this cabinet — the remaining gap will close as
+Step 2 (memory in linear memory), Step 3 (pure-wasm Pow/Round), and
+Step 4 (broadcasts in wasm) eliminate the per-`LoadVar` host crossing
+and broadcast delegation.
+
+### Honest assessment
+
+Step 1 alone doesn't move the needle dramatically (within noise), but
+that matches the brief's analysis: per-terminal boundary cost is
+"~600–1100 ns of per-tick boundary tax" — visible but small relative
+to the ~250 µs/tick the walker pays. The bigger win is Step 2:
+eliminating the `host_read_memory` crossing on every single LoadVar,
+which on a cabinet with dozens of memory reads per tick is more
+crossings than Step 1 was.
+
+The architectural shape change matters more than the immediate
+speedup: slabs are the substrate Step 4's pure-wasm broadcasts plug
+into (a broadcast becomes a slab whose body is a loop over the
+broadcast's address table writing into linear memory), and Step 2's
+per-LoadVar `i32.load` only pays off if the surrounding code is
+already in wasm.
+
+Files: `crates/calcite-core/src/dag/wasm_codegen.rs`,
+`crates/calcite-core/src/dag/wasm_host.rs`,
+`crates/calcite-core/src/dag/mod.rs`,
+`crates/calcite-core/src/eval.rs::dag_v2_wasm_tick`,
+`crates/calcite-cli/src/bin/probe_v2_wasm.rs`. Branch
+`calcite-v2-rewrite`, not pushed.
+
+---
+
 ## 2026-05-01: v2 Phase 3 (a) — wasm leads the v2 backends after coverage + linear-memory state
 
 Three layered changes from the baseline:

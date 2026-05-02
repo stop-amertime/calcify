@@ -44,7 +44,8 @@ fn main() {
         let mut tmp_state = State::default();
         tmp_state.load_properties(&parsed.properties);
         let n_state_vars = tmp_state.state_var_count() as u32;
-        let wasm_dag = WasmDag::build(dag, n_state_vars);
+        let mc_capacity = 0u32;
+        let wasm_dag = WasmDag::build(dag, n_state_vars, mc_capacity);
         let (total, covered) = wasm_dag.coverage();
         println!("=== coverage ===");
         println!(

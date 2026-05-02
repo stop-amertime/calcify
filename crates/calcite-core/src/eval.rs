@@ -200,6 +200,17 @@ pub struct Evaluator {
     dag_v2_wasm: Option<crate::dag::WasmDag>,
     #[cfg(not(target_arch = "wasm32"))]
     dag_v2_wasm_host: Option<crate::dag::WasmHost>,
+    /// Per-slab scratch — addresses written by the slab's memory-cell
+    /// terminals, drained back into `memory_cache` after each slab
+    /// call. Reused across slabs and ticks so we don't allocate.
+    #[cfg(not(target_arch = "wasm32"))]
+    dag_v2_wasm_slab_mem_addrs: Vec<i32>,
+    /// Per-slab scratch — state-var indices written by the slab.
+    #[cfg(not(target_arch = "wasm32"))]
+    dag_v2_wasm_slab_sv_idxs: Vec<usize>,
+    /// Per-slab scratch — transient indices written by the slab.
+    #[cfg(not(target_arch = "wasm32"))]
+    dag_v2_wasm_slab_tr_idxs: Vec<usize>,
 }
 
 /// Granular timing breakdown from [`Evaluator::tick_profiled`].
@@ -623,6 +634,12 @@ impl Evaluator {
             dag_v2_wasm: None,
             #[cfg(not(target_arch = "wasm32"))]
             dag_v2_wasm_host: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            dag_v2_wasm_slab_mem_addrs: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            dag_v2_wasm_slab_sv_idxs: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            dag_v2_wasm_slab_tr_idxs: Vec::new(),
         }
     }
 
@@ -2327,10 +2344,15 @@ impl Evaluator {
     /// Phase 3 (a) tick: per-terminal wasm where supported, walker
     /// fallback otherwise. Same phase ordering as the inlined backend.
     ///
-    /// Per-terminal wasm functions read state through host imports
-    /// bound to the per-tick caches via `WasmHost::run_terminal`. The
-    /// host clears its raw-pointer ctx after each call so a stray
-    /// reentry would NPE rather than read stale memory.
+    /// Slab wasm functions read state through host imports bound to
+    /// the per-tick caches via `WasmHost::run_slab`. The host clears
+    /// its raw-pointer ctx after each call so a stray reentry would
+    /// NPE rather than read stale memory.
+    ///
+    /// Each slab covers a contiguous run of emittable WriteVar
+    /// terminals; non-emittable terminals (and IndirectStore broadcast
+    /// terminals) become walker fallback in this driver, with their
+    /// results poked into linear memory so subsequent slabs see them.
     #[cfg(not(target_arch = "wasm32"))]
     fn dag_v2_wasm_tick(&mut self, state: &mut State) {
         // Lazy build: codegen needs `state.state_var_count()` to size
@@ -2338,10 +2360,17 @@ impl Evaluator {
         // State access. Build on first tick.
         if self.dag_v2_wasm.is_none() {
             let n_state_vars = state.state_var_count() as u32;
-            let wasm_dag = crate::dag::WasmDag::build(self.dag_v2.clone(), n_state_vars);
+            // Memory cells currently trampoline through host imports
+            // (Step 2 measured them as a perf-negative when lifted —
+            // cold-read overhead dominated the cache-hit savings on
+            // doom8088). The mc cache region is sized 0 so the layout
+            // doesn't allocate the present/value regions.
+            let mc_capacity = 0u32;
+            let wasm_dag =
+                crate::dag::WasmDag::build(self.dag_v2.clone(), n_state_vars, mc_capacity);
             let host = crate::dag::WasmHost::instantiate(
                 &wasm_dag.wasm_bytes,
-                &wasm_dag.emitted,
+                &wasm_dag.slabs,
                 wasm_dag.layout,
             )
             .expect("wasm host instantiate (codegen drift?)");
@@ -2387,28 +2416,102 @@ impl Evaluator {
             self.dag_v2_epoch = 0;
         }
 
-        // Phase 1: scalar WriteVars. For each terminal: if it has a
-        // wasm function, call it; otherwise walker fallback.
+        // Phase 1: scalar WriteVars. Walk terminals in dispatch order;
+        // call slab functions when their leading terminal is reached
+        // (each slab covers a contiguous run, so we only enter it
+        // once), and walker-fallback for any non-emittable terminal
+        // in between.
         //
         // Wasm linear memory holds the cascade caches for state-var
-        // and transient reads. Reset once at tick start, then poke
-        // after each terminal so subsequent terminals see prior
-        // writes (matches walker semantics — every LoadVar reads the
-        // live cascade cache). Bulk re-zeroing per-terminal would
-        // cost O(n_state_vars × n_terminals) of memory writes, which
-        // exceeds the wasm savings on cabinets with hundreds of slots.
+        // and transient reads — slabs read/write directly, walker
+        // pokes via `host.poke_*` so subsequent slabs see prior
+        // writes.
         host.reset_tick();
+        let mut next_slab_term: usize = wdag
+            .slabs
+            .first()
+            .and_then(|s| s.term_indices.first().copied())
+            .unwrap_or(usize::MAX);
+        let mut next_slab_idx: usize = 0;
         for (i, &term_id) in wdag.dag.terminals.iter().enumerate() {
+            // Slab boundary — run the next slab once. After the slab
+            // returns, sync the slots it wrote into the host caches
+            // so a later walker fallback (or broadcast) sees the
+            // composite cascade. Walker fallback only consults
+            // `state_var_cache` / `transient_cache` for in-tick reads;
+            // it never re-reads wasm linear memory.
+            if i == next_slab_term {
+                host.run_slab(next_slab_idx, state, &mut memory_cache);
+                let slab = &wdag.slabs[next_slab_idx];
+                // Collect cell indices/addresses by kind, then call
+                // one bulk drain per kind. Each drain takes one
+                // Mutex acquisition rather than N per cell — at ~12
+                // terminals per slab × ~9 slabs that saves ~100
+                // Mutex acquisitions per tick.
+                let sv_idxs = &mut self.dag_v2_wasm_slab_sv_idxs;
+                let tr_idxs = &mut self.dag_v2_wasm_slab_tr_idxs;
+                let mem_addrs = &mut self.dag_v2_wasm_slab_mem_addrs;
+                sv_idxs.clear();
+                tr_idxs.clear();
+                mem_addrs.clear();
+                for &ti in &slab.term_indices {
+                    if let crate::dag::DagNode::WriteVar { slot, .. } =
+                        &wdag.dag.nodes[wdag.dag.terminals[ti] as usize]
+                    {
+                        let slot = *slot;
+                        if slot < 0 {
+                            let idx = (-slot - 1) as usize;
+                            if idx < state_var_cache.len() {
+                                sv_idxs.push(idx);
+                            }
+                        } else if slot >= crate::dag::TRANSIENT_BASE {
+                            let idx = (slot - crate::dag::TRANSIENT_BASE) as usize;
+                            if idx < transient_cache.len() {
+                                tr_idxs.push(idx);
+                            }
+                        } else {
+                            mem_addrs.push(slot);
+                        }
+                    }
+                }
+                if !sv_idxs.is_empty() {
+                    host.drain_state_vars_into(sv_idxs, |idx, v| {
+                        state_var_cache[idx] = Some(v);
+                    });
+                }
+                if !tr_idxs.is_empty() {
+                    host.drain_transients_into(tr_idxs, |idx, v| {
+                        transient_cache[idx] = Some(v);
+                    });
+                }
+                if !mem_addrs.is_empty() {
+                    host.drain_mem_cells_into(mem_addrs, |addr, v| {
+                        memory_cache.insert(addr, v);
+                    });
+                }
+                next_slab_idx += 1;
+                next_slab_term = wdag
+                    .slabs
+                    .get(next_slab_idx)
+                    .and_then(|s| s.term_indices.first().copied())
+                    .unwrap_or(usize::MAX);
+            }
+            // Slab terminals are handled as part of the slab call —
+            // their per-terminal store ops live inside the slab body.
+            // Skip the per-terminal walker dispatch.
+            if matches!(wdag.term_dispatch[i], crate::dag::TermDispatch::Slab(_)) {
+                continue;
+            }
+            // Walker fallback for non-emittable WriteVar terminals.
+            // IndirectStore terminals are skipped here (they're Phase 3).
             let crate::dag::DagNode::WriteVar { slot, value } = &wdag.dag.nodes[term_id as usize]
             else {
                 continue;
             };
             let slot = *slot;
             let value_id = *value;
-            let v = if wdag.emitted[i].is_some() {
-                host.run_terminal(i, state, &memory_cache)
-            } else {
-                self.dag_v2_epoch = self.dag_v2_epoch.wrapping_add(1);
+            self.dag_v2_epoch = self.dag_v2_epoch.wrapping_add(1);
+            let v = {
                 let mut buf = DagWalkBuf {
                     memo: &mut memo,
                     memo_epoch: &mut memo_epoch,
@@ -2434,6 +2537,7 @@ impl Evaluator {
                 }
             } else {
                 memory_cache.insert(slot, v);
+                host.poke_mem_cell(slot, v);
             }
         }
 
@@ -3634,6 +3738,12 @@ mod tests {
             dag_v2_wasm: None,
             #[cfg(not(target_arch = "wasm32"))]
             dag_v2_wasm_host: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            dag_v2_wasm_slab_mem_addrs: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            dag_v2_wasm_slab_sv_idxs: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            dag_v2_wasm_slab_tr_idxs: Vec::new(),
         };
         (evaluator, state)
     }
