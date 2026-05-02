@@ -373,6 +373,21 @@ impl ModuleBuilder {
 
 // ---------- emit context ---------------------------------------------
 
+/// Wasm engines (wasmtime, V8) enforce a per-function local limit
+/// well below the spec's 2^32 — instantiation fails with
+/// "too many locals" above ~50,000. A complex cabinet's `WriteVar`
+/// cone can blow this cap on real DOS cabinets. Cap below the
+/// engine limit and bail to walker fallback when allocation fails.
+const LOCAL_LIMIT: u32 = 30_000;
+
+/// Wasm engines also cap per-function code size. Wasmtime's default
+/// "Code for function is too large" threshold lands around 0.5–1 M
+/// instructions on most cabinets. Bail well below to leave headroom
+/// for instruction encoding (Switch/If cascades inflate ~5–10× on
+/// the byte side) and to keep emit time bounded on pathological
+/// terminal cones (Doom8088 has cones with millions of nodes).
+const INSTRUCTION_LIMIT: usize = 200_000;
+
 struct EmitCtx<'a> {
     local_count: &'a mut u32,
     local_of: &'a mut HashMap<NodeId, u32>,
@@ -381,10 +396,16 @@ struct EmitCtx<'a> {
 }
 
 impl<'a> EmitCtx<'a> {
-    fn alloc_local(&mut self) -> u32 {
+    /// Returns the new local index, or `None` once we'd cross the
+    /// engine's per-function local limit. Callers propagate `None`
+    /// as `false` (walker fallback) up the emit stack.
+    fn alloc_local(&mut self) -> Option<u32> {
+        if *self.local_count >= LOCAL_LIMIT {
+            return None;
+        }
         let id = *self.local_count;
         *self.local_count += 1;
-        id
+        Some(id)
     }
 }
 
@@ -420,6 +441,12 @@ fn emit_value(
     ctx: &mut EmitCtx<'_>,
     inside_branch: bool,
 ) -> bool {
+    // Bail early if this function's body has grown past what the wasm
+    // engine will accept. Cones with millions of nodes (Doom8088) blow
+    // wasmtime's "Code for function is too large" otherwise.
+    if body.len() > INSTRUCTION_LIMIT {
+        return false;
+    }
     if !inside_branch {
         if let Some(&local) = ctx.local_of.get(&node_id) {
             body.push(Instruction::LocalGet(local));
@@ -483,7 +510,7 @@ fn emit_value(
             body.push(Instruction::Call(target_idx));
         }
         DagNode::Switch { key, table, fallback } => {
-            let key_local = ctx.alloc_local();
+            let Some(key_local) = ctx.alloc_local() else { return false; };
             if !emit_value(dag, *key, body, ctx, inside_branch) {
                 return false;
             }
@@ -520,8 +547,18 @@ fn emit_value(
             if branches.is_empty() {
                 return emit_value(dag, *fallback, body, ctx, inside_branch);
             }
+            // Subsequent conditions are emitted INSIDE the `else` block
+            // of the previous branch, so they're structurally inside a
+            // branch even though `inside_branch` (the parameter to this
+            // call) might be false. Force `inside_branch=true` for every
+            // cond — caching a local inside an else-only path means a
+            // later read returns 0 if any earlier branch was taken
+            // (locals default to 0 in wasm). The first cond is at the
+            // structural top of the If; emitting it with `true` is
+            // harmless (just suppresses caching for cond[0]'s LoadVar/
+            // Calc nodes).
             for (cond, branch) in branches {
-                if !emit_style_cond(dag, cond, body, ctx, inside_branch) {
+                if !emit_style_cond(dag, cond, body, ctx, true) {
                     return false;
                 }
                 body.push(Instruction::If(BlockType::Result(ValType::I32)));
@@ -548,9 +585,12 @@ fn emit_value(
             | DagNode::BitField { .. }
             | DagNode::BitwiseOp { .. }
             | DagNode::Call { .. } => {
-                let local = ctx.alloc_local();
-                body.push(Instruction::LocalTee(local));
-                ctx.local_of.insert(node_id, local);
+                if let Some(local) = ctx.alloc_local() {
+                    body.push(Instruction::LocalTee(local));
+                    ctx.local_of.insert(node_id, local);
+                } else {
+                    return false;
+                }
             }
             _ => {}
         }
@@ -690,8 +730,8 @@ fn emit_div(
     ctx: &mut EmitCtx<'_>,
     inside_branch: bool,
 ) -> bool {
-    let n_local = ctx.alloc_local();
-    let d_local = ctx.alloc_local();
+    let Some(n_local) = ctx.alloc_local() else { return false; };
+    let Some(d_local) = ctx.alloc_local() else { return false; };
     if !emit_value(dag, args[0], body, ctx, inside_branch) { return false; }
     body.push(Instruction::LocalSet(n_local));
     if !emit_value(dag, args[1], body, ctx, inside_branch) { return false; }
@@ -728,8 +768,13 @@ fn emit_mod(
     ctx: &mut EmitCtx<'_>,
     inside_branch: bool,
 ) -> bool {
-    let n_local = ctx.alloc_local();
-    let d_local = ctx.alloc_local();
+    // CSS `mod()` is floor-mod (sign of divisor), matching the walker's
+    // `av - (av / bv).floor() * bv`. wasm `i32.rem_s` is trunc-mod
+    // (sign of dividend); apply the standard floor correction:
+    // if r != 0 and r and d have opposite signs, r += d.
+    let Some(n_local) = ctx.alloc_local() else { return false; };
+    let Some(d_local) = ctx.alloc_local() else { return false; };
+    let Some(r_local) = ctx.alloc_local() else { return false; };
     if !emit_value(dag, args[0], body, ctx, inside_branch) { return false; }
     body.push(Instruction::LocalSet(n_local));
     if !emit_value(dag, args[1], body, ctx, inside_branch) { return false; }
@@ -749,9 +794,29 @@ fn emit_mod(
     body.push(Instruction::If(BlockType::Result(ValType::I32)));
     body.push(Instruction::I32Const(0));
     body.push(Instruction::Else);
+    // r = n %_s d  (trunc-mod), keep on stack and tee into r_local.
     body.push(Instruction::LocalGet(n_local));
     body.push(Instruction::LocalGet(d_local));
     body.push(Instruction::I32RemS);
+    body.push(Instruction::LocalTee(r_local));
+    // floor correction: r==0 → 0; else if (r XOR d) < 0 → r+d; else r.
+    body.push(Instruction::I32Eqz);
+    body.push(Instruction::If(BlockType::Result(ValType::I32)));
+    body.push(Instruction::I32Const(0));
+    body.push(Instruction::Else);
+    body.push(Instruction::LocalGet(r_local));
+    body.push(Instruction::LocalGet(d_local));
+    body.push(Instruction::I32Xor);
+    body.push(Instruction::I32Const(0));
+    body.push(Instruction::I32LtS);
+    body.push(Instruction::If(BlockType::Result(ValType::I32)));
+    body.push(Instruction::LocalGet(r_local));
+    body.push(Instruction::LocalGet(d_local));
+    body.push(Instruction::I32Add);
+    body.push(Instruction::Else);
+    body.push(Instruction::LocalGet(r_local));
+    body.push(Instruction::End);
+    body.push(Instruction::End);
     body.push(Instruction::End);
     body.push(Instruction::End);
     true
@@ -765,8 +830,8 @@ fn emit_min_or_max(
     inside_branch: bool,
     is_min: bool,
 ) -> bool {
-    let a_local = ctx.alloc_local();
-    let b_local = ctx.alloc_local();
+    let Some(a_local) = ctx.alloc_local() else { return false; };
+    let Some(b_local) = ctx.alloc_local() else { return false; };
     if !emit_value(dag, args[0], body, ctx, inside_branch) { return false; }
     body.push(Instruction::LocalSet(a_local));
     if !emit_value(dag, args[1], body, ctx, inside_branch) { return false; }
@@ -787,7 +852,7 @@ fn emit_abs(
     ctx: &mut EmitCtx<'_>,
     inside_branch: bool,
 ) -> bool {
-    let a_local = ctx.alloc_local();
+    let Some(a_local) = ctx.alloc_local() else { return false; };
     if !emit_value(dag, args[0], body, ctx, inside_branch) { return false; }
     body.push(Instruction::LocalSet(a_local));
     body.push(Instruction::LocalGet(a_local));
@@ -808,7 +873,7 @@ fn emit_sign(
     ctx: &mut EmitCtx<'_>,
     inside_branch: bool,
 ) -> bool {
-    let a_local = ctx.alloc_local();
+    let Some(a_local) = ctx.alloc_local() else { return false; };
     if !emit_value(dag, args[0], body, ctx, inside_branch) { return false; }
     body.push(Instruction::LocalSet(a_local));
     // (x > 0 ? 1 : 0) - (x < 0 ? 1 : 0)
@@ -835,10 +900,10 @@ fn emit_clamp(
     ctx: &mut EmitCtx<'_>,
     inside_branch: bool,
 ) -> bool {
-    let lo_local = ctx.alloc_local();
-    let v_local = ctx.alloc_local();
-    let hi_local = ctx.alloc_local();
-    let max_local = ctx.alloc_local();
+    let Some(lo_local) = ctx.alloc_local() else { return false; };
+    let Some(v_local) = ctx.alloc_local() else { return false; };
+    let Some(hi_local) = ctx.alloc_local() else { return false; };
+    let Some(max_local) = ctx.alloc_local() else { return false; };
     if !emit_value(dag, args[0], body, ctx, inside_branch) { return false; }
     body.push(Instruction::LocalSet(lo_local));
     if !emit_value(dag, args[1], body, ctx, inside_branch) { return false; }
