@@ -27,6 +27,9 @@
 //! - `emit`
 //! - `halt`
 //! - `setvar=NAME,VALUE`
+//! - `setvar_pulse=NAME,VALUE,HOLD_TICKS`  (make→break edge pair;
+//!                                          writes VALUE now, schedules
+//!                                          write-of-0 after HOLD_TICKS)
 //! - `dump=ADDR,LEN[,PATH]`     (PATH supports `{tick}` / `{name}`)
 //! - `snapshot[=PATH]`
 //!
@@ -58,7 +61,8 @@ fn split_actions(s: &str) -> Vec<&str> {
 
 /// Split a `cond` SPEC into TEST tokens. Tests use `,` and may
 /// optionally include the literal token `repeat` to mean "fire on
-/// every rising edge of the predicate, not just the first match".
+/// every gated poll while the predicate holds (sustain), instead of
+/// the default of firing once and disabling".
 fn split_tests(s: &str) -> Vec<&str> {
     s.split(',').map(str::trim).filter(|t| !t.is_empty()).collect()
 }
@@ -117,6 +121,28 @@ fn parse_action(tok: &str) -> Result<Action, String> {
                 Ok(Action::SetVar {
                     name: parts[0].to_string(),
                     value,
+                })
+            } else if let Some(rest) = tok.strip_prefix("setvar_pulse=") {
+                // setvar_pulse=NAME,VALUE,HOLD_TICKS — write VALUE now,
+                // schedule a write-of-0 HOLD_TICKS later. Generic edge-pair
+                // primitive; CSS-DOS-side profiles use it for keyboard taps.
+                let parts: Vec<&str> = rest.split(',').collect();
+                if parts.len() != 3 {
+                    return Err(format!(
+                        "setvar_pulse expects NAME,VALUE,HOLD_TICKS; got {rest:?}"
+                    ));
+                }
+                let value = parse_int(parts[1], "VALUE")? as i32;
+                let hold_ticks = parse_int(parts[2], "HOLD_TICKS")? as u32;
+                if hold_ticks == 0 {
+                    return Err(format!(
+                        "setvar_pulse HOLD_TICKS must be > 0 (would never release): {rest:?}"
+                    ));
+                }
+                Ok(Action::SetVarPulse {
+                    name: parts[0].to_string(),
+                    value,
+                    hold_ticks,
                 })
             } else if let Some(rest) = tok.strip_prefix("dump=") {
                 // ADDR,LEN[,PATH]. ADDR/LEN can use 0x prefix; PATH may

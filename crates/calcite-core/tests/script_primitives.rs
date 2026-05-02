@@ -323,3 +323,220 @@ fn cond_with_byte_pattern_at() {
     assert_eq!(events[0].tick, 350);
     assert_eq!(events[0].watch_name, "needle_visible");
 }
+
+#[test]
+fn setvar_pulse_writes_make_then_break_after_hold_ticks() {
+    // SetVarPulse writes VALUE immediately, schedules write-of-0 after
+    // HOLD_TICKS more polled ticks. This is the generic edge-pair
+    // primitive that CSS-DOS-side profiles use for keyboard taps —
+    // the cabinet's edge detector needs both make and break to
+    // register a press.
+    //
+    // Add a `--keyboard` property to the test cabinet so the host can
+    // watch it from the State side.
+    let css = r#"
+@property --n {
+    syntax: "<integer>";
+    inherits: true;
+    initial-value: 0;
+}
+@property --keyboard {
+    syntax: "<integer>";
+    inherits: true;
+    initial-value: 0;
+}
+@property --opcode {
+    syntax: "<integer>";
+    inherits: true;
+    initial-value: 144;
+}
+.cpu {
+    --n: calc(var(--n) + 1);
+}
+"#;
+    let (mut ev, mut state) = build(css);
+    let mut reg = WatchRegistry::new();
+
+    // Fire a pulse at tick 100, hold for 50 ticks. Expected timeline:
+    //   tick 99:   keyboard = 0  (initial)
+    //   tick 100:  pulse fires → keyboard = 0x1c0d, release scheduled
+    //              for tick 100 + 50 = 150
+    //   tick 100..149: keyboard = 0x1c0d
+    //   tick 150:  release dispatched at top of poll → keyboard = 0
+    //   tick 150..: keyboard = 0
+    reg.register(WatchSpec {
+        name: "tap".to_string(),
+        kind: WatchKind::At { tick: 100 },
+        gate: None,
+        actions: vec![Action::SetVarPulse {
+            name: "keyboard".to_string(),
+            value: 0x1c0d,
+            hold_ticks: 50,
+        }],
+        sample_vars: vec![],
+    });
+
+    // Sample the var at specific ticks.
+    let mut samples: Vec<(u32, i32)> = Vec::new();
+    for tick in 1..=300 {
+        ev.run_batch_silent(&mut state, 1);
+        poll(&mut reg, &mut state, tick);
+        let _ = reg.drain_events();
+        if matches!(tick, 99 | 100 | 120 | 149 | 150 | 200) {
+            let v = state.get_var("keyboard").unwrap_or(0);
+            samples.push((tick, v));
+        }
+    }
+    // tick 99: pre-pulse → 0
+    assert_eq!(samples.iter().find(|(t,_)| *t==99).unwrap().1, 0);
+    // tick 100: make edge → 0x1c0d
+    assert_eq!(samples.iter().find(|(t,_)| *t==100).unwrap().1, 0x1c0d);
+    // tick 120 / 149: still held
+    assert_eq!(samples.iter().find(|(t,_)| *t==120).unwrap().1, 0x1c0d);
+    assert_eq!(samples.iter().find(|(t,_)| *t==149).unwrap().1, 0x1c0d);
+    // tick 150: release dispatched at top of poll → 0
+    assert_eq!(samples.iter().find(|(t,_)| *t==150).unwrap().1, 0);
+    assert_eq!(samples.iter().find(|(t,_)| *t==200).unwrap().1, 0);
+}
+
+#[test]
+fn setvar_pulse_skips_when_release_pending() {
+    // A second pulse on the same var while the first is still
+    // mid-hold is a no-op — skip rather than re-arm. This is the
+    // semantic the doom-loading bench needs: a sustain `cond:repeat`
+    // that fires on every gated poll while a stage holds must NOT
+    // re-pulse on every poll, because the same-poll race
+    // (release-fires-then-pulse-fires) would write the value back
+    // before the engine ever sees zero, so the cabinet's edge
+    // detector never registers the break edge. Skipping while a
+    // release is queued gives the engine a full inter-poll batch
+    // with the var = 0 between releases, producing the make/break
+    // pair the cabinet needs.
+    let css = r#"
+@property --keyboard { syntax: "<integer>"; inherits: true; initial-value: 0; }
+@property --opcode { syntax: "<integer>"; inherits: true; initial-value: 144; }
+.cpu {}
+"#;
+    let (mut ev, mut state) = build(css);
+    let mut reg = WatchRegistry::new();
+
+    // Two taps at 100 and 150, both with hold=100. With skip-while-
+    // pending, tap2 is a no-op (release from tap1 is still queued at
+    // 200 when tap2 fires). Release happens at 200; var stays 0
+    // afterwards.
+    reg.register(WatchSpec {
+        name: "tap1".to_string(),
+        kind: WatchKind::At { tick: 100 },
+        gate: None,
+        actions: vec![Action::SetVarPulse {
+            name: "keyboard".to_string(),
+            value: 0x1c0d,
+            hold_ticks: 100,
+        }],
+        sample_vars: vec![],
+    });
+    reg.register(WatchSpec {
+        name: "tap2".to_string(),
+        kind: WatchKind::At { tick: 150 },
+        gate: None,
+        actions: vec![Action::SetVarPulse {
+            name: "keyboard".to_string(),
+            value: 0x1c0d,
+            hold_ticks: 100,
+        }],
+        sample_vars: vec![],
+    });
+
+    let mut samples: Vec<(u32, i32)> = Vec::new();
+    for tick in 1..=400 {
+        ev.run_batch_silent(&mut state, 1);
+        poll(&mut reg, &mut state, tick);
+        let _ = reg.drain_events();
+        if matches!(tick, 99 | 100 | 149 | 150 | 199 | 200 | 201) {
+            samples.push((tick, state.get_var("keyboard").unwrap_or(0)));
+        }
+    }
+    let at = |t: u32| samples.iter().find(|(x,_)| *x==t).unwrap().1;
+    assert_eq!(at(99),  0);
+    assert_eq!(at(100), 0x1c0d);  // first tap's make
+    assert_eq!(at(149), 0x1c0d);  // still held
+    assert_eq!(at(150), 0x1c0d);  // tap2 was a no-op (skipped)
+    assert_eq!(at(199), 0x1c0d);  // still held (release at 200)
+    assert_eq!(at(200), 0);       // tap1's release fires
+    assert_eq!(at(201), 0);       // stays released
+}
+
+#[test]
+fn sustain_cond_pulse_alternates_make_and_break_at_2x_poll_stride() {
+    // The doom-loading bench's pattern: a sustain `cond:repeat` with
+    // setvar_pulse should produce a clean make/break alternation at
+    // twice the poll stride (one stride for the held make, one stride
+    // for the released break). Without skip-when-released-this-poll,
+    // the make would re-fire the same poll the release dispatched and
+    // the engine would never see the break edge.
+    let css = r#"
+@property --keyboard { syntax: "<integer>"; inherits: true; initial-value: 0; }
+@property --opcode { syntax: "<integer>"; inherits: true; initial-value: 144; }
+@property --target_byte { syntax: "<integer>"; inherits: true; initial-value: 1; }
+.cpu {}
+"#;
+    let (mut ev, mut state) = build(css);
+    let mut reg = WatchRegistry::new();
+
+    // Cheap stride gate at 100 ticks (substitute for the 50K poll
+    // stride the doom bench uses; same shape, faster test).
+    reg.register(WatchSpec {
+        name: "poll".to_string(),
+        kind: WatchKind::Stride { every: 100 },
+        gate: None,
+        actions: vec![],
+        sample_vars: vec![],
+    });
+    // Sustain cond: predicate is "byte at 0x300 == 1" (always true in
+    // this test — no cabinet writes 0x300). Sustain mode means it
+    // fires on every gated poll while held.
+    state.write_mem(0x300, 1);
+    reg.register(WatchSpec {
+        name: "tap".to_string(),
+        kind: WatchKind::Cond {
+            tests: vec![Predicate::ByteEq { addr: 0x300, val: 1 }],
+            repeat: true,  // sustain
+            fired: std::cell::Cell::new(false),
+            last_held: std::cell::Cell::new(false),
+        },
+        gate: Some("poll".to_string()),
+        actions: vec![Action::SetVarPulse {
+            name: "keyboard".to_string(),
+            value: 0x1c0d,
+            hold_ticks: 100,
+        }],
+        sample_vars: vec![],
+    });
+
+    // Sample at every poll boundary to see the cadence.
+    let mut samples: Vec<(u32, i32)> = Vec::new();
+    for tick in 1..=600 {
+        ev.run_batch_silent(&mut state, 1);
+        poll(&mut reg, &mut state, tick);
+        let _ = reg.drain_events();
+        // Sample MID-batch (between polls) so we see what the engine
+        // sees: tick 50, 150, 250, ... — halfway between polls.
+        if tick % 100 == 50 {
+            samples.push((tick, state.get_var("keyboard").unwrap_or(0)));
+        }
+    }
+    // Expected mid-batch values:
+    //   tick 50: keyboard = 0 (no poll has fired yet)
+    //   tick 150: keyboard = 0x1c0d (poll@100 pulsed, release scheduled @200)
+    //   tick 250: keyboard = 0 (poll@200 released, skipped pulse this poll)
+    //   tick 350: keyboard = 0x1c0d (poll@300 pulsed, release @400)
+    //   tick 450: keyboard = 0 (poll@400 released, skipped)
+    //   tick 550: keyboard = 0x1c0d (poll@500 pulsed)
+    let at = |t: u32| samples.iter().find(|(x,_)| *x==t).unwrap().1;
+    assert_eq!(at(50),  0);
+    assert_eq!(at(150), 0x1c0d);
+    assert_eq!(at(250), 0);
+    assert_eq!(at(350), 0x1c0d);
+    assert_eq!(at(450), 0);
+    assert_eq!(at(550), 0x1c0d);
+}

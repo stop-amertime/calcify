@@ -115,8 +115,10 @@ pub enum WatchKind {
     },
     /// Fire when all `tests` hold simultaneously. Expensive — gate it.
     /// If `repeat` is false, fires once and is then disabled. If `true`,
-    /// fires every gate-tick the predicate holds (re-arms when it goes
-    /// back to false in between).
+    /// fires on every gated poll where the predicate is true (sustain
+    /// mode) — useful for actions that need to keep firing while a
+    /// state holds, e.g. `setvar_pulse=keyboard,...` to spam a key
+    /// while the title screen is up.
     Cond {
         tests: Vec<Predicate>,
         repeat: bool,
@@ -124,7 +126,8 @@ pub enum WatchKind {
         /// `repeat=false`).
         fired: Cell<bool>,
         /// Internal: was the predicate true on the last evaluation?
-        /// Used with `repeat=true` to fire only on the rising edge.
+        /// Reserved for future fall-detection; not currently consulted
+        /// by the eval path.
         last_held: Cell<bool>,
     },
     /// Fire when byte at `addr` is non-zero. Implicitly requests halt
@@ -187,6 +190,15 @@ pub enum Action {
     /// Generic; upstream knowledge about WHICH variable to set lives in
     /// the host that registers the watch.
     SetVar { name: String, value: i32 },
+    /// Set state variable `name` to `value` immediately, then schedule
+    /// a release (set to 0) after `hold_ticks` ticks have passed.
+    /// Generic edge-pair primitive; CSS-DOS-side profiles use it for
+    /// keyboard taps (`SetVarPulse { "keyboard", 0x1c0d, 50_000 }`)
+    /// where the cabinet's keyboard handler needs a make-then-break
+    /// edge to register a press. The release is dispatched by
+    /// [`WatchRegistry::poll`] when its `tick` argument reaches the
+    /// scheduled release-tick.
+    SetVarPulse { name: String, value: i32, hold_ticks: u32 },
     /// Request the host stop the run. Effective from
     /// [`WatchRegistry::halt_requested`] after this watch's other
     /// actions have run.
@@ -261,6 +273,24 @@ pub struct WatchRegistry {
     /// Where dump bytes go on this build (Memory on wasm, configurable
     /// on native).
     pub(crate) dump_sink: DumpSink,
+    /// Pending `SetVarPulse` releases. Each entry is a (release_tick,
+    /// var_name) pair scheduled when the pulse fired. `poll` checks at
+    /// the top of every call and releases (writes 0 to the named var)
+    /// any whose release_tick has passed. Sorted on insertion so the
+    /// front entries are always the soonest-due.
+    pub(crate) pending_releases: Vec<PendingRelease>,
+    /// Var names that had releases dispatched at the start of THIS
+    /// poll. Pulse actions that target one of these skip — gives the
+    /// engine a full inter-poll batch with the var at 0 between
+    /// pulses, the break edge edge-detectors need.
+    pub(crate) released_this_poll: Vec<String>,
+}
+
+/// A `SetVarPulse` release scheduled for a future tick.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingRelease {
+    pub release_tick: u32,
+    pub var_name: String,
 }
 
 impl WatchRegistry {
@@ -275,6 +305,8 @@ impl WatchRegistry {
             events: Vec::new(),
             halt_requested: false,
             dump_sink: DumpSink::Memory,
+            pending_releases: Vec::new(),
+            released_this_poll: Vec::new(),
         }
     }
 

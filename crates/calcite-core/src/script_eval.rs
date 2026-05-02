@@ -25,6 +25,26 @@ use crate::state::State;
 /// evaluates ungated watches (recording their fire status), second
 /// pass evaluates gated ones whose gate fired.
 pub fn poll(reg: &mut WatchRegistry, state: &mut State, tick: u32) {
+    // Pending `SetVarPulse` releases: any whose release_tick has passed
+    // get applied (var → 0) before we re-evaluate watches. Vars that
+    // released THIS poll go into `released_this_poll` so subsequent
+    // pulses on the same var skip — that gives the engine a full
+    // inter-poll batch where the var sits at 0 (the break edge a
+    // cabinet's edge detector needs to register a key-up).
+    reg.released_this_poll.clear();
+    if !reg.pending_releases.is_empty() {
+        let mut keep: Vec<PendingRelease> = Vec::with_capacity(reg.pending_releases.len());
+        for pr in std::mem::take(&mut reg.pending_releases) {
+            if tick >= pr.release_tick {
+                state.set_var(&pr.var_name, 0);
+                reg.released_this_poll.push(pr.var_name);
+            } else {
+                keep.push(pr);
+            }
+        }
+        reg.pending_releases = keep;
+    }
+
     if reg.is_empty() {
         return;
     }
@@ -107,11 +127,15 @@ fn evaluate_watch(
                 let holds = tests.iter().all(|t| predicate_holds(t, state));
                 if holds {
                     if *repeat {
-                        let was_held = last_held.get();
+                        // Sustain mode: fire on every gated poll while
+                        // the predicate holds. Re-arms after a fall.
+                        // (Rising-edge-only mode would be a separate
+                        // variant; the documented behaviour is the
+                        // sustain shape that matches the upstream
+                        // `:then=spam` use case the new primitives
+                        // replace.)
                         last_held.set(true);
-                        // Rising edge only — fire on first poll where
-                        // it transitioned from "not held" to "held".
-                        !was_held
+                        true
                     } else {
                         fired.set(true);
                         true
@@ -157,6 +181,10 @@ fn evaluate_watch(
     }
 
     let mut wants_emit = false;
+    // SetVarPulse releases scheduled by this watch. Pushed onto the
+    // registry after the action loop so we don't tangle borrow-of-actions
+    // with mutable-borrow-of-registry.
+    let mut pending_pulse_releases: Vec<PendingRelease> = Vec::new();
     for action in &actions {
         match action {
             Action::Emit => {
@@ -226,6 +254,34 @@ fn evaluate_watch(
             Action::SetVar { name, value } => {
                 state.set_var(name, *value);
             }
+            Action::SetVarPulse { name, value, hold_ticks } => {
+                // Skip if (a) this var has a pending release queued
+                // for a future tick (a previous pulse is still mid-
+                // hold) or (b) this var was JUST released at the top
+                // of this poll. Both prevent a sustain-cond + pulse
+                // race that would overwrite the break edge before the
+                // engine ever ticks with the var at 0. The engine
+                // sees: pulse → batch ticks → release → batch ticks
+                // → pulse → ... — a clean make/break/make/break
+                // cadence at 2× the gating poll-stride.
+                let already_pending = reg.pending_releases
+                    .iter()
+                    .any(|pr| pr.var_name == *name)
+                    || pending_pulse_releases
+                        .iter()
+                        .any(|pr| pr.var_name == *name);
+                let just_released = reg.released_this_poll
+                    .iter()
+                    .any(|n| n == name);
+                if !already_pending && !just_released {
+                    // Make edge: write the value now.
+                    state.set_var(name, *value);
+                    pending_pulse_releases.push(PendingRelease {
+                        release_tick: tick.saturating_add(*hold_ticks),
+                        var_name: name.clone(),
+                    });
+                }
+            }
             Action::Halt => {
                 implicit_halt = true;
             }
@@ -241,6 +297,11 @@ fn evaluate_watch(
     if wants_emit {
         reg.events.push(event);
     }
+
+    // Append SetVarPulse releases scheduled by this watch. The
+    // skip-if-pending check inside the action loop guarantees we never
+    // queue two entries for the same var simultaneously.
+    reg.pending_releases.extend(pending_pulse_releases);
 
     true
 }

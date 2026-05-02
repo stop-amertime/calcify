@@ -217,9 +217,13 @@ struct Cli {
     ///                                old --script-event scheduling).
     ///   `edge:addr=A`              — fire on byte transitions at A.
     ///   `cond:TEST1[,TEST2...][,repeat]`
-    ///                              — fire when all tests hold. Add
-    ///                                `,repeat` to fire on every rising
-    ///                                edge (default fires once).
+    ///                              — fire when all tests hold. Default
+    ///                                fires once, then disables. Add
+    ///                                `,repeat` for sustain mode: fires
+    ///                                on every gated poll while the
+    ///                                predicate holds (pair with
+    ///                                `setvar_pulse` to spam a key while
+    ///                                a stage is up).
     ///   `halt:addr=A`              — fire and stop the run when byte at A
     ///                                is non-zero.
     ///
@@ -230,6 +234,11 @@ struct Cli {
     ///   `halt`                     — stop the run.
     ///   `setvar=NAME,VALUE`        — write VALUE to state var NAME (e.g.
     ///                                `setvar=keyboard,0x1c0d`).
+    ///   `setvar_pulse=NAME,VALUE,HOLD_TICKS`  — write VALUE now, then 0
+    ///                                after HOLD_TICKS ticks. The make/break
+    ///                                edge pair lets cabinet keyboard
+    ///                                handlers register a press
+    ///                                (e.g. `setvar_pulse=keyboard,0x1c0d,50000`).
     ///   `dump=ADDR,LEN[,PATH]`     — write LEN bytes from ADDR to PATH.
     ///                                PATH supports `{tick}` and `{name}`.
     ///   `snapshot[=PATH]`          — write a snapshot blob to PATH.
@@ -243,7 +252,7 @@ struct Cli {
     ///   --watch poll:stride:every=50000
     ///   --watch ingame:cond:0x3a3c4=0:gate=poll:then=emit+halt
     ///   --watch text_drdos:cond:0x449=0x03,pattern@0xb8000:2:4000=DR-DOS:gate=poll:then=emit
-    ///   --watch enter_at_2m:at:tick=2000000:then=setvar=keyboard,0x1c0d
+    ///   --watch enter_at_2m:at:tick=2000000:then=setvar_pulse=keyboard,0x1c0d,50000
     ///   --watch dump_vram:stride:every=1000000:then=dump=0xb8000,4000,vram_{tick}.bin
     ///
     /// Events go to stderr (one line each) and, if `--measure-out=PATH`
