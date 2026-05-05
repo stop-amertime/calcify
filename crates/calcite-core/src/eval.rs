@@ -1401,12 +1401,6 @@ pub fn property_to_address(name: &str) -> Option<i32> {
         return parse_mem_address(rest);
     }
 
-    // keyboard / __1keyboard / __2keyboard → linear address 0x500.
-    // The CSS-DOS BIOS polls address 0x500 (word) for keystrokes.
-    if canonical == "keyboard" || canonical == "__1keyboard" || canonical == "__2keyboard" {
-        return Some(0x500);
-    }
-
     None
 }
 

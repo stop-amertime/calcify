@@ -11,6 +11,38 @@ and the Criterion benchmarks.
 
 ---
 
+## 2026-05-05 — cleanup: delete `0x500` keyboard fallback in `property_to_address`
+
+Cardinal-rule cleanup. `eval.rs::property_to_address` had a hardcoded
+fallback: `keyboard / __1keyboard / __2keyboard → 0x500`. Six lines,
+upstream knowledge (DOS BDA keyboard slot is at 0x500 in CSS-DOS land,
+which calcite has no business knowing). Deleted.
+
+The fallback was dead code on every current cabinet — kiln declares
+`@property --keyboard` in `template.mjs::emitPropertyDecls`, so
+`State::load_properties` registers it in the address map at a
+state-var slot, and `property_to_address("keyboard")` returns that
+slot before reaching the fallback. Verified by running CSS-DOS smoke
+(7 carts including dos-smoke, montezuma, zork1) end-to-end before and
+after the deletion: identical pass set, identical tick budgets reached.
+
+The remaining keyboard input path in calcite — the SW link route into
+`engine.set_keyboard` — stays. That's host plumbing under the no-page-JS
+constraint and is legitimate. The cheat being removed here was the
+*name-based literal* in calcite-core, which made calcite assume any
+property called `keyboard` lives at 0x500 regardless of what the cabinet
+actually says. With the kiln-side `@property --keyboard` declaration the
+address map handles this generically.
+
+Part of the broader plan in CSS-DOS LOGBOOK 2026-05-05 ("JS-free
+keyboard via :active, removes calcite cheat"). Phase A on the CSS-DOS
+side is in progress; Phase B's structural recogniser
+(`:has(...:pseudo)` edges + `engine.set_pseudo_class_active`) is still
+to come. This deletion is the smallest, safest, one-way step that
+clears the literal cheat without waiting for the recogniser to land.
+
+Files: `crates/calcite-core/src/eval.rs` (-6 lines).
+
 ## 2026-05-02 — script: setvar_pulse + cond:repeat sustain mode
 
 Closes the first follow-up from the 2026-05-01 chunk D entry: the
