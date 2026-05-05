@@ -209,6 +209,13 @@ impl CalciteEngine {
     /// at 0x41E for INT 16h consumers (zork, etc.) and lets DOOM read the
     /// scancode via `IN AL, 0x60`. To produce a make/break pair the caller posts
     /// (key=N, then key=0) on consecutive `set_keyboard` calls.
+    ///
+    /// **Deprecated** — this is a side-channel from the page that bypasses
+    /// the cabinet's CSS input rules. New callers should drive
+    /// `set_pseudo_class_active("active", "kb-X", true/false)` and let
+    /// the cabinet's `&:has(#kb-X:active) { --keyboard: N; }` rules produce
+    /// the same value through calcite's recogniser. Retained for
+    /// compatibility with hosts that haven't migrated yet.
     pub fn set_keyboard(&mut self, key: i32) {
         // Drive the `--keyboard` state-var that calcite watches for IRQ 1
         // edges. The cabinet's INT 09h ISR is the single source of BDA ring
@@ -216,6 +223,41 @@ impl CalciteEngine {
         // directly; once corduroy installed an INT 09h handler that also
         // pushes, every press doubled (zork "G" → "gg").
         self.state.set_var("keyboard", key & 0xFFFF);
+    }
+
+    /// Report a pseudo-class match edge as active or inactive.
+    ///
+    /// This is the principled input surface: the cabinet's CSS uses
+    /// `&:has(#SELECTOR:PSEUDO) { --PROP: VALUE; }` rules to bind the
+    /// match state to a custom property. The host calls this to flip
+    /// the (pseudo, selector) edge; the next tick's evaluation
+    /// produces VALUE on PROP via calcite's input-edge recogniser.
+    ///
+    /// `pseudo` is the pseudo-class name without the leading `:`
+    /// (e.g. `"active"`). `selector` is the id-selector text without
+    /// the leading `#` (e.g. `"kb-1"`). `value` is the boolean state.
+    ///
+    /// The host is responsible for sending matching false edges
+    /// (release) — calcite does not synthesise key-up automatically.
+    pub fn set_pseudo_class_active(&mut self, pseudo: &str, selector: &str, value: bool) {
+        self.state.set_pseudo_class_active(pseudo, selector, value);
+    }
+
+    /// Returns the input edges the recogniser found in this cabinet's
+    /// CSS, as a JS array of `{property, pseudo, selector, value}`
+    /// objects. Useful for the host to know which edges to drive.
+    pub fn input_edges(&self) -> JsValue {
+        let edges = self.evaluator.input_edges_for_host();
+        let arr = js_sys::Array::new();
+        for (property, pseudo, selector, value) in edges {
+            let obj = js_sys::Object::new();
+            let _ = js_sys::Reflect::set(&obj, &"property".into(), &property.into());
+            let _ = js_sys::Reflect::set(&obj, &"pseudo".into(), &pseudo.into());
+            let _ = js_sys::Reflect::set(&obj, &"selector".into(), &selector.into());
+            let _ = js_sys::Reflect::set(&obj, &"value".into(), &value.into());
+            arr.push(&obj);
+        }
+        arr.into()
     }
 
     /// Register a watch (script-primitive) with the engine. The spec

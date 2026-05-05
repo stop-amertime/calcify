@@ -98,6 +98,13 @@ pub struct State {
     /// no CLI-only loading path; calcite-cli and calcite-wasm both use this
     /// path identically.
     pub windowed_byte_array: Option<WindowedByteArray>,
+    /// Host-supplied pseudo-class state. Keyed by `(pseudo, selector)`
+    /// (e.g. `("active", "kb-1")`); value `true` means the host has
+    /// reported the gate as active. Read by gated assignments synthesised
+    /// from `ParsedProgram::input_edges`. The host calls
+    /// `set_pseudo_class_active` to flip an entry. Sparse — only edges
+    /// the host actually drives appear here.
+    pub pseudo_active: std::collections::HashMap<(String, String), bool>,
 }
 
 /// A "window of bytes addressed by an in-memory key" — a CSS shape where a
@@ -148,6 +155,7 @@ impl State {
             packed_cell_table: Vec::new(),
             packed_cell_size: 0,
             windowed_byte_array: None,
+            pseudo_active: std::collections::HashMap::new(),
         }
     }
 
@@ -234,6 +242,33 @@ impl State {
     /// Look up the slot index for a state variable name.
     pub fn var_slot(&self, name: &str) -> Option<usize> {
         self.state_var_index.get(name).copied()
+    }
+
+    /// Report a pseudo-class match edge as active or inactive. The
+    /// (pseudo, selector) pair must match an InputEdge the cabinet's
+    /// CSS declared via `&:has(#SELECTOR:PSEUDO) { ... }`. The next
+    /// tick's evaluation of the gated property will see the new state.
+    ///
+    /// `value=true` means "the host considers this pseudo-class active
+    /// on this element right now"; `value=false` means inactive. The
+    /// host is responsible for sending matching false edges (release).
+    pub fn set_pseudo_class_active(&mut self, pseudo: &str, selector: &str, value: bool) {
+        if value {
+            self.pseudo_active.insert(
+                (pseudo.to_string(), selector.to_string()),
+                true,
+            );
+        } else {
+            self.pseudo_active.remove(&(pseudo.to_string(), selector.to_string()));
+        }
+    }
+
+    /// Read whether a pseudo-class match edge is currently active.
+    pub fn pseudo_class_active(&self, pseudo: &str, selector: &str) -> bool {
+        self.pseudo_active
+            .get(&(pseudo.to_string(), selector.to_string()))
+            .copied()
+            .unwrap_or(false)
     }
 
     /// Number of state variables.

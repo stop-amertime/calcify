@@ -1036,3 +1036,53 @@ fn summary_captures_three_phases() {
     let prose = calcite_core::summary::render_summary(&blocks);
     assert!(prose.lines().count() == blocks.len());
 }
+
+/// End-to-end input-edge test: parse a tiny cabinet with two
+/// `&:has(#kb-X:active) { --keyboard: V; }` rules, drive press/release
+/// via `set_pseudo_class_active`, and verify `--keyboard` reflects the
+/// gated values via the recogniser. No host-side `set_var` calls.
+///
+/// Mirrors the calcite-wasm e2e probe (pseudo-active-api-probe.html) but
+/// runs in plain Rust so it shows up in `cargo test`.
+#[test]
+fn input_edges_drive_keyboard_via_set_pseudo_class_active() {
+    let css = r#"
+        @property --keyboard { syntax: "<integer>"; initial-value: 0; inherits: true; }
+        @property --opcode   { syntax: "<integer>"; initial-value: 0; inherits: true; }
+        .cpu {
+            &:has(#kb-1:active) { --keyboard: 561; }
+            &:has(#kb-a:active) { --keyboard: 7777; }
+        }
+    "#;
+    let (mut eval, mut state) = setup(css);
+
+    // Sanity: parser found two input edges.
+    let edges = eval.input_edges_for_host();
+    assert_eq!(edges.len(), 2);
+    assert!(edges.iter().any(|(p, ps, sel, v)| p == "--keyboard" && ps == "active" && sel == "kb-1" && *v == 561));
+    assert!(edges.iter().any(|(p, ps, sel, v)| p == "--keyboard" && ps == "active" && sel == "kb-a" && *v == 7777));
+
+    // No press → 0.
+    eval.tick(&mut state);
+    assert_eq!(state.get_var("keyboard").unwrap(), 0);
+
+    // Press kb-1 → 561.
+    state.set_pseudo_class_active("active", "kb-1", true);
+    eval.tick(&mut state);
+    assert_eq!(state.get_var("keyboard").unwrap(), 561);
+
+    // Add kb-a → sum to 8338.
+    state.set_pseudo_class_active("active", "kb-a", true);
+    eval.tick(&mut state);
+    assert_eq!(state.get_var("keyboard").unwrap(), 8338);
+
+    // Release kb-1 → just kb-a → 7777.
+    state.set_pseudo_class_active("active", "kb-1", false);
+    eval.tick(&mut state);
+    assert_eq!(state.get_var("keyboard").unwrap(), 7777);
+
+    // Release kb-a → 0.
+    state.set_pseudo_class_active("active", "kb-a", false);
+    eval.tick(&mut state);
+    assert_eq!(state.get_var("keyboard").unwrap(), 0);
+}

@@ -11,6 +11,96 @@ and the Criterion benchmarks.
 
 ---
 
+## 2026-05-05 — Phase B: structural input-edge recogniser + `set_pseudo_class_active`
+
+Phase B of the keyboard-cheat removal landed. Calcite now recognises
+`&:has(#SELECTOR:PSEUDO) { --PROP: VALUE; }` rules at parse time and
+exposes a generic host API to flip those gates. The
+`engine.set_keyboard` side-channel is no longer required for the
+principled path, though it remains for compatibility.
+
+### What landed
+
+- **Parser** — `parser/stylesheet.rs`: `parse_declarations` now detects
+  the leading `&` token and dispatches to `try_parse_input_edge_rule`,
+  which walks `:has(#IDENT:IDENT)` and the nested `{ --PROP: <expr>; }`
+  block, recording each gated assignment as an `InputEdge` on the
+  `ParsedProgram`. Recognition is purely structural: the parser doesn't
+  care whether the property is `--keyboard` or `--mood`, or whether the
+  selector is `kb-1` or `power-button`. Nested rules that don't fit the
+  shape (e.g. `&:nth-child(2)`) are skipped without breaking the
+  surrounding declaration block.
+- **Type** — `types::InputEdge { property, pseudo, selector, value: Expr }`
+  + `ParsedProgram::input_edges: Vec<InputEdge>`.
+- **State** — `state::State::pseudo_active: HashMap<(String, String), bool>`,
+  with `set_pseudo_class_active(pseudo, selector, value)` and
+  `pseudo_class_active(pseudo, selector)`. Sparse: only entries the
+  host actually flips occupy the map.
+- **Evaluator** — at construction time, `Evaluator::from_parsed`
+  compiles each `InputEdge` whose value is a literal into an
+  `InputEdgeBinding { property, pseudo, selector, value: i32 }`. Per
+  tick, before `compile::execute`, `apply_input_edges` walks the
+  bindings: for each gated property it finds, sums the values of edges
+  whose `(pseudo, selector)` is currently active per host, and writes
+  the sum into the underlying state-var slot. Properties with no
+  active edges get 0 (release semantics). Cheap: the typical
+  "nothing pressed" case is `n_edges` HashMap probes. The pre-tick
+  apply runs in `tick`, `tick_no_diff`, `tick_profiled`, and
+  `tick_interpreted` — every entry point.
+- **Wasm** — `engine.set_pseudo_class_active(pseudo, selector, value)`
+  delegates to State; `engine.input_edges()` returns a JS array of
+  `{property, pseudo, selector, value}` so the host knows which edges
+  to drive. `engine.set_keyboard` retained but documented as legacy
+  side-channel.
+- **Tests** — three new parser unit tests (input edges recognised;
+  complex value expression; nonsense nested rules skipped); one
+  evaluator unit test (input-edge bindings drive state var with
+  release semantics + sum on multi-press); one integration test
+  exercising the full parse→compile→tick pipeline with
+  `set_pseudo_class_active`. All green. Pre-existing 4 lib failures
+  in the `rep_fast_forward` suite (no `--opcode` slot in their test
+  cabinets) unchanged.
+
+### Cardinal-rule check
+
+The recogniser fires on shape `&:has(#IDENT:IDENT) { --PROP: <expr> }`
+and nothing else. It doesn't look at property names, scancodes, or
+ASCII values; it doesn't know that `kb-1` is a key or that `--keyboard`
+is a keyboard slot. A 6502 cabinet that emitted
+`&:has(#brake-pedal:active) { --braking: 1 }` would get the same
+treatment with no calcite-side change.
+
+The host plumbing (SW URL parsing, bridge drainer) still has the same
+shape — it just translates pseudo-class events instead of scancodes —
+and the cabinet's CSS now does the actual lookup of "what value does
+this gate produce" via its own
+`&:has(#kb-X:active) { --keyboard: V; }` rules.
+
+### Verification
+
+- 165/169 calcite-core lib tests pass (4 pre-existing rep_fast_forward
+  failures unchanged).
+- 1 new integration test passes
+  (`input_edges_drive_keyboard_via_set_pseudo_class_active`).
+- doom8088 cabinet (316 MB, post-build) parses with **59 input edges
+  recognised** (matches the 59 `:has(#kb-` rules kiln emits).
+- Wasm e2e probe (`web/player/experiments/pseudo-active-api-probe.html`)
+  loads a tiny synthetic cabinet, calls `set_pseudo_class_active` for
+  presses/releases, observes `--keyboard` flipping correctly through
+  `tick_batch` (561 → 8338 → 0).
+- CSS-DOS smoke 7/7 PASS pre and post change.
+
+### Work remaining (not in this commit)
+
+- Migrate the bench harness `doom-loading.mjs` from `setvar_pulse=keyboard`
+  to the new pseudo-class API (currently still uses `--key-events`-style
+  scancodes via `setvar_pulse`; this is independent of the new
+  recogniser).
+- Eventually retire `engine.set_keyboard` entirely. Held back here
+  for back-compat: existing browser-builder UIs and the bench harness
+  still emit `key=` URLs and call `set_keyboard`. Once both have moved
+  to the pseudo path the side-channel can go.
+
 ## 2026-05-05 — cleanup: delete `0x500` keyboard fallback in `property_to_address`
 
 Cardinal-rule cleanup. `eval.rs::property_to_address` had a hardcoded
