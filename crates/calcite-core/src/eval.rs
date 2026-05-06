@@ -81,7 +81,7 @@ pub struct Evaluator {
     pub dispatch_tables: HashMap<String, DispatchTable>,
     /// Recognised broadcast write patterns.
     pub broadcast_writes: Vec<BroadcastWrite>,
-    /// Recognised packed-cell broadcast ports (one per CSS-DOS write slot).
+    /// Recognised packed-cell broadcast ports (one per cabinet write slot).
     /// Each port covers all `--mcN` cell assignments absorbed into a single
     /// (gate, addr, val) shape. The interpreter runs these after the
     /// per-assignment loop so packed cabinets see the same memory writes
@@ -114,6 +114,14 @@ pub struct Evaluator {
     /// expression evaluator isn't worth the complexity for the current
     /// shapes kiln emits).
     pub(crate) input_edge_bindings: Vec<InputEdgeBinding>,
+    /// Self-loop descriptors recognised from the dispatch family on
+    /// `program.assignments`. Phase 1 of the
+    /// [rep_fast_forward genericity mission][plan] produces these but does
+    /// NOT use them at runtime — they're available for diagnostic printout
+    /// and for phase 2 to consume.
+    ///
+    /// [plan]: ../../../CSS-DOS/docs/plans/2026-05-06-rep-fast-forward-genericity.md
+    pub loop_descriptors: Vec<crate::pattern::loop_descriptor::LoopDescriptor>,
 }
 
 /// Compiled form of a `ParsedProgram::input_edges` entry. The
@@ -261,10 +269,11 @@ impl Evaluator {
         let Some(ref cw) = self.compiled.windowed_byte_array else { return };
         // The compiler tracks the cell by NAME (e.g. "--__1mc632"), since
         // state-var slot indices aren't assigned until State::load_properties.
-        // Resolve to the state var here. CSS-DOS double-buffers cells through
-        // intermediate names `--__1mcN` / `--__2mcN` whose default sources the
-        // canonical `--mcN` property; the canonical name is what
-        // `load_properties` registers as a state var (with the `--` stripped).
+        // Resolve to the state var here. Cabinets that double-buffer cells
+        // through intermediate names (e.g. `--__1mcN` / `--__2mcN`) have those
+        // intermediates default-source the canonical `--mcN` property; the
+        // canonical name is what `load_properties` registers as a state var
+        // (with the `--` stripped).
         let bare = cw.key_cell_property.trim_start_matches("--");
         let canonical = bare
             .strip_prefix("__1")
@@ -354,7 +363,7 @@ impl Evaluator {
                 gate,
             );
         }
-        // Packed broadcast writes: CSS-DOS PACK_SIZE=2 cell writes via the
+        // Packed broadcast writes: PACK_SIZE=2 cell writes via the
         // nested --applySlot chain. Replaces ~190K ops/tick with ~6 port
         // checks. The absorbed property set is merged into broadcast_result
         // so the assignment loop drops them.
@@ -543,6 +552,46 @@ impl Evaluator {
             );
         }
 
+        // Self-loop descriptor recognition (phase 1 of the genericity
+        // mission). Operates on the original parsed assignments — the
+        // raw dispatch-family shapes kiln emitted, before any
+        // pattern-rewriting. Producing descriptors is side-effect-free
+        // here; phase 2 will consume them in the runtime applier.
+        let _t_loop = Instant::now();
+        let loop_descriptors =
+            crate::pattern::loop_descriptor::recognise_loops(&program.assignments);
+        log::info!(
+            "[compile phase] loop descriptor recognition: {:.2}s ({} descriptors)",
+            _t_loop.elapsed().as_secs_f64(),
+            loop_descriptors.len(),
+        );
+        if loop_descriptor_diag_enabled() && !loop_descriptors.is_empty() {
+            eprintln!(
+                "[loop_descriptor] recognised {} self-loop descriptor(s):",
+                loop_descriptors.len()
+            );
+            for d in &loop_descriptors {
+                let mut psteps: Vec<i32> =
+                    d.pointers.iter().map(|p| p.base_step).collect();
+                psteps.sort_unstable();
+                eprintln!(
+                    "  key={}={:#x} ip={} ip_self={} adv={} \
+                     counter={} pointers={} pointer_steps={:?} \
+                     writes={} flag_cond={}",
+                    d.key_property,
+                    d.key_value,
+                    d.ip_property,
+                    d.ip_self_property,
+                    d.ip_advance_literal,
+                    d.counter.is_some(),
+                    d.pointers.len(),
+                    psteps,
+                    d.writes.len(),
+                    d.flag_conditioned,
+                );
+            }
+        }
+
         Evaluator {
             functions,
             assignments,
@@ -558,6 +607,7 @@ impl Evaluator {
             compiled,
             slots: Vec::with_capacity(slot_count),
             input_edge_bindings,
+            loop_descriptors,
         }
     }
 
@@ -1169,7 +1219,7 @@ impl Evaluator {
     ///
     /// Use this when the caller doesn't consume the diff (the web bridge
     /// observes state via direct property reads after each batch). On
-    /// dense cabinets — doom8088 has ~10K state vars — the snapshot+sweep
+    /// dense cabinets — the reference cabinet has ~10K state vars — the snapshot+sweep
     /// is a real per-batch cost we shouldn't pay if no one's reading it.
     pub fn run_batch_silent(&mut self, state: &mut State, count: u32) {
         for _ in 0..count {
@@ -1180,9 +1230,10 @@ impl Evaluator {
     /// Apply computed property values to state and return the changes.
     ///
     /// Only writes canonical (non-prefixed) properties to state.
-    /// Buffer copies (`--__0AX`, `--__1AX`, `--__2AX`) are skipped —
-    /// they exist for x86CSS's triple-buffer pipeline but carry stale values
-    /// that would nondeterministically overwrite the current tick's result.
+    /// Buffer copies (`--__0X`, `--__1X`, `--__2X` for any state var X) are
+    /// skipped — they exist for the cabinet's triple-buffer pipeline but
+    /// carry stale values that would nondeterministically overwrite the
+    /// current tick's result.
     fn apply_state(&self, state: &mut State) -> Vec<(String, String)> {
         let mut changes = Vec::new();
 
@@ -1473,7 +1524,7 @@ fn collect_style_test_deps(
 
 /// Check if a property is a triple-buffer copy (`--__0*`, `--__1*`, `--__2*`).
 ///
-/// These assignments exist for x86CSS's animation pipeline but are no-ops
+/// These assignments exist for the cabinet's animation pipeline but are no-ops
 /// in calcite's mutable-state model — they just copy the canonical value
 /// to a buffer slot that resolves back to the same value via `resolve_property`.
 fn is_buffer_copy(name: &str) -> bool {
@@ -1495,6 +1546,30 @@ fn is_buffer_copy(name: &str) -> bool {
 /// both resolve to the same canonical name. This keeps the function safe when
 /// called from code paths that build names programmatically (e.g. the packed
 /// cell table builder formats `"mc{}"` without the leading `--`).
+/// Diag gate for the loop-descriptor recogniser print-out.
+///
+/// Phase 1 of the rep_fast_forward genericity mission produces
+/// descriptors at compile time but doesn't drive any runtime path. This
+/// gate prints them to stderr at evaluator construction so a developer
+/// can verify recognition on a real cabinet (e.g. doom8088). Default
+/// off; set `CALCITE_LOOP_DIAG=1` to enable. Wasm builds always return
+/// false (no env access).
+#[cfg(not(target_arch = "wasm32"))]
+fn loop_descriptor_diag_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("CALCITE_LOOP_DIAG").as_deref(),
+            Ok("1") | Ok("true") | Ok("on")
+        )
+    })
+}
+#[cfg(target_arch = "wasm32")]
+fn loop_descriptor_diag_enabled() -> bool {
+    false
+}
+
 fn to_bare_name(name: &str) -> &str {
     let after_dashes = name.strip_prefix("--").unwrap_or(name);
     if let Some(rest) = after_dashes.strip_prefix("__0") {
@@ -1571,11 +1646,11 @@ pub fn merge_address_map(map: HashMap<String, i32>) {
 /// the property→address mapping without any hardcoded knowledge.
 ///
 /// Tables do NOT need to be pure identity mappings — individual entries
-/// with literal values or non-Var expressions (e.g. BIOS ROM constants,
+/// with literal values or non-Var expressions (e.g. ROM-region constants,
 /// helper function calls for memory-mapped devices) are skipped, but the
 /// identity entries in the same table are still recorded. This matters
-/// for x86-CSS's `--readMem` function which mixes identity reads of
-/// writable memory with literal reads of the BIOS ROM.
+/// for cabinets whose memory-read function mixes identity reads of
+/// writable memory with literal reads of read-only regions.
 pub fn build_address_map(dispatch_tables: &HashMap<String, DispatchTable>) -> HashMap<String, i32> {
     let mut map = HashMap::new();
     for table in dispatch_tables.values() {
@@ -2229,6 +2304,7 @@ mod tests {
             compiled,
             slots: Vec::new(),
             input_edge_bindings: Vec::new(),
+            loop_descriptors: Vec::new(),
         };
         (evaluator, state)
     }

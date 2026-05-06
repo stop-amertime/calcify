@@ -11,6 +11,141 @@ and the Criterion benchmarks.
 
 ---
 
+## 2026-05-06 — `rep_fast_forward` genericity mission, phase 1: structural loop recogniser
+
+Cross-link: see CSS-DOS
+[`docs/plans/2026-05-06-rep-fast-forward-genericity.md`](../../CSS-DOS/docs/plans/2026-05-06-rep-fast-forward-genericity.md)
+for the multi-session mission brief.
+[`../CSS-DOS/docs/logbook/LOGBOOK.md`](../../CSS-DOS/docs/logbook/LOGBOOK.md)
+2026-05-06 mirrors this entry for cross-cutting visibility.
+
+Phase 1 landed: a compile-time recogniser that produces structural
+self-loop descriptors from the cabinet's dispatch family, with no
+runtime path change. Phase 2 (descriptor-driven applier behind a
+flag) is the next checkpoint.
+
+### What landed
+
+- **New module**: `crates/calcite-core/src/pattern/loop_descriptor.rs`
+  (recogniser + types) and `pattern/loop_descriptor/tests.rs` (9
+  synthetic-CSS unit tests). The recogniser runs against
+  `ParsedProgram::assignments` and emits a
+  `Vec<LoopDescriptor>`. Each descriptor captures: the dispatch key
+  property and key value, the IP slot, the IP-advance literal, the
+  loop predicate, an optional counter slot, zero or more pointer
+  slots (with base step magnitude and direction-flag slot/bit), and
+  zero or more memwrite descriptors (address-side and value-side
+  expressions).
+- **Wiring**: `Evaluator::loop_descriptors: Vec<LoopDescriptor>`
+  populated in `from_parsed`. `CALCITE_LOOP_DIAG=1` env var prints
+  the recognised set to stderr at evaluator construction.
+- **Genericity probe**: two synthetic test cabinets, one x86-shaped
+  (`--CX`/`--DI`/`--__1IP`/etc.) and one brainfuck-shaped
+  (`--tapeUses`/`--tapeWriteHead`/`--priorCursor`/etc., no x86 ABI,
+  no shared naming convention with cabinet A). Both produce
+  structurally identical descriptors with no calcite-side change.
+  A renaming test verifies the recogniser is invariant under
+  arbitrary slot-name substitution.
+
+### Cardinal-rule contract enforced
+
+The recogniser inspects:
+- Slot/property *identity* (string-equality on whole names).
+- Expression-tree *shape* (variant, arity, literals).
+- Slot *repetition* (counts of references, structural co-occurrence).
+
+It does NOT inspect any character of any slot name. No prefix
+sniffing, no underscore checks, no substring searches. The renaming
+test in the unit suite locks this in.
+
+### Recogniser shape
+
+The "killer signature" is the IP-stay-or-advance shape: a per-V
+StyleCondition body whose two branches produce
+`calc(self - subtrahend)` and `calc(self + literal)` (in either
+order, against a common self slot). When found, the predicate
+becomes the loop predicate; other family members' per-V bodies are
+classified against it as counter/pointer/memwrite by their own
+structural shapes:
+
+- Counter: `if(<gate>: self; else: max(0, calc(self - step)))`
+  (or with branches flipped).
+- Pointer: `if(<gate>: self; else: outerCall(calc(self + k - innerCall(flag, bit) * 2k), modulus))`
+  (or flipped). Outer/inner function names are not inspected; only
+  arity and the literal-2 modulus structure.
+- Memwrite: any per-V body containing the `-1` literal somewhere
+  becomes the address side; everything else becomes the value side.
+
+Outer wrappers are stripped structurally:
+- `calc(<inner-dispatch> + <anything>)` (kiln's prefixLen wrapper
+  around IP).
+- Wrapper StyleCondition whose fallback contains the real
+  single-key dispatch (kiln's TF/IRQ override layer that takes
+  precedence over instruction execution).
+- Mixed-key StyleCondition where one property dominates the branch
+  set ≥50% (kiln's memwrite-slot layout, where TF/IRQ override
+  branches are folded into the same `if(...)` chain as the
+  opcode-keyed branches). The dominant-key branches are extracted;
+  others are ignored as wrapper noise.
+
+### Recogniser output on doom8088
+
+```
+[loop_descriptor] recognised 6 self-loop descriptor(s):
+  key=--opcode=0xa4 ip=--IP ip_self=--__1IP adv=1 counter=true pointers=2 pointer_steps=[1, 1] writes=1 flag_cond=false
+  key=--opcode=0xa5 ip=--IP ip_self=--__1IP adv=1 counter=true pointers=2 pointer_steps=[2, 2] writes=2 flag_cond=false
+  key=--opcode=0xaa ip=--IP ip_self=--__1IP adv=1 counter=true pointers=1 pointer_steps=[1] writes=1 flag_cond=false
+  key=--opcode=0xab ip=--IP ip_self=--__1IP adv=1 counter=true pointers=1 pointer_steps=[2] writes=2 flag_cond=false
+  key=--opcode=0xac ip=--IP ip_self=--__1IP adv=1 counter=true pointers=1 pointer_steps=[1] writes=0 flag_cond=false
+  key=--opcode=0xad ip=--IP ip_self=--__1IP adv=1 counter=true pointers=1 pointer_steps=[2] writes=0 flag_cond=false
+```
+
+Cross-checked against x86 string-op semantics (verifying the
+recogniser, not encoding it): MOVSB reads/writes 1 pointer pair
+with byte stride; MOVSW with word stride; STOSB writes 1 byte;
+STOSW writes lo+hi; LODSB/LODSW read but don't write. All match.
+
+CMPSB/CMPSW (0xA6/A7) and SCASB/SCASW (0xAE/AF) are NOT yet
+recognised — their IP shape uses the conjunction-of-style-tests
+predicate (kiln's `repCondIP`, with the ZF check), and the current
+matcher only handles single-test predicates. That's a known gap;
+phase 1's plan-noted limitation. CMPS/SCAS recognition lands in
+phase 2 alongside the runtime applier, where flag-conditioned
+exits are first-class.
+
+### Verification
+
+- `cargo test -p calcite-core --lib loop_descriptor`: 9/9 pass.
+- `cargo test -p calcite-core --lib`: 172/176 pass (4 pre-existing
+  rep_fast_forward unit-test failures unchanged — same baseline as
+  before the mission).
+- `cargo build --release` (workspace): clean.
+- `cargo build --release --target wasm32-unknown-unknown -p
+  calcite-wasm`: clean.
+- CSS-DOS `node tests/harness/run.mjs smoke`: 7/7 PASS pre and post
+  change.
+- doom8088 cabinet: recogniser fires with 6 valid descriptors at
+  evaluator construction (under `CALCITE_LOOP_DIAG=1`). Old
+  `rep_fast_forward` path remains the active runtime; phase 1 only
+  produces descriptors, doesn't consume them.
+
+### Plan checkpoint
+
+Plan §"Checkpoints / Checkpoint 1" complete:
+- [x] Add `LoopDescriptor` and friends.
+- [x] Implement the recogniser pass on the dispatch table.
+- [x] Synthetic-CSS unit tests (cabinets A + B + negatives + rename
+      probe).
+- [x] Real doom8088 verification with 6 recognised descriptors at
+      sensible opcode values (0xA4/A5/AA/AB/AC/AD; structural facts
+      cross-check against x86 semantics).
+
+Old `rep_fast_forward` still active. Smoke + doom8088 in-game
+unchanged. Phase 2 (runtime applier behind `CALCITE_REP_GENERIC`
+flag) is the next pickup point.
+
+---
+
 ## 2026-05-06 — `pseudo_pulse` action + `--press-events` CLI flag, retiring `set_keyboard`
 
 Closing out the keyboard-cheat retirement. Phase B (2026-05-05) gave
