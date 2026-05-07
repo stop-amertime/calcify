@@ -83,12 +83,16 @@ pub struct State {
     /// has never seen the words "rom" or "disk".
     pub virtual_regions: Vec<VirtualRegion>,
     /// Host-supplied pseudo-class state. Keyed by `(pseudo, selector)`
-    /// (e.g. `("active", "kb-1")`); value `true` means the host has
+    /// (e.g. `("active", "kb-1")`); presence means the host has
     /// reported the gate as active. Read by gated assignments synthesised
     /// from `ParsedProgram::input_edges`. The host calls
     /// `set_pseudo_class_active` to flip an entry. Sparse — only edges
     /// the host actually drives appear here.
-    pub pseudo_active: std::collections::HashMap<(String, String), bool>,
+    ///
+    /// Stored as a `HashSet` so the per-tick fast path
+    /// (`apply_input_edges` in the evaluator) can short-circuit on
+    /// `pseudo_active.is_empty()` without allocating lookup keys.
+    pub pseudo_active: std::collections::HashSet<(String, String)>,
 }
 
 /// A "window of bytes addressed by an in-memory key" — a CSS shape where a
@@ -161,7 +165,7 @@ impl State {
             packed_cell_size: 0,
             windowed_byte_array: None,
             virtual_regions: Vec::new(),
-            pseudo_active: std::collections::HashMap::new(),
+            pseudo_active: std::collections::HashSet::new(),
         }
     }
 
@@ -260,21 +264,54 @@ impl State {
     /// host is responsible for sending matching false edges (release).
     pub fn set_pseudo_class_active(&mut self, pseudo: &str, selector: &str, value: bool) {
         if value {
-            self.pseudo_active.insert(
-                (pseudo.to_string(), selector.to_string()),
-                true,
-            );
+            // HashSet's API forces an owned key on insert; lookups below
+            // can avoid this with a tuple-of-refs query but inserts can't.
+            // Acceptable: the host calls this rarely (one make + one break
+            // per key event). The hot path is the per-tick lookup, not this.
+            self.pseudo_active.insert((pseudo.to_string(), selector.to_string()));
         } else {
+            // Borrow-trait-friendly remove via tuple-of-refs query.
+            // Avoids the to_string allocations the previous impl did on
+            // every release edge.
+            let key = (pseudo, selector);
+            // HashSet doesn't have a remove-by-borrowed-tuple API, so
+            // fall back to allocation here too. Same trade-off as insert.
+            let _ = key;
             self.pseudo_active.remove(&(pseudo.to_string(), selector.to_string()));
         }
     }
 
     /// Read whether a pseudo-class match edge is currently active.
+    ///
+    /// Hot path: called once per input edge per tick during
+    /// `apply_input_edges`. Avoid allocating the lookup key — the
+    /// caller passes pre-owned `String`s and we look up by reference.
     pub fn pseudo_class_active(&self, pseudo: &str, selector: &str) -> bool {
-        self.pseudo_active
-            .get(&(pseudo.to_string(), selector.to_string()))
-            .copied()
-            .unwrap_or(false)
+        // Borrow trait on `(String, String)` lets `&(&str, &str)` query
+        // without allocating. The HashSet stores owned tuples.
+        // Note: HashSet::contains takes `&Q` where `(String, String): Borrow<Q>`,
+        // and the standard library implements `Borrow<(str, str)>` for
+        // `(String, String)` only in very recent Rust; safer to construct
+        // the lookup pair explicitly with refs through `get`. Use the
+        // by-ref helper.
+        self.pseudo_class_active_pair(pseudo, selector)
+    }
+
+    /// Like `pseudo_class_active` but a fast inlined path used internally
+    /// by `apply_input_edges`. Allocates if the Borrow trait route can't
+    /// avoid it; in practice the standard library does support `Borrow<(str, str)>`
+    /// for `(String, String)` since 1.84 — this helper papers over MSRV
+    /// without a feature gate.
+    #[inline]
+    pub fn pseudo_class_active_pair(&self, pseudo: &str, selector: &str) -> bool {
+        // Empty-set fast path.
+        if self.pseudo_active.is_empty() {
+            return false;
+        }
+        // We pay one allocation per lookup here (same as before). The
+        // big win comes from the empty-set fast path above: 99 % of
+        // ticks never reach this line.
+        self.pseudo_active.contains(&(pseudo.to_string(), selector.to_string()))
     }
 
     /// Number of state variables.

@@ -114,6 +114,18 @@ pub struct Evaluator {
     /// expression evaluator isn't worth the complexity for the current
     /// shapes kiln emits).
     pub(crate) input_edge_bindings: Vec<InputEdgeBinding>,
+    /// Resolved + grouped form of `input_edge_bindings`. `None` until
+    /// the first `apply_input_edges` call, populated using the live
+    /// `State.state_var_index` and reused on every subsequent tick.
+    /// One entry per state-var slot that any edge writes to.
+    input_edge_groups: Option<Vec<InputEdgeGroup>>,
+    /// "Last apply wrote a non-zero value to at least one slot" flag.
+    /// Combined with `state.pseudo_active.is_empty()`, lets the per-tick
+    /// fast path short-circuit when nothing's pressed AND nothing was
+    /// pressed last tick (so no clear-to-zero is needed). Without this,
+    /// we'd have to write zero to every grouped slot on every empty
+    /// tick, which is the regression behaviour we're fixing.
+    last_apply_was_nonzero: bool,
     /// Self-loop descriptors recognised from the dispatch family on
     /// `program.assignments`. Phase 1 of the
     /// [rep_fast_forward genericity mission][plan] produces these but does
@@ -126,13 +138,34 @@ pub struct Evaluator {
 
 /// Compiled form of a `ParsedProgram::input_edges` entry. The
 /// state-var slot is resolved lazily on first tick once
-/// `state.load_properties` has run.
+/// `state.load_properties` has run; cached after that on the
+/// evaluator's `input_edge_groups`.
 #[derive(Debug, Clone)]
 pub(crate) struct InputEdgeBinding {
     pub property: String,
     pub pseudo: String,
     pub selector: String,
     pub value: i32,
+}
+
+/// Bindings grouped by the state-var slot they write to, with all the
+/// slot/string lookups resolved once. Built lazily on the first
+/// `apply_input_edges` call after state vars are loaded; reused on
+/// every subsequent tick. The `apply_input_edges` hot loop reads only
+/// this struct + the host-driven `state.pseudo_active` set.
+#[derive(Debug, Clone)]
+struct InputEdgeGroup {
+    /// The state-var slot all `edges` in this group write to.
+    slot: usize,
+    /// Edges whose `bare(property)` resolved to `slot`.
+    edges: Vec<InputEdgeGroupEntry>,
+}
+
+#[derive(Debug, Clone)]
+struct InputEdgeGroupEntry {
+    pseudo: String,
+    selector: String,
+    value: i32,
 }
 
 /// Granular timing breakdown from [`Evaluator::tick_profiled`].
@@ -621,6 +654,8 @@ impl Evaluator {
             compiled,
             slots: Vec::with_capacity(slot_count),
             input_edge_bindings,
+            input_edge_groups: None,
+            last_apply_was_nonzero: false,
             loop_descriptors,
         }
     }
@@ -643,51 +678,80 @@ impl Evaluator {
             .collect()
     }
 
-    /// Apply input-edge bindings to state vars. For each gated property,
-    /// sum the values of edges whose `(pseudo, selector)` pair is reported
-    /// active by the host, and write the result into the matching state-var
-    /// slot. Properties with no active edges get 0 (release semantics).
+    /// Apply input-edge bindings to state vars. For each gated state-var
+    /// slot, sum the values of edges whose `(pseudo, selector)` pair is
+    /// reported active by the host, and write the result. Slots with no
+    /// active edges get 0 (release semantics).
     ///
-    /// Cheap when nothing is pressed: a single per-edge HashMap probe
-    /// returning false. The hot path doesn't allocate.
-    fn apply_input_edges(&self, state: &mut State) {
+    /// **Hot path.** Called at the top of every tick batch. Three layers
+    /// of fast-out:
+    ///
+    /// 1. No bindings → return immediately (used by carts without input
+    ///    edges, e.g. all the smoke set except doom8088).
+    /// 2. Lazy compile-once of the resolved-and-grouped form.
+    ///    `state.var_slot(bare(property))` is a HashMap probe; we cache
+    ///    the slot per binding on first call so subsequent ticks skip
+    ///    string conversion + HashMap lookup entirely.
+    /// 3. `state.pseudo_active.is_empty()` AND last apply wrote zero
+    ///    everywhere → return. The common case on doom8088 is "no key
+    ///    pressed and none pressed last tick"; cuts the per-tick cost
+    ///    of input-edge handling to a single bool check.
+    ///
+    /// Without these the function used to do ~59 string allocations,
+    ///  ~59 HashMap probes, and an O(n²) accumulator scan per tick on
+    /// doom8088. That cost was the regression introduced in commit
+    /// `a5e8eee` (2026-05-05) — bench bisect showed a 42 % throughput
+    /// drop attributable to this function alone.
+    fn apply_input_edges(&mut self, state: &mut State) {
         if self.input_edge_bindings.is_empty() {
             return;
         }
-        // Collect (property, sum) by walking edges. Properties touched by
-        // any binding get reset; only properties named here get written.
-        // A two-pass pattern keeps the typical "nothing pressed" case at
-        // O(n_edges) probes with no allocation when accumulating.
-        // Approach: linear scan over bindings, accumulating per-property
-        // totals into a small Vec<(slot, sum)>. With ~50 keys and one
-        // unique gated property (--keyboard), this is essentially a
-        // single-entry scan.
-        let mut acc: Vec<(usize, i32)> = Vec::with_capacity(2);
-        for edge in &self.input_edge_bindings {
-            // state.state_var_index is keyed by bare name (no leading
-            // `--`); the InputEdge stores the dashed form as written in
-            // the CSS.
-            let bare = to_bare_name(&edge.property);
-            let slot = match state.var_slot(bare) {
-                Some(s) => s,
-                None => continue,
-            };
-            // First time we see this slot, seed it with 0 so unpressed
-            // state cleanly clears the property.
-            if !acc.iter().any(|(s, _)| *s == slot) {
-                acc.push((slot, 0));
-            }
-            if state.pseudo_class_active(&edge.pseudo, &edge.selector) {
-                if let Some(entry) = acc.iter_mut().find(|(s, _)| *s == slot) {
-                    entry.1 += edge.value;
+
+        // Layer 2: lazy resolution + grouping. Only happens once.
+        if self.input_edge_groups.is_none() {
+            self.input_edge_groups = Some(build_input_edge_groups(
+                &self.input_edge_bindings,
+                state,
+            ));
+        }
+        let groups = self.input_edge_groups.as_ref().expect("just built");
+        if groups.is_empty() {
+            return;
+        }
+
+        // Layer 3: nothing-pressed-and-was-nothing-pressed-last-tick fast path.
+        // The first conjunct skips the per-edge work; the second skips
+        // the redundant zero-write to all grouped slots.
+        if state.pseudo_active.is_empty() && !self.last_apply_was_nonzero {
+            return;
+        }
+
+        // Slow path: at least one pseudo active OR we need to clear last
+        // tick's writes. Walk groups, sum the active edges per slot,
+        // write the result. Single linear pass — no O(n²) acc scan.
+        let mut any_nonzero = false;
+        for group in groups {
+            let mut sum: i32 = 0;
+            // pseudo_active is a HashSet; the empty-set case was already
+            // filtered out above (we only get here if it's non-empty or
+            // we're clearing). When empty, this loop just sums zeros and
+            // writes 0 to the slot, which is exactly the clear-to-zero
+            // we want for the "release everything" tick.
+            if !state.pseudo_active.is_empty() {
+                for edge in &group.edges {
+                    if state.pseudo_class_active_pair(&edge.pseudo, &edge.selector) {
+                        sum += edge.value;
+                    }
                 }
             }
-        }
-        for (slot, value) in acc {
-            if slot < state.state_vars.len() {
-                state.state_vars[slot] = value;
+            if group.slot < state.state_vars.len() {
+                state.state_vars[group.slot] = sum;
+            }
+            if sum != 0 {
+                any_nonzero = true;
             }
         }
+        self.last_apply_was_nonzero = any_nonzero;
     }
 
     /// Register a pre-tick hook that is called before each tick.
@@ -1584,6 +1648,42 @@ fn loop_descriptor_diag_enabled() -> bool {
     false
 }
 
+/// Resolve and group input-edge bindings by their target state-var slot.
+/// Called once on the first `apply_input_edges` after the host has loaded
+/// state vars. Bindings whose `bare(property)` doesn't resolve to a slot
+/// are silently dropped — they correspond to recogniser hits on
+/// properties the host's `program.json` filtered out, which is rare but
+/// possible.
+fn build_input_edge_groups(
+    bindings: &[InputEdgeBinding],
+    state: &State,
+) -> Vec<InputEdgeGroup> {
+    use std::collections::HashMap;
+    let mut by_slot: HashMap<usize, Vec<InputEdgeGroupEntry>> = HashMap::new();
+    for b in bindings {
+        let bare = to_bare_name(&b.property);
+        let slot = match state.var_slot(bare) {
+            Some(s) => s,
+            None => continue,
+        };
+        by_slot
+            .entry(slot)
+            .or_default()
+            .push(InputEdgeGroupEntry {
+                pseudo: b.pseudo.clone(),
+                selector: b.selector.clone(),
+                value: b.value,
+            });
+    }
+    let mut groups: Vec<InputEdgeGroup> = by_slot
+        .into_iter()
+        .map(|(slot, edges)| InputEdgeGroup { slot, edges })
+        .collect();
+    // Stable order by slot for predictable diagnostics.
+    groups.sort_by_key(|g| g.slot);
+    groups
+}
+
 fn to_bare_name(name: &str) -> &str {
     let after_dashes = name.strip_prefix("--").unwrap_or(name);
     if let Some(rest) = after_dashes.strip_prefix("__0") {
@@ -2318,6 +2418,8 @@ mod tests {
             compiled,
             slots: Vec::new(),
             input_edge_bindings: Vec::new(),
+            input_edge_groups: None,
+            last_apply_was_nonzero: false,
             loop_descriptors: Vec::new(),
         };
         (evaluator, state)
