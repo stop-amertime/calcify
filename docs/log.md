@@ -2163,3 +2163,42 @@ side) is real; the 10×-ceiling of Task 2 is not here.
   + bench probes for the new detector.
 - `../CSS-DOS/bios/splash.c` (commit `2acc748`) — REP STOSB rewrite,
   shipped.
+
+---
+
+## 2026-05-07 — phase 3b step 2: indirect-read intermediate recognition
+
+Worktree branch `worktree-rep-3b`, commit `0c62a4b`. Resolves the
+MOVS DRIFT noted in phase 3a: doom8088's MOVS val_expr is a bare
+`Var(--_strSrcByte)` whose own dispatch body is a function call
+keyed on the SI pointer mirror, structurally invisible to the pure-
+shape classifier. Step 2 adds a one-level trace through the
+assignment table — for any `WriteEntry.val_expr = Var(name)`, look
+up `name`'s body. If it's `FunctionCall(_, args)` with args
+referencing one of the descriptor's pointer mirror slots,
+`val_indirect_read = Some(IndirectRead { seg_property,
+pointer_property, intermediate_property })` is captured, and
+`classify_bulk` promotes Fill → Copy.
+
+Cardinal-rule shape preserved: whole-name slot identity only, no
+character of any name inspected. Verified via brainfuck-shaped
+genericity probe (cabinet-B-style names sharing nothing with x86) —
+identical Copy classification.
+
+26 unit tests pass on `cargo test -p calcite-core --lib
+pattern::loop_descriptor` (20 prior + 6 new positive/negative cases).
+Real-cabinet verification on doom8088 deferred — CSS-DOS is under
+change this session, so cabinet rebuilds and CLI runs were out-of-
+bounds.
+
+Files: `crates/calcite-core/src/pattern/loop_descriptor.rs` (added
+`IndirectRead`, `recognise_indirect_read`, `decompose_indirect_addr`,
+`first_pointer_mirror_referenced` and helpers; threaded through
+`recognise_loops`/`recognise_one_opcode`),
+`crates/calcite-core/src/pattern/loop_descriptor/tests.rs` (six new
+tests + a `cabinet_with_indirect_read` helper),
+`crates/calcite-core/src/eval.rs` (validator's diagnostic output now
+prints `indirect=` alongside `decompose=`),
+`crates/calcite-core/tests/rep_fast_forward.rs` (empty-program
+fixture gains `loop_descriptors: Vec::new()` to compile against the
+phase-3a field).
