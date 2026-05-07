@@ -1711,3 +1711,434 @@ fn addr_decomposition_returns_none_for_non_canonical_shape() {
         descs[0].writes[0].addr_decomposition
     );
 }
+
+// ---------------------------------------------------------------------------
+// Phase 3b Step 2: indirect-read intermediate recognition.
+//
+// MOVS-style cabinets emit the per-iter source byte as a derived
+// intermediate slot whose dispatch body is a function call keyed on a
+// stepping pointer (`var(--_strSrcByte)` in doom8088, with body
+// `--readMem(calc(var(--_strSrcSeg) + var(--__1SI)))`). The pure-shape
+// classifier in phase 3a couldn't see through the intermediate; step 2
+// traces one level into the assignment list so MOVS reclassifies from
+// Fill to Copy.
+// ---------------------------------------------------------------------------
+
+/// Helper: build a STOS-shape cabinet whose val_expr is a bare
+/// `Var(intermediate)`, with the intermediate's body being a function
+/// call keyed on the loop's pointer mirror. With the indirect-read
+/// recogniser, this should classify as Copy (the "MOVS through derived
+/// intermediate" pattern).
+fn cabinet_with_indirect_read(
+    intermediate_name: &str,
+    intermediate_body: Expr,
+) -> Vec<Assignment> {
+    let pred_continue = style_eq("--cont", 1.0);
+    let no_rep = style_eq("--hasRep", 0.0);
+    let active_guard = style_eq("--repActive", 0.0);
+
+    let cx = dispatch(
+        "--op",
+        vec![(0xA4 as f64, counter_body(no_rep.clone(), "--cx0"))],
+        keep_self("--cx0"),
+    );
+    let ip_inner = dispatch(
+        "--op",
+        vec![(
+            0xA4 as f64,
+            ip_body(pred_continue.clone(), "--ip0", var("--pl"), 1),
+        )],
+        keep_self("--ip0"),
+    );
+    let ip_wrapped = add(ip_inner, var("--pl"));
+
+    let di = dispatch(
+        "--op",
+        vec![(
+            0xA4 as f64,
+            pointer_body(
+                active_guard.clone(),
+                "--diMirror",
+                1,
+                "--flags0",
+                10,
+                "--lowBytes",
+                "--bit",
+            ),
+        )],
+        keep_self("--diMirror"),
+    );
+    let si = dispatch(
+        "--op",
+        vec![(
+            0xA4 as f64,
+            pointer_body(
+                active_guard.clone(),
+                "--siMirror",
+                1,
+                "--flags0",
+                10,
+                "--lowBytes",
+                "--bit",
+            ),
+        )],
+        keep_self("--siMirror"),
+    );
+
+    let addr = dispatch(
+        "--op",
+        vec![(
+            0xA4 as f64,
+            iff(
+                active_guard.clone(),
+                lit(-1.0),
+                add(mul(var("--es"), lit(16.0)), var("--diMirror")),
+            ),
+        )],
+        lit(-1.0),
+    );
+
+    // val_expr is a bare Var to the intermediate slot.
+    let val = dispatch(
+        "--op",
+        vec![(0xA4 as f64, var(intermediate_name))],
+        lit(0.0),
+    );
+
+    vec![
+        assign("--cx0", cx),
+        assign("--ip0", ip_wrapped),
+        assign("--diReg", di),
+        assign("--siReg", si),
+        assign("--addr0", addr),
+        assign("--val0", val),
+        // The intermediate's own dispatch body — a function call keyed
+        // on the SI pointer mirror. This is the structural shape the
+        // step-2 recogniser traces into.
+        assign(intermediate_name, intermediate_body),
+    ]
+}
+
+/// Positive: x86-shaped cabinet, MOVS-style. The intermediate's body is
+/// `--readMem(calc(var(--seg) + var(--siMirror)))`. Step 2 must
+/// recognise the indirect read and classify the loop as Copy.
+#[test]
+fn indirect_read_through_intermediate_classifies_as_copy() {
+    // Body: --readMem(calc(var(--srcSeg) + var(--siMirror)))
+    let body = call(
+        "--readMem",
+        vec![add(var("--srcSeg"), var("--siMirror"))],
+    );
+    let asns = cabinet_with_indirect_read("--strSrcByte", body);
+    let descs = recognise_loops(&asns);
+    assert_eq!(descs.len(), 1, "expected one descriptor: {:?}", descs);
+    let d = &descs[0];
+    assert_eq!(d.writes.len(), 1);
+    let w = &d.writes[0];
+    let ir = w
+        .val_indirect_read
+        .as_ref()
+        .expect("indirect_read should be Some");
+    assert_eq!(ir.intermediate_property, "--strSrcByte");
+    assert_eq!(ir.pointer_property, "--siMirror");
+    assert_eq!(ir.seg_property.as_deref(), Some("--srcSeg"));
+    assert_eq!(
+        d.bulk_class,
+        BulkClass::Copy,
+        "indirect-read through pointer mirror promotes Fill → Copy",
+    );
+}
+
+/// Cardinal-rule probe for step 2: a brainfuck-shaped cabinet using the
+/// same structural shape (function-call keyed on a pointer mirror via a
+/// derived intermediate) must produce the same Copy classification.
+/// Names share nothing with x86 land — only the shape matters.
+#[test]
+fn brainfuck_indirect_read_classifies_identically() {
+    let pred_continue = style_eq("--moodMeter", 1.0);
+    let no_rep = style_eq("--cookbookOpen", 0.0);
+    let active_guard = StyleTest::And(vec![
+        style_eq("--cookbookOpen", 1.0),
+        style_eq("--ladlePoised", 0.0),
+    ]);
+
+    let cx = dispatch(
+        "--recipeStep",
+        vec![(80.0, counter_body(no_rep.clone(), "--priorTapeUses"))],
+        keep_self("--priorTapeUses"),
+    );
+    let cursor_inner = dispatch(
+        "--recipeStep",
+        vec![(
+            80.0,
+            ip_body(pred_continue.clone(), "--priorCursor", var("--introBytes"), 1),
+        )],
+        keep_self("--priorCursor"),
+    );
+    let cursor_wrapped = add(cursor_inner, var("--introBytes"));
+
+    // Two pointers with brainfuck-shaped names.
+    let twh = dispatch(
+        "--recipeStep",
+        vec![(
+            80.0,
+            pointer_body(
+                active_guard.clone(),
+                "--priorTapeWriteHead",
+                1,
+                "--priorMoodFlags",
+                7,
+                "--clampLowBits",
+                "--readBitN",
+            ),
+        )],
+        keep_self("--priorTapeWriteHead"),
+    );
+    let trh = dispatch(
+        "--recipeStep",
+        vec![(
+            80.0,
+            pointer_body(
+                active_guard.clone(),
+                "--priorTapeReadHead",
+                1,
+                "--priorMoodFlags",
+                7,
+                "--clampLowBits",
+                "--readBitN",
+            ),
+        )],
+        keep_self("--priorTapeReadHead"),
+    );
+
+    let bag_addr = dispatch(
+        "--recipeStep",
+        vec![(
+            80.0,
+            iff(
+                active_guard.clone(),
+                lit(-1.0),
+                add(
+                    mul(var("--priorBagPage"), lit(16.0)),
+                    var("--priorTapeWriteHead"),
+                ),
+            ),
+        )],
+        lit(-1.0),
+    );
+    // val reads through an intermediate that itself reads via the
+    // tapeReadHead pointer mirror. Same structural shape as cabinet A's
+    // `--_strSrcByte`, but every name is brainfuck-flavoured.
+    let bag_val = dispatch(
+        "--recipeStep",
+        vec![(80.0, var("--mirrorSourceByte"))],
+        lit(0.0),
+    );
+    // The intermediate's own body — function call keyed on the read
+    // head pointer mirror.
+    let mirror_body = call(
+        "--peekByteAt",
+        vec![add(var("--bagSourceSeg"), var("--priorTapeReadHead"))],
+    );
+
+    let asns = vec![
+        assign("--tapeUses", cx),
+        assign("--cursor", cursor_wrapped),
+        assign("--tapeWriteHead", twh),
+        assign("--tapeReadHead", trh),
+        assign("--bagAddr0", bag_addr),
+        assign("--bagVal0", bag_val),
+        assign("--mirrorSourceByte", mirror_body),
+    ];
+
+    let descs = recognise_loops(&asns);
+    assert_eq!(descs.len(), 1, "expected one descriptor: {:?}", descs);
+    let d = &descs[0];
+    assert_eq!(d.writes.len(), 1);
+    let w = &d.writes[0];
+    let ir = w
+        .val_indirect_read
+        .as_ref()
+        .expect("brainfuck cabinet must also recognise indirect read");
+    assert_eq!(ir.intermediate_property, "--mirrorSourceByte");
+    assert_eq!(ir.pointer_property, "--priorTapeReadHead");
+    assert_eq!(ir.seg_property.as_deref(), Some("--bagSourceSeg"));
+    assert_eq!(
+        d.bulk_class,
+        BulkClass::Copy,
+        "brainfuck cabinet with same shape must classify identically",
+    );
+}
+
+/// Negative: val_expr's intermediate body is NOT a function call — just
+/// a bare Var or a plain literal. Step 2 must not promote this; the
+/// classifier stays at Fill.
+#[test]
+fn intermediate_without_function_call_stays_fill() {
+    // Body is a bare Var, not a function call. Even though it
+    // references the pointer mirror, the recogniser requires the
+    // FunctionCall shape (the canonical "this is a read primitive"
+    // marker). Anything else might be a derived constant or a
+    // pointer-mirror passthrough — promotion is unsafe without the
+    // call-shape signal.
+    let body = var("--siMirror");
+    let asns = cabinet_with_indirect_read("--strSrcByte", body);
+    let descs = recognise_loops(&asns);
+    let w = &descs[0].writes[0];
+    assert!(
+        w.val_indirect_read.is_none(),
+        "non-call-shape body must not produce indirect_read, got {:?}",
+        w.val_indirect_read,
+    );
+    assert_eq!(
+        descs[0].bulk_class,
+        BulkClass::Fill,
+        "without indirect-read recognition, classifier stays Fill",
+    );
+}
+
+/// Negative: the intermediate's body is a function call but its args
+/// don't reference any of the loop's pointer mirrors. The recogniser
+/// must reject this — the read isn't keyed on the stepping pointer, so
+/// it doesn't represent a per-iter source byte.
+#[test]
+fn function_call_without_pointer_mirror_reference_stays_fill() {
+    // Body: --readMem(calc(var(--someConst) + var(--otherConst))) —
+    // function call with no pointer-mirror reference.
+    let body = call(
+        "--readMem",
+        vec![add(var("--someConst"), var("--otherConst"))],
+    );
+    let asns = cabinet_with_indirect_read("--strSrcByte", body);
+    let descs = recognise_loops(&asns);
+    let w = &descs[0].writes[0];
+    assert!(
+        w.val_indirect_read.is_none(),
+        "no pointer mirror in args → no indirect_read, got {:?}",
+        w.val_indirect_read,
+    );
+    assert_eq!(descs[0].bulk_class, BulkClass::Fill);
+}
+
+/// Negative: the intermediate name doesn't resolve to any top-level
+/// assignment in the cabinet. The recogniser cannot trace through it
+/// and must leave the classification unchanged. This matches the
+/// existing `cabinet_a` shape (which references `--_strSrcByte` but
+/// doesn't define it locally) — the existing test that asserts
+/// `Fill | Copy` still holds.
+#[test]
+fn unresolved_intermediate_name_leaves_classification_unchanged() {
+    // Build a cabinet whose val references an intermediate, but DON'T
+    // include the intermediate in the assignment list.
+    let pred_continue = style_eq("--cont", 1.0);
+    let no_rep = style_eq("--hasRep", 0.0);
+    let active_guard = style_eq("--repActive", 0.0);
+
+    let cx = dispatch(
+        "--op",
+        vec![(0xA4 as f64, counter_body(no_rep.clone(), "--cx0"))],
+        keep_self("--cx0"),
+    );
+    let ip_inner = dispatch(
+        "--op",
+        vec![(
+            0xA4 as f64,
+            ip_body(pred_continue.clone(), "--ip0", var("--pl"), 1),
+        )],
+        keep_self("--ip0"),
+    );
+    let ip_wrapped = add(ip_inner, var("--pl"));
+    let di = dispatch(
+        "--op",
+        vec![(
+            0xA4 as f64,
+            pointer_body(
+                active_guard.clone(),
+                "--diMirror",
+                1,
+                "--flags0",
+                10,
+                "--lowBytes",
+                "--bit",
+            ),
+        )],
+        keep_self("--diMirror"),
+    );
+    let addr = dispatch(
+        "--op",
+        vec![(
+            0xA4 as f64,
+            iff(
+                active_guard.clone(),
+                lit(-1.0),
+                add(mul(var("--es"), lit(16.0)), var("--diMirror")),
+            ),
+        )],
+        lit(-1.0),
+    );
+    let val = dispatch(
+        "--op",
+        // References --notDefinedAnywhere — no assignment for it.
+        vec![(0xA4 as f64, var("--notDefinedAnywhere"))],
+        lit(0.0),
+    );
+
+    let asns = vec![
+        assign("--cx0", cx),
+        assign("--ip0", ip_wrapped),
+        assign("--diReg", di),
+        assign("--addr0", addr),
+        assign("--val0", val),
+    ];
+    let descs = recognise_loops(&asns);
+    let w = &descs[0].writes[0];
+    assert!(
+        w.val_indirect_read.is_none(),
+        "unresolved intermediate must yield None, got {:?}",
+        w.val_indirect_read,
+    );
+    assert_eq!(
+        descs[0].bulk_class,
+        BulkClass::Fill,
+        "unresolved intermediate stays at Fill",
+    );
+}
+
+/// Indirect read where the call argument is a complex expression that
+/// doesn't decompose as `var(seg) + var(ptr)` — only the pointer
+/// reference is found, not a clean segment slot. The recogniser still
+/// captures the indirect read (so Copy classification fires) but with
+/// `seg_property: None`. The runtime applier later evaluates the full
+/// arg expression rather than relying on a pre-resolved seg slot.
+#[test]
+fn indirect_read_without_clean_seg_decomposition_still_promotes_to_copy() {
+    // Body: --readMem(calc(calc(var(--baseSeg) * 16) + var(--siMirror)))
+    // The arg has the pointer mirror in it, but the seg side is an
+    // arithmetic expression rather than a bare Var. Decomposition can't
+    // simplify it.
+    let body = call(
+        "--readMem",
+        vec![add(
+            mul(var("--baseSeg"), lit(16.0)),
+            var("--siMirror"),
+        )],
+    );
+    let asns = cabinet_with_indirect_read("--strSrcByte", body);
+    let descs = recognise_loops(&asns);
+    let w = &descs[0].writes[0];
+    let ir = w
+        .val_indirect_read
+        .as_ref()
+        .expect("pointer mirror present → indirect_read should be Some");
+    assert_eq!(ir.pointer_property, "--siMirror");
+    assert!(
+        ir.seg_property.is_none(),
+        "non-bare-Var seg expression → seg_property is None, got {:?}",
+        ir.seg_property,
+    );
+    assert_eq!(
+        descs[0].bulk_class,
+        BulkClass::Copy,
+        "Copy promotion fires on pointer-mirror reference alone",
+    );
+}

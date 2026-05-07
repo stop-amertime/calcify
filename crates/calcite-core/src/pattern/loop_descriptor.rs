@@ -232,6 +232,51 @@ pub struct WriteEntry {
     /// simplify — bulk appliers fall back to per-iter `addr_expr`
     /// evaluation in that case).
     pub addr_decomposition: Option<(String, String)>,
+    /// Indirect-read intermediate decomposition for the value side.
+    ///
+    /// When `val_expr` is a bare `Var(name)` whose dispatch body in the
+    /// cabinet has the canonical "read function-call keyed on pointer
+    /// mirror" shape, this captures the structural fact. The matcher
+    /// allows: `body = FunctionCall(_, args)` where `args` contains —
+    /// anywhere in their tree — a `Var` reference to one of the
+    /// descriptor's pointer `self_property` slots.
+    ///
+    /// Optionally extracts a segment slot when the call's argument tree
+    /// has the clean shape `calc(var(seg_slot) + var(ptr_mirror))` (or
+    /// the reversed orientation). Otherwise `seg_property` is `None`
+    /// and the runtime must evaluate the address expression as-is.
+    ///
+    /// This is the structural meat of phase 3b step 2: the cabinet
+    /// writes a byte that's the result of a memory read keyed on the
+    /// loop's source pointer. Recognising the indirect-read intermediate
+    /// at compile time lets the bulk classifier promote `Fill` → `Copy`
+    /// for MOVS-style loops that route their source byte through a
+    /// derived intermediate slot. Pure structural shape — no character
+    /// inspection of any name.
+    pub val_indirect_read: Option<IndirectRead>,
+}
+
+/// Decomposition of a value-side indirect read through a pointer mirror.
+///
+/// Captured structurally: the cabinet's `val_expr` is a bare `Var(name)`
+/// whose dispatch body is `FunctionCall(_, args)` with the args tree
+/// referencing one of the descriptor's pointer mirror slots. The matcher
+/// inspects only `Expr` shapes and slot identity (whole-name equality);
+/// no character of any name is read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndirectRead {
+    /// Segment slot, when the call's argument decomposes cleanly as
+    /// `var(seg) + var(ptr)`. The segment slot may itself be an
+    /// intermediate (e.g. a `StyleCondition` honouring a segment
+    /// override) — runtime resolution is the runtime's problem.
+    pub seg_property: Option<String>,
+    /// The pointer mirror slot the indirect read keys on. Always one of
+    /// the descriptor's pointer `self_property` names.
+    pub pointer_property: String,
+    /// The intermediate slot name itself (the bare `Var` the val_expr
+    /// reads). Carried so the runtime can re-resolve via slot index when
+    /// it needs more than the seg/ptr pair.
+    pub intermediate_property: String,
 }
 
 /// Recognise self-loop opcodes in a dispatch family.
@@ -259,14 +304,29 @@ pub fn recognise_loops(assignments: &[Assignment]) -> Vec<LoopDescriptor> {
     let family = collect_dispatch_family(assignments);
     let Some(family) = family else { return Vec::new() };
 
+    // Build a name → body lookup over all top-level assignments. The
+    // val-side indirect-read recogniser uses this to peek inside
+    // intermediate slots like the cabinet's `--_strSrcByte`-shaped
+    // pre-computed read. Whole-name equality only — the lookup is just a
+    // HashMap on the property string the cabinet emitted.
+    let assignment_index = build_assignment_index(assignments);
+
     let mut out = Vec::new();
     for &key_value in &family.keys {
-        if let Some(desc) = recognise_one_opcode(&family, key_value) {
+        if let Some(desc) = recognise_one_opcode(&family, key_value, &assignment_index) {
             out.push(desc);
         }
     }
     out.sort_by_key(|d| d.key_value);
     out
+}
+
+fn build_assignment_index(assignments: &[Assignment]) -> HashMap<&str, &Expr> {
+    let mut idx: HashMap<&str, &Expr> = HashMap::with_capacity(assignments.len());
+    for a in assignments {
+        idx.insert(a.property.as_str(), &a.value);
+    }
+    idx
 }
 
 // ---------------------------------------------------------------------------
@@ -588,6 +648,7 @@ fn extract_dominant_dispatch_key<'a>(
 fn recognise_one_opcode<'a>(
     family: &DispatchFamily<'a>,
     key_value: i64,
+    assignment_index: &HashMap<&'a str, &'a Expr>,
 ) -> Option<LoopDescriptor> {
     // Step 1: find a member with the IP-stay-or-advance shape for this
     // key. This is the killer signature; without it there is no loop.
@@ -668,6 +729,15 @@ fn recognise_one_opcode<'a>(
     // through the cabinet source (deterministic regardless of HashMap
     // iteration order).
     addr_props.sort_by_key(|p| family.members[*p].assignment_index);
+    // Pointer mirrors — the prior-tick `self_property` slots the
+    // pointer step bodies read. The val-side indirect-read recogniser
+    // uses these to decide whether an intermediate slot's body is
+    // structurally a "read keyed on a pointer" (Copy-shape) versus
+    // anything else (Fill / PerIter).
+    let pointer_mirrors: HashSet<&str> = pointers
+        .iter()
+        .map(|p| p.self_property.as_str())
+        .collect();
     for ap in addr_props {
         let (_, addr_expr) = writes_addr[ap];
         let addr_idx = family.members[ap].assignment_index;
@@ -696,12 +766,15 @@ fn recognise_one_opcode<'a>(
         if let Some((vp, _, _)) = best {
             let ve = writes_val[vp];
             writes_val.remove(vp);
+            let val_indirect_read =
+                recognise_indirect_read(ve, &pointer_mirrors, assignment_index);
             writes.push(WriteEntry {
                 addr_property: ap.to_string(),
                 val_property: vp.to_string(),
                 addr_expr: addr_expr.clone(),
                 val_expr: ve.clone(),
                 addr_decomposition,
+                val_indirect_read,
             });
         } else {
             writes.push(WriteEntry {
@@ -710,6 +783,7 @@ fn recognise_one_opcode<'a>(
                 addr_expr: addr_expr.clone(),
                 val_expr: Expr::Literal(0.0),
                 addr_decomposition,
+                val_indirect_read: None,
             });
         }
     }
@@ -745,11 +819,17 @@ fn recognise_one_opcode<'a>(
 
 /// Classify the bulk-applier shape of a recognised loop, structurally.
 ///
-/// See [`BulkClass`]. This consults the pointer entries' `self_property`
-/// strings (the prior-tick mirror slots) and asks, for each write's
-/// value expression, whether any of those mirror names appear anywhere
-/// in the expression tree. Pure name-equality on whole names — no
-/// substring or character inspection.
+/// See [`BulkClass`]. Two ways a loop's writes get tagged as `Copy`:
+///
+/// 1. The write's `val_expr` directly references one of the pointer
+///    entries' `self_property` slots (e.g. a cabinet that emits
+///    `var(--ptrMirror)` inline as the value).
+/// 2. The write's `val_expr` is a bare `Var(name)` whose dispatch body
+///    elsewhere has the indirect-read shape — captured at descriptor
+///    build time as `WriteEntry.val_indirect_read`.
+///
+/// Pure structural shape — whole-name identity only, no substring or
+/// character inspection.
 fn classify_bulk(pointers: &[PointerEntry], writes: &[WriteEntry]) -> BulkClass {
     if writes.is_empty() {
         return BulkClass::ReadOnly;
@@ -762,6 +842,10 @@ fn classify_bulk(pointers: &[PointerEntry], writes: &[WriteEntry]) -> BulkClass 
     for w in writes {
         if expr_references_any(&w.val_expr, &mirrors) {
             any_copy = true;
+            continue;
+        }
+        if w.val_indirect_read.is_some() {
+            any_copy = true;
         }
     }
     if any_copy {
@@ -769,6 +853,174 @@ fn classify_bulk(pointers: &[PointerEntry], writes: &[WriteEntry]) -> BulkClass 
     } else {
         BulkClass::Fill
     }
+}
+
+/// Recognise an indirect-read intermediate on a write's value expression.
+///
+/// The MOVS-style shape: the value-side dispatch entry is a bare
+/// `Var(name)`, and `name`'s top-level assignment body is a
+/// `FunctionCall` (any opaque name) whose argument tree references —
+/// somewhere — one of the loop's pointer mirror slots. That tells us the
+/// per-iter source byte is a memory read keyed on a stepping pointer:
+/// the canonical Copy-shape, exposed via a derived intermediate.
+///
+/// When the FunctionCall's first argument has the clean shape
+/// `calc(var(seg) + var(ptr_mirror))` (or the reversed orientation),
+/// the segment slot is captured too. Otherwise `seg_property` is `None`
+/// and the runtime evaluates the address argument verbatim.
+///
+/// Cardinal-rule shape:
+/// - Inputs are `&Expr` and a name set; this matcher does not split or
+///   substring any name.
+/// - The function's name is opaque — calcite does not encode any
+///   "this is the read primitive" knowledge. The structural fact is:
+///   "a function call keyed on a stepping pointer" — generic across
+///   any cabinet that uses a function-call shape for memory access.
+fn recognise_indirect_read<'a>(
+    val_expr: &Expr,
+    mirrors: &HashSet<&str>,
+    assignment_index: &HashMap<&'a str, &'a Expr>,
+) -> Option<IndirectRead> {
+    // Step 1: val_expr must be a bare Var with no fallback. A val_expr
+    // that's already a complex expression doesn't fit the "intermediate
+    // hides the dependency" pattern this matcher is for — direct
+    // references through pointer mirrors are caught by the existing
+    // `expr_references_any` path in `classify_bulk`.
+    let intermediate_name = match val_expr {
+        Expr::Var { name, fallback: None } => name.as_str(),
+        _ => return None,
+    };
+    // Step 2: look up the intermediate's body. If it's not a top-level
+    // assignment in the cabinet, we can't trace through it.
+    let body = *assignment_index.get(intermediate_name)?;
+    // Step 3: the body must be a FunctionCall (any name, any arg
+    // count). The function's name is opaque to the matcher; the
+    // structural fact "this is a call expression" is what marks it as a
+    // candidate read primitive.
+    let Expr::FunctionCall { args, .. } = body else { return None };
+    if args.is_empty() {
+        return None;
+    }
+    // Step 4: somewhere in the args' expression trees there must be a
+    // Var reference matching one of the loop's pointer mirrors.
+    let mut pointer_property: Option<String> = None;
+    for arg in args {
+        if let Some(name) = first_pointer_mirror_referenced(arg, mirrors) {
+            pointer_property = Some(name);
+            break;
+        }
+    }
+    let pointer_property = pointer_property?;
+    // Step 5: try to extract a clean `(seg, ptr)` decomposition from
+    // the first argument. If the first arg is `calc(seg + ptr)` (or the
+    // reversed orientation) where ptr matches the pointer mirror we
+    // found, capture seg too. Otherwise leave it None — the runtime
+    // can still evaluate the address argument verbatim per-iter.
+    let seg_property = decompose_indirect_addr(&args[0], &pointer_property);
+
+    Some(IndirectRead {
+        seg_property,
+        pointer_property,
+        intermediate_property: intermediate_name.to_string(),
+    })
+}
+
+/// Return the first pointer-mirror name referenced by `expr` (depth-first
+/// pre-order) if any. Whole-name identity check — no substring or
+/// character inspection.
+fn first_pointer_mirror_referenced(expr: &Expr, mirrors: &HashSet<&str>) -> Option<String> {
+    match expr {
+        Expr::Var { name, fallback } => {
+            if mirrors.contains(name.as_str()) {
+                return Some(name.clone());
+            }
+            if let Some(fb) = fallback {
+                return first_pointer_mirror_referenced(fb, mirrors);
+            }
+            None
+        }
+        Expr::Literal(_) | Expr::StringLiteral(_) => None,
+        Expr::Calc(op) => first_pointer_mirror_in_calc(op, mirrors),
+        Expr::StyleCondition { branches, fallback } => {
+            for b in branches {
+                if let Some(n) = first_pointer_mirror_in_test(&b.condition, mirrors) {
+                    return Some(n);
+                }
+                if let Some(n) = first_pointer_mirror_referenced(&b.then, mirrors) {
+                    return Some(n);
+                }
+            }
+            first_pointer_mirror_referenced(fallback, mirrors)
+        }
+        Expr::FunctionCall { args, .. } => args
+            .iter()
+            .find_map(|a| first_pointer_mirror_referenced(a, mirrors)),
+        Expr::Concat(parts) => parts
+            .iter()
+            .find_map(|p| first_pointer_mirror_referenced(p, mirrors)),
+    }
+}
+
+fn first_pointer_mirror_in_calc(op: &CalcOp, mirrors: &HashSet<&str>) -> Option<String> {
+    match op {
+        CalcOp::Add(a, b)
+        | CalcOp::Sub(a, b)
+        | CalcOp::Mul(a, b)
+        | CalcOp::Div(a, b)
+        | CalcOp::Mod(a, b)
+        | CalcOp::Pow(a, b) => first_pointer_mirror_referenced(a, mirrors)
+            .or_else(|| first_pointer_mirror_referenced(b, mirrors)),
+        CalcOp::Min(args) | CalcOp::Max(args) => args
+            .iter()
+            .find_map(|a| first_pointer_mirror_referenced(a, mirrors)),
+        CalcOp::Clamp(a, b, c) => first_pointer_mirror_referenced(a, mirrors)
+            .or_else(|| first_pointer_mirror_referenced(b, mirrors))
+            .or_else(|| first_pointer_mirror_referenced(c, mirrors)),
+        CalcOp::Round(_, a, b) => first_pointer_mirror_referenced(a, mirrors)
+            .or_else(|| first_pointer_mirror_referenced(b, mirrors)),
+        CalcOp::Sign(a) | CalcOp::Abs(a) | CalcOp::Negate(a) => {
+            first_pointer_mirror_referenced(a, mirrors)
+        }
+    }
+}
+
+fn first_pointer_mirror_in_test(test: &StyleTest, mirrors: &HashSet<&str>) -> Option<String> {
+    match test {
+        StyleTest::Single { property, value } => {
+            if mirrors.contains(property.as_str()) {
+                return Some(property.clone());
+            }
+            first_pointer_mirror_referenced(value, mirrors)
+        }
+        StyleTest::And(parts) | StyleTest::Or(parts) => parts
+            .iter()
+            .find_map(|p| first_pointer_mirror_in_test(p, mirrors)),
+    }
+}
+
+/// Try to extract a segment slot from an indirect-read function call's
+/// first argument. Accepts the shape `calc(var(seg) + var(ptr))` (or
+/// the reversed orientation `calc(var(ptr) + var(seg))`) where one
+/// operand is the pointer mirror we already identified. The other
+/// operand must be a bare `Var` whose name we capture as the segment
+/// slot — its name is opaque to the matcher (the segment slot may
+/// itself be an intermediate that the runtime resolves later).
+///
+/// Returns `None` for arg shapes the structural matcher can't simplify
+/// (e.g. extra arithmetic, deep nesting). The runtime falls back to
+/// evaluating the full argument expression in those cases.
+fn decompose_indirect_addr(arg: &Expr, pointer_property: &str) -> Option<String> {
+    let Expr::Calc(CalcOp::Add(left, right)) = arg else { return None };
+    // Try left = ptr, right = seg.
+    if let (Some(p), Some(s)) = (match_bare_var(left), match_bare_var(right)) {
+        if p == pointer_property {
+            return Some(s);
+        }
+        if s == pointer_property {
+            return Some(p);
+        }
+    }
+    None
 }
 
 /// True iff `expr` transitively references any `Expr::Var { name, .. }`

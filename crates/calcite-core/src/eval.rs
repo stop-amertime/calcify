@@ -608,9 +608,18 @@ impl Evaluator {
                         Some((s, p)) => format!("({}, {})", s, p),
                         None => String::from("None"),
                     };
+                    let ind = match &w.val_indirect_read {
+                        Some(ir) => format!(
+                            "Some(intermediate={} seg={:?} ptr={})",
+                            ir.intermediate_property,
+                            ir.seg_property,
+                            ir.pointer_property
+                        ),
+                        None => String::from("None"),
+                    };
                     eprintln!(
-                        "    write addr={} val={} decompose={}",
-                        w.addr_property, w.val_property, dec
+                        "    write addr={} val={} decompose={} indirect={}",
+                        w.addr_property, w.val_property, dec, ind
                     );
                 }
             }

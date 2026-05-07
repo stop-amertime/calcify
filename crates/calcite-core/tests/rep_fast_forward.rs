@@ -31,6 +31,7 @@ fn empty_program() -> CompiledProgram {
         property_slots: std::collections::HashMap::new(),
         functions: Vec::new(),
         windowed_byte_array: None,
+        loop_descriptors: Vec::new(),
     }
 }
 
