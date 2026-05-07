@@ -117,6 +117,50 @@ pub struct LoopDescriptor {
     /// shape itself has a flag-bit conjunction; phase 2 will use it to
     /// drive the right runtime walker.
     pub flag_conditioned: bool,
+    /// Bulk-applier classification computed structurally at descriptor
+    /// build time. Phase 3a populates this; phase 3b's runtime applier
+    /// dispatches on it. The classifier is purely shape-based — it does
+    /// not look at any name, only at whether write-value expressions
+    /// transitively reference any pointer-slot mirror.
+    pub bulk_class: BulkClass,
+}
+
+/// Coarse classification of how a recognised self-loop's per-iter
+/// memory writes can be collapsed into a bulk operation.
+///
+/// The classifier is structural and does not encode opcode knowledge.
+/// It looks at:
+///
+/// - Whether the descriptor has any write entries (`writes.len()`).
+/// - Whether each write's value expression transitively references the
+///   `self_property` of any pointer entry (i.e. the prior-tick mirror
+///   the cabinet uses to read the source pointer's pre-iter value).
+///
+/// "Transitively references" means: there is some `Expr::Var` or
+/// `StyleTest::Single { property, .. }` somewhere in the value
+/// expression tree whose property name equals one of the pointer's
+/// `self_property` strings (whole-name equality — no substring or
+/// character inspection).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BulkClass {
+    /// No memory writes (CMPS / SCAS / LODS). Bulk applier walks
+    /// counter-many iterations doing reads and predicate checks; no
+    /// memory mutation.
+    ReadOnly,
+    /// All write-value expressions are independent of pointer-slot
+    /// state (typical STOS: every iteration writes the same constant
+    /// from an accumulator). Collapses to a flat memset over the
+    /// iterated address range.
+    Fill,
+    /// At least one write-value expression reads through a pointer
+    /// slot's mirror (typical MOVS: writes byte fetched from the
+    /// per-iter source pointer). Collapses to a memcpy along the
+    /// stepped address range, modulo overlap rules.
+    Copy,
+    /// Write-value expression depends on something other than a
+    /// pointer mirror, or has shape we don't recognise structurally.
+    /// Bulk applier falls back to per-iter evaluation.
+    PerIter,
 }
 
 /// A counter slot — one whose per-V body decrements itself when the
@@ -657,6 +701,8 @@ fn recognise_one_opcode<'a>(
     // For determinism, sort pointer entries by property name.
     pointers.sort_by(|a, b| a.property.cmp(&b.property));
 
+    let bulk_class = classify_bulk(&pointers, &writes);
+
     Some(LoopDescriptor {
         key_property: family.key_property.clone(),
         key_value,
@@ -669,7 +715,103 @@ fn recognise_one_opcode<'a>(
         pointers,
         writes,
         flag_conditioned,
+        bulk_class,
     })
+}
+
+/// Classify the bulk-applier shape of a recognised loop, structurally.
+///
+/// See [`BulkClass`]. This consults the pointer entries' `self_property`
+/// strings (the prior-tick mirror slots) and asks, for each write's
+/// value expression, whether any of those mirror names appear anywhere
+/// in the expression tree. Pure name-equality on whole names — no
+/// substring or character inspection.
+fn classify_bulk(pointers: &[PointerEntry], writes: &[WriteEntry]) -> BulkClass {
+    if writes.is_empty() {
+        return BulkClass::ReadOnly;
+    }
+    let mirrors: HashSet<&str> = pointers
+        .iter()
+        .map(|p| p.self_property.as_str())
+        .collect();
+    let mut any_copy = false;
+    for w in writes {
+        if expr_references_any(&w.val_expr, &mirrors) {
+            any_copy = true;
+        }
+    }
+    if any_copy {
+        BulkClass::Copy
+    } else {
+        BulkClass::Fill
+    }
+}
+
+/// True iff `expr` transitively references any `Expr::Var { name, .. }`
+/// or `StyleTest::Single { property, .. }` whose name is in `names`.
+/// Whole-name equality only — no substring matching.
+fn expr_references_any(expr: &Expr, names: &HashSet<&str>) -> bool {
+    match expr {
+        Expr::Var { name, fallback } => {
+            if names.contains(name.as_str()) {
+                return true;
+            }
+            if let Some(fb) = fallback {
+                return expr_references_any(fb, names);
+            }
+            false
+        }
+        Expr::Literal(_) | Expr::StringLiteral(_) => false,
+        Expr::Calc(op) => calc_references_any(op, names),
+        Expr::StyleCondition { branches, fallback } => {
+            for b in branches {
+                if test_references_any(&b.condition, names) || expr_references_any(&b.then, names) {
+                    return true;
+                }
+            }
+            expr_references_any(fallback, names)
+        }
+        Expr::FunctionCall { args, .. } => {
+            args.iter().any(|a| expr_references_any(a, names))
+        }
+        Expr::Concat(parts) => parts.iter().any(|p| expr_references_any(p, names)),
+    }
+}
+
+fn calc_references_any(op: &CalcOp, names: &HashSet<&str>) -> bool {
+    match op {
+        CalcOp::Add(a, b)
+        | CalcOp::Sub(a, b)
+        | CalcOp::Mul(a, b)
+        | CalcOp::Div(a, b)
+        | CalcOp::Mod(a, b)
+        | CalcOp::Pow(a, b) => {
+            expr_references_any(a, names) || expr_references_any(b, names)
+        }
+        CalcOp::Min(args) | CalcOp::Max(args) => {
+            args.iter().any(|a| expr_references_any(a, names))
+        }
+        CalcOp::Clamp(a, b, c) => {
+            expr_references_any(a, names)
+                || expr_references_any(b, names)
+                || expr_references_any(c, names)
+        }
+        CalcOp::Round(_, a, b) => {
+            expr_references_any(a, names) || expr_references_any(b, names)
+        }
+        CalcOp::Sign(a) | CalcOp::Abs(a) | CalcOp::Negate(a) => expr_references_any(a, names),
+    }
+}
+
+fn test_references_any(test: &StyleTest, names: &HashSet<&str>) -> bool {
+    match test {
+        StyleTest::Single { property, value } => {
+            names.contains(property.as_str()) || expr_references_any(value, names)
+        }
+        StyleTest::And(parts) | StyleTest::Or(parts) => {
+            parts.iter().any(|p| test_references_any(p, names))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -687,30 +829,68 @@ struct IpShape {
     predicate: StyleTest,
 }
 
-/// Match `if(<pred>: <X>; else: <Y>)` where one of `<X>` / `<Y>` is
-/// `calc(self - <subtrahend>)` (the loop-stay branch) and the other is
-/// `calc(self + <integer literal>)` (the loop-advance branch). The two
-/// outcomes must share the same `self` slot.
+/// Match an IP-body whose shape is "stay-here-or-advance".
 ///
-/// The predicate stored in the descriptor is the test as it appears in
-/// the source, NOT normalised — phase 2 evaluates it directly. If the
-/// stay branch was the `else` (i.e. kiln emitted the inverted shape),
-/// phase 2 just reads the predicate and inverts its outcome there;
-/// phase 1's job is only to extract the structural fact that this is
-/// an IP body, not to canonicalise it.
+/// Two structural variants are accepted, both purely in terms of CSS
+/// shape — the recogniser does not look at any property name:
+///
+/// 1. **Single-predicate (STOS/MOVS/LODS form).**
+///    `if(<pred>: <X>; else: <Y>)` where one of `<X>` / `<Y>` is
+///    `calc(self - <subtrahend>)` (the loop-stay branch) and the other
+///    is `calc(self + <integer literal>)` (the loop-advance branch).
+///    The two outcomes share the same `self` slot.
+///
+/// 2. **Disjunctive-predicate (CMPS/SCAS form).**
+///    `if(<P1>: stay; <P2>: stay; ...; <Pn>: stay; else: advance)` —
+///    multiple branches all yielding the same stay body, with the
+///    fallback being the advance body. Or symmetrically, multiple
+///    branches all advancing with the fallback staying. The synthesised
+///    predicate is `Or(P1, P2, ..., Pn)`.
+///
+/// The predicate stored in the descriptor is the test as it appears (or
+/// the synthesised disjunction), NOT normalised — phase 2 evaluates it
+/// directly. If the stay branch was the `else` (i.e. kiln emitted the
+/// inverted shape), phase 2 just reads the predicate and inverts its
+/// outcome there; phase 1's job is only to extract the structural fact
+/// that this is an IP body, not to canonicalise it.
 fn match_ip_stay_or_advance(body: &Expr) -> Option<IpShape> {
     let Expr::StyleCondition { branches, fallback } = body else { return None };
-    if branches.len() != 1 {
+    if branches.is_empty() {
         return None;
     }
-    let then = &branches[0].then;
     let else_ = fallback.as_ref();
 
-    // Try both orientations.
-    if let Some(s) = match_ip_orientation(then, else_, &branches[0].condition) {
+    if branches.len() == 1 {
+        // Single-branch form (STOS/MOVS/LODS). Try both orientations.
+        let then = &branches[0].then;
+        if let Some(s) = match_ip_orientation(then, else_, &branches[0].condition) {
+            return Some(s);
+        }
+        return match_ip_orientation(else_, then, &branches[0].condition);
+    }
+
+    // Multi-branch form (CMPS/SCAS): all branch `then`s must be
+    // structurally equal; fallback is the other side. Two orientations:
+    //
+    //   - All branches stay; fallback advances. Predicate = OR(branch
+    //     conditions).
+    //   - All branches advance; fallback stays. Predicate = OR(branch
+    //     conditions), but inverted in meaning. We capture it as-is and
+    //     let phase 2 choose the polarity.
+    //
+    // Equality is recursive structural equality on Expr (PartialEq).
+    let first_then = &branches[0].then;
+    if !branches.iter().all(|b| &b.then == first_then) {
+        return None;
+    }
+    let conditions: Vec<StyleTest> = branches.iter().map(|b| b.condition.clone()).collect();
+    let synth_predicate = StyleTest::Or(conditions);
+
+    // Try (then=stay, else=advance) first, then the inverse.
+    if let Some(s) = match_ip_orientation(first_then, else_, &synth_predicate) {
         return Some(s);
     }
-    match_ip_orientation(else_, then, &branches[0].condition)
+    match_ip_orientation(else_, first_then, &synth_predicate)
 }
 
 fn match_ip_orientation(

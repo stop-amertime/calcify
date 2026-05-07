@@ -590,7 +590,7 @@ impl Evaluator {
                 eprintln!(
                     "  key={}={:#x} ip={} ip_self={} adv={} \
                      counter={} pointers={} pointer_steps={:?} \
-                     writes={} flag_cond={}",
+                     writes={} flag_cond={} bulk={:?}",
                     d.key_property,
                     d.key_value,
                     d.ip_property,
@@ -601,6 +601,7 @@ impl Evaluator {
                     psteps,
                     d.writes.len(),
                     d.flag_conditioned,
+                    d.bulk_class,
                 );
             }
         }

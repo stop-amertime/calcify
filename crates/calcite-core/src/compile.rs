@@ -6450,16 +6450,46 @@ fn validate_descriptor_for_opcode(
     if !ip_resolves {
         issues.push(format!("ip_property `{}` doesn't resolve", desc.ip_property));
     }
+
+    // Phase 3a: validate flag-conditioning matches what the runtime
+    // path treats as a flag-conditioned exit (CMPS/SCAS), and that the
+    // bulk classification is consistent with the runtime's hardcoded
+    // behaviour. The runtime always treats:
+    //   STOS (0xAA/AB) → Fill (constant from AL/AX)
+    //   MOVS (0xA4/A5) → Copy (reads through SI mirror)
+    //   CMPS/SCAS (0xA6/A7/AE/AF) → ReadOnly (no memory writes)
+    //   LODS (0xAC/AD) → ReadOnly
+    let expected_flag_cond = matches!(opcode, 0xA6 | 0xA7 | 0xAE | 0xAF);
+    if desc.flag_conditioned != expected_flag_cond {
+        issues.push(format!(
+            "flag_conditioned {} != expected {}",
+            desc.flag_conditioned, expected_flag_cond,
+        ));
+    }
+    use crate::pattern::loop_descriptor::BulkClass;
+    let expected_class = match opcode {
+        0xAA | 0xAB => BulkClass::Fill,
+        0xA4 | 0xA5 => BulkClass::Copy,
+        _ => BulkClass::ReadOnly,
+    };
+    if desc.bulk_class != expected_class {
+        issues.push(format!(
+            "bulk_class {:?} != expected {:?}",
+            desc.bulk_class, expected_class,
+        ));
+    }
     let _ = slots; // currently unused, may be used by deeper structural checks
 
     if issues.is_empty() {
         eprintln!(
-            "[rep-generic-validator] OK opcode {:#04x}: counter={} pointers={} writes={} ip={}",
+            "[rep-generic-validator] OK opcode {:#04x}: counter={} pointers={} writes={} ip={} flag_cond={} bulk={:?}",
             opcode,
             desc.counter.is_some(),
             desc.pointers.len(),
             desc.writes.len(),
             desc.ip_property,
+            desc.flag_conditioned,
+            desc.bulk_class,
         );
     } else {
         eprintln!(

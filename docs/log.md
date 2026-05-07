@@ -11,6 +11,104 @@ and the Criterion benchmarks.
 
 ---
 
+## 2026-05-07 — `rep_fast_forward` genericity mission, phase 3a: CMPS/SCAS recognition + BulkClass classification
+
+Cross-link: see CSS-DOS
+[`docs/plans/2026-05-06-rep-fast-forward-genericity.md`](../../CSS-DOS/docs/plans/2026-05-06-rep-fast-forward-genericity.md)
+checkpoint 3 — landed today as **phase 3a** (recogniser + classification,
+diagnostic-bedded). Phase 3b (the actual descriptor-driven applier
+flip + memory snapshot diffs + ±1% perf gate) is deferred to a future
+session. Same in-session re-scope rationale that split phase 2 into a
+diagnostic-bedded validator: trying to ship both halves of phase 3
+together in one session is high-risk on a perf-gated mission.
+
+What landed in calcite:
+
+- **CMPS/SCAS-shape recognition.** `match_ip_stay_or_advance` now
+  accepts multi-branch IP bodies where N≥1 branches all yield the same
+  "stay" body and the fallback advances (or vice versa). The
+  synthesised predicate is `Or(branch1.condition, branch2.condition,
+  ...)`. The single-branch shape (STOS/MOVS/LODS) is unchanged; the
+  multi-branch shape (CMPS/SCAS via kiln's `repCondIP`) is new. Pure
+  structural — no opcode awareness.
+- **`BulkClass` enum on `LoopDescriptor`.** Computed at descriptor
+  build time by `classify_bulk()`. Four variants:
+  - `ReadOnly` — no writes. CMPS/SCAS/LODS land here.
+  - `Fill` — writes exist; no value expression transitively references
+    any pointer's `self_property` mirror. STOSB/STOSW land here, as
+    does the cabinet-shape MOVSB/MOVSW that uses an intermediate slot
+    (`--_strSrcByte`) instead of reading directly through SI's mirror.
+  - `Copy` — at least one value expression references a pointer
+    mirror. The structural test is `expr_references_any(val_expr,
+    {pointer.self_property})` — whole-name equality only, no
+    substring inspection.
+  - `PerIter` — fallback. Currently unused but reserved for future
+    shapes the classifier can't simplify.
+- **Validator extended.** `validate_descriptor_for_opcode` now also
+  asserts `flag_conditioned` and `bulk_class` against runtime
+  expectations (CMPS/SCAS expected `flag_conditioned=true`,
+  ReadOnly; STOS expected Fill; MOVS expected Copy). DRIFT messages
+  surface the mismatches honestly rather than papering over them.
+- **5 new unit tests** in `pattern::loop_descriptor::tests`:
+  - `cmps_shape_recognised_with_flag_conditioning` — multi-branch IP
+    body, `Or` synthesised predicate, flag_conditioned, ReadOnly.
+  - `scas_shape_recognised_with_one_pointer_and_readonly_class`.
+  - `cabinet_a_classifies_stos_as_fill_and_movs_as_copy` — documents
+    that cabinet A's MOVSB classifies as Fill (not Copy) because the
+    val_expr is `var("--_strSrcByte")`, not a pointer mirror. Real
+    structural finding, not a bug.
+  - `pointer_mirror_in_value_expr_classifies_as_copy` — explicit
+    cabinet whose val_expr reads through the pointer mirror. Confirms
+    the classifier flips to Copy when the dependency is structurally
+    visible.
+  - `brainfuck_cmps_shape_classifies_identically_to_x86_cmps_shape` —
+    cardinal-rule probe for phase 3a: arbitrary-named CMPS-shaped
+    cabinet produces the same structural classification.
+- 15 / 15 loop-descriptor tests pass.
+
+Validator output on the live doom8088 cabinet:
+
+```
+[rep-generic-validator] OK opcode 0xab: ... flag_cond=false bulk=Fill
+[rep-generic-validator] OK opcode 0xaa: ... flag_cond=false bulk=Fill
+[rep-generic-validator] DRIFT opcode 0xa4: bulk_class Fill != expected Copy
+[rep-generic-validator] DRIFT opcode 0xa5: bulk_class Fill != expected Copy
+[rep-generic-validator] OK opcode 0xa6: ... flag_cond=true bulk=ReadOnly
+[rep-generic-validator] OK opcode 0xae: ... flag_cond=true bulk=ReadOnly
+[rep-generic-validator] OK opcode 0xa7: ... flag_cond=true bulk=ReadOnly
+[rep-generic-validator] OK opcode 0xaf: ... flag_cond=true bulk=ReadOnly
+```
+
+The MOVS DRIFT is a real, structurally-honest finding: the kiln-emitted
+cabinet inserts an intermediate slot (`--_strSrcByte`) between SI's
+prior-tick mirror and the write value, so the pure-shape classifier
+can't see the pointer dependency. Phase 3b's runtime applier needs
+either a separate pass that traces intermediates, or to fall back to
+PerIter for cabinets where Copy isn't structurally visible.
+
+`CALCITE_LOOP_DIAG=1` on doom8088 now reports 10 descriptors (was 6
+in phase 1+2): adds 0xA6/A7/AE/AF (CMPS/SCAS) all with
+`flag_cond=true bulk=ReadOnly`.
+
+Smoke 7/7 PASS. doom-loading bench reaches in-game at tick 34.65M on
+calcite-cli with the flag both off and on (parity with pre-mission
+baseline). Validator runs at most 8 times per session (once per
+fast-forwarded opcode), so cost is negligible.
+
+Default still OFF — diagnostic-bedded landing, same shape as phase 2.
+
+Pickup notes for whoever takes phase 3b: the pieces that would benefit
+from earlier-than-final landing are already there. The recogniser
+covers all 8 opcodes. The descriptor carries `bulk_class`. The
+validator surfaces drift. What remains is the actual applier — and the
+honest finding that real-cabinet MOVS classifies as Fill structurally
+means phase 3b either (a) ships an intermediate-tracing classification
+pass that promotes Fill→Copy where applicable, or (b) accepts that
+some shapes will only ever be PerIter and the bulk fast-path covers
+STOS but not MOVS.
+
+---
+
 ## 2026-05-07 — `rep_fast_forward` genericity mission, phase 2: descriptor validator + virtual_regions
 
 Cross-link: see CSS-DOS
