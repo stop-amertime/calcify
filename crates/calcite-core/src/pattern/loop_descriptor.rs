@@ -211,6 +211,27 @@ pub struct WriteEntry {
     pub addr_expr: Expr,
     /// Value expression for this opcode.
     pub val_expr: Expr,
+    /// Structural decomposition of `addr_expr` into a `(segment_slot,
+    /// pointer_slot)` pair, when the address has the canonical
+    /// "segment-shifted-by-16 plus pointer" shape that bulk appliers
+    /// can iterate over.
+    ///
+    /// The recogniser searches `addr_expr` for any sub-expression of
+    /// shape `calc(seg_var * 16 + ptr_var)` or `calc(ptr_var + seg_var
+    /// * 16)`, where `seg_var` and `ptr_var` are both `Expr::Var`
+    /// references. The literal `16` is the only number-content the
+    /// matcher is allowed to read — it is the canonical 8086-style
+    /// segment shift, structurally identical to "scale a base by a
+    /// fixed page size and add an offset" in any other ISA. (The
+    /// genericity probe: a 6502 / brainfuck / non-emulator cabinet
+    /// that emits the same shape — base * K + index, K constant — must
+    /// decompose identically.)
+    ///
+    /// `Some((seg_property, pointer_property))` when the shape matches;
+    /// `None` otherwise (e.g. for shapes the structural matcher can't
+    /// simplify — bulk appliers fall back to per-iter `addr_expr`
+    /// evaluation in that case).
+    pub addr_decomposition: Option<(String, String)>,
 }
 
 /// Recognise self-loop opcodes in a dispatch family.
@@ -671,6 +692,7 @@ fn recognise_one_opcode<'a>(
             };
         }
 
+        let addr_decomposition = decompose_addr_expr(addr_expr);
         if let Some((vp, _, _)) = best {
             let ve = writes_val[vp];
             writes_val.remove(vp);
@@ -679,6 +701,7 @@ fn recognise_one_opcode<'a>(
                 val_property: vp.to_string(),
                 addr_expr: addr_expr.clone(),
                 val_expr: ve.clone(),
+                addr_decomposition,
             });
         } else {
             writes.push(WriteEntry {
@@ -686,6 +709,7 @@ fn recognise_one_opcode<'a>(
                 val_property: String::new(),
                 addr_expr: addr_expr.clone(),
                 val_expr: Expr::Literal(0.0),
+                addr_decomposition,
             });
         }
     }
@@ -1118,6 +1142,122 @@ fn classify_memwrite_side(body: &Expr) -> MemwriteSide {
     } else {
         MemwriteSide::ValueLike
     }
+}
+
+/// Search `expr` for any sub-expression of shape `(var * 16) + var` or
+/// `var + (var * 16)`. Returns the `(scale_var, offset_var)` pair on the
+/// first match found via post-order tree walk.
+///
+/// The bulk applier (phase 3b runtime path) needs the segment/pointer
+/// pair to step through memory iteration-by-iteration. The recogniser
+/// finds it once at compile time so the applier can stay name-blind.
+///
+/// Cardinal-rule note: this matcher reads the literal **value** `16`
+/// (the page-size constant the canonical 8086 segment shift uses), but
+/// inspects no character of any property name. Any cabinet — ISA-
+/// flavoured or otherwise — whose write-address has shape
+/// `calc(base * 16 + offset)` decomposes identically.
+fn decompose_addr_expr(expr: &Expr) -> Option<(String, String)> {
+    // Try to match this node directly.
+    if let Some(pair) = match_segmented_address(expr) {
+        return Some(pair);
+    }
+    // Otherwise descend through the structures the recogniser already
+    // knows how to peek inside (StyleCondition branches, Calc/FunCall
+    // children). The address expression typically appears wrapped in
+    // `if(active_guard: -1; else: <real_address>)`; finding the shape
+    // anywhere inside that wrapper is sufficient.
+    match expr {
+        Expr::Calc(op) => decompose_in_calc(op),
+        Expr::StyleCondition { branches, fallback } => {
+            for b in branches {
+                if let Some(pair) = decompose_addr_expr(&b.then) {
+                    return Some(pair);
+                }
+            }
+            decompose_addr_expr(fallback)
+        }
+        Expr::FunctionCall { args, .. } => {
+            for a in args {
+                if let Some(pair) = decompose_addr_expr(a) {
+                    return Some(pair);
+                }
+            }
+            None
+        }
+        Expr::Concat(parts) => {
+            for p in parts {
+                if let Some(pair) = decompose_addr_expr(p) {
+                    return Some(pair);
+                }
+            }
+            None
+        }
+        Expr::Literal(_) | Expr::StringLiteral(_) | Expr::Var { .. } => None,
+    }
+}
+
+fn decompose_in_calc(op: &CalcOp) -> Option<(String, String)> {
+    match op {
+        CalcOp::Add(a, b) | CalcOp::Sub(a, b) | CalcOp::Mul(a, b)
+        | CalcOp::Div(a, b) | CalcOp::Mod(a, b) | CalcOp::Pow(a, b) => {
+            decompose_addr_expr(a).or_else(|| decompose_addr_expr(b))
+        }
+        CalcOp::Min(args) | CalcOp::Max(args) => {
+            for a in args { if let Some(p) = decompose_addr_expr(a) { return Some(p); } }
+            None
+        }
+        CalcOp::Clamp(a, b, c) => decompose_addr_expr(a)
+            .or_else(|| decompose_addr_expr(b))
+            .or_else(|| decompose_addr_expr(c)),
+        CalcOp::Round(_, a, b) => decompose_addr_expr(a).or_else(|| decompose_addr_expr(b)),
+        CalcOp::Sign(a) | CalcOp::Abs(a) | CalcOp::Negate(a) => decompose_addr_expr(a),
+    }
+}
+
+/// Match the canonical "segment * 16 + pointer" shape at this exact
+/// node. Returns `Some((seg_name, ptr_name))` when both halves are bare
+/// `Expr::Var` references and the multiplication's other operand is the
+/// literal 16. Recognises both operand orderings of the outer `+`.
+fn match_segmented_address(expr: &Expr) -> Option<(String, String)> {
+    let Expr::Calc(CalcOp::Add(left, right)) = expr else { return None };
+    // Try left = (seg * 16), right = pointer.
+    if let Some(seg) = match_var_times_sixteen(left) {
+        if let Some(ptr) = match_bare_var(right) {
+            return Some((seg, ptr));
+        }
+    }
+    // Try right = (seg * 16), left = pointer.
+    if let Some(seg) = match_var_times_sixteen(right) {
+        if let Some(ptr) = match_bare_var(left) {
+            return Some((seg, ptr));
+        }
+    }
+    None
+}
+
+/// `var(--name) * 16` or `16 * var(--name)`, returning the var name.
+fn match_var_times_sixteen(expr: &Expr) -> Option<String> {
+    let Expr::Calc(CalcOp::Mul(a, b)) = expr else { return None };
+    if let (Some(name), true) = (match_bare_var(a), match_lit_eq(b, 16.0)) {
+        return Some(name);
+    }
+    if let (Some(name), true) = (match_bare_var(b), match_lit_eq(a, 16.0)) {
+        return Some(name);
+    }
+    None
+}
+
+fn match_bare_var(expr: &Expr) -> Option<String> {
+    if let Expr::Var { name, fallback: None } = expr {
+        Some(name.clone())
+    } else {
+        None
+    }
+}
+
+fn match_lit_eq(expr: &Expr, target: f64) -> bool {
+    matches!(expr, Expr::Literal(v) if *v == target)
 }
 
 fn expression_contains_neg_one_literal(expr: &Expr) -> bool {

@@ -1500,3 +1500,214 @@ fn brainfuck_cmps_shape_classifies_identically_to_x86_cmps_shape() {
     assert!(d.flag_conditioned);
     assert_eq!(d.bulk_class, BulkClass::ReadOnly);
 }
+
+// ---------------------------------------------------------------------------
+// Phase 3b Step 1: addr_decomposition.
+// ---------------------------------------------------------------------------
+
+/// Cabinet A's STOS / MOVS write addresses are
+/// `add(mul(--__1ES, 16), --__1DI)` — segment-shifted-then-pointer.
+/// Both descriptors should pick up the same `(segment, pointer)` pair.
+#[test]
+fn cabinet_a_writes_decompose_segment_times_sixteen_plus_pointer() {
+    let descs = recognise_loops(&cabinet_a());
+    assert!(!descs.is_empty());
+    for d in &descs {
+        assert!(!d.writes.is_empty(), "expected at least one write entry: {:?}", d);
+        for w in &d.writes {
+            assert_eq!(
+                w.addr_decomposition.as_ref().map(|(s, p)| (s.as_str(), p.as_str())),
+                Some(("--__1ES", "--__1DI")),
+                "expected decomposition (--__1ES, --__1DI), got {:?}",
+                w.addr_decomposition
+            );
+        }
+    }
+}
+
+/// Cabinet B uses unrelated names but the same structural shape, so
+/// decomposition must succeed and produce that cabinet's seg/ptr pair.
+/// This is the cardinal-rule genericity probe for Step 1.
+#[test]
+fn cabinet_b_writes_decompose_to_brainfuck_names() {
+    let descs = recognise_loops(&cabinet_b());
+    assert!(!descs.is_empty());
+    for d in &descs {
+        for w in &d.writes {
+            assert_eq!(
+                w.addr_decomposition.as_ref().map(|(s, p)| (s.as_str(), p.as_str())),
+                Some(("--priorBagPage", "--priorTapeWriteHead")),
+                "expected decomposition (--priorBagPage, --priorTapeWriteHead), got {:?}",
+                w.addr_decomposition
+            );
+        }
+    }
+}
+
+/// The reversed-orientation form `pointer + (segment * 16)` decomposes
+/// the same way. The matcher accepts either ordering of the outer add.
+#[test]
+fn addr_decomposition_accepts_pointer_plus_segment_times_sixteen() {
+    // Hand-roll a one-opcode dispatch family with the reversed addr
+    // shape, otherwise structurally identical to cabinet_a's stos.
+    let pred_continue = style_eq("--rc", 1.0);
+    let no_rep = style_eq("--hr", 0.0);
+    let active = StyleTest::And(vec![
+        style_eq("--hr", 1.0),
+        style_eq("--ra", 0.0),
+    ]);
+
+    let cx = dispatch("--op", vec![(1.0, counter_body(no_rep, "--c"))], keep_self("--c"));
+    let ip = dispatch(
+        "--op",
+        vec![(1.0, ip_body(pred_continue, "--ip", var("--pl"), 1))],
+        keep_self("--ip"),
+    );
+    let ip_wrapped = add(ip, var("--pl"));
+    let p = dispatch(
+        "--op",
+        vec![(1.0, pointer_body(active.clone(), "--di", 1, "--fl", 10, "--lb", "--bit"))],
+        keep_self("--di"),
+    );
+    // Reversed: pointer first, then (segment * 16).
+    let addr = dispatch(
+        "--op",
+        vec![(
+            1.0,
+            iff(
+                active.clone(),
+                lit(-1.0),
+                add(var("--di"), mul(var("--es"), lit(16.0))),
+            ),
+        )],
+        lit(-1.0),
+    );
+    let val = dispatch("--op", vec![(1.0, var("--al"))], lit(0.0));
+
+    let asns = vec![
+        assign("--c", cx),
+        assign("--ip", ip_wrapped),
+        assign("--di", p),
+        assign("--mAddr", addr),
+        assign("--mVal", val),
+    ];
+    let descs = recognise_loops(&asns);
+    assert_eq!(descs.len(), 1, "expected 1 descriptor, got {:?}", descs);
+    let w = &descs[0].writes[0];
+    assert_eq!(
+        w.addr_decomposition.as_ref().map(|(s, p)| (s.as_str(), p.as_str())),
+        Some(("--es", "--di")),
+    );
+}
+
+/// `16 * segment` (multiplication operand order swapped) is also accepted.
+/// The rule is "one operand is the literal 16, the other is a bare var",
+/// not "the var must come first".
+#[test]
+fn addr_decomposition_accepts_sixteen_times_segment() {
+    let pred_continue = style_eq("--rc", 1.0);
+    let no_rep = style_eq("--hr", 0.0);
+    let active = StyleTest::And(vec![
+        style_eq("--hr", 1.0),
+        style_eq("--ra", 0.0),
+    ]);
+
+    let cx = dispatch("--op", vec![(1.0, counter_body(no_rep, "--c"))], keep_self("--c"));
+    let ip = dispatch(
+        "--op",
+        vec![(1.0, ip_body(pred_continue, "--ip", var("--pl"), 1))],
+        keep_self("--ip"),
+    );
+    let ip_wrapped = add(ip, var("--pl"));
+    let p = dispatch(
+        "--op",
+        vec![(1.0, pointer_body(active.clone(), "--di", 1, "--fl", 10, "--lb", "--bit"))],
+        keep_self("--di"),
+    );
+    let addr = dispatch(
+        "--op",
+        vec![(
+            1.0,
+            iff(
+                active.clone(),
+                lit(-1.0),
+                // (16 * --es) + --di
+                add(mul(lit(16.0), var("--es")), var("--di")),
+            ),
+        )],
+        lit(-1.0),
+    );
+    let val = dispatch("--op", vec![(1.0, var("--al"))], lit(0.0));
+
+    let asns = vec![
+        assign("--c", cx),
+        assign("--ip", ip_wrapped),
+        assign("--di", p),
+        assign("--mAddr", addr),
+        assign("--mVal", val),
+    ];
+    let descs = recognise_loops(&asns);
+    let w = &descs[0].writes[0];
+    assert_eq!(
+        w.addr_decomposition.as_ref().map(|(s, p)| (s.as_str(), p.as_str())),
+        Some(("--es", "--di")),
+    );
+}
+
+/// An address whose shape is NOT segment*16 + pointer must yield None.
+/// Here the multiplier is 32 (some other paging granule) — the matcher
+/// is committed to literal 16 (the canonical 8086 page constant; any
+/// non-emulator cabinet using a different page size will need its own
+/// matcher entry, which is fine — that's a structural fact about the
+/// shape, not a name-content read).
+#[test]
+fn addr_decomposition_returns_none_for_non_canonical_shape() {
+    let pred_continue = style_eq("--rc", 1.0);
+    let no_rep = style_eq("--hr", 0.0);
+    let active = StyleTest::And(vec![
+        style_eq("--hr", 1.0),
+        style_eq("--ra", 0.0),
+    ]);
+
+    let cx = dispatch("--op", vec![(1.0, counter_body(no_rep, "--c"))], keep_self("--c"));
+    let ip = dispatch(
+        "--op",
+        vec![(1.0, ip_body(pred_continue, "--ip", var("--pl"), 1))],
+        keep_self("--ip"),
+    );
+    let ip_wrapped = add(ip, var("--pl"));
+    let p = dispatch(
+        "--op",
+        vec![(1.0, pointer_body(active.clone(), "--di", 1, "--fl", 10, "--lb", "--bit"))],
+        keep_self("--di"),
+    );
+    // Multiplier is 32, not 16. Decomposer should return None.
+    let addr = dispatch(
+        "--op",
+        vec![(
+            1.0,
+            iff(
+                active.clone(),
+                lit(-1.0),
+                add(mul(var("--es"), lit(32.0)), var("--di")),
+            ),
+        )],
+        lit(-1.0),
+    );
+    let val = dispatch("--op", vec![(1.0, var("--al"))], lit(0.0));
+
+    let asns = vec![
+        assign("--c", cx),
+        assign("--ip", ip_wrapped),
+        assign("--di", p),
+        assign("--mAddr", addr),
+        assign("--mVal", val),
+    ];
+    let descs = recognise_loops(&asns);
+    assert_eq!(descs.len(), 1);
+    assert!(
+        descs[0].writes[0].addr_decomposition.is_none(),
+        "expected None for multiplier-32 shape, got {:?}",
+        descs[0].writes[0].addr_decomposition
+    );
+}

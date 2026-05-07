@@ -603,6 +603,16 @@ impl Evaluator {
                     d.flag_conditioned,
                     d.bulk_class,
                 );
+                for w in &d.writes {
+                    let dec = match &w.addr_decomposition {
+                        Some((s, p)) => format!("({}, {})", s, p),
+                        None => String::from("None"),
+                    };
+                    eprintln!(
+                        "    write addr={} val={} decompose={}",
+                        w.addr_property, w.val_property, dec
+                    );
+                }
             }
         }
 
