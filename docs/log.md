@@ -11,6 +11,67 @@ and the Criterion benchmarks.
 
 ---
 
+## 2026-05-07 — phase 3b step 6: `BulkClass::ReadOnly` applier (LODS / CMPS / SCAS)
+
+Worktree `worktree-rep-3b` only. `apply_read_only` lands in
+`crates/calcite-core/src/pattern/rep_applier.rs` as the third sibling
+of `apply_fill` / `apply_copy`, completes the descriptor-driven
+applier surface for the three no-write self-loop shapes, and is
+wired into `rep_dual_harness::apply_descriptor`.
+
+**Key design decision: the three sub-shapes fall out of structural
+metadata without naming opcodes.** `bulk_class == ReadOnly` plus
+`writes.is_empty()` is the universal mark. The dispatch then keys on
+two structural facts the recogniser already produces:
+`flag_conditioned` (whether the predicate has the disjunction shape
+that gates an early exit) and `pointers.len()`. LODS =
+`flag_conditioned=false` + 1 pointer + no comparison. SCAS =
+`flag_conditioned=true` + 1 pointer. CMPS = `flag_conditioned=true`
++ 2 pointers. No opcode dispatch, no name inspection in the LODS
+arm. The CMPS-shape arm structurally enforces that both pointers
+share `base_step` and `flag_property`/`flag_bit` — disagreement
+bails to Unsupported.
+
+**Cardinal-rule wart, contained and documented in code.** The
+CMPS/SCAS arm reads `--ES`, `--DS`, `--SI`, `--DI`, `--AL`, `--AX`,
+and `--repType` by literal name to drive the per-iter equality check
+and REPE/REPNE early-exit logic. Documented in a multi-paragraph
+WART comment in `apply_read_only` (search for "CARDINAL-RULE WART")
+explicitly as **the next cardinal-rule wart to fix after
+`rep_fast_forward` is gone**, with a forward reference to scoping
+doc Q3 Option B (the recogniser-extension fix that lifts the
+`ComparisonShape` info onto the descriptor structurally). Q3 Option
+A is the agreed temporary; the LODS arm is structurally clean.
+Memory and extended diffs are trivially satisfied by both paths
+(`ReadOnly` doesn't mutate either).
+
+**Tests landed: 18 new (228 → 246 passing).** Coverage: LODS byte
+forward / reverse / zero-counter; CMPS byte equal-throughout (REPE
+runs all iterations), CMPS byte mismatch-mid-walk (REPE early exit),
+CMPS byte REPNE early exit on first match, CMPS word equal-
+throughout; SCAS byte REPNE find-target, SCAS byte REPNE no-match-
+full-counter, SCAS word REPNE find-target; refusal paths (non-
+ReadOnly class, writes-present, no pointers, LODS with two pointers,
+CMPS with mismatched steps); LODS genericity probe (unrelated
+property names); dual-mode equivalence against direct mirrors of the
+hardcoded path for SCASB/REPNE and CMPSB/REPE. The 4 pre-existing
+`rep_fast_forward: no-opcode` failures (`compile::tests::compile_*`,
+`eval::tests::tick_applies_assignments`) are unchanged.
+
+**Deferred to step 7.** State-var commits (DI/SI/CX/IP/cycleCount/
+flags) — same boundary as steps 4-5. Real-cabinet verification (no
+calcite-cli runs against any cabinet this session per brief). Q3
+Option B's recogniser-driven `ComparisonShape` extraction. The
+`rep_dual_harness` `BulkClass::ReadOnly` arm now dispatches to the
+applier (no longer `unimplemented!()`); the corresponding
+`stub_applier_dispatches_on_readonly_arm` test was renamed
+`*_without_panic` and now asserts `ApplierResult::Skip` on the
+minimal fixture, mirroring the Fill/Copy precedent.
+`BulkClass::PerIter` remains the only `unimplemented!()` arm,
+awaiting step 7.
+
+---
+
 ## 2026-05-07 — phase 3b step 5: `BulkClass::Copy` applier (worktree)
 
 `crates/calcite-core/src/pattern/rep_applier.rs::apply_copy` is the

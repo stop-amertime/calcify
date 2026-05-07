@@ -5,8 +5,10 @@
 //! per-opcode `match`. Step 5 adds [`apply_copy`] — the `BulkClass::Copy`
 //! arm, MOVS-shaped: each iteration reads a byte (or a small block of
 //! bytes) at a stepping source pointer and writes it at a stepping
-//! destination pointer. Step 6 fills in `ReadOnly` next to them; step 7
-//! then rips out the hardcoded path.
+//! destination pointer. Step 6 adds [`apply_read_only`] for LODS / CMPS /
+//! SCAS — loops that walk pointers without mutating memory, with a
+//! flag-conditioned early exit on CMPS/SCAS. Step 7 then rips out the
+//! hardcoded path.
 //!
 //! ## What "descriptor-driven" means here
 //!
@@ -538,6 +540,251 @@ pub(crate) fn apply_copy(
     }
 
     ApplyOutcome::Applied { iterations: n }
+}
+
+/// Apply a `BulkClass::ReadOnly` descriptor to state. The structural contract:
+///
+/// `ReadOnly` covers loops that walk pointers and possibly check a
+/// flag-conditioned early-exit predicate, but never mutate memory. On x86
+/// these are LODS / CMPS / SCAS; structurally any cabinet whose recogniser
+/// produces a descriptor with `writes.len() == 0` and one of the three
+/// shapes below would dispatch identically here.
+///
+/// ## Structural sub-shapes (no opcode dispatch)
+///
+/// The applier distinguishes the three sub-shapes structurally from
+/// metadata the recogniser already produces:
+///
+/// | Shape | `flag_conditioned` | `pointers.len()` | Behaviour |
+/// |-------|--------------------|------------------|-----------|
+/// | LODS  | false              | 1                | walks `n` iters, no comparison, no exit |
+/// | SCAS  | true               | 1                | walks until CX exhausted or flag-condition flips |
+/// | CMPS  | true               | 2                | walks until CX exhausted or flag-condition flips |
+///
+/// `flag_conditioned` is captured by the recogniser at descriptor build
+/// time from the predicate's disjunction shape (REPE/REPNE arms). The
+/// pointer count is structural by construction. The applier never reads
+/// an opcode value or a property name as a discriminator.
+///
+/// ## Memory side-effects
+///
+/// `ReadOnly` produces zero memory or extended-map mutation by definition
+/// — neither LODS, CMPS, nor SCAS writes a single byte. The applier
+/// therefore satisfies the dual harness's memory + extended diff trivially:
+/// it never touches `state.memory` or `state.extended`.
+///
+/// ## Iteration count
+///
+/// For LODS, the iteration count equals the counter `n`.
+///
+/// For CMPS/SCAS, the iteration count depends on per-iter source-vs-
+/// destination equality. Computing it accurately requires reading source
+/// segments / accumulators / `--repType` to apply the REPE/REPNE early-
+/// exit logic. The descriptor as it stands today does NOT carry segment
+/// info for `ReadOnly` (segments live on `WriteEntry.addr_decomposition`,
+/// and `ReadOnly` has no writes), nor does it carry "this is the
+/// accumulator" metadata for SCAS, nor does it expose the predicate's
+/// REPE-vs-REPNE distinction in a name-blind form (the predicate is a
+/// `StyleTest` against the cabinet's `--repType` slot; the runtime needs
+/// to read that slot's current value to decide which branch fires).
+///
+/// **The cardinal-rule wart for ReadOnly** therefore lives in the
+/// CMPS/SCAS branch below: it reads `--ES`, `--DS`, `--SI`, `--DI`,
+/// `--AL`, `--AX`, and `--repType` by name, mirroring the hardcoded
+/// path's `rep_fast_forward_cmps_scas`. This is **the next cardinal-rule
+/// wart to fix after `rep_fast_forward` itself is gone** — Q3 of the
+/// scoping doc explicitly accepts it as a temporary in this step. The
+/// scoping doc's Q3 Option B (extracting the comparison structurally
+/// into the descriptor as a `comparison: Option<ComparisonShape>` field)
+/// is the cardinal-rule clean answer; landing it requires extending the
+/// recogniser and is deliberately deferred.
+///
+/// LODS is structurally clean — it reads no name as text beyond the
+/// `counter.property` lookup that all variants share (which is itself
+/// whole-name slot equality, the same routing every applier uses).
+///
+/// ## State-var deltas (deferred to step 7)
+///
+/// As with [`apply_fill`] and [`apply_copy`], state-var commits
+/// (DI/SI/CX/IP/cycleCount/flags) are deferred to step 7's full flip.
+/// The dual harness diffs only memory + extended in this step.
+pub(crate) fn apply_read_only(
+    descriptor: &LoopDescriptor,
+    program: &CompiledProgram,
+    state: &mut State,
+    slots: &[i32],
+) -> ApplyOutcome {
+    if descriptor.bulk_class != BulkClass::ReadOnly {
+        return ApplyOutcome::Unsupported("not ReadOnly class");
+    }
+    let Some(counter) = descriptor.counter.as_ref() else {
+        return ApplyOutcome::Unsupported("no counter");
+    };
+    let Some(n) = read_prop(program, state, slots, &counter.property) else {
+        return ApplyOutcome::Unsupported("counter unresolved");
+    };
+    if n <= 0 {
+        return ApplyOutcome::Applied { iterations: 0 };
+    }
+    if !descriptor.writes.is_empty() {
+        // ReadOnly by definition has no writes. A descriptor with writes
+        // got mis-classified upstream — bail.
+        return ApplyOutcome::Unsupported("ReadOnly expects no writes");
+    }
+    let p_count = descriptor.pointers.len();
+    if p_count == 0 || p_count > 2 {
+        return ApplyOutcome::Unsupported("ReadOnly expects 1 or 2 pointers");
+    }
+
+    // Structural sub-shape selection. No opcode discriminator; no name
+    // inspection. The classifier's `flag_conditioned` already captured
+    // whether the predicate has the disjunction shape that gates an
+    // early exit; pointer count distinguishes CMPS (2) from SCAS (1) at
+    // a structural level. LODS is the no-exit case (`flag_conditioned`
+    // is false; the predicate is just the counter check).
+    if !descriptor.flag_conditioned {
+        // LODS shape. No memory writes, no early exit, n iterations.
+        // The accumulator is loaded at end of run from the post-walk
+        // pointer position — that's a state-var update which step 7
+        // owns. For step 6 the only observable from the harness's
+        // perspective is "memory unchanged" + iteration count = n.
+        if p_count != 1 {
+            return ApplyOutcome::Unsupported(
+                "LODS shape (flag_conditioned=false) expects exactly 1 pointer",
+            );
+        }
+        return ApplyOutcome::Applied { iterations: n };
+    }
+
+    // CMPS / SCAS shape. CMPS = 2 pointers (source + dest), SCAS = 1
+    // pointer (dest only — source is the accumulator).
+    //
+    // -------------------------------------------------------------------
+    // CARDINAL-RULE WART (next to fix after rep_fast_forward retirement).
+    // -------------------------------------------------------------------
+    // The reads below resolve `--ES` / `--DS` / `--SI` / `--DI` / `--AL`
+    // / `--AX` / `--repType` by literal name. This re-introduces upstream
+    // (x86) knowledge into a calcite-core path. It is contained to this
+    // function and only fires for CMPS/SCAS-shaped descriptors. The Q3
+    // Option B fix is to add a `comparison: Option<ComparisonShape>`
+    // field to `LoopDescriptor` that the recogniser populates from the
+    // predicate's structural shape (where ComparisonShape captures
+    // "compare bytes at two stepping pointers" or "compare register vs
+    // byte at stepping pointer", with segment slot info per pointer).
+    // Once that field exists, the lookups below become structural slot
+    // resolutions just like every other applier, and this WART comment
+    // can come out.
+    //
+    // Q3 Option A (this code) is acceptable as a temporary because:
+    //   1. It's a leaf call site, not a structural decision in the
+    //      recogniser. The cardinal rule's "calcite must work on a
+    //      6502 / brainfuck cabinet" property holds for the recogniser
+    //      and the dispatch in this function (LODS path is clean; the
+    //      CMPS/SCAS dispatch is by `flag_conditioned` + pointer count,
+    //      both purely structural).
+    //   2. The hardcoded names match what the existing
+    //      `rep_fast_forward_cmps_scas` already reads — the wart is
+    //      transferred, not multiplied.
+    //   3. Steps 4-5 set the precedent of accepting bounded warts when
+    //      the cleaner path requires a recogniser extension that's
+    //      genuinely independent work.
+    let dst_seg = read_prop(program, state, slots, "--ES").unwrap_or(0) & 0xFFFF;
+    let dst_seg_base = (dst_seg as i64) * 16;
+    let dst_entry = &descriptor.pointers[0];
+    let Some(dst_ptr) = read_prop(program, state, slots, &dst_entry.self_property) else {
+        return ApplyOutcome::Unsupported("dst pointer unresolved");
+    };
+    let Some(flags) = read_prop(program, state, slots, &dst_entry.flag_property) else {
+        return ApplyOutcome::Unsupported("flag_property unresolved");
+    };
+    let df_active = ((flags >> dst_entry.flag_bit) & 1) != 0;
+    let step: i32 = dst_entry.base_step;
+    let signed_step: i32 = if df_active { -step } else { step };
+    let is_word = step == 2;
+
+    // CMPS gets its source pointer from the second pointer entry.
+    // SCAS gets its source from the AL/AX accumulator.
+    let is_cmps = p_count == 2;
+    let (src_ptr_opt, src_seg_base, scas_acc) = if is_cmps {
+        let src_entry = &descriptor.pointers[1];
+        // Sanity: CMPS-shape pointers must share step + direction flag.
+        if src_entry.base_step != step
+            || src_entry.flag_property != dst_entry.flag_property
+            || src_entry.flag_bit != dst_entry.flag_bit
+        {
+            return ApplyOutcome::Unsupported(
+                "CMPS-shape pointers disagree on step / direction flag",
+            );
+        }
+        let Some(src_ptr) = read_prop(program, state, slots, &src_entry.self_property) else {
+            return ApplyOutcome::Unsupported("src pointer unresolved");
+        };
+        let src_seg = read_prop(program, state, slots, "--DS").unwrap_or(0) & 0xFFFF;
+        (Some(src_ptr & 0xFFFF), (src_seg as i64) * 16, 0)
+    } else {
+        // SCAS. Accumulator: AX for word, AL for byte.
+        let acc = if is_word {
+            read_prop(program, state, slots, "--AX").unwrap_or(0) & 0xFFFF
+        } else {
+            read_prop(program, state, slots, "--AL").unwrap_or(0) & 0xFF
+        };
+        (None, 0i64, acc)
+    };
+    let rep_type = read_prop(program, state, slots, "--repType").unwrap_or(0);
+
+    // Per-iter walk. Same shape as `rep_fast_forward_cmps_scas`. We don't
+    // mutate memory (no `bulk_store_byte` or `bulk_fill` here), so the
+    // dual-harness memory+extended diff is trivially satisfied; the only
+    // observable that matters for step 7's commit is `iterations`.
+    let dst_mask = 0xFFFFi64;
+    let mut di = (dst_ptr & 0xFFFF) as i64;
+    let mut si = src_ptr_opt.map(|p| p as i64).unwrap_or(0);
+    let mut iters = 0i32;
+    let n_max = n;
+    for _ in 0..n_max {
+        let dst_lin = (dst_seg_base + di) & 0xFFFFF;
+        let dst_v = if is_word {
+            let lo = state.read_mem(dst_lin as i32) & 0xFF;
+            let hi = state.read_mem(((dst_lin + 1) & 0xFFFFF) as i32) & 0xFF;
+            lo | (hi << 8)
+        } else {
+            state.read_mem(dst_lin as i32) & 0xFF
+        };
+        let src_v = if is_cmps {
+            let src_lin = (src_seg_base + si) & 0xFFFFF;
+            if is_word {
+                let lo = state.read_mem(src_lin as i32) & 0xFF;
+                let hi = state.read_mem(((src_lin + 1) & 0xFFFFF) as i32) & 0xFF;
+                lo | (hi << 8)
+            } else {
+                state.read_mem(src_lin as i32) & 0xFF
+            }
+        } else {
+            scas_acc
+        };
+
+        // Pointer advance and CX decrement (CX is virtual here — we just
+        // count `iters`).
+        di = (di + signed_step as i64) & dst_mask;
+        if is_cmps {
+            si = (si + signed_step as i64) & dst_mask;
+        }
+        iters += 1;
+
+        // Early-exit. ZF set iff equal. REPE (rep_type=1): exit when not
+        // equal. REPNE (rep_type=2): exit when equal. Other rep_type
+        // values shouldn't reach a flag-conditioned descriptor — bail
+        // out at iteration count and let step 7 surface it.
+        let zf = src_v == dst_v;
+        if rep_type == 1 && !zf {
+            break;
+        }
+        if rep_type == 2 && zf {
+            break;
+        }
+    }
+
+    ApplyOutcome::Applied { iterations: iters }
 }
 
 // ---------------------------------------------------------------------------
@@ -1671,5 +1918,626 @@ mod tests {
             state_a.memory, state_b.memory,
             "applier word-copy reverse must match direct loop byte-for-byte"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Step 6 — apply_read_only (BulkClass::ReadOnly: LODS / CMPS / SCAS).
+    // -----------------------------------------------------------------
+
+    /// LODSB-shape: one byte-step pointer (`--SI`), no writes,
+    /// `flag_conditioned=false`. The recogniser would emit this for any
+    /// cabinet whose dispatch family produces a single-pointer no-write
+    /// loop without an early-exit predicate.
+    fn lodsb_descriptor() -> LoopDescriptor {
+        LoopDescriptor {
+            key_property: "--opcode".to_string(),
+            key_value: 0xAC,
+            ip_property: "--IP".to_string(),
+            ip_self_property: "--IP_prev".to_string(),
+            ip_advance_literal: 1,
+            predicate_properties: vec!["--repContinue".to_string()],
+            predicate: StyleTest::Single {
+                property: "--repContinue".to_string(),
+                value: Expr::Literal(1.0),
+            },
+            counter: Some(CounterEntry {
+                property: "--CX".to_string(),
+                self_property: "--CX_prev".to_string(),
+                step: 1,
+            }),
+            pointers: vec![PointerEntry {
+                property: "--SI".to_string(),
+                self_property: "--SI".to_string(),
+                base_step: 1,
+                flag_property: "--flags".to_string(),
+                flag_bit: 10,
+            }],
+            writes: vec![],
+            flag_conditioned: false,
+            bulk_class: BulkClass::ReadOnly,
+        }
+    }
+
+    /// CMPSB-shape: two byte-step pointers (`--DI` dst at index 0,
+    /// `--SI` src at index 1), no writes, `flag_conditioned=true`.
+    fn cmpsb_descriptor() -> LoopDescriptor {
+        LoopDescriptor {
+            key_property: "--opcode".to_string(),
+            key_value: 0xA6,
+            ip_property: "--IP".to_string(),
+            ip_self_property: "--IP_prev".to_string(),
+            ip_advance_literal: 1,
+            predicate_properties: vec!["--repContinue".to_string(), "--repZF".to_string()],
+            predicate: StyleTest::Single {
+                property: "--repContinue".to_string(),
+                value: Expr::Literal(1.0),
+            },
+            counter: Some(CounterEntry {
+                property: "--CX".to_string(),
+                self_property: "--CX_prev".to_string(),
+                step: 1,
+            }),
+            pointers: vec![
+                PointerEntry {
+                    property: "--DI".to_string(),
+                    self_property: "--DI".to_string(),
+                    base_step: 1,
+                    flag_property: "--flags".to_string(),
+                    flag_bit: 10,
+                },
+                PointerEntry {
+                    property: "--SI".to_string(),
+                    self_property: "--SI".to_string(),
+                    base_step: 1,
+                    flag_property: "--flags".to_string(),
+                    flag_bit: 10,
+                },
+            ],
+            writes: vec![],
+            flag_conditioned: true,
+            bulk_class: BulkClass::ReadOnly,
+        }
+    }
+
+    /// CMPSW-shape: word-step variant of `cmpsb_descriptor`.
+    fn cmpsw_descriptor() -> LoopDescriptor {
+        let mut d = cmpsb_descriptor();
+        d.key_value = 0xA7;
+        d.pointers[0].base_step = 2;
+        d.pointers[1].base_step = 2;
+        d
+    }
+
+    /// SCASB-shape: one byte-step pointer (`--DI`), no writes,
+    /// `flag_conditioned=true`.
+    fn scasb_descriptor() -> LoopDescriptor {
+        LoopDescriptor {
+            key_property: "--opcode".to_string(),
+            key_value: 0xAE,
+            ip_property: "--IP".to_string(),
+            ip_self_property: "--IP_prev".to_string(),
+            ip_advance_literal: 1,
+            predicate_properties: vec!["--repContinue".to_string(), "--repZF".to_string()],
+            predicate: StyleTest::Single {
+                property: "--repContinue".to_string(),
+                value: Expr::Literal(1.0),
+            },
+            counter: Some(CounterEntry {
+                property: "--CX".to_string(),
+                self_property: "--CX_prev".to_string(),
+                step: 1,
+            }),
+            pointers: vec![PointerEntry {
+                property: "--DI".to_string(),
+                self_property: "--DI".to_string(),
+                base_step: 1,
+                flag_property: "--flags".to_string(),
+                flag_bit: 10,
+            }],
+            writes: vec![],
+            flag_conditioned: true,
+            bulk_class: BulkClass::ReadOnly,
+        }
+    }
+
+    /// SCASW-shape: word-step variant of `scasb_descriptor`.
+    fn scasw_descriptor() -> LoopDescriptor {
+        let mut d = scasb_descriptor();
+        d.key_value = 0xAF;
+        d.pointers[0].base_step = 2;
+        d
+    }
+
+    /// LODSB forward: 16 iterations. Memory must be untouched; outcome
+    /// must report 16 iterations (no early exit possible).
+    #[test]
+    fn read_only_lods_byte_forward() {
+        let desc = lodsb_descriptor();
+        let prog = empty_program_with_descriptor(desc.clone());
+        let mut state = rigged_state(&["CX", "SI", "DS", "flags"]);
+        state.set_var("CX", 16);
+        state.set_var("SI", 0x100);
+        state.set_var("DS", 0x1000);
+        state.set_var("flags", 0); // DF=0
+        // Seed memory; after applier runs we re-check those exact bytes.
+        let base = 0x1000 * 16 + 0x100;
+        for i in 0..16 {
+            state.memory[base + i] = 0x40 + i as u8;
+        }
+        let memory_before = state.memory.clone();
+
+        let outcome = apply_read_only(&desc, &prog, &mut state, &[]);
+        assert_eq!(outcome, ApplyOutcome::Applied { iterations: 16 });
+        assert_eq!(state.memory, memory_before, "LODS must not mutate memory");
+    }
+
+    /// LODSB reverse direction (DF=1): same memory-untouched contract.
+    /// Iteration count still equals N (no early exit for LODS).
+    #[test]
+    fn read_only_lods_byte_reverse() {
+        let desc = lodsb_descriptor();
+        let prog = empty_program_with_descriptor(desc.clone());
+        let mut state = rigged_state(&["CX", "SI", "DS", "flags"]);
+        state.set_var("CX", 8);
+        state.set_var("SI", 0x80);
+        state.set_var("DS", 0x2000);
+        state.set_var("flags", 1 << 10); // DF=1
+        let memory_before = state.memory.clone();
+
+        let outcome = apply_read_only(&desc, &prog, &mut state, &[]);
+        assert_eq!(outcome, ApplyOutcome::Applied { iterations: 8 });
+        assert_eq!(state.memory, memory_before);
+    }
+
+    /// LODS with zero counter is a noop. (Mirrors `apply_fill` /
+    /// `apply_copy` semantics for cx<=0.)
+    #[test]
+    fn read_only_lods_zero_counter_is_noop() {
+        let desc = lodsb_descriptor();
+        let prog = empty_program_with_descriptor(desc.clone());
+        let mut state = rigged_state(&["CX", "SI", "DS", "flags"]);
+        state.set_var("CX", 0);
+        state.set_var("SI", 0x100);
+        state.set_var("DS", 0x1000);
+
+        let outcome = apply_read_only(&desc, &prog, &mut state, &[]);
+        assert_eq!(outcome, ApplyOutcome::Applied { iterations: 0 });
+    }
+
+    /// CMPSB equal-throughout: source and destination ranges contain
+    /// identical bytes. With REPE (`--repType=1`) the loop runs to
+    /// counter exhaustion (no inequality to exit on). Memory unchanged.
+    #[test]
+    fn read_only_cmps_byte_equal_throughout_repe_completes() {
+        let desc = cmpsb_descriptor();
+        let prog = empty_program_with_descriptor(desc.clone());
+        let mut state =
+            rigged_state(&["CX", "DI", "SI", "ES", "DS", "AL", "AX", "flags", "repType"]);
+        state.set_var("CX", 12);
+        state.set_var("DI", 0x200);
+        state.set_var("SI", 0x100);
+        state.set_var("ES", 0x4000);
+        state.set_var("DS", 0x1000);
+        state.set_var("flags", 0); // DF=0
+        state.set_var("repType", 1); // REPE
+        // Equal bytes across both ranges.
+        let dst_base = 0x4000 * 16 + 0x200;
+        let src_base = 0x1000 * 16 + 0x100;
+        for i in 0..12 {
+            state.memory[dst_base + i] = 0x55;
+            state.memory[src_base + i] = 0x55;
+        }
+        let memory_before = state.memory.clone();
+
+        let outcome = apply_read_only(&desc, &prog, &mut state, &[]);
+        // REPE walks all 12 iters; src==dst throughout.
+        assert_eq!(outcome, ApplyOutcome::Applied { iterations: 12 });
+        assert_eq!(state.memory, memory_before, "CMPS must not mutate memory");
+    }
+
+    /// CMPSB mismatch mid-walk under REPE: the loop exits as soon as a
+    /// pair of bytes differ.
+    #[test]
+    fn read_only_cmps_byte_repe_early_exit_on_mismatch() {
+        let desc = cmpsb_descriptor();
+        let prog = empty_program_with_descriptor(desc.clone());
+        let mut state =
+            rigged_state(&["CX", "DI", "SI", "ES", "DS", "AL", "AX", "flags", "repType"]);
+        state.set_var("CX", 16);
+        state.set_var("DI", 0x300);
+        state.set_var("SI", 0x100);
+        state.set_var("ES", 0x4000);
+        state.set_var("DS", 0x1000);
+        state.set_var("flags", 0);
+        state.set_var("repType", 1); // REPE
+        let dst_base = 0x4000 * 16 + 0x300;
+        let src_base = 0x1000 * 16 + 0x100;
+        for i in 0..16 {
+            state.memory[dst_base + i] = 0xAA;
+            state.memory[src_base + i] = 0xAA;
+        }
+        // Inject mismatch at offset 5.
+        state.memory[src_base + 5] = 0xBB;
+
+        let outcome = apply_read_only(&desc, &prog, &mut state, &[]);
+        // Iters 0..=5 run (iter 5 sees the mismatch and exits after
+        // counting). Iter 5 increments `iters` to 6 then breaks.
+        assert_eq!(outcome, ApplyOutcome::Applied { iterations: 6 });
+    }
+
+    /// CMPSB mismatch mid-walk under REPNE: REPNE exits on equality. So
+    /// the loop runs through inequality and stops the first time
+    /// src==dst.
+    #[test]
+    fn read_only_cmps_byte_repne_early_exit_on_match() {
+        let desc = cmpsb_descriptor();
+        let prog = empty_program_with_descriptor(desc.clone());
+        let mut state =
+            rigged_state(&["CX", "DI", "SI", "ES", "DS", "AL", "AX", "flags", "repType"]);
+        state.set_var("CX", 16);
+        state.set_var("DI", 0x400);
+        state.set_var("SI", 0x100);
+        state.set_var("ES", 0x4000);
+        state.set_var("DS", 0x1000);
+        state.set_var("flags", 0);
+        state.set_var("repType", 2); // REPNE
+        let dst_base = 0x4000 * 16 + 0x400;
+        let src_base = 0x1000 * 16 + 0x100;
+        for i in 0..16 {
+            state.memory[dst_base + i] = 0xAA;
+            state.memory[src_base + i] = 0xBB;
+        }
+        // Inject a match at offset 3.
+        state.memory[src_base + 3] = 0xAA;
+
+        let outcome = apply_read_only(&desc, &prog, &mut state, &[]);
+        // REPNE: iters 0,1,2 see inequality, iter 3 sees equality and
+        // breaks → 4 iterations total.
+        assert_eq!(outcome, ApplyOutcome::Applied { iterations: 4 });
+    }
+
+    /// CMPSW (word-step), forward, all-equal: counter exhausted.
+    #[test]
+    fn read_only_cmps_word_equal_throughout_repe_completes() {
+        let desc = cmpsw_descriptor();
+        let prog = empty_program_with_descriptor(desc.clone());
+        let mut state =
+            rigged_state(&["CX", "DI", "SI", "ES", "DS", "AL", "AX", "flags", "repType"]);
+        state.set_var("CX", 4);
+        state.set_var("DI", 0x100);
+        state.set_var("SI", 0x80);
+        state.set_var("ES", 0x4000);
+        state.set_var("DS", 0x1000);
+        state.set_var("flags", 0);
+        state.set_var("repType", 1); // REPE
+        let dst_base = 0x4000 * 16 + 0x100;
+        let src_base = 0x1000 * 16 + 0x80;
+        // 4 words of 0xBEEF in both.
+        for i in 0..4 {
+            state.memory[dst_base + i * 2] = 0xEF;
+            state.memory[dst_base + i * 2 + 1] = 0xBE;
+            state.memory[src_base + i * 2] = 0xEF;
+            state.memory[src_base + i * 2 + 1] = 0xBE;
+        }
+        let memory_before = state.memory.clone();
+
+        let outcome = apply_read_only(&desc, &prog, &mut state, &[]);
+        assert_eq!(outcome, ApplyOutcome::Applied { iterations: 4 });
+        assert_eq!(state.memory, memory_before);
+    }
+
+    /// SCASB (single pointer, accumulator-vs-memory) under REPNE: scan
+    /// for a target byte. Loop exits at the first match.
+    #[test]
+    fn read_only_scas_byte_repne_finds_target() {
+        let desc = scasb_descriptor();
+        let prog = empty_program_with_descriptor(desc.clone());
+        let mut state =
+            rigged_state(&["CX", "DI", "ES", "DS", "AL", "AX", "flags", "repType"]);
+        state.set_var("CX", 32);
+        state.set_var("DI", 0x500);
+        state.set_var("ES", 0x4000);
+        state.set_var("DS", 0); // SCAS doesn't read DS but the resolver still tries
+        state.set_var("AL", 0x42);
+        state.set_var("flags", 0);
+        state.set_var("repType", 2); // REPNE — exit on equality
+        let dst_base = 0x4000 * 16 + 0x500;
+        // Fill with 0xFF, plant target at offset 7.
+        for i in 0..32 {
+            state.memory[dst_base + i] = 0xFF;
+        }
+        state.memory[dst_base + 7] = 0x42;
+
+        let outcome = apply_read_only(&desc, &prog, &mut state, &[]);
+        // REPNE: iters 0..6 see 0xFF != 0x42, iter 7 sees 0x42 == 0x42
+        // and breaks → 8 iterations total.
+        assert_eq!(outcome, ApplyOutcome::Applied { iterations: 8 });
+    }
+
+    /// SCASB no match: loop runs through full counter.
+    #[test]
+    fn read_only_scas_byte_repne_no_match_full_counter() {
+        let desc = scasb_descriptor();
+        let prog = empty_program_with_descriptor(desc.clone());
+        let mut state =
+            rigged_state(&["CX", "DI", "ES", "DS", "AL", "AX", "flags", "repType"]);
+        state.set_var("CX", 10);
+        state.set_var("DI", 0x600);
+        state.set_var("ES", 0x4000);
+        state.set_var("AL", 0xCC);
+        state.set_var("flags", 0);
+        state.set_var("repType", 2); // REPNE
+        let dst_base = 0x4000 * 16 + 0x600;
+        for i in 0..10 {
+            state.memory[dst_base + i] = 0xDD; // never matches AL=0xCC
+        }
+        let memory_before = state.memory.clone();
+
+        let outcome = apply_read_only(&desc, &prog, &mut state, &[]);
+        assert_eq!(outcome, ApplyOutcome::Applied { iterations: 10 });
+        assert_eq!(state.memory, memory_before);
+    }
+
+    /// SCASW (word, accumulator AX): same shape, word reads.
+    #[test]
+    fn read_only_scas_word_repne_finds_target() {
+        let desc = scasw_descriptor();
+        let prog = empty_program_with_descriptor(desc.clone());
+        let mut state =
+            rigged_state(&["CX", "DI", "ES", "DS", "AL", "AX", "flags", "repType"]);
+        state.set_var("CX", 8);
+        state.set_var("DI", 0x100);
+        state.set_var("ES", 0x4000);
+        state.set_var("AX", 0xDEAD);
+        state.set_var("flags", 0);
+        state.set_var("repType", 2); // REPNE
+        let dst_base = 0x4000 * 16 + 0x100;
+        // Fill with 0xBEEF; plant DEAD at word index 4.
+        for i in 0..8 {
+            state.memory[dst_base + i * 2] = 0xEF;
+            state.memory[dst_base + i * 2 + 1] = 0xBE;
+        }
+        state.memory[dst_base + 4 * 2] = 0xAD;
+        state.memory[dst_base + 4 * 2 + 1] = 0xDE;
+
+        let outcome = apply_read_only(&desc, &prog, &mut state, &[]);
+        // 5 iters: indices 0..3 mismatch, index 4 matches.
+        assert_eq!(outcome, ApplyOutcome::Applied { iterations: 5 });
+    }
+
+    /// Refusal paths.
+    #[test]
+    fn read_only_refuses_non_read_only_class() {
+        let mut desc = lodsb_descriptor();
+        desc.bulk_class = BulkClass::Fill;
+        let prog = empty_program_with_descriptor(desc.clone());
+        let mut state = rigged_state(&["CX", "SI", "DS", "flags"]);
+        state.set_var("CX", 1);
+        let outcome = apply_read_only(&desc, &prog, &mut state, &[]);
+        assert!(matches!(outcome, ApplyOutcome::Unsupported(_)));
+    }
+
+    #[test]
+    fn read_only_refuses_when_writes_present() {
+        let mut desc = lodsb_descriptor();
+        desc.writes.push(WriteEntry {
+            addr_property: "--mAddr0".to_string(),
+            val_property: "--mVal0".to_string(),
+            addr_expr: Expr::Literal(0.0),
+            val_expr: Expr::Literal(0.0),
+            addr_decomposition: None,
+            val_indirect_read: None,
+        });
+        let prog = empty_program_with_descriptor(desc.clone());
+        let mut state = rigged_state(&["CX", "SI", "DS", "flags"]);
+        state.set_var("CX", 1);
+        let outcome = apply_read_only(&desc, &prog, &mut state, &[]);
+        assert!(matches!(outcome, ApplyOutcome::Unsupported(_)));
+    }
+
+    #[test]
+    fn read_only_refuses_when_no_pointers() {
+        let mut desc = lodsb_descriptor();
+        desc.pointers.clear();
+        let prog = empty_program_with_descriptor(desc.clone());
+        let mut state = rigged_state(&["CX", "SI", "DS", "flags"]);
+        state.set_var("CX", 1);
+        let outcome = apply_read_only(&desc, &prog, &mut state, &[]);
+        assert!(matches!(outcome, ApplyOutcome::Unsupported(_)));
+    }
+
+    /// LODS shape requires exactly 1 pointer. A descriptor with
+    /// `flag_conditioned=false` and 2 pointers is structurally
+    /// inconsistent (there's no x86 self-loop with 2 pointers and no
+    /// flag-conditioned exit) — bail.
+    #[test]
+    fn read_only_refuses_lods_shape_with_two_pointers() {
+        let mut desc = lodsb_descriptor();
+        desc.pointers.push(PointerEntry {
+            property: "--DI".to_string(),
+            self_property: "--DI".to_string(),
+            base_step: 1,
+            flag_property: "--flags".to_string(),
+            flag_bit: 10,
+        });
+        let prog = empty_program_with_descriptor(desc.clone());
+        let mut state = rigged_state(&["CX", "SI", "DI", "DS", "flags"]);
+        state.set_var("CX", 4);
+        let outcome = apply_read_only(&desc, &prog, &mut state, &[]);
+        assert!(matches!(outcome, ApplyOutcome::Unsupported(_)));
+    }
+
+    /// CMPS-shape pointers must agree on step and direction flag.
+    #[test]
+    fn read_only_refuses_cmps_with_mismatched_steps() {
+        let mut desc = cmpsb_descriptor();
+        desc.pointers[1].base_step = 2;
+        let prog = empty_program_with_descriptor(desc.clone());
+        let mut state =
+            rigged_state(&["CX", "DI", "SI", "ES", "DS", "AL", "AX", "flags", "repType"]);
+        state.set_var("CX", 4);
+        state.set_var("repType", 1);
+        let outcome = apply_read_only(&desc, &prog, &mut state, &[]);
+        assert!(matches!(outcome, ApplyOutcome::Unsupported(_)));
+    }
+
+    /// Genericity probe: a SCAS-shape descriptor with completely
+    /// unrelated property names. The applier reads `--ES`, `--AL`,
+    /// `--AX`, `--repType` by literal name today (the documented
+    /// cardinal-rule wart), so this probe verifies the LODS path's
+    /// genericity — which is the structurally clean one.
+    #[test]
+    fn read_only_lods_genericity_unrelated_names() {
+        let desc = LoopDescriptor {
+            key_property: "--opaque_key".to_string(),
+            key_value: 0x99,
+            ip_property: "--ip_x".to_string(),
+            ip_self_property: "--ip_x_prev".to_string(),
+            ip_advance_literal: 1,
+            predicate_properties: vec!["--cont_x".to_string()],
+            predicate: StyleTest::Single {
+                property: "--cont_x".to_string(),
+                value: Expr::Literal(1.0),
+            },
+            counter: Some(CounterEntry {
+                property: "--alpha".to_string(),
+                self_property: "--alpha_prev".to_string(),
+                step: 1,
+            }),
+            pointers: vec![PointerEntry {
+                property: "--beta".to_string(),
+                self_property: "--beta".to_string(),
+                base_step: 1,
+                flag_property: "--gamma".to_string(),
+                flag_bit: 7, // arbitrary
+            }],
+            writes: vec![],
+            flag_conditioned: false,
+            bulk_class: BulkClass::ReadOnly,
+        };
+        let prog = empty_program_with_descriptor(desc.clone());
+        let mut state = rigged_state(&["alpha", "beta", "gamma"]);
+        state.set_var("alpha", 11);
+        state.set_var("beta", 0x2000);
+        state.set_var("gamma", 0); // bit 7 clear → forward
+        let memory_before = state.memory.clone();
+
+        let outcome = apply_read_only(&desc, &prog, &mut state, &[]);
+        assert_eq!(outcome, ApplyOutcome::Applied { iterations: 11 });
+        assert_eq!(state.memory, memory_before);
+    }
+
+    /// Dual-mode equivalence (SCASB, REPNE): drive the same setup
+    /// through the applier and through a direct mirror of the hardcoded
+    /// SCAS loop on independent State clones. Memory must be byte-for-
+    /// byte identical (both paths leave memory untouched), and
+    /// iteration counts must match.
+    #[test]
+    fn read_only_scas_equivalence_byte_repne() {
+        let desc = scasb_descriptor();
+        let prog = empty_program_with_descriptor(desc.clone());
+        let names = &["CX", "DI", "ES", "DS", "AL", "AX", "flags", "repType"];
+        let mut state_a = rigged_state(names);
+        let mut state_b = rigged_state(names);
+        let n = 64i32;
+        for s in [&mut state_a, &mut state_b] {
+            s.set_var("CX", n);
+            s.set_var("DI", 0x80);
+            s.set_var("ES", 0x4000);
+            s.set_var("AL", 0x77);
+            s.set_var("flags", 0);
+            s.set_var("repType", 2); // REPNE
+            let dst_base = 0x4000 * 16 + 0x80;
+            for k in 0..(n as usize) {
+                s.memory[dst_base + k] = (k as u8).wrapping_mul(3); // varied bytes
+            }
+            s.memory[dst_base + 23] = 0x77; // first match at offset 23
+        }
+        let mem_a_before = state_a.memory.clone();
+
+        // Path A: applier.
+        let outcome_a = apply_read_only(&desc, &prog, &mut state_a, &[]);
+
+        // Path B: mirror the hardcoded SCAS loop semantics.
+        let mut iters_b = 0i32;
+        let mut di_b = 0x80i64;
+        let es_base = 0x4000i64 * 16;
+        let acc = 0x77;
+        for _ in 0..n {
+            let dst_lin = (es_base + di_b) & 0xFFFFF;
+            let dst_v = state_b.read_mem(dst_lin as i32) & 0xFF;
+            di_b = (di_b + 1) & 0xFFFF;
+            iters_b += 1;
+            // REPNE: exit on equality.
+            if acc == dst_v {
+                break;
+            }
+        }
+
+        assert_eq!(
+            outcome_a,
+            ApplyOutcome::Applied { iterations: iters_b },
+            "applier and direct loop must report same iteration count",
+        );
+        // Both paths leave memory unchanged.
+        assert_eq!(state_a.memory, mem_a_before);
+        assert_eq!(state_a.memory, state_b.memory);
+    }
+
+    /// Dual-mode equivalence (CMPSB, REPE) — full memory diff against a
+    /// direct mirror.
+    #[test]
+    fn read_only_cmps_equivalence_byte_repe() {
+        let desc = cmpsb_descriptor();
+        let prog = empty_program_with_descriptor(desc.clone());
+        let names = &["CX", "DI", "SI", "ES", "DS", "AL", "AX", "flags", "repType"];
+        let mut state_a = rigged_state(names);
+        let mut state_b = rigged_state(names);
+        let n = 32i32;
+        for s in [&mut state_a, &mut state_b] {
+            s.set_var("CX", n);
+            s.set_var("DI", 0x200);
+            s.set_var("SI", 0x100);
+            s.set_var("ES", 0x4000);
+            s.set_var("DS", 0x1000);
+            s.set_var("flags", 0);
+            s.set_var("repType", 1); // REPE
+            let dst_base = 0x4000 * 16 + 0x200;
+            let src_base = 0x1000 * 16 + 0x100;
+            for k in 0..(n as usize) {
+                s.memory[dst_base + k] = 0x33;
+                s.memory[src_base + k] = 0x33;
+            }
+            // Inject divergence at offset 11.
+            s.memory[src_base + 11] = 0x44;
+        }
+        let mem_a_before = state_a.memory.clone();
+
+        let outcome_a = apply_read_only(&desc, &prog, &mut state_a, &[]);
+
+        // Direct mirror.
+        let mut iters_b = 0i32;
+        let mut di_b = 0x200i64;
+        let mut si_b = 0x100i64;
+        let es_base = 0x4000i64 * 16;
+        let ds_base = 0x1000i64 * 16;
+        for _ in 0..n {
+            let dst_v = state_b.read_mem(((es_base + di_b) & 0xFFFFF) as i32) & 0xFF;
+            let src_v = state_b.read_mem(((ds_base + si_b) & 0xFFFFF) as i32) & 0xFF;
+            di_b = (di_b + 1) & 0xFFFF;
+            si_b = (si_b + 1) & 0xFFFF;
+            iters_b += 1;
+            // REPE: exit on inequality.
+            if src_v != dst_v {
+                break;
+            }
+        }
+
+        assert_eq!(
+            outcome_a,
+            ApplyOutcome::Applied { iterations: iters_b },
+        );
+        assert_eq!(state_a.memory, mem_a_before);
+        assert_eq!(state_a.memory, state_b.memory);
     }
 }

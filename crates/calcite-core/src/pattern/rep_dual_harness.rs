@@ -170,7 +170,7 @@ fn apply_descriptor(
     state: &mut State,
     slots: &[i32],
 ) -> ApplierResult {
-    use crate::pattern::rep_applier::{apply_copy, apply_fill, ApplyOutcome};
+    use crate::pattern::rep_applier::{apply_copy, apply_fill, apply_read_only, ApplyOutcome};
     match descriptor.bulk_class {
         BulkClass::Fill => match apply_fill(descriptor, program, state, slots) {
             ApplyOutcome::Applied { .. } => ApplierResult::Diff,
@@ -180,9 +180,10 @@ fn apply_descriptor(
             ApplyOutcome::Applied { .. } => ApplierResult::Diff,
             ApplyOutcome::Unsupported(reason) => ApplierResult::Skip(reason),
         },
-        BulkClass::ReadOnly => unimplemented!(
-            "BulkClass::ReadOnly applier lands in phase 3b step 6 — CMPS/SCAS/LODS"
-        ),
+        BulkClass::ReadOnly => match apply_read_only(descriptor, program, state, slots) {
+            ApplyOutcome::Applied { .. } => ApplierResult::Diff,
+            ApplyOutcome::Unsupported(reason) => ApplierResult::Skip(reason),
+        },
         BulkClass::PerIter => unimplemented!(
             "BulkClass::PerIter applier — fallback walker, lands alongside step 6"
         ),
@@ -453,13 +454,20 @@ mod tests {
         assert!(matches!(result, ApplierResult::Skip(_)));
     }
 
+    /// Step 6 implements `BulkClass::ReadOnly`. Dispatch should reach
+    /// [`crate::pattern::rep_applier::apply_read_only`] without panicking.
+    /// The minimal `descriptor_with_class` helper produces a structurally
+    /// invalid `ReadOnly` descriptor (one write entry, the wrong shape),
+    /// so the applier returns `Unsupported` and the dispatcher returns
+    /// `ApplierResult::Skip`. The point of the test is that the
+    /// `BulkClass::ReadOnly` arm is no longer `unimplemented!()`.
     #[test]
-    #[should_panic(expected = "BulkClass::ReadOnly applier lands in phase 3b step 6")]
-    fn stub_applier_dispatches_on_readonly_arm() {
+    fn stub_applier_dispatches_on_readonly_arm_without_panic() {
         let desc = descriptor_with_class(0xA6, BulkClass::ReadOnly);
         let mut state = State::new(0x10);
         let prog = empty_program();
-        let _ = apply_descriptor(&desc, &prog, &mut state, &[]);
+        let result = apply_descriptor(&desc, &prog, &mut state, &[]);
+        assert!(matches!(result, ApplierResult::Skip(_)));
     }
 
     #[test]
