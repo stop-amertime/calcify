@@ -6030,6 +6030,15 @@ fn rep_fast_forward(program: &CompiledProgram, state: &mut State, slots: &[i32])
     let ip = state.get_var("IP").unwrap_or(0);
     let prefix_len = read_prop(program, state, slots, "--prefixLen").unwrap_or(1);
 
+    // Phase 3b step 3: dual-execute harness. Snapshots state before the
+    // hardcoded mutations so a descriptor-driven applier can run on the
+    // clone afterward. No-op (returns None) when CALCITE_REP_DUAL is
+    // unset or the descriptor's bulk_class isn't in the per-variant
+    // allow-list — see crate::pattern::rep_dual_harness.
+    let dual_session = crate::pattern::rep_dual_harness::pre_hardcoded(
+        program, state, slots, opcode,
+    );
+
     // Now mutate memory and state vars. State reads are done.
     //
     // For STOS{B,W} the same byte(s) are written to every iteration's
@@ -6107,6 +6116,16 @@ fn rep_fast_forward(program: &CompiledProgram, state: &mut State, slots: &[i32])
         state.set_var("cycleCount", cc.wrapping_add(n.wrapping_mul(per_iter)));
     }
     rep_diag_fire(opcode, n);
+
+    // Phase 3b step 3: dual-execute harness post-mutation diff. When the
+    // pre-hook took a snapshot, this runs the stub applier on the clone
+    // and panics on any divergence. Inert in step 3 because every
+    // BulkClass arm of the stub is `unimplemented!()` — but
+    // `pre_hardcoded` only returns Some when the variant is explicitly
+    // allow-listed, so we never reach an unimplemented arm by accident.
+    if let Some(session) = dual_session {
+        crate::pattern::rep_dual_harness::post_hardcoded(session, program, state, slots);
+    }
 }
 
 /// Fast-forward REPE/REPNE CMPS{B,W} and SCAS{B,W}.
@@ -6138,6 +6157,13 @@ fn rep_fast_forward_cmps_scas(
         let bare = name.strip_prefix("--").unwrap_or(name);
         state.get_var(bare)
     }
+
+    // Phase 3b step 3: dual-execute harness pre-snapshot for CMPS/SCAS.
+    // Inert in step 3 (no BulkClass::ReadOnly applier yet), but wired so
+    // step 6's flip surfaces divergence the moment a real applier ships.
+    let dual_session = crate::pattern::rep_dual_harness::pre_hardcoded(
+        program, state, slots, opcode,
+    );
 
     let is_word = matches!(opcode, 0xA7 | 0xAF);
     let is_cmps = matches!(opcode, 0xA6 | 0xA7);
@@ -6259,6 +6285,11 @@ fn rep_fast_forward_cmps_scas(
     }
     rep_diag_fire(opcode, iters);
     rep_trace_cmps_scas(opcode, rep_type, cx_in, iters, di_start, di, exit_reason);
+
+    // Phase 3b step 3: dual-execute harness post-mutation diff.
+    if let Some(session) = dual_session {
+        crate::pattern::rep_dual_harness::post_hardcoded(session, program, state, slots);
+    }
 }
 
 /// Compute the 8086 flag word produced by SUB(dst, src), preserving the

@@ -11,6 +11,46 @@ and the Criterion benchmarks.
 
 ---
 
+## 2026-05-07 — phase 3b step 3: dual-execute harness landed (worktree)
+
+Step 3 of the [rep-3b 10-step plan](../docs/rep-3b-scoping.md): the
+safety net that lets steps 4–6 land one `BulkClass` applier at a
+time. New module `crates/calcite-core/src/pattern/rep_dual_harness.rs`
+exposes `pre_hardcoded` / `post_hardcoded` hooks, called from the top
+and bottom of `compile.rs::rep_fast_forward` (and its `_cmps_scas`
+sibling). When `CALCITE_REP_DUAL=1` is set AND the descriptor's
+`bulk_class` is in the comma-separated `CALCITE_REP_DUAL_VARIANTS`
+allow-list, the pre-hook clones the entire `State` and the slot
+vector; the post-hook runs the descriptor-driven stub applier on the
+clone and panics on memory / state_var / extended-map divergence.
+
+Stub applier dispatches on `BulkClass`; every arm is `unimplemented!()`
+today. Steps 4–6 fill in `Fill`, `Copy`, `ReadOnly` one commit each;
+the variant gate keeps unimplemented arms from firing while their
+applier is being built (a panic from `unimplemented!()` is a
+configuration error, not a real divergence). Empty allow-list (the
+default) means dual mode is wired but inert — no `unimplemented!()`
+ever reached. Snapshot scope is the full `State`, not a narrowed
+"only what the descriptor names" subset, deliberately: a future
+applier that touches an unexpected slot must surface as divergence,
+not silently agree.
+
+Cardinal-rule shape: harness reads only `descriptor.key_value`,
+`descriptor.bulk_class`, and slot indices; no property name is
+inspected as text. The `match` in the stub is on `BulkClass`, never
+on opcode. Hook lives inside `rep_fast_forward` per scoping doc Q1
+Option A — applier is name-blind, walks slot indices.
+
+Tests: 199 passing (10 new), 4 pre-existing failures unchanged. New
+tests cover allow-list parsing (empty, single, multi+aliases,
+whitespace/empty-tokens, unknown-variant tolerance), each
+`BulkClass` arm dispatch via `should_panic`, and the
+`pre_hardcoded`-returns-`None`-when-disabled contract. wasm32 build
+clean. Real-cabinet verification deferred to step 4 onwards (CSS-DOS
+read-only this session).
+
+---
+
 ## 2026-05-07 — `rep_fast_forward` genericity mission, phase 3a: CMPS/SCAS recognition + BulkClass classification
 
 Cross-link: see CSS-DOS
