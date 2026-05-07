@@ -11,6 +11,72 @@ and the Criterion benchmarks.
 
 ---
 
+## 2026-05-07 — phase 3b step 4: `BulkClass::Fill` applier landed (worktree)
+
+Step 4 of the [rep-3b 10-step plan](../docs/rep-3b-scoping.md): the
+first real descriptor-driven applier. New module
+`crates/calcite-core/src/pattern/rep_applier.rs` exposes `apply_fill`,
+which mutates `state.memory` for STOS-shape loops driven entirely by
+`LoopDescriptor` metadata — counter slot, single destination pointer
+(slot + `base_step` + flag bit), and the `WriteEntry` vector with its
+`addr_decomposition: Some((seg, ptr))` and bare-Var `val_expr`.
+
+Key design decision: the applier never asks "is this STOSB or STOSW?".
+The byte-vs-word width comes from `pointer.base_step` (1 or 2). The
+per-iteration byte count comes from `descriptor.writes.len()`. The
+within-iteration byte offset of write `k` is its **position in the
+writes vector** — kiln pre-sorts them by `assignment_index` at
+recogniser time, which is the same source order that produced the
+hardcoded path's `lo` / `hi` byte ordering. A structural sanity check
+(`writes.len() == base_step`) catches recogniser drift before it
+silently miscomputes. Single-write descriptors collapse to one
+`bulk_fill` call (the STOSB fast path); multi-write descriptors walk
+per-iteration per-write through `bulk_store_byte`. Memory-write
+primitives (`bulk_fill`, `bulk_store_byte`, `ranges_overlap_virtual`)
+lifted to `pub(crate)` — no reinvention of the packed-cell /
+windowed-array / extended-map routing the hardcoded path relies on.
+
+Wired into the dual harness: `CALCITE_REP_DUAL_VARIANTS=Fill` opts in;
+the `BulkClass::Fill` arm of `apply_descriptor` now calls `apply_fill`,
+and `post_hardcoded` differentiates `Diff` (applier ran, compare
+clones) from `Skip` (applier returned `Unsupported` for a shape it
+doesn't yet handle, e.g. non-bare-Var val_expr — caller stays on the
+hardcoded path). The diff intentionally compares memory + extended
+only — state-var updates (DI/CX/IP/cycleCount) and the prefix-length
+lookup are deferred to step 7's full flip, where the missing
+structural metadata (per-iter cycle cost, prefix length) gets
+recogniser support.
+
+Cardinal-rule shape: applier reads zero property names as text. Slot
+lookups go through whole-name `property_slots` / `state_var_index`
+equality. Dispatch on `BulkClass`, never on opcode. Genericity probe
+test (descriptor with completely unrelated names — `--alpha`,
+`--beta`, `--epsilon`, `--delta`, `--gamma`, flag bit 3) fills memory
+identically, confirming a 6502 / brainfuck / non-emulator cabinet
+sharing the structural shape works the same.
+
+Tests: 214 passing in `cargo test -p calcite-core --lib` (15 new), 4
+pre-existing failures unchanged. New tests cover byte fill forward,
+byte fill reverse, word fill forward, word fill reverse, zero-counter
+no-op, negative-counter no-op, refusal of non-Fill class, refusal of
+missing addr_decomposition, refusal of non-bare-Var val_expr,
+pointer-wrap refusal, write-order-determines-byte-order (verifies the
+position-as-offset structural assumption), unrelated-names genericity
+probe, and two **dual-mode equivalence tests** (run the applier and
+direct `bulk_fill` / `bulk_store_byte` on independent State clones,
+assert `state_a.memory == state_b.memory`) — the smallest possible
+test of the harness's actual contract. wasm32 build clean.
+Real-cabinet verification (doom8088 dual-mode boot through STOSB/STOSW)
+deferred — CSS-DOS read-only this session.
+
+Pick up at step 5: `BulkClass::Copy` applier for MOVS, driven by
+`val_indirect_read` from step 2.
+
+Cross-link: see CSS-DOS LOGBOOK 2026-05-07 entry for the parent
+mission's status.
+
+---
+
 ## 2026-05-07 — phase 3b step 3: dual-execute harness landed (worktree)
 
 Step 3 of the [rep-3b 10-step plan](../docs/rep-3b-scoping.md): the

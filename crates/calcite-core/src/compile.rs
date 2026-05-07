@@ -6625,7 +6625,7 @@ pub fn rep_diag_report() -> String {
 ///   in `state.extended`, not `state.memory`). Hardcoded here because
 ///   it's a State-level invariant, not a per-cabinet feature.
 #[inline]
-fn ranges_overlap_virtual(state: &State, start: i64, len: i64) -> bool {
+pub(crate) fn ranges_overlap_virtual(state: &State, start: i64, len: i64) -> bool {
     if len <= 0 { return false; }
     let end = start + len;
     let overlaps = |a: i64, b: i64, c: i64, d: i64| a < d && c < b;
@@ -6642,7 +6642,7 @@ fn ranges_overlap_virtual(state: &State, start: i64, len: i64) -> bool {
     false
 }
 
-fn bulk_store_byte(state: &mut State, addr: i64, val: u8) {
+pub(crate) fn bulk_store_byte(state: &mut State, addr: i64, val: u8) {
     // Mirrors MemoryFill/MemoryCopy discipline (bulk path is
     // diagnostic-silent: no write_log entries). Routes through
     // `bulk_fill_byte(count=1)` so packed cabinets land the byte in the
@@ -6674,7 +6674,7 @@ fn effective_guest_mem_end(state: &State) -> usize {
 }
 
 #[inline]
-fn bulk_fill(state: &mut State, dst: i64, count: usize, val: u8) {
+pub(crate) fn bulk_fill(state: &mut State, dst: i64, count: usize, val: u8) {
     if count == 0 || dst < 0 { return; }
     let mem_len = effective_guest_mem_end(state);
     if (dst as usize) >= mem_len { return; }

@@ -20,5 +20,6 @@ pub mod fusion_sim;
 pub mod loop_descriptor;
 pub mod op_profile;
 pub mod packed_broadcast_write;
+pub mod rep_applier;
 pub mod rep_dual_harness;
 pub mod replicated_body;
