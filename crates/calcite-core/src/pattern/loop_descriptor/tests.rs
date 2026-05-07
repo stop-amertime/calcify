@@ -983,3 +983,83 @@ fn ip_wrapper_with_non_self_overrides_still_recognises() {
     assert!(d.counter.is_some());
     assert_eq!(d.pointers.len(), 1);
 }
+
+#[test]
+fn memwrite_pairing_uses_assignment_order_proximity() {
+    // Build a cabinet with TWO write pairs interleaved in source order:
+    //   --addrA (idx 2)
+    //   --valA  (idx 3)
+    //   --addrB (idx 4)
+    //   --valB  (idx 5)
+    // The recogniser should pair (addrA, valA) and (addrB, valB), NOT
+    // pair them by alphabetical sort which would give (addrA, valA) but
+    // also pair (addrB, valA) if we didn't track positions.
+    let pred_continue = style_eq("--repCont", 1.0);
+    let no_rep = style_eq("--hasRep", 0.0);
+    let active_guard = style_eq("--repActive", 0.0);
+
+    let cx = dispatch(
+        "--op",
+        vec![(0xAA as f64, counter_body(no_rep.clone(), "--cx0"))],
+        keep_self("--cx0"),
+    );
+    let ip = dispatch(
+        "--op",
+        vec![(
+            0xAA as f64,
+            ip_body(pred_continue.clone(), "--ip0", var("--pl"), 1),
+        )],
+        keep_self("--ip0"),
+    );
+
+    // Address bodies: -1 when active, real address otherwise.
+    fn addr(active_guard: StyleTest, slot_self: &str) -> Expr {
+        iff(active_guard, lit(-1.0), add(mul(var("--es"), lit(16.0)), var(slot_self)))
+    }
+
+    let addr_a = dispatch(
+        "--op",
+        vec![(0xAA as f64, addr(active_guard.clone(), "--di0"))],
+        lit(-1.0),
+    );
+    // Two distinct value bodies so we can distinguish which got paired.
+    let val_a = dispatch(
+        "--op",
+        vec![(0xAA as f64, var("--regA"))],
+        lit(0.0),
+    );
+    let addr_b = dispatch(
+        "--op",
+        vec![(0xAA as f64, addr(active_guard.clone(), "--di1"))],
+        lit(-1.0),
+    );
+    let val_b = dispatch(
+        "--op",
+        vec![(0xAA as f64, var("--regB"))],
+        lit(0.0),
+    );
+
+    // Order matters: this is the test.
+    let asns = vec![
+        assign("--cx0", cx),       // idx 0
+        assign("--ip0", ip),       // idx 1
+        assign("--addrA", addr_a), // idx 2
+        assign("--valA", val_a),   // idx 3
+        assign("--addrB", addr_b), // idx 4
+        assign("--valB", val_b),   // idx 5
+    ];
+
+    let descs = recognise_loops(&asns);
+    assert_eq!(descs.len(), 1, "one descriptor expected: {:?}", descs);
+    let d = &descs[0];
+    assert_eq!(d.writes.len(), 2, "two write pairs expected");
+    // Sort by addr_property for deterministic comparison.
+    let mut writes = d.writes.clone();
+    writes.sort_by(|a, b| a.addr_property.cmp(&b.addr_property));
+    assert_eq!(writes[0].addr_property, "--addrA");
+    assert_eq!(writes[0].val_property, "--valA",
+        "addrA must pair with valA (immediately after in source order), got {:?}", writes[0]);
+    assert_eq!(writes[1].addr_property, "--addrB");
+    assert_eq!(writes[1].val_property, "--valB",
+        "addrB must pair with valB (immediately after in source order), got {:?}", writes[1]);
+}

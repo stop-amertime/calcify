@@ -16,7 +16,7 @@ use std::collections::HashMap;
 // hashing cost is on the critical path. SipHash, the std default, takes
 // ~30 cycles per i32 key; FxHasher is essentially `multiply + xor` and
 // runs in ~3 cycles. Flamegraph (LOGBOOK 2026-04-30) showed SipHash-related
-// frames at ~17% of worker CPU on doom8088 LOAD/INGAME.
+// frames at ~17% of worker CPU on the reference cabinet's hot phases.
 //
 // Compile-time HashMaps (string-keyed dispatch_tables, function maps,
 // caches in CompilerCtx, etc.) are NOT swapped — they're hit once at
@@ -118,7 +118,8 @@ fn lit_as_i32(v: f64) -> Option<i32> {
 /// A single operation in the compiled bytecode.
 ///
 /// All operands are `Slot` (u32) indices into a flat `Vec<i32>` array.
-/// State reads/writes use `i32` addresses matching the x86CSS convention.
+/// State reads/writes use `i32` addresses matching the cabinet's
+/// negative-state-var / positive-memory convention.
 #[derive(Debug, Clone)]
 pub enum Op {
     // --- Loads ---
@@ -369,7 +370,8 @@ pub enum Op {
     /// Dispatch chain: look up slot[a] in chain_tables[chain_id]; if found,
     /// jump to the matching body PC, else jump to miss_target. Replaces a run
     /// of BranchIfNotEqLit ops all testing the same slot against different
-    /// literals (the dominant pattern in CSS-DOS bytecode).
+    /// literals (the dominant pattern when a cabinet emits switch-on-slot
+    /// dispatch as a chain of equality checks).
     DispatchChain {
         a: Slot,
         chain_id: u32,
@@ -521,7 +523,7 @@ pub struct CompiledProgram {
     /// LoadPackedByte runtime; if returns Some(byte), used instead of the packed
     /// extract. Dense base-keyed Vec avoids HashMap overhead in the hot path.
     pub packed_exception_tables: Vec<PackedExceptionTable>,
-    /// Packed-broadcast write ports (one per CSS-DOS write slot). Each port
+    /// Packed-broadcast write ports (one per cabinet write slot). Each port
     /// covers all packed `--mc{N}` cells through one slot — at writeback time
     /// the executor checks the gate, looks up the cell from the byte address,
     /// and splices in the new byte. Replaces ~190K ops/tick of nested
@@ -538,6 +540,14 @@ pub struct CompiledProgram {
     /// inside the window collapse to one state-var read + one array index,
     /// instead of walking the inline-exception CmpEq chain on every byte.
     pub windowed_byte_array: Option<CompiledWindowedByteArray>,
+    /// Self-loop descriptors emitted by `pattern::loop_descriptor`. Carried
+    /// here (in addition to `Evaluator::loop_descriptors`) so the per-tick
+    /// runtime path inside `compile.rs` — which only sees `&CompiledProgram`
+    /// — can validate that any opcode it fast-forwards has a matching
+    /// descriptor under `CALCITE_REP_GENERIC=1`. Phase 1's diagnostic
+    /// telemetry was a side-channel; phase 2's validator wants the
+    /// descriptors at the same scope as the runtime.
+    pub loop_descriptors: Vec<crate::pattern::loop_descriptor::LoopDescriptor>,
 }
 
 /// Compile-time half of the windowed-byte-array fast path. The compiler can't
@@ -1260,8 +1270,8 @@ fn decode_disk_entry(expr: &Expr) -> Option<DiskEntryShape> {
 /// The flat array `--func` compiles to is looked up in `flat_dispatch_cache`;
 /// a missing entry means `--func` itself isn't yet recognised as a flat
 /// dispatch — recognition is order-dependent (the inner function gets
-/// compiled first by demand) but in practice for CSS-DOS `--readDiskByte` is
-/// compiled before `--readMem`'s exceptions are walked here, so the cache hit
+/// compiled first by demand) but in practice the inner function is
+/// compiled before the outer's exceptions are walked here, so the cache hit
 /// is reliable. If we miss, we just bail and the read path falls through to
 /// the inline-exception chain (correct, but slower).
 ///
@@ -1986,8 +1996,8 @@ impl<'a> Compiler<'a> {
             // Fast path: if the condition is a conjunction of `style(--prop: literal)`
             // singletons, emit a chain of BranchIfNotEqLit ops going straight to the
             // next-branch target. Avoids the generic style_test machinery (Mul, intermediate
-            // bool slots) and skips the fuse pass entirely. Covers the dominant BIOS
-            // pattern `style(--opcode: N) and style(--uOp: K)`.
+            // bool slots) and skips the fuse pass entirely. Covers the dominant
+            // dispatch pattern `style(--A: N) and style(--B: K)`.
             let mut fast_branch_idxs: Vec<usize> = Vec::new();
             let used_fast = collect_literal_and_tests(&branch.condition)
                 .map(|tests| {
@@ -2206,8 +2216,10 @@ impl<'a> Compiler<'a> {
                 if let Some(exception_keys) = self.check_near_identity_read(name) {
                     return self.compile_near_identity_dispatch(name, args, &exception_keys, ops);
                 }
-                // Near-packed-byte-read: CSS-DOS PACK_SIZE=2 memory layout.
-                // Compile as LoadPackedByte + small exception dispatch.
+                // Near-packed-byte-read: cabinets that pack 2 bytes per state
+                // var (PACK_SIZE=2) emit memory reads as a giant if-chain mostly
+                // following the linear-extract shape, with a small set of
+                // exceptions. Compile as LoadPackedByte + small exception dispatch.
                 if let Some((pack, exception_keys)) = self.check_near_packed_byte(name) {
                     return self.compile_near_packed_byte_dispatch(
                         name, args, pack, &exception_keys, ops,
@@ -2243,8 +2255,8 @@ impl<'a> Compiler<'a> {
         // Word read: 1 param, body = calc(readMem(param) + readMem(param+1) * 256)
         // Compile as LoadMem16 instead of two separate readMem calls — BUT ONLY
         // if the inner readMem is a pure identity read. If it has literal
-        // exception entries (e.g. BIOS ROM constants encoded as
-        // `style(--at: N): 201` inside --readMem's dispatch), LoadMem16 would
+        // exception entries (e.g. ROM-region constants encoded as
+        // `style(--at: N): 201` inside the read function's dispatch), LoadMem16 would
         // bypass those and read 0 from state. In that case we must fall through
         // to general compilation so the two nested readMem calls each go
         // through compile_near_identity_dispatch and pick up the exceptions.
@@ -3127,8 +3139,8 @@ impl<'a> Compiler<'a> {
 ///
 /// Used by `compile_style_condition_linear` to emit direct BranchIfNotEqLit chains
 /// in place of the generic compile_style_test machinery (which emits Mul/CmpEq/branch
-/// per term and never fuses). Covers the dominant BIOS pattern:
-/// `style(--opcode: N) and style(--uOp: K)`.
+/// per term and never fuses). Covers the dominant nested-dispatch pattern:
+/// `style(--A: N) and style(--B: K)`.
 fn collect_literal_and_tests(test: &StyleTest) -> Option<Vec<(String, i32)>> {
     let mut out: Vec<(String, i32)> = Vec::new();
     fn walk(t: &StyleTest, out: &mut Vec<(String, i32)>) -> bool {
@@ -3322,6 +3334,7 @@ pub fn compile(
         packed_exception_tables: compiler.packed_exception_tables,
         packed_broadcast_writes: compiled_packed_bw,
         windowed_byte_array: compiler.recognised_windowed_byte_array.take(),
+        loop_descriptors: Vec::new(),
     };
 
     // Expand all Op::Call sites inline. Op::Call was a compile-time device to
@@ -3346,12 +3359,13 @@ pub fn compile(
     let lsfused = fuse_loadstate_branch(&mut program);
     log::info!("[compile detail] fuse_loadstate_branch: {} fused, {:.2}s", lsfused, _ct.elapsed().as_secs_f64());
 
-    // BIfNEL2 fusion: OFF by default. Static analysis shows 1330 adjacent
-    // diff-slot AND-guard pairs in doom8088 (95% of all such pairs), but
-    // web bench shows the saved dispatch is offset by the `pc += 2; continue;`
-    // cost and possibly cache effects from a new Op variant. Net wash on
-    // doom8088. See logbook 2026-04-30. Set CALCITE_BIF2_FUSE=1 to enable
-    // for measurement / future cabinets.
+    // BIfNEL2 fusion: OFF by default. Static analysis on the reference
+    // cabinet shows 1330 adjacent diff-slot AND-guard pairs (95% of all
+    // such pairs), but web bench shows the saved dispatch is offset by the
+    // `pc += 2; continue;` cost and possibly cache effects from a new Op
+    // variant. Net wash on the reference cabinet. See CSS-DOS logbook
+    // 2026-04-30. Set CALCITE_BIF2_FUSE=1 to enable for measurement /
+    // future cabinets.
     let _ct = web_time::Instant::now();
     let bif2_fused = if std::env::var("CALCITE_BIF2_FUSE").is_ok() {
         fuse_diff_slot_bifnel_pairs(&mut program)
@@ -3629,7 +3643,7 @@ fn inline_calls(program: &mut CompiledProgram) -> usize {
 ///
 /// The fused op skips two intermediate slot writes and two match-dispatch cycles
 /// in the interpreter, which matters because these triplets make up ~99% of ops
-/// in CSS-DOS v4 programs.
+/// in measured cabinets.
 ///
 /// Also applies to dispatch table entry ops and broadcast write value ops.
 ///
@@ -3779,9 +3793,9 @@ fn fuse_ops(ops: &mut Vec<Op>) -> usize {
 // Peephole: fuse adjacent BranchIfNotEqLit pairs sharing a target → BranchIfNotEqLit2
 // ---------------------------------------------------------------------------
 //
-// Static structure (doom8088): 1395 adjacent BIfNEL pairs in the static op
-// stream, all different-slot. 1330 of those (95.3%) share their `target` —
-// they form an AND-guard:
+// Static structure (reference cabinet): 1395 adjacent BIfNEL pairs in the
+// static op stream, all different-slot. 1330 of those (95.3%) share their
+// `target` — they form an AND-guard:
 //
 //   BranchIfNotEqLit { a: A, val: vA, target: T }
 //   BranchIfNotEqLit { a: B, val: vB, target: T }
@@ -5633,7 +5647,7 @@ pub fn execute(program: &CompiledProgram, state: &mut State, slots: &mut Vec<i32
         }
     }
 
-    // Packed broadcast writes: one port per CSS-DOS write slot. Replaces
+    // Packed broadcast writes: one port per cabinet write slot. Replaces
     // the absorbed `--mc{N}: --applySlot(...)` chain. We iterate ports in
     // REVERSE order so slot 0 fires LAST — matching the CSS semantics where
     // slot 0 is the outermost --applySlot wrapper and wins same-cell
@@ -5685,291 +5699,6 @@ pub fn execute(program: &CompiledProgram, state: &mut State, slots: &mut Vec<i32
     if rep_fastfwd_enabled() {
         rep_fast_forward(program, state, slots);
     }
-
-    // Fusion fast-forward: detect the doom column-drawer body in ROM at
-    // current CS:IP, bulk-apply its net effect. See column_drawer_fast_forward.
-    if fusion_fastfwd_enabled() {
-        let _ = column_drawer_fast_forward(program, state, slots);
-    }
-}
-
-/// Diagnostic funnel counters for `column_drawer_fast_forward`. Single-
-/// threaded by construction (calcite-core runs on one thread per State),
-/// stored in a `thread_local!` cell so the hot path can use plain `usize`
-/// increments — no atomics, no parameter threading.
-///
-/// Production cost when disabled: one `thread_local!` access + branch on
-/// `enabled` per tick. When enabled: the same plus a few non-atomic
-/// integer increments. Compare to the prior `AtomicUsize::fetch_add`
-/// implementation which was a `lock xadd` per stage per tick — at 10M
-/// ticks/sec that's the cost the diag was supposed to be measuring,
-/// not adding to.
-#[derive(Default, Clone, Debug)]
-pub struct FusionDiag {
-    pub enabled: bool,
-    pub ticks: usize,
-    pub pass_b0: usize,
-    pub pass_b1: usize,
-    pub pass_flags: usize,
-    pub pass_rom: usize,
-    pub body_iters_applied: usize,
-}
-
-impl FusionDiag {
-    pub fn report(&self) -> String {
-        if !self.enabled {
-            return String::from("fusion-diag: disabled (call fusion_diag_enable() before the run)\n");
-        }
-        if self.ticks == 0 {
-            return String::from("fusion-diag: no ticks recorded\n");
-        }
-        let pct = |n: usize| (n as f64) * 100.0 / (self.ticks as f64);
-        format!(
-            "fusion-diag: ticks={} pass_b0={} ({:.3}%) pass_b1={} ({:.4}%) pass_flags={} ({:.4}%) pass_rom={} ({:.4}%) body_iters_applied={}\n",
-            self.ticks,
-            self.pass_b0, pct(self.pass_b0),
-            self.pass_b1, pct(self.pass_b1),
-            self.pass_flags, pct(self.pass_flags),
-            self.pass_rom, pct(self.pass_rom),
-            self.body_iters_applied,
-        )
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-thread_local! {
-    static FUSION_DIAG: std::cell::RefCell<FusionDiag> = std::cell::RefCell::new(FusionDiag::default());
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-pub fn fusion_diag_enable() {
-    FUSION_DIAG.with(|d| {
-        let mut d = d.borrow_mut();
-        *d = FusionDiag::default();
-        d.enabled = true;
-    });
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-pub fn fusion_diag_snapshot() -> FusionDiag {
-    FUSION_DIAG.with(|d| d.borrow().clone())
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-pub fn fusion_fire_count() -> usize {
-    FUSION_DIAG.with(|d| d.borrow().body_iters_applied)
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn fusion_fastfwd_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        // OFF by default. Bench-doom-gameplay shows fusion as a net
-        // loss (~3% slower with fast-out, much worse without). Cause
-        // unknown — see CSS-DOS logbook entry "2026-04-29 — fusion
-        // disabled by default". Set CALCITE_FUSION_FASTFWD=1 to
-        // re-enable for investigation.
-        match std::env::var("CALCITE_FUSION_FASTFWD").as_deref() {
-            Ok("1") | Ok("true") | Ok("on") => true,
-            _ => false,
-        }
-    })
-}
-
-#[cfg(target_arch = "wasm32")]
-fn fusion_fastfwd_enabled() -> bool { false }
-
-/// The 21-byte column-drawer body pattern. Detected periodically in the
-/// doom8088 ROM by byte_period (offset 86306, 16 reps). Pattern matching
-/// against this byte sequence at current CS:IP triggers the fused body
-/// emit. Cabinet-agnostic — any cabinet whose ROM happens to contain this
-/// sequence at the current IP and whose register state matches the body's
-/// preconditions (no REP, no segment override, etc.) fires the fast-forward.
-const COLUMN_DRAWER_BODY: &[u8] = &[
-    0x88, 0xF0, 0xD0, 0xE8, 0x89, 0xF3, 0xD7, 0x89, 0xCB, 0x36, 0xD7,
-    0x88, 0xC4, 0xAB, 0xAB, 0x81, 0xC7, 0xEC, 0x00, 0x01, 0xEA,
-];
-
-/// Bulk-apply N iterations of the column-drawer body. Each body iteration:
-///   mov al, dh           ; al = dh
-///   shr al, 1            ; al = dh >> 1
-///   mov bx, si           ; bx = si (transient)
-///   xlat                 ; al = mem[ds*16 + si + al]
-///   mov bx, cx           ; bx = cx
-///   ss: xlat             ; al = mem[ss*16 + cx + al]  (with SS: prefix)
-///   mov ah, al           ; ax = (al << 8) | al
-///   stosw                ; mem[es*16 + di] = ax; di += 2
-///   stosw                ; mem[es*16 + di] = ax; di += 2
-///   add di, 0xEC         ; di += 0xEC
-///   add dx, bp           ; dx += bp
-///
-/// Net per-iteration: two memory reads (palette, colormap) → one byte →
-/// broadcast to AX → two memory writes → DI advances 4 + 0xEC = 0xF0,
-/// DX advances by BP, AL/AH = colormap byte, BX = CX (final).
-///
-/// Returns the number of iterations applied (0 if no match).
-fn column_drawer_fast_forward(program: &CompiledProgram, state: &mut State, slots: &[i32]) -> usize {
-    fn read_prop(program: &CompiledProgram, state: &State, slots: &[i32], name: &str) -> Option<i32> {
-        if let Some(&s) = program.property_slots.get(name) {
-            return Some(slots[s as usize]);
-        }
-        let bare = name.strip_prefix("--").unwrap_or(name);
-        state.get_var(bare)
-    }
-
-    // Diag funnel. The thread-local access is cheap (one TLS load + one
-    // RefCell borrow), but we still want to short-circuit when disabled
-    // so the production hot path costs nothing. Read enabled-flag once
-    // and pass through `&mut FusionDiag` only on the diag path.
-    #[cfg(not(target_arch = "wasm32"))]
-    let diag_enabled = FUSION_DIAG.with(|d| d.borrow().enabled);
-    #[cfg(target_arch = "wasm32")]
-    let diag_enabled = false;
-
-    // Cheap fast-out: the column-drawer body STARTS with 0x88 (mov r/m8,r8).
-    // Read the byte at current linear-IP first; if it's not 0x88 we can't
-    // be at body entry. This costs one read_mem per tick rather than the
-    // 21-byte rom_match. Almost every tick lands here.
-    #[cfg(not(target_arch = "wasm32"))]
-    if diag_enabled {
-        FUSION_DIAG.with(|d| d.borrow_mut().ticks += 1);
-    }
-    let cs = match state.get_var("CS") { Some(v) => v, None => return 0 };
-    let ip = match state.get_var("IP") { Some(v) => v, None => return 0 };
-    let cs_base = (cs as i64) * 16;
-    let ip_lin = cs_base + (ip as i64);
-    if ip_lin < 0 { return 0; }
-    if (state.read_mem(ip_lin as i32) & 0xFF) as u8 != COLUMN_DRAWER_BODY[0] {
-        return 0;
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    if diag_enabled {
-        FUSION_DIAG.with(|d| d.borrow_mut().pass_b0 += 1);
-    }
-
-    // Cheap byte-1 fast-out: body[1] = 0xF0 (modrm of mov al,dh).
-    if (state.read_mem((ip_lin + 1) as i32) & 0xFF) as u8 != COLUMN_DRAWER_BODY[1] {
-        return 0;
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    if diag_enabled {
-        FUSION_DIAG.with(|d| d.borrow_mut().pass_b1 += 1);
-    }
-
-    // Now we've passed the cheap pre-filter (byte 0 + byte 1 match). Do the
-    // expensive guards: no REP, no segment override, full body match.
-    let has_rep = read_prop(program, state, slots, "--hasREP").unwrap_or(0);
-    if has_rep != 0 { return 0; }
-    let has_seg_ov = read_prop(program, state, slots, "--hasSegOverride").unwrap_or(0);
-    if has_seg_ov != 0 { return 0; }
-    #[cfg(not(target_arch = "wasm32"))]
-    if diag_enabled {
-        FUSION_DIAG.with(|d| d.borrow_mut().pass_flags += 1);
-    }
-
-    // Full 21-byte body match starting at current post-tick IP.
-    if !rom_match(state, ip_lin as i32, COLUMN_DRAWER_BODY) {
-        return 0;
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    if diag_enabled {
-        FUSION_DIAG.with(|d| d.borrow_mut().pass_rom += 1);
-    }
-
-    // Detect how many bodies are stacked (max 16 unrolled).
-    let mut reps = 0;
-    while reps < 16 {
-        let off = (reps as i64) * (COLUMN_DRAWER_BODY.len() as i64);
-        if !rom_match(state, (ip_lin + off) as i32, COLUMN_DRAWER_BODY) {
-            break;
-        }
-        reps += 1;
-    }
-    if reps == 0 { return 0; }
-
-    // Read entry-state registers.
-    let dx = state.get_var("DX").unwrap_or(0) as i32;
-    let bp = state.get_var("BP").unwrap_or(0) as i32;
-    let cx = state.get_var("CX").unwrap_or(0) as i32;
-    let si = state.get_var("SI").unwrap_or(0) as i32;
-    let mut di = state.get_var("DI").unwrap_or(0) as i32;
-    let ds = state.get_var("DS").unwrap_or(0) as i32;
-    let ss = state.get_var("SS").unwrap_or(0) as i32;
-    let es = state.get_var("ES").unwrap_or(0) as i32;
-    let ax_init = state.get_var("AX").unwrap_or(0) as i32;
-
-    // Run N body iterations. Each iteration mutates dx, di; ax/bx are
-    // overwritten per body, only their final values matter.
-    let mut dx_cur = dx;
-    let mut last_byte: i32 = 0;
-    for _ in 0..reps {
-        // dh = high byte of dx (pre-iteration; the body reads dh BEFORE
-        // updating dx. Update happens at the very end via 'add dx,bp'.)
-        let dh = (dx_cur >> 8) & 0xFF;
-        let al0 = dh >> 1;                              // shr al,1
-        // First xlat: ds*16 + si + al0
-        let p0_addr = ((ds as i64) * 16 + (si as i64) + (al0 as i64)) as i32;
-        let p0 = state.read_mem(p0_addr) & 0xFF;
-        // Second xlat (with SS:): ss*16 + cx + p0
-        let p1_addr = ((ss as i64) * 16 + (cx as i64) + (p0 as i64)) as i32;
-        let p1 = state.read_mem(p1_addr) & 0xFF;
-        last_byte = p1;
-        // ax = (p1 << 8) | p1
-        let ax = (p1 << 8) | p1;
-        let ax_lo = (ax & 0xFF) as u8;
-        let ax_hi = ((ax >> 8) & 0xFF) as u8;
-        // stosw at es:di, di += 2
-        let d0 = ((es as i64) * 16 + (di as i64)) as i32;
-        bulk_store_byte(state, d0 as i64, ax_lo);
-        bulk_store_byte(state, (d0 + 1) as i64, ax_hi);
-        di = (di + 2) & 0xFFFF;
-        // stosw at es:di, di += 2
-        let d1 = ((es as i64) * 16 + (di as i64)) as i32;
-        bulk_store_byte(state, d1 as i64, ax_lo);
-        bulk_store_byte(state, (d1 + 1) as i64, ax_hi);
-        di = (di + 2) & 0xFFFF;
-        // add di, 0xEC
-        di = (di + 0xEC) & 0xFFFF;
-        // add dx, bp (16-bit wrap)
-        dx_cur = (dx_cur + bp) & 0xFFFF;
-    }
-
-    // Commit: AX = (last_byte << 8) | last_byte, BX = CX (final body wrote it),
-    // DX = dx_cur, DI = di, IP advanced by reps * 21.
-    let ax_final = (last_byte << 8) | last_byte;
-    state.set_var("AX", ax_final & 0xFFFF);
-    state.set_var("BX", cx & 0xFFFF);
-    state.set_var("DX", dx_cur & 0xFFFF);
-    state.set_var("DI", di & 0xFFFF);
-    let ip_new = ((ip as i64) + (reps as i64) * (COLUMN_DRAWER_BODY.len() as i64)) & 0xFFFF;
-    state.set_var("IP", ip_new as i32);
-    // Charge cycles. Per body: ~50 cycles (rough estimate based on opcodes).
-    if let Some(cc) = state.get_var("cycleCount") {
-        let total = (reps as i32).wrapping_mul(50);
-        state.set_var("cycleCount", cc.wrapping_add(total));
-    }
-    // We initially only accounted for the post-tick state of the *first*
-    // body byte (0x88 mov al,dh) since that's what the CSS would have just
-    // executed. Skip that — we instead detected at the START of a body
-    // (post-tick IP at byte 0 of the unfired body). So we apply ALL reps
-    // here, no need to subtract.
-    let _ = ax_init;
-    #[cfg(not(target_arch = "wasm32"))]
-    if diag_enabled {
-        FUSION_DIAG.with(|d| d.borrow_mut().body_iters_applied += reps);
-    }
-    reps
-}
-
-fn rom_match(state: &State, addr: i32, pattern: &[u8]) -> bool {
-    for (i, &b) in pattern.iter().enumerate() {
-        let a = addr.wrapping_add(i as i32);
-        if (state.read_mem(a) & 0xFF) as u8 != b {
-            return false;
-        }
-    }
-    true
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -5986,6 +5715,27 @@ fn rep_fastfwd_enabled() -> bool {
 
 #[cfg(target_arch = "wasm32")]
 fn rep_fastfwd_enabled() -> bool { true }
+
+/// Phase-2 diagnostic gate: when `CALCITE_REP_GENERIC=1`, the generic
+/// loop-descriptor validator runs alongside the existing
+/// `rep_fast_forward`. The validator confirms that every fast-forward
+/// fire corresponds to a recognised descriptor with consistent shape;
+/// mismatches are logged loudly. Default off — landing in
+/// diagnostic-bedded form per the genericity mission plan.
+#[cfg(not(target_arch = "wasm32"))]
+fn rep_generic_validator_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("CALCITE_REP_GENERIC").as_deref(),
+            Ok("1") | Ok("true") | Ok("on")
+        )
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+fn rep_generic_validator_enabled() -> bool { false }
 
 /// Post-tick recognizer for REP string ops. Runs after the CSS has applied
 /// exactly one iteration. If the opcode is a simple REP string op (0xAA STOSB,
@@ -6032,7 +5782,8 @@ fn rep_fast_forward(program: &CompiledProgram, state: &mut State, slots: &[i32])
     // silently. Conditions that would have to fall back to per-byte CSS
     // evaluation panic loudly with the offending state — the per-byte path
     // is so slow (10-1000x slower per iteration than the bulk path) that
-    // long REPs make conformance testing untenable and DOOM never reaches
+    // long REPs make conformance testing untenable and the reference cabinet's
+    // upstream program never reaches
     // its menu within a reasonable tick budget. When a panic fires, the
     // fix is to extend rep_fast_forward to handle that variant, not to
     // make the bail silent.
@@ -6052,6 +5803,12 @@ fn rep_fast_forward(program: &CompiledProgram, state: &mut State, slots: &[i32])
     //     condition; repType 1 (REPE) or 2 (REPNE) are both meaningful.
     let is_stos_movs = matches!(opcode, 0xAA | 0xAB | 0xA4 | 0xA5);
     let is_cmps_scas = matches!(opcode, 0xA6 | 0xA7 | 0xAE | 0xAF);
+    // Phase-2 diagnostic: confirm a descriptor exists for this opcode
+    // and its structural fields agree with what the runtime fast-forward
+    // would compute. Fires once per opcode-fire, not per tick.
+    if (is_stos_movs || is_cmps_scas) && rep_generic_validator_enabled() {
+        validate_descriptor_for_opcode(program, state, slots, opcode);
+    }
     if !is_stos_movs && !is_cmps_scas {
         // Current instruction is not a string op at all. Most ticks land here.
         rep_diag_bail("opcode-not-string");
@@ -6133,7 +5890,8 @@ fn rep_fast_forward(program: &CompiledProgram, state: &mut State, slots: &[i32])
     // the post-IRQ IP with `0 + 1 + prefix_len = 2`, skipping the first two
     // bytes of the handler.
     //
-    // Symptom (Doom8088, 2026-04-26): PIT fires during a libc memcpy REP
+    // Symptom (reference cabinet, 2026-04-26): a hardware-timer IRQ fires
+    // during a libc memcpy REP
     // MOVSW. CSS computes IRQ override (--IP = IVT[8].IP = 0, --CS = 0x2BC2),
     // writeback updates state-vars. rep_fast_forward then reads IP=0 and
     // writes IP=2, skipping `PUSH CX; PUSH AX`. Handler still pops them on
@@ -6234,11 +5992,11 @@ fn rep_fast_forward(program: &CompiledProgram, state: &mut State, slots: &[i32])
     //
     //   [0xD0000, 0xD0200)  — ROM-disk window (read-only via --readDiskByte)
     //   [0xF0000, 0x100000) — BIOS ROM (extended map, not state.memory)
-    if ranges_overlap_virtual(dst_lo_linear, dst_hi_linear - dst_lo_linear) {
+    if ranges_overlap_virtual(state, dst_lo_linear, dst_hi_linear - dst_lo_linear) {
         rep_fast_forward_panic(
             "dst-virtual-range",
             opcode, rep_type, cx, flags, cs_for_diag, ip_for_diag,
-            "REP dest overlaps a virtual region (BIOS ROM or disk window) — extend bulk path to route through write_mem for those ranges",
+            "REP dest overlaps a virtual region (extended map or recogniser-registered window) — extend bulk path to route through write_mem for those ranges",
         );
     }
 
@@ -6575,7 +6333,8 @@ fn rep_diag_bail(_reason: &'static str) {}
 /// Panic with the offending REP state. Called when a fast-forward bail
 /// would otherwise drop into per-byte CSS execution. There is no slow
 /// path: per-byte CSS for a long REP is so slow that conformance can't
-/// progress and DOOM never reaches its menu within a sensible budget.
+/// progress and the cabinet's upstream program can't make headway within
+/// a sensible budget.
 /// When this fires, the fix is to extend rep_fast_forward to handle the
 /// new variant — never to make the bail silent.
 fn rep_fast_forward_panic(
@@ -6603,6 +6362,121 @@ fn rep_fast_forward_panic(
     panic!(
         "rep_fast_forward: {reason} — {prefix} {opname} (op={opcode:#04x}) at CS:IP={cs:#06x}:{ip:#06x} CX={cx} flags={flags:#x}\n  {advice}\n  No slow path: extend rep_fast_forward to handle this variant.",
     );
+}
+
+/// Phase-2 validator (gated by `CALCITE_REP_GENERIC=1`).
+///
+/// For each opcode that triggers `rep_fast_forward`, confirm that the
+/// loop-descriptor recogniser produced a matching descriptor with
+/// shape consistent with the runtime hardcoded behaviour. Mismatches
+/// log to stderr (once per opcode) so we can see when the recogniser's
+/// view of the cabinet diverges from what the hardcoded path is doing.
+///
+/// The validator is read-only — it never changes the runtime path.
+/// Phase 3 will flip the data flow so the descriptor decides; the
+/// hardcoded path will become the validator. Phase 5 deletes the
+/// hardcoded path altogether.
+#[cfg(not(target_arch = "wasm32"))]
+fn validate_descriptor_for_opcode(
+    program: &CompiledProgram,
+    state: &State,
+    slots: &[i32],
+    opcode: i32,
+) {
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+    static SEEN: OnceLock<Mutex<std::collections::HashSet<i32>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+    {
+        let mut s = seen.lock().unwrap();
+        if !s.insert(opcode) {
+            return; // already validated for this opcode
+        }
+    }
+
+    // 1. Find a descriptor whose key_value matches this opcode.
+    let desc = program
+        .loop_descriptors
+        .iter()
+        .find(|d| d.key_value == opcode as i64);
+    let Some(desc) = desc else {
+        eprintln!(
+            "[rep-generic-validator] MISS: opcode {:#04x} fired rep_fast_forward but no descriptor was emitted by the recogniser. \
+             {} descriptors total: {:?}",
+            opcode,
+            program.loop_descriptors.len(),
+            program.loop_descriptors.iter().map(|d| format!("{:#04x}", d.key_value)).collect::<Vec<_>>(),
+        );
+        return;
+    };
+
+    // 2. Spot-check the structural fields against runtime expectations:
+    //    - There must be a counter slot (CX-equivalent for x86; whatever
+    //      the cabinet uses).
+    //    - Pointer count: 1 for STOS/SCAS, 2 for MOVS/CMPS. The recogniser
+    //      shouldn't know x86, but we *do* know the cabinet's hardcoded
+    //      runtime path. The validator is allowed to.
+    //    - The IP property's slot resolves; the IP advance literal is 1
+    //      (single-byte instruction). Extending to flag-conditioned
+    //      exits (CMPS/SCAS) lands with phase 3.
+    let mut issues: Vec<String> = Vec::new();
+    if desc.counter.is_none() {
+        issues.push("no counter recognised".to_string());
+    }
+    let expected_pointers = match opcode {
+        0xAA | 0xAB | 0xAE | 0xAF => 1, // STOS/SCAS: just DI
+        0xA4 | 0xA5 | 0xA6 | 0xA7 => 2, // MOVS/CMPS: DI and SI
+        _ => 0,
+    };
+    if desc.pointers.len() != expected_pointers {
+        issues.push(format!(
+            "pointer count {} != expected {}",
+            desc.pointers.len(),
+            expected_pointers
+        ));
+    }
+    if desc.ip_advance_literal != 1 {
+        issues.push(format!(
+            "ip_advance_literal {} != 1 (instrLen for string ops)",
+            desc.ip_advance_literal
+        ));
+    }
+    // The IP property and counter property should both resolve to known
+    // slots/state-vars (i.e. running cabinet has them).
+    let ip_resolves = program.property_slots.contains_key(&desc.ip_property)
+        || state
+            .state_var_index
+            .contains_key(desc.ip_property.trim_start_matches("--"));
+    if !ip_resolves {
+        issues.push(format!("ip_property `{}` doesn't resolve", desc.ip_property));
+    }
+    let _ = slots; // currently unused, may be used by deeper structural checks
+
+    if issues.is_empty() {
+        eprintln!(
+            "[rep-generic-validator] OK opcode {:#04x}: counter={} pointers={} writes={} ip={}",
+            opcode,
+            desc.counter.is_some(),
+            desc.pointers.len(),
+            desc.writes.len(),
+            desc.ip_property,
+        );
+    } else {
+        eprintln!(
+            "[rep-generic-validator] DRIFT opcode {:#04x}: {}",
+            opcode,
+            issues.join("; ")
+        );
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn validate_descriptor_for_opcode(
+    _program: &CompiledProgram,
+    _state: &State,
+    _slots: &[i32],
+    _opcode: i32,
+) {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -6674,23 +6548,37 @@ pub fn rep_diag_report() -> String {
     { String::new() }
 }
 
-/// Returns true if [start, start+len) overlaps a memory region that isn't
-/// backed by plain `state.memory` byte storage. CSS-DOS exposes three such
-/// regions via dispatch in `--readMem`:
-///   - [0x0500, 0x0502)   — BDA keyboard head bridge to `--keyboard` state var.
-///   - [0xD0000, 0xD0200) — ROM-disk window synthesised by `--readDiskByte`.
-///   - [0xF0000, 0x100000) — BIOS ROM, routed to state.extended.
-/// Plus writes to the BIOS region also route to state.extended. The
-/// fast-forward collapses iterations into a single `state.memory`
-/// operation, which would be wrong for any of these ranges.
+/// Returns true if [start, start+len) overlaps any region whose reads/
+/// writes aren't plain `state.memory` byte storage. The bulk fast-forward
+/// path bails on overlap because flat `bulk_fill`/`bulk_copy` would skip
+/// the dispatch CSS would have run.
+///
+/// Two sources contribute:
+///
+/// - `state.virtual_regions` — populated by recognisers at compile time.
+///   Currently the windowed-byte-array recogniser registers its window
+///   here. Generic — calcite-core knows nothing about what's in the
+///   window.
+/// - The structural `>=0xF0000` extended-map range — a property of
+///   `State` itself (everything at that linear address or above lives
+///   in `state.extended`, not `state.memory`). Hardcoded here because
+///   it's a State-level invariant, not a per-cabinet feature.
 #[inline]
-fn ranges_overlap_virtual(start: i64, len: i64) -> bool {
+fn ranges_overlap_virtual(state: &State, start: i64, len: i64) -> bool {
     if len <= 0 { return false; }
     let end = start + len;
     let overlaps = |a: i64, b: i64, c: i64, d: i64| a < d && c < b;
-    overlaps(start, end, 0x0500, 0x0502)
-        || overlaps(start, end, 0xD_0000, 0xD_0200)
-        || overlaps(start, end, 0xF_0000, 0x10_0000)
+    // Extended-map range: a State invariant, not a cabinet feature.
+    if overlaps(start, end, 0xF_0000, 0x10_0000) {
+        return true;
+    }
+    // Cabinet-registered virtual regions.
+    for region in &state.virtual_regions {
+        if overlaps(start, end, region.start as i64, region.end as i64) {
+            return true;
+        }
+    }
+    false
 }
 
 fn bulk_store_byte(state: &mut State, addr: i64, val: u8) {
@@ -6817,7 +6705,7 @@ fn exec_ops(
         // Safety: pc < len checked by loop condition.
         let op = unsafe { ops.get_unchecked(pc) };
         match op {
-            // Hot path: 96%+ of ops in CSS-DOS programs are this one variant.
+            // Hot path: 96%+ of ops in measured cabinets are this one variant.
             // Keep it first so the compiler can (hopefully) lay out the jump table
             // with this case at the predicted target.
             Op::BranchIfNotEqLit { a, val, target } => {

@@ -11,6 +11,94 @@ and the Criterion benchmarks.
 
 ---
 
+## 2026-05-07 — `rep_fast_forward` genericity mission, phase 2: descriptor validator + virtual_regions
+
+Cross-link: see CSS-DOS
+[`docs/plans/2026-05-06-rep-fast-forward-genericity.md`](../../CSS-DOS/docs/plans/2026-05-06-rep-fast-forward-genericity.md)
+checkpoint 2 — landed today as a diagnostic-bedded validator (path B
+of the in-session re-scope) rather than the original full per-iter
+applier (path A). Path A was deferred to checkpoint 3 once the
+bulk specialisations land alongside it; building both at once in one
+session was judged too risky for a perf-gated mission.
+
+What landed in calcite:
+
+- **`CALCITE_REP_GENERIC=1` env-var gate.** Default off. When on, fires
+  a per-tick validator inside `rep_fast_forward` that checks the
+  recognised descriptor agrees with what the runtime is doing.
+- **`loop_descriptors` mirrored onto `CompiledProgram`.** Phase 1 only
+  stored them on `Evaluator`; the per-tick fast-forward hook only
+  sees `&CompiledProgram`, so `Evaluator::from_parsed` now also
+  writes the descriptor list onto `compiled.loop_descriptors`.
+- **`state.virtual_regions: Vec<VirtualRegion>`.** Populated at compile
+  time by recognisers that own a region. Currently the
+  windowed-byte-array recogniser registers its window. The bulk
+  fast-forward path consults this list instead of the hardcoded
+  0xD0000 carve-out. The 0xF0000+ extended-map boundary stays a
+  State invariant (every read above lives in `state.extended`, not
+  per-cabinet). The stale 0x500 keyboard-bridge entry, obsolete since
+  the input-edge recogniser landed, is removed.
+- **Memwrite addr/val pairing by assignment-order proximity.**
+  Replaces the phase-1 name-sort heuristic with a positional pairing
+  rule: for each address slot, the matching value slot is the unpaired
+  value whose `assignment_index` is closest, ties broken in favour of
+  "immediately after". Cabinets that emit pairs adjacently (kiln does)
+  pair correctly; others degrade to "closest available" which is no
+  worse than name-sort. Cardinal-rule clean — purely positional, no
+  character-level reads. Locked in by
+  `memwrite_pairing_uses_assignment_order_proximity` test.
+
+Validator findings on the live doom8088 cabinet:
+
+```
+[rep-generic-validator] OK opcode 0xab: counter=true pointers=1 writes=2 ip=--IP
+[rep-generic-validator] OK opcode 0xaa: counter=true pointers=1 writes=1 ip=--IP
+[rep-generic-validator] OK opcode 0xa4: counter=true pointers=2 writes=1 ip=--IP
+[rep-generic-validator] OK opcode 0xa5: counter=true pointers=2 writes=2 ip=--IP
+[rep-generic-validator] MISS: opcode 0xa6 ... no descriptor (CMPS/SCAS, expected — phase 3)
+[rep-generic-validator] MISS: opcode 0xa7 ... no descriptor (CMPS/SCAS, expected — phase 3)
+[rep-generic-validator] MISS: opcode 0xae ... no descriptor (CMPS/SCAS, expected — phase 3)
+[rep-generic-validator] MISS: opcode 0xaf ... no descriptor (CMPS/SCAS, expected — phase 3)
+```
+
+The OK lines confirm phase 1's recogniser sees STOS/MOVS exactly as the
+runtime path expects them. The MISS lines are exactly as documented in
+the phase-1 brief: the recogniser doesn't yet handle flag-conditioned
+exits. Phase 3 extends the predicate matcher to recognise
+`<rep-continue> AND <flag-bit-condition>` shape and fold CMPS/SCAS in.
+
+Verification: smoke 7/7 with flag both off and on. Doom8088 reaches
+in-game on calcite-cli at tick 34.65M with flag on (parity with
+pre-mission baseline). Validator is read-only — runtime path
+unchanged.
+
+Files: `crates/calcite-core/src/compile.rs` (validator function,
+env-var gate, `ranges_overlap_virtual` consults state),
+`crates/calcite-core/src/state.rs` (`VirtualRegion` struct,
+`State::virtual_regions` field), `crates/calcite-core/src/eval.rs`
+(register virtual region when wiring `windowed_byte_array`,
+mirror descriptors onto `compiled`),
+`crates/calcite-core/src/pattern/loop_descriptor.rs` (`assignment_index`
+on `FamilyMember`, addr/val pairing by proximity),
+`crates/calcite-core/src/pattern/loop_descriptor/tests.rs`
+(positional pairing test).
+
+Tests: 10 pattern::loop_descriptor unit tests (was 9, +1 for new
+pairing test). 4 pre-existing test failures in compile/eval modules
+unrelated to this change — same as on prior tip.
+
+Pickup notes for checkpoint 3: extend
+`pattern::loop_descriptor::match_ip_stay_or_advance` to accept
+conjunction predicates; flip `flag_conditioned: bool` on the
+descriptor when the predicate has the AND-with-flag-bit shape. Build
+the per-iter applier (and its bulk_fill / bulk_copy specialisations)
+inside `compile.rs::rep_fast_forward` behind the same flag. When the
+applier runs, it makes the validator redundant — collapse the validator
+into the applier (or just keep both for one more checkpoint as a
+fail-safe).
+
+---
+
 ## 2026-05-06 — `rep_fast_forward` genericity mission, phase 1: structural loop recogniser
 
 Cross-link: see CSS-DOS

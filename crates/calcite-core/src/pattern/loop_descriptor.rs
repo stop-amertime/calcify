@@ -226,6 +226,14 @@ struct FamilyMember<'a> {
     /// The fallback Expr (applied when no key matches).
     #[allow(dead_code)]
     fallback: &'a Expr,
+    /// Position of this assignment in the source's `assignments` list.
+    /// Used purely structurally — the recogniser does not interpret the
+    /// number, only compares it across members. Cabinets that emit
+    /// related slots in matched order (kiln pairs an address slot with
+    /// the value slot that immediately follows) get correct pairing for
+    /// free; cabinets that don't degrade to first-by-position pairing,
+    /// which is no worse than the old name-sort heuristic.
+    assignment_index: usize,
 }
 
 fn collect_dispatch_family<'a>(assignments: &'a [Assignment]) -> Option<DispatchFamily<'a>> {
@@ -235,10 +243,11 @@ fn collect_dispatch_family<'a>(assignments: &'a [Assignment]) -> Option<Dispatch
     // same P, with K_i a literal.)
     let mut by_key: HashMap<String, HashMap<&'a str, FamilyMember<'a>>> = HashMap::new();
 
-    for asn in assignments {
-        let Some((key_prop, member)) = extract_single_key_dispatch(asn) else {
+    for (idx, asn) in assignments.iter().enumerate() {
+        let Some((key_prop, mut member)) = extract_single_key_dispatch(asn) else {
             continue;
         };
+        member.assignment_index = idx;
         by_key.entry(key_prop).or_default().insert(asn.property.as_str(), member);
     }
 
@@ -304,6 +313,7 @@ fn extract_single_key_dispatch<'a>(
         FamilyMember {
             bodies,
             fallback,
+            assignment_index: 0, // overwritten by caller
         },
     ))
 }
@@ -338,6 +348,7 @@ fn extract_strict_single_key<'a>(
         FamilyMember {
             bodies,
             fallback: fallback.as_ref(),
+            assignment_index: 0, // overwritten by caller
         },
     ))
 }
@@ -574,29 +585,50 @@ fn recognise_one_opcode<'a>(
         }
     }
 
-    // Phase 1 doesn't pair address ↔ value rigorously; we just note the
-    // raw expressions. Phase 2 will pair them by their slot indices in
-    // the cabinet's `--memAddrN` / `--memValN` correspondence (kiln pairs
-    // them by index, not by name). For now we emit one WriteEntry per
-    // address with the value slot name set to the empty string when no
-    // match is found by raw co-occurrence.
+    // Pair address/value memwrite slots by assignment-index proximity.
+    //
+    // The cabinet's emitter (in CSS-DOS, kiln) pairs related slots by
+    // emitting them adjacent in the cabinet source. We exploit that
+    // structurally: for each address slot, the matching value slot is
+    // the one whose assignment_index is closest to it among unpaired
+    // value slots, with ties broken in favour of the immediately-after
+    // position. This is purely positional — no character-level reads.
+    //
+    // Cabinets that don't co-locate addr/val slots degrade to "pick the
+    // closest available", which is no worse than the old name-sort
+    // heuristic and still deterministic.
     let mut writes: Vec<WriteEntry> = Vec::new();
     let mut addr_props: Vec<&str> = writes_addr.keys().copied().collect();
-    addr_props.sort_unstable();
+    // Sort addresses by assignment_index so pairing is left-to-right
+    // through the cabinet source (deterministic regardless of HashMap
+    // iteration order).
+    addr_props.sort_by_key(|p| family.members[*p].assignment_index);
     for ap in addr_props {
         let (_, addr_expr) = writes_addr[ap];
-        // Heuristic pairing: pick the value property whose slot index
-        // (parsed from a trailing integer if any) matches the address
-        // property's slot index. Phase 1 stays structural — we don't read
-        // characters out of names. Instead we just take the first
-        // unmatched value, in sorted order, as the pair. Phase 2 will
-        // refine using the assignment ordering.
-        let mut val_props: Vec<&str> = writes_val.keys().copied().collect();
-        val_props.sort_unstable();
-        let val_pick = val_props.first().copied();
-        let val_expr = val_pick.map(|p| writes_val[p]);
+        let addr_idx = family.members[ap].assignment_index;
+        // Find the unpaired value property whose assignment_index is
+        // closest to addr_idx, preferring "immediately after" over
+        // "immediately before" on a tie.
+        let mut best: Option<(&str, usize, isize)> = None; // (prop, |delta|, signed_delta)
+        for vp in writes_val.keys().copied() {
+            let v_idx = family.members[vp].assignment_index;
+            let signed = v_idx as isize - addr_idx as isize;
+            let abs = signed.unsigned_abs();
+            let candidate = (vp, abs, signed);
+            best = match best {
+                None => Some(candidate),
+                Some((_, prev_abs, prev_signed)) => {
+                    if abs < prev_abs || (abs == prev_abs && signed > prev_signed) {
+                        Some(candidate)
+                    } else {
+                        best
+                    }
+                }
+            };
+        }
 
-        if let (Some(vp), Some(ve)) = (val_pick, val_expr) {
+        if let Some((vp, _, _)) = best {
+            let ve = writes_val[vp];
             writes_val.remove(vp);
             writes.push(WriteEntry {
                 addr_property: ap.to_string(),

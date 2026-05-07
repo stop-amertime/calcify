@@ -294,6 +294,15 @@ impl Evaluator {
             byte_array_base_key: cw.byte_array_base_key,
             byte_array: cw.byte_array.clone(),
         });
+        // Register the window as a virtual region so bulk paths (e.g.
+        // the REP fast-forward applier) can detect overlaps and bail
+        // without per-recogniser hardcoding. Generic — the bulk path
+        // sees a (start, end) range, not "rom-disk".
+        state.virtual_regions.push(crate::state::VirtualRegion {
+            start: cw.window_base,
+            end: cw.window_end,
+            source: "windowed_byte_array",
+        });
         log::info!(
             "[windowed-byte-array] installed: window=[0x{:X},0x{:X}) stride={} key_cell={} byte_array_len={}",
             cw.window_base, cw.window_end, cw.stride, cw.key_cell_property,
@@ -496,7 +505,7 @@ impl Evaluator {
 
         log::info!("[compile phase] logging: {:.2}s", _t.elapsed().as_secs_f64());
         let _t = Instant::now();
-        let compiled = compile::compile(
+        let mut compiled = compile::compile(
             &assignments,
             &broadcast_result.writes,
             &packed_bw_result.ports,
@@ -565,6 +574,10 @@ impl Evaluator {
             _t_loop.elapsed().as_secs_f64(),
             loop_descriptors.len(),
         );
+        // Mirror onto CompiledProgram so the per-tick rep_fast_forward
+        // validator (CALCITE_REP_GENERIC=1) can consult them — that
+        // hook only sees `&CompiledProgram`, not the Evaluator.
+        compiled.loop_descriptors = loop_descriptors.clone();
         if loop_descriptor_diag_enabled() && !loop_descriptors.is_empty() {
             eprintln!(
                 "[loop_descriptor] recognised {} self-loop descriptor(s):",
