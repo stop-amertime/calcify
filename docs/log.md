@@ -11,6 +11,81 @@ and the Criterion benchmarks.
 
 ---
 
+## 2026-05-07 — Widened `fuse_loadstate_branch`: NEGATIVE RESULT, lead retired
+
+Cross-link: pre-ship Doom8088 FPS brief in
+[`../../CSS-DOS/docs/agent-briefs/2026-05-07-pre-ship-fps-leads.md`](../../CSS-DOS/docs/agent-briefs/2026-05-07-pre-ship-fps-leads.md)
+listed widening `fuse_loadstate_branch` to allow non-aliasing
+intervening ops between `LoadState{dst:X}` and `BranchIfNotEqLit{a:X}`
+as the highest-leverage pre-ship lead, motivated by the stale
+`compile.rs:6738` "96%+" comment vs the measured 0.8 % runtime
+hit-rate.
+
+**Implementation.** Replaced `fuse_ls_ops`'s single-step adjacency
+check with a forward scan up to `LS_WINDOW=8`, breaking on:
+intervening op reads/writes slot X, writes memory, is a jump target,
+is a branch/jump/dispatch op. Behaviour preserved on linear flow,
+fall-through, and the (forbidden) external-jump-to-branch case. Built
+clean, ran on doom8088. **Found exactly the same 50 fusions as the
+adjacent path.** Reverted.
+
+**Diagnosis — probe.** Wrote
+`crates/calcite-cli/src/bin/probe_bif_predecessor.rs`: for every
+isolated `BranchIfNotEqLit` in the post-compile op stream (across
+main ops, dispatch entries + fallbacks, broadcast value_ops +
+spillovers), classify the predecessor at `i-1` and walk back up to 16
+ops within the basic block looking for a matching
+`LoadState{dst:X}`. On `tests/bench/cache/doom8088.css`:
+
+```
+Total isolated BIfNEL ops:    80118
+With LoadState{dst:X} in 16-window: 0 (0.00%)
+Without:                            80118
+
+Predecessor op kinds for BIfNEL (ops[i-1]):
+  Jump                              77970 (97.3%)
+  BranchIfNotEqLit                   1395 (1.7%)
+  LoadSlot                            164 (0.2%)
+  LoadLit                             113 (0.1%)
+  DispatchChain                        49 (0.1%)
+  Add                                  22 (0.0%)
+  ... (long tail)
+```
+
+The brief assumed kiln emits `LoadState → LoadLit → CmpEq →
+BranchIfZero → ...` with intervening slot-shuffles, leaving residual
+gaps for a widened scan. Reality: `fuse_cmp_branch` already collapses
+the `LoadLit + CmpEq + BranchIfZero` triplet to `BranchIfNotEqLit`
+upstream, and `build_dispatch_chains` lays out chain-miss exits as
+`...; Jump <chain entry body>; BranchIfNotEqLit <next-test>; ...`.
+The BIfNEL is reached *as a jump target* from elsewhere — not via the
+adjacent `Jump` — so the LoadState that originally fed it lives on a
+different basic block (or has been folded into a `LoadStateAnd...`).
+**0 candidates for any window size.**
+
+**Bench (sanity).** Median of 3 on `doom-loading --target=cli`:
+241.872s. Not changed by the (reverted) widened scan. Per-tick op
+floor on doom8088 in steady state isn't moved by widening this peephole
+because there are no opportunities to widen.
+
+**Static fusion counts** (compile.rs INFO):
+- `fuse_cmp_branch: 77100 fused`
+- `fuse_loadstate_branch: 50 fused` (both adjacent and widened)
+- `fuse_diff_slot_bifnel_pairs: 0 fused` (gated off by default)
+
+**What's kept.** `probe_bif_predecessor.rs` is in-tree as a permanent
+diagnostic — quick way to sanity-check any future fusion lead that
+assumes a specific predecessor pattern around BIfNEL.
+
+**Lessons.** A stale code comment claiming a hit-rate is not evidence
+of an opportunity. Always probe the actual post-compile static stream
+before designing a peephole; the cost is 200 lines of probe + 1 cargo
+run, vs hours of an uncalibrated implementation. The brief for next
+iteration has been updated to retire lead #1 and elevate lead #3
+(`apply_input_edges` short-circuit) to top pick.
+
+---
+
 ## 2026-05-07 — `rep_fast_forward` genericity mission, phase 3a: CMPS/SCAS recognition + BulkClass classification
 
 Cross-link: see CSS-DOS
