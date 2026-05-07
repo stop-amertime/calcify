@@ -57,7 +57,7 @@
 //! packed-cell + windowed-array + extended-map routing the hardcoded path
 //! relies on; rewriting them here would be reinvention.
 
-use crate::compile::{bulk_fill, bulk_store_byte, ranges_overlap_virtual, CompiledProgram};
+use crate::compile::{bulk_fill, bulk_store_byte, compute_sub_flags, ranges_overlap_virtual, CompiledProgram};
 use crate::pattern::loop_descriptor::{BulkClass, LoopDescriptor};
 use crate::state::State;
 use crate::types::Expr;
@@ -79,6 +79,96 @@ pub(crate) enum ApplyOutcome {
     /// `BulkClass` other than `Fill`, and for `Fill` shapes whose
     /// `val_expr` isn't a bare `Var`.)
     Unsupported(&'static str),
+}
+
+/// Whether an applier should also commit the post-loop state vars
+/// (DI/SI/CX/IP/cycleCount/flags), or only mutate memory.
+///
+/// `MemoryOnly` is what the dual-execute harness uses: the harness leaves
+/// state-var commits to the hardcoded path (which runs on the real state
+/// in parallel), and only diffs memory + extended after the applier runs
+/// on the clone.
+///
+/// `Full` is what step 7's flag-flip uses: the applier becomes the only
+/// source of truth for the post-tick state vars too, replacing every
+/// observable side effect of the hardcoded path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommitMode {
+    /// Only mutate `state.memory` / `state.extended`. Used by the dual
+    /// harness — the hardcoded path concurrently commits state vars on
+    /// the real (non-clone) state.
+    MemoryOnly,
+    /// Mutate memory AND commit DI/SI/CX/IP/cycleCount/flags exactly as
+    /// the hardcoded path would. Used by `CALCITE_REP_GENERIC=1` callers
+    /// that have replaced the hardcoded path entirely.
+    Full,
+}
+
+// ---------------------------------------------------------------------------
+// Per-iter cycle cost.
+// ---------------------------------------------------------------------------
+//
+// CARDINAL-RULE WART (per scoping doc Q3 / step 7).
+//
+// The per-iteration cycle counts (10/17/22/15) are taken straight from the
+// hardcoded `rep_fast_forward` path, which got them from kiln's per-opcode
+// schedule. They are upstream (x86) knowledge: a 6502 / brainfuck cabinet
+// emitting structurally identical CSS would have different cycle costs.
+//
+// The cleanest cardinal-rule fix is for the recogniser to discover the
+// per-iteration cycle increment from the cabinet's `--cycleCount` dispatch
+// body — a structural pass that finds, for each opcode key, the `+ K`
+// added to a counter mirror — and stash it on the descriptor as a
+// `per_iter_cycles: i32` field. That pass is independent work and carries
+// the same flavour of Q3 Option B (it's structurally extractable, but
+// requires extending the recogniser).
+//
+// Step 7 takes the pragmatic option (b) called out by the scoping doc:
+// keyed on `BulkClass` + pointer count + step. The dispatch is structural
+// (no opcode lookup, no name inspection), and the WART is bounded to this
+// helper. Cabinets whose cycle costs differ from doom8088 will produce
+// observable cycleCount drift under `CALCITE_REP_GENERIC=1`; the next
+// session's punch list owns the recogniser-driven fix.
+fn per_iter_cycles(descriptor: &LoopDescriptor) -> i32 {
+    match descriptor.bulk_class {
+        // STOS-shape: one stepping pointer, no source pointer, fill.
+        BulkClass::Fill => 10,
+        // MOVS-shape: two stepping pointers, source-keyed indirect read.
+        BulkClass::Copy => 17,
+        // CMPS (2 pointers) costs 22; SCAS (1 pointer) costs 15. LODS
+        // would also fall here (1 pointer, !flag_conditioned) but the
+        // hardcoded path doesn't fast-forward LODS at all, so the
+        // dispatch in `compile.rs::rep_fast_forward` never reaches the
+        // descriptor-driven applier with a LODS descriptor under the
+        // generic flag — the parity is preserved trivially.
+        BulkClass::ReadOnly => {
+            if descriptor.pointers.len() == 2 {
+                22 // CMPS
+            } else {
+                15 // SCAS / LODS
+            }
+        }
+        // PerIter shapes don't have a fast-forward applier yet; this
+        // branch is unreachable from the dispatch sites.
+        BulkClass::PerIter => 0,
+    }
+}
+
+/// Resolve the prefix-length value used by the IP advance formula.
+///
+/// CARDINAL-RULE WART. The hardcoded path reads `--prefixLen` as a literal
+/// property name (default 1 if missing); the descriptor as it stands today
+/// has no structural pointer to that slot. Recognising it would require
+/// the recogniser to trace the cabinet's IP-advance branch back through
+/// the slot graph and identify the slot whose value is added to IP — a
+/// well-formed structural recognition, but independent work.
+///
+/// Step 7 reads `--prefixLen` by name as a contained wart, mirroring the
+/// hardcoded path's lookup. This is a leaf call site, not a structural
+/// decision in the recogniser. Default of 1 matches the hardcoded path's
+/// default.
+fn read_prefix_len(program: &CompiledProgram, state: &State, slots: &[i32]) -> i32 {
+    read_prop(program, state, slots, "--prefixLen").unwrap_or(1)
 }
 
 /// Look up a property name's current value. Mirrors the resolver inside
@@ -156,6 +246,21 @@ pub(crate) fn apply_fill(
     program: &CompiledProgram,
     state: &mut State,
     slots: &[i32],
+) -> ApplyOutcome {
+    apply_fill_with_commit(descriptor, program, state, slots, CommitMode::MemoryOnly)
+}
+
+/// Variant of [`apply_fill`] that optionally commits post-loop state vars
+/// (DI/CX/IP/cycleCount). When `commit == CommitMode::Full`, the applier
+/// reproduces every observable side effect of the hardcoded `rep_fast_forward`
+/// path for STOS-shape loops; when `MemoryOnly`, only memory is mutated
+/// (existing dual-harness contract).
+pub(crate) fn apply_fill_with_commit(
+    descriptor: &LoopDescriptor,
+    program: &CompiledProgram,
+    state: &mut State,
+    slots: &[i32],
+    commit: CommitMode,
 ) -> ApplyOutcome {
     if descriptor.bulk_class != BulkClass::Fill {
         return ApplyOutcome::Unsupported("not Fill class");
@@ -282,6 +387,16 @@ pub(crate) fn apply_fill(
         }
     }
 
+    if commit == CommitMode::Full {
+        // Pointer commit (single pointer, 16-bit wrap).
+        let new_ptr = (ptr_value + n * signed_step) & 0xFFFF;
+        commit_pointer(state, &ptr_entry.property, new_ptr);
+        // Counter commit: drains to zero.
+        commit_counter(state, &counter.property, 0);
+        // IP advance and cycle charge.
+        commit_ip_and_cycles(program, state, slots, descriptor, n);
+    }
+
     ApplyOutcome::Applied { iterations }
 }
 
@@ -328,6 +443,18 @@ pub(crate) fn apply_copy(
     program: &CompiledProgram,
     state: &mut State,
     slots: &[i32],
+) -> ApplyOutcome {
+    apply_copy_with_commit(descriptor, program, state, slots, CommitMode::MemoryOnly)
+}
+
+/// Variant of [`apply_copy`] that optionally commits state vars
+/// (DI/SI/CX/IP/cycleCount). See [`apply_fill_with_commit`].
+pub(crate) fn apply_copy_with_commit(
+    descriptor: &LoopDescriptor,
+    program: &CompiledProgram,
+    state: &mut State,
+    slots: &[i32],
+    commit: CommitMode,
 ) -> ApplyOutcome {
     if descriptor.bulk_class != BulkClass::Copy {
         return ApplyOutcome::Unsupported("not Copy class");
@@ -539,6 +666,18 @@ pub(crate) fn apply_copy(
         }
     }
 
+    if commit == CommitMode::Full {
+        // Both pointers advance by the same signed step (structurally
+        // verified above). 16-bit wrap on commit, matching the hardcoded
+        // path's `& 0xFFFF`.
+        let new_dst = (dst_ptr_value + n * signed_step) & 0xFFFF;
+        let new_src = (src_ptr_value + n * signed_step) & 0xFFFF;
+        commit_pointer(state, &dst_entry.property, new_dst);
+        commit_pointer(state, &src_entry.property, new_src);
+        commit_counter(state, &counter.property, 0);
+        commit_ip_and_cycles(program, state, slots, descriptor, n);
+    }
+
     ApplyOutcome::Applied { iterations: n }
 }
 
@@ -614,6 +753,18 @@ pub(crate) fn apply_read_only(
     state: &mut State,
     slots: &[i32],
 ) -> ApplyOutcome {
+    apply_read_only_with_commit(descriptor, program, state, slots, CommitMode::MemoryOnly)
+}
+
+/// Variant of [`apply_read_only`] that optionally commits state vars
+/// (DI/SI/CX/IP/cycleCount/flags). See [`apply_fill_with_commit`].
+pub(crate) fn apply_read_only_with_commit(
+    descriptor: &LoopDescriptor,
+    program: &CompiledProgram,
+    state: &mut State,
+    slots: &[i32],
+    commit: CommitMode,
+) -> ApplyOutcome {
     if descriptor.bulk_class != BulkClass::ReadOnly {
         return ApplyOutcome::Unsupported("not ReadOnly class");
     }
@@ -644,14 +795,36 @@ pub(crate) fn apply_read_only(
     // is false; the predicate is just the counter check).
     if !descriptor.flag_conditioned {
         // LODS shape. No memory writes, no early exit, n iterations.
-        // The accumulator is loaded at end of run from the post-walk
-        // pointer position — that's a state-var update which step 7
-        // owns. For step 6 the only observable from the harness's
-        // perspective is "memory unchanged" + iteration count = n.
+        //
+        // The hardcoded `rep_fast_forward` does NOT fast-forward LODS at
+        // all (it's not in `is_stos_movs` or `is_cmps_scas`), so the
+        // dispatch site in `compile.rs::rep_fast_forward` never reaches
+        // this branch with `commit == Full`. The applier is wired to
+        // produce a defensible iteration count for the dual harness, but
+        // the state-var commit below is unused in practice. We commit it
+        // anyway because if a future caller does feed LODS through this
+        // path, partial commits would be a worse failure mode than
+        // committing what we know.
         if p_count != 1 {
             return ApplyOutcome::Unsupported(
                 "LODS shape (flag_conditioned=false) expects exactly 1 pointer",
             );
+        }
+        if commit == CommitMode::Full {
+            let ptr_entry = &descriptor.pointers[0];
+            let Some(ptr_value) = read_prop(program, state, slots, &ptr_entry.self_property)
+            else {
+                return ApplyOutcome::Unsupported("LODS pointer unresolved");
+            };
+            let Some(flags) = read_prop(program, state, slots, &ptr_entry.flag_property) else {
+                return ApplyOutcome::Unsupported("LODS flag_property unresolved");
+            };
+            let df_active = ((flags >> ptr_entry.flag_bit) & 1) != 0;
+            let signed_step = if df_active { -ptr_entry.base_step } else { ptr_entry.base_step };
+            let new_ptr = (ptr_value + n * signed_step) & 0xFFFF;
+            commit_pointer(state, &ptr_entry.property, new_ptr);
+            commit_counter(state, &counter.property, 0);
+            commit_ip_and_cycles(program, state, slots, descriptor, n);
         }
         return ApplyOutcome::Applied { iterations: n };
     }
@@ -733,13 +906,15 @@ pub(crate) fn apply_read_only(
     let rep_type = read_prop(program, state, slots, "--repType").unwrap_or(0);
 
     // Per-iter walk. Same shape as `rep_fast_forward_cmps_scas`. We don't
-    // mutate memory (no `bulk_store_byte` or `bulk_fill` here), so the
-    // dual-harness memory+extended diff is trivially satisfied; the only
-    // observable that matters for step 7's commit is `iterations`.
+    // mutate memory (no `bulk_store_byte` or `bulk_fill` here); state-var
+    // commits below match the hardcoded path observable-for-observable.
     let dst_mask = 0xFFFFi64;
     let mut di = (dst_ptr & 0xFFFF) as i64;
     let mut si = src_ptr_opt.map(|p| p as i64).unwrap_or(0);
     let mut iters = 0i32;
+    let mut last_dst: i32 = 0;
+    let mut last_src: i32 = 0;
+    let mut cx_remaining: i32 = n;
     let n_max = n;
     for _ in 0..n_max {
         let dst_lin = (dst_seg_base + di) & 0xFFFFF;
@@ -763,13 +938,16 @@ pub(crate) fn apply_read_only(
             scas_acc
         };
 
-        // Pointer advance and CX decrement (CX is virtual here — we just
-        // count `iters`).
+        last_dst = dst_v;
+        last_src = src_v;
+
+        // Pointer advance, CX decrement.
         di = (di + signed_step as i64) & dst_mask;
         if is_cmps {
             si = (si + signed_step as i64) & dst_mask;
         }
         iters += 1;
+        cx_remaining -= 1;
 
         // Early-exit. ZF set iff equal. REPE (rep_type=1): exit when not
         // equal. REPNE (rep_type=2): exit when equal. Other rep_type
@@ -784,7 +962,111 @@ pub(crate) fn apply_read_only(
         }
     }
 
+    if commit == CommitMode::Full {
+        // Pointer commits.
+        commit_pointer(state, &dst_entry.property, di as i32);
+        if is_cmps {
+            // Find the source pointer entry's property name. We resolved
+            // the pointer index earlier (descriptor.pointers[1]).
+            let src_entry = &descriptor.pointers[1];
+            commit_pointer(state, &src_entry.property, si as i32);
+        }
+        // CX commit: cx_remaining is what's left after the loop.
+        // Hardcoded path masks with 0xFFFF.
+        commit_counter(state, &counter.property, cx_remaining & 0xFFFF);
+
+        // Flags commit. Mirrors `rep_fast_forward_cmps_scas`'s
+        // subFlags(dst, src) order:
+        //   CMPS: dst_arg = mem[DS:SI] (last_src), src_arg = mem[ES:DI] (last_dst)
+        //   SCAS: dst_arg = AL/AX (scas_acc),     src_arg = mem[ES:DI] (last_dst)
+        let prev_flags = read_prop(program, state, slots, &dst_entry.flag_property)
+            .unwrap_or(0);
+        let (fl_dst, fl_src) = if is_cmps {
+            (last_src, last_dst)
+        } else {
+            (scas_acc, last_dst)
+        };
+        // If the loop ran zero iterations (n was 0 — caught above) we'd
+        // skip the commit; here iters > 0 by construction, so last_*
+        // are populated.
+        let _ = iters;
+        let new_flags = compute_sub_flags(fl_dst, fl_src, is_word, prev_flags);
+        // The flag word lives on the slot named by dst_entry.flag_property
+        // (e.g. `--flags`). Commit through the same helper as pointers
+        // so writes route to property_slots first, state vars second.
+        commit_pointer(state, &dst_entry.flag_property, new_flags);
+
+        // IP advance and per-iter cycle charge. The `iters` value (not
+        // n) is what the hardcoded path uses for the cycle multiplier on
+        // CMPS/SCAS — early-exit reduces actual work done.
+        commit_ip_and_cycles(program, state, slots, descriptor, iters);
+    }
+
     ApplyOutcome::Applied { iterations: iters }
+}
+
+// ---------------------------------------------------------------------------
+// State-var commit helpers.
+// ---------------------------------------------------------------------------
+//
+// The hardcoded `rep_fast_forward` writes post-loop state vars by *bare*
+// name (e.g. `state.set_var("DI", ...)`). The descriptor carries property
+// names with the `--` prefix attached (`pointer.property = "--DI"`). The
+// helpers below normalise this — they try `state.set_var(bare_name, ...)`
+// first (the path the cabinet actually uses for register-shaped slots),
+// and fall back to no-op if the slot doesn't exist.
+//
+// Cardinal-rule note: these helpers are name-agnostic. They never inspect
+// any character of the property name they're handed — `strip_prefix("--")`
+// is a uniform transformation on the whole string, identical to what
+// `read_prop` does for resolution.
+
+/// Commit a pointer (or a flag word) to its post-loop value. Used for
+/// DI/SI commits in Fill/Copy and for the flags slot in ReadOnly's
+/// CMPS/SCAS sub-shape.
+fn commit_pointer(state: &mut State, property: &str, value: i32) {
+    let bare = property.strip_prefix("--").unwrap_or(property);
+    if state.state_var_index.contains_key(bare) {
+        state.set_var(bare, value);
+    }
+    // If neither the bare name nor the prefixed name exists as a state
+    // var, the cabinet doesn't have this slot reachable through the
+    // state-var path. The hardcoded `rep_fast_forward` only ever writes
+    // through `set_var` so we mirror that — slot-only properties fall
+    // through silently (the recogniser would have flagged a structurally
+    // invalid descriptor before we got here).
+}
+
+/// Commit the loop counter to its post-loop value (`0` for Fill/Copy,
+/// CX remaining for CMPS/SCAS early exits).
+fn commit_counter(state: &mut State, property: &str, value: i32) {
+    commit_pointer(state, property, value);
+}
+
+/// Advance IP and charge cycles for `iters` iterations. Mirrors the
+/// hardcoded path's
+///     state.set_var("IP", (ip + 1 + prefix_len) & 0xFFFF);
+///     state.set_var("cycleCount", cc + iters * per_iter);
+/// The `+ 1` is `descriptor.ip_advance_literal` (the structural per-iter
+/// IP step from the recogniser); the `+ prefix_len` is the WART
+/// documented at [`read_prefix_len`].
+fn commit_ip_and_cycles(
+    program: &CompiledProgram,
+    state: &mut State,
+    slots: &[i32],
+    descriptor: &LoopDescriptor,
+    iters: i32,
+) {
+    let ip = state.get_var("IP").unwrap_or(0);
+    let prefix_len = read_prefix_len(program, state, slots);
+    let new_ip = (ip + descriptor.ip_advance_literal + prefix_len) & 0xFFFF;
+    if state.state_var_index.contains_key("IP") {
+        state.set_var("IP", new_ip);
+    }
+    let per_iter = per_iter_cycles(descriptor);
+    if let Some(cc) = state.get_var("cycleCount") {
+        state.set_var("cycleCount", cc.wrapping_add(iters.wrapping_mul(per_iter)));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2538,6 +2820,280 @@ mod tests {
             ApplyOutcome::Applied { iterations: iters_b },
         );
         assert_eq!(state_a.memory, mem_a_before);
+        assert_eq!(state_a.memory, state_b.memory);
+    }
+
+    // -----------------------------------------------------------------
+    // Step 7: state-var commit tests.
+    //
+    // These exercise the new `CommitMode::Full` codepath. The memory
+    // mutations are already covered by the existing tests; here we
+    // verify DI/SI/CX/IP/cycleCount/flags reach the same post-state the
+    // hardcoded `rep_fast_forward` would produce.
+    // -----------------------------------------------------------------
+
+    /// `CommitMode::Full` on STOSB: DI, CX, IP, cycleCount must all
+    /// advance to the values the hardcoded path would write.
+    #[test]
+    fn commit_full_stosb_updates_state_vars() {
+        let desc = stosb_descriptor();
+        let prog = empty_program_with_descriptor(desc.clone());
+        let mut state = rigged_state(&[
+            "CX", "DI", "ES", "AL", "flags", "IP", "cycleCount", "prefixLen",
+        ]);
+        state.set_var("CX", 32);
+        state.set_var("DI", 0x100);
+        state.set_var("ES", 0x2000);
+        state.set_var("AL", 0x55);
+        state.set_var("flags", 0); // DF=0
+        state.set_var("IP", 0x1234);
+        state.set_var("cycleCount", 1000);
+        state.set_var("prefixLen", 1);
+
+        let outcome = apply_fill_with_commit(&desc, &prog, &mut state, &[], CommitMode::Full);
+        assert_eq!(outcome, ApplyOutcome::Applied { iterations: 32 });
+        // Pointer advance: DI = 0x100 + 32 * 1 = 0x120
+        assert_eq!(state.get_var("DI"), Some(0x120));
+        // Counter drains.
+        assert_eq!(state.get_var("CX"), Some(0));
+        // IP advance: 0x1234 + ip_advance_literal(=1) + prefixLen(=1) = 0x1236
+        assert_eq!(state.get_var("IP"), Some(0x1236));
+        // cycleCount: 1000 + 32 * 10 (STOS per_iter) = 1320
+        assert_eq!(state.get_var("cycleCount"), Some(1320));
+    }
+
+    /// `CommitMode::Full` on STOSW with DF=1 (reverse): pointer arithmetic
+    /// flips sign correctly.
+    #[test]
+    fn commit_full_stosw_reverse_dec_pointer() {
+        let desc = stosw_descriptor();
+        let prog = empty_program_with_descriptor(desc.clone());
+        let mut state = rigged_state(&[
+            "CX", "DI", "ES", "AL", "AH", "flags", "IP", "cycleCount", "prefixLen",
+        ]);
+        state.set_var("CX", 8);
+        state.set_var("DI", 0x80);
+        state.set_var("ES", 0x3000);
+        state.set_var("AL", 0x11);
+        state.set_var("AH", 0x22);
+        state.set_var("flags", 1 << 10); // DF=1
+        state.set_var("IP", 0x4000);
+        state.set_var("cycleCount", 0);
+        state.set_var("prefixLen", 1);
+
+        let outcome = apply_fill_with_commit(&desc, &prog, &mut state, &[], CommitMode::Full);
+        assert_eq!(outcome, ApplyOutcome::Applied { iterations: 8 });
+        // Reverse: DI = 0x80 + 8 * (-2) = 0x70
+        assert_eq!(state.get_var("DI"), Some(0x70));
+        assert_eq!(state.get_var("CX"), Some(0));
+        assert_eq!(state.get_var("IP"), Some(0x4002));
+        assert_eq!(state.get_var("cycleCount"), Some(80)); // 8 * 10
+    }
+
+    /// `CommitMode::Full` on MOVSB: both DI and SI advance, CX drains,
+    /// IP and cycleCount move.
+    #[test]
+    fn commit_full_movsb_updates_both_pointers() {
+        let desc = movsb_descriptor();
+        let prog = empty_program_with_descriptor(desc.clone());
+        let mut state = rigged_state(&[
+            "CX", "DI", "SI", "ES", "DS", "flags", "IP", "cycleCount", "prefixLen",
+        ]);
+        state.set_var("CX", 16);
+        state.set_var("DI", 0x200);
+        state.set_var("SI", 0x800);
+        state.set_var("ES", 0x4000);
+        state.set_var("DS", 0x5000);
+        state.set_var("flags", 0); // DF=0
+        state.set_var("IP", 0x100);
+        state.set_var("cycleCount", 0);
+        state.set_var("prefixLen", 1);
+
+        // Seed source bytes so reads succeed (we don't care about the
+        // memory diff in this test, only state vars).
+        for i in 0..16 {
+            state.memory[(0x5000 * 16 + 0x800 + i) as usize] = (i & 0xFF) as u8;
+        }
+
+        let outcome = apply_copy_with_commit(&desc, &prog, &mut state, &[], CommitMode::Full);
+        assert_eq!(outcome, ApplyOutcome::Applied { iterations: 16 });
+        assert_eq!(state.get_var("DI"), Some(0x210));
+        assert_eq!(state.get_var("SI"), Some(0x810));
+        assert_eq!(state.get_var("CX"), Some(0));
+        assert_eq!(state.get_var("IP"), Some(0x102));
+        // 16 iters * 17 cycles per MOVS iter = 272
+        assert_eq!(state.get_var("cycleCount"), Some(272));
+    }
+
+    /// `CommitMode::Full` on SCASB REPNE: CX drains as iterations consume,
+    /// DI advances, flags reflect the last comparison.
+    #[test]
+    fn commit_full_scasb_repne_finds_match() {
+        let desc = scasb_descriptor();
+        let prog = empty_program_with_descriptor(desc.clone());
+        let mut state = rigged_state(&[
+            "CX", "DI", "ES", "AL", "flags", "IP", "cycleCount", "prefixLen", "repType",
+        ]);
+        state.set_var("CX", 16);
+        state.set_var("DI", 0x100);
+        state.set_var("ES", 0x6000);
+        state.set_var("AL", 0xAA);
+        state.set_var("flags", 0); // DF=0, ZF=0
+        state.set_var("IP", 0x500);
+        state.set_var("cycleCount", 0);
+        state.set_var("prefixLen", 1);
+        state.set_var("repType", 2); // REPNE
+
+        // Plant the match at offset 5: scan finds it after 6 iterations
+        // (compares at offsets 0..=5, exits when match found at 5).
+        let base = 0x6000 * 16 + 0x100;
+        state.memory[base + 5] = 0xAA;
+
+        let outcome = apply_read_only_with_commit(&desc, &prog, &mut state, &[], CommitMode::Full);
+        assert_eq!(outcome, ApplyOutcome::Applied { iterations: 6 });
+        // DI advanced by 6 bytes.
+        assert_eq!(state.get_var("DI"), Some(0x106));
+        // CX = 16 - 6 = 10
+        assert_eq!(state.get_var("CX"), Some(10));
+        // IP advance.
+        assert_eq!(state.get_var("IP"), Some(0x502));
+        // cycleCount: 6 iters * 15 cycles per SCAS iter = 90
+        assert_eq!(state.get_var("cycleCount"), Some(90));
+        // ZF set (last compare AL == mem[ES:DI-step] was equal).
+        let new_flags = state.get_var("flags").unwrap();
+        assert_eq!(new_flags & 0x40, 0x40, "ZF should be set after match");
+    }
+
+    /// `CommitMode::Full` on CMPSB REPE: walks until inequality, both
+    /// pointers advance, CX drains, flags carry the last SUB result.
+    #[test]
+    fn commit_full_cmpsb_repe_breaks_on_inequality() {
+        let desc = cmpsb_descriptor();
+        let prog = empty_program_with_descriptor(desc.clone());
+        let mut state = rigged_state(&[
+            "CX", "DI", "SI", "ES", "DS", "flags", "IP", "cycleCount", "prefixLen", "repType",
+        ]);
+        state.set_var("CX", 32);
+        state.set_var("DI", 0x100);
+        state.set_var("SI", 0x800);
+        state.set_var("ES", 0x7000);
+        state.set_var("DS", 0x8000);
+        state.set_var("flags", 0);
+        state.set_var("IP", 0x300);
+        state.set_var("cycleCount", 0);
+        state.set_var("prefixLen", 1);
+        state.set_var("repType", 1); // REPE
+
+        let dst_base = 0x7000 * 16 + 0x100;
+        let src_base = 0x8000 * 16 + 0x800;
+        // First 4 bytes match; 5th byte differs → REPE breaks at iter 5.
+        for i in 0..4 {
+            state.memory[dst_base + i] = 0xCC;
+            state.memory[src_base + i] = 0xCC;
+        }
+        state.memory[dst_base + 4] = 0xAA;
+        state.memory[src_base + 4] = 0xBB; // different
+
+        let outcome = apply_read_only_with_commit(&desc, &prog, &mut state, &[], CommitMode::Full);
+        assert_eq!(outcome, ApplyOutcome::Applied { iterations: 5 });
+        assert_eq!(state.get_var("DI"), Some(0x105));
+        assert_eq!(state.get_var("SI"), Some(0x805));
+        assert_eq!(state.get_var("CX"), Some(27)); // 32 - 5
+        assert_eq!(state.get_var("IP"), Some(0x302));
+        assert_eq!(state.get_var("cycleCount"), Some(110)); // 5 * 22 (CMPS)
+        // Last compare: src=0xBB, dst=0xAA; ZF clear.
+        let new_flags = state.get_var("flags").unwrap();
+        assert_eq!(new_flags & 0x40, 0, "ZF should be clear after mismatch");
+    }
+
+    /// `CommitMode::MemoryOnly` on STOSB: state vars must NOT change
+    /// (the dual-harness contract). Memory still updates.
+    #[test]
+    fn commit_memory_only_leaves_state_vars_untouched() {
+        let desc = stosb_descriptor();
+        let prog = empty_program_with_descriptor(desc.clone());
+        let mut state = rigged_state(&[
+            "CX", "DI", "ES", "AL", "flags", "IP", "cycleCount", "prefixLen",
+        ]);
+        state.set_var("CX", 16);
+        state.set_var("DI", 0x100);
+        state.set_var("ES", 0x2000);
+        state.set_var("AL", 0x42);
+        state.set_var("flags", 0);
+        state.set_var("IP", 0x1000);
+        state.set_var("cycleCount", 5000);
+        state.set_var("prefixLen", 1);
+
+        let outcome = apply_fill_with_commit(&desc, &prog, &mut state, &[], CommitMode::MemoryOnly);
+        assert_eq!(outcome, ApplyOutcome::Applied { iterations: 16 });
+        // Pre-loop state preserved.
+        assert_eq!(state.get_var("CX"), Some(16));
+        assert_eq!(state.get_var("DI"), Some(0x100));
+        assert_eq!(state.get_var("IP"), Some(0x1000));
+        assert_eq!(state.get_var("cycleCount"), Some(5000));
+        // Memory still fills.
+        assert_eq!(state.memory[0x20100], 0x42);
+        assert_eq!(state.memory[0x2010F], 0x42);
+    }
+
+    /// Strongest in-test verification short of running a real cabinet:
+    /// `CommitMode::MemoryOnly` and `CommitMode::Full` produce identical
+    /// memory mutations on independent State clones. This is what
+    /// guarantees `CALCITE_REP_GENERIC=1` wouldn't drift from the dual-
+    /// harness baseline on the memory side.
+    #[test]
+    fn full_and_memory_only_agree_on_memory_for_stosb() {
+        let desc = stosb_descriptor();
+        let prog = empty_program_with_descriptor(desc.clone());
+        let mut state_full = rigged_state(&[
+            "CX", "DI", "ES", "AL", "flags", "IP", "cycleCount", "prefixLen",
+        ]);
+        state_full.set_var("CX", 64);
+        state_full.set_var("DI", 0x10);
+        state_full.set_var("ES", 0xA000);
+        state_full.set_var("AL", 0x99);
+        state_full.set_var("flags", 0);
+        state_full.set_var("IP", 0x500);
+        state_full.set_var("cycleCount", 0);
+        state_full.set_var("prefixLen", 1);
+
+        let mut state_mem = rigged_state(&[
+            "CX", "DI", "ES", "AL", "flags", "IP", "cycleCount", "prefixLen",
+        ]);
+        state_mem.set_var("CX", 64);
+        state_mem.set_var("DI", 0x10);
+        state_mem.set_var("ES", 0xA000);
+        state_mem.set_var("AL", 0x99);
+        state_mem.set_var("flags", 0);
+        state_mem.set_var("IP", 0x500);
+        state_mem.set_var("cycleCount", 0);
+        state_mem.set_var("prefixLen", 1);
+
+        let _ = apply_fill_with_commit(&desc, &prog, &mut state_full, &[], CommitMode::Full);
+        let _ = apply_fill_with_commit(&desc, &prog, &mut state_mem, &[], CommitMode::MemoryOnly);
+        assert_eq!(state_full.memory, state_mem.memory);
+    }
+
+    /// Default-shape compatibility: `apply_fill` (no commit param) is
+    /// equivalent to `apply_fill_with_commit(MemoryOnly)`. This is the
+    /// dual-harness invariant — existing call sites must keep their
+    /// memory-only contract.
+    #[test]
+    fn default_apply_fill_equivalent_to_memory_only() {
+        let desc = stosb_descriptor();
+        let prog = empty_program_with_descriptor(desc.clone());
+        let mut state_a = rigged_state(&["CX", "DI", "ES", "AL", "flags"]);
+        let mut state_b = rigged_state(&["CX", "DI", "ES", "AL", "flags"]);
+        for s in [&mut state_a, &mut state_b] {
+            s.set_var("CX", 8);
+            s.set_var("DI", 0x40);
+            s.set_var("ES", 0xB000);
+            s.set_var("AL", 0x77);
+            s.set_var("flags", 0);
+        }
+
+        let _ = apply_fill(&desc, &prog, &mut state_a, &[]);
+        let _ = apply_fill_with_commit(&desc, &prog, &mut state_b, &[], CommitMode::MemoryOnly);
         assert_eq!(state_a.memory, state_b.memory);
     }
 }

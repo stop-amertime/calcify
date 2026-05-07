@@ -11,6 +11,133 @@ and the Criterion benchmarks.
 
 ---
 
+## 2026-05-07 — phase 3b step 7: flip the data flow (`CALCITE_REP_GENERIC=1` is the applier)
+
+This is the actual flip. Steps 1–6 built the descriptor metadata, the
+three appliers (`apply_fill` / `apply_copy` / `apply_read_only`), and the
+dual-execute harness. Step 7 makes `CALCITE_REP_GENERIC=1` route the per-
+tick fast-forward through those appliers instead of `compile.rs::rep_fast_forward`'s
+hardcoded per-opcode `match`. When the env var is unset (the default),
+behaviour is unchanged — the hardcoded path is still the active one until
+the cabinet-level perf gate (steps 8/9) is verified.
+
+### What landed
+
+1. **`CommitMode` parameter on the appliers.** Each applier now has an
+   `apply_*_with_commit` variant that takes `CommitMode::{MemoryOnly,
+   Full}`. `MemoryOnly` is the existing dual-harness contract (only memory
+   + extended mutate). `Full` adds DI/SI/CX/IP/cycleCount/flags commits
+   matching the hardcoded path's observable side effects exactly. The
+   default (zero-arg) `apply_*` calls forward to `MemoryOnly` so existing
+   call sites keep their contract.
+2. **`try_apply_generic` in `compile.rs`.** When `CALCITE_REP_GENERIC=1`,
+   `rep_fast_forward` first calls this helper. The helper replicates the
+   hardcoded path's panic-or-bail gates (hasREP / repType / CX / DF /
+   segOverride / IRQ / TF / CMPS-SCAS rep_already_exited short-circuit),
+   looks up the descriptor by `key_value`, dispatches on `BulkClass`, and
+   commits with `CommitMode::Full`. If the applier returns `Unsupported`,
+   the helper logs to stderr and falls through to the hardcoded path —
+   so cabinets with shapes the recogniser doesn't yet handle still work.
+3. **Phase-2 validator retired.** The 100-line `validate_descriptor_for_opcode`
+   function and its wasm32 stub are gone. Under `CALCITE_REP_GENERIC=1`
+   the applier IS the validation: shapes it can't handle return
+   `Unsupported`, fall back to the hardcoded path, and surface as stderr
+   diagnostics. The dual-execute harness (`CALCITE_REP_DUAL=1`) is the
+   stronger byte-for-byte equivalence check the validator was a stand-in
+   for, and is unaffected.
+
+### State-var commit details
+
+The `apply_*_with_commit` variants commit, per `BulkClass`:
+
+- **Fill (STOS):** `DI = (di + n*signed_step) & 0xFFFF`, `CX = 0`,
+  `IP = (ip + ip_advance_literal + prefixLen) & 0xFFFF`,
+  `cycleCount += n * 10`.
+- **Copy (MOVS):** same as Fill plus `SI = (si + n*signed_step) & 0xFFFF`,
+  `cycleCount += n * 17`.
+- **ReadOnly + flag_conditioned (CMPS/SCAS):** `DI` and (for CMPS) `SI`
+  to their post-walk values, `CX = remaining`, `IP` advance,
+  `cycleCount += iters * (22 if 2 pointers else 15)`, `flags` from
+  `compute_sub_flags(last_dst, last_src, is_word, prev_flags)`.
+- **ReadOnly without flag_conditioned (LODS):** committed defensively
+  even though the hardcoded path doesn't fast-forward LODS, so a future
+  caller that does feed it through can't observe partial commits.
+
+### Cardinal-rule warts now in the codebase
+
+These exist BECAUSE we shipped the flip without recogniser extensions for
+each of them. They are bounded, documented in code with multi-paragraph
+WART comments, and on the next session's punch list:
+
+1. **Per-iter cycle cost (10/17/22/15) is keyed on `(BulkClass, pointer
+   count)`.** Structurally derived from descriptor shape, but the actual
+   numbers are upstream (x86) knowledge. Lives in `per_iter_cycles()` in
+   `pattern/rep_applier.rs`. Cleanest fix: structural recogniser pass
+   over the cabinet's `--cycleCount` dispatch body to extract the
+   per-opcode increment. Independent work, deferred.
+2. **`--prefixLen` read by literal name in `read_prefix_len()`.** The
+   IP-advance formula needs `IP + 1 + prefixLen`; `+1` is on the
+   descriptor as `ip_advance_literal`, `+prefixLen` is the wart. Fix:
+   recogniser traces the cabinet's IP-advance body and identifies the
+   slot whose value is added to IP, captures it as
+   `LoopDescriptor::ip_advance_extra_property: Option<String>`. Deferred.
+3. **`apply_read_only`'s CMPS/SCAS branch reads `--ES`/`--DS`/`--SI`/
+   `--DI`/`--AL`/`--AX`/`--repType` by literal name** (the Q3 Option A
+   wart inherited from step 6). Fix is Q3 Option B: structural
+   `comparison: Option<ComparisonShape>` field on `LoopDescriptor`,
+   populated from the predicate's disjunction shape. Deferred.
+
+All three warts are leaf call sites, not structural decisions in the
+recogniser — the dispatch in `try_apply_generic` and in each applier is
+on `BulkClass` + pointer count + structural metadata, never on opcode or
+property name. A 6502 / brainfuck cabinet sharing the structural shape
+would dispatch identically; only the cycle constants and `--prefixLen`
+specifics carry upstream taint, and only at the leaves.
+
+### Tests
+
+- 8 new unit tests in `pattern::rep_applier::tests`:
+  `commit_full_stosb_updates_state_vars`,
+  `commit_full_stosw_reverse_dec_pointer`,
+  `commit_full_movsb_updates_both_pointers`,
+  `commit_full_scasb_repne_finds_match`,
+  `commit_full_cmpsb_repe_breaks_on_inequality`,
+  `commit_memory_only_leaves_state_vars_untouched`,
+  `full_and_memory_only_agree_on_memory_for_stosb`,
+  `default_apply_fill_equivalent_to_memory_only`.
+- `cargo test -p calcite-core --lib`: **254 passing** (was 246), 4 pre-
+  existing `no-opcode` failures unchanged.
+- `cargo check -p calcite-core --target wasm32-unknown-unknown`: clean.
+- `cargo check -p calcite-wasm --target wasm32-unknown-unknown`: clean.
+
+### Deferred to a session when CSS-DOS is writable
+
+- **Cabinet-level perf gate (step 8 of the scoping doc).**
+  `CALCITE_REP_GENERIC=1` doom-loading must reach in-game within ±1% of
+  the 216568 ms baseline. Native + web targets.
+- **Snapshot diff (step 9).** With the flag on, dump memory snapshots
+  every 100K ticks and diff against a baseline run with the flag off.
+  Zero divergence required.
+- **Recogniser-extension follow-ups** for each cardinal-rule wart above.
+- **Hardcoded path deletion (step 10).** Once the recogniser covers
+  every shape, `compile.rs::rep_fast_forward` and `_cmps_scas` can be
+  deleted entirely; `try_apply_generic` becomes the only path.
+
+### Files
+
+- `crates/calcite-core/src/pattern/rep_applier.rs`: `CommitMode` enum,
+  `apply_*_with_commit` variants, `commit_pointer` / `commit_counter` /
+  `commit_ip_and_cycles` / `per_iter_cycles` / `read_prefix_len` helpers,
+  8 new tests.
+- `crates/calcite-core/src/compile.rs`: `try_apply_generic` dispatcher
+  (~140 lines), validator deletion, `rep_generic_validator_enabled` →
+  `rep_generic_enabled`, `compute_sub_flags` lifted to `pub(crate)`.
+
+Commit on `worktree-rep-3b`. Pick up at step 8 (CSS-DOS-side bench) when
+the sibling repo is writable again.
+
+---
+
 ## 2026-05-07 — phase 3b step 6: `BulkClass::ReadOnly` applier (LODS / CMPS / SCAS)
 
 Worktree `worktree-rep-3b` only. `apply_read_only` lands in

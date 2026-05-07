@@ -5716,14 +5716,17 @@ fn rep_fastfwd_enabled() -> bool {
 #[cfg(target_arch = "wasm32")]
 fn rep_fastfwd_enabled() -> bool { true }
 
-/// Phase-2 diagnostic gate: when `CALCITE_REP_GENERIC=1`, the generic
-/// loop-descriptor validator runs alongside the existing
-/// `rep_fast_forward`. The validator confirms that every fast-forward
-/// fire corresponds to a recognised descriptor with consistent shape;
-/// mismatches are logged loudly. Default off — landing in
-/// diagnostic-bedded form per the genericity mission plan.
+/// Step-7 dispatch gate: when `CALCITE_REP_GENERIC=1`, dispatch into the
+/// descriptor-driven applier in [`crate::pattern::rep_applier`] instead of
+/// the hardcoded per-opcode `match` below. Default off — flipping requires
+/// a deliberate opt-in until the cabinet-level perf gate (steps 8/9 of the
+/// scoping doc) is verified.
+///
+/// This env-var was previously the gate for the phase-2 read-only validator.
+/// Step 7 retires the validator (it's redundant once the applier IS the
+/// path) and reuses the env-var name as the actual flag-flip switch.
 #[cfg(not(target_arch = "wasm32"))]
-fn rep_generic_validator_enabled() -> bool {
+fn rep_generic_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -5735,7 +5738,7 @@ fn rep_generic_validator_enabled() -> bool {
 }
 
 #[cfg(target_arch = "wasm32")]
-fn rep_generic_validator_enabled() -> bool { false }
+fn rep_generic_enabled() -> bool { false }
 
 /// Post-tick recognizer for REP string ops. Runs after the CSS has applied
 /// exactly one iteration. If the opcode is a simple REP string op (0xAA STOSB,
@@ -5803,11 +5806,34 @@ fn rep_fast_forward(program: &CompiledProgram, state: &mut State, slots: &[i32])
     //     condition; repType 1 (REPE) or 2 (REPNE) are both meaningful.
     let is_stos_movs = matches!(opcode, 0xAA | 0xAB | 0xA4 | 0xA5);
     let is_cmps_scas = matches!(opcode, 0xA6 | 0xA7 | 0xAE | 0xAF);
-    // Phase-2 diagnostic: confirm a descriptor exists for this opcode
-    // and its structural fields agree with what the runtime fast-forward
-    // would compute. Fires once per opcode-fire, not per tick.
-    if (is_stos_movs || is_cmps_scas) && rep_generic_validator_enabled() {
-        validate_descriptor_for_opcode(program, state, slots, opcode);
+    // Step 7: when CALCITE_REP_GENERIC=1, dispatch into the descriptor-
+    // driven applier instead of the hardcoded per-opcode match below.
+    // This is the actual flag-flip described in the scoping doc step 7.
+    //
+    // Constraints that must still be checked here in compile.rs (not
+    // pushed into the applier):
+    //   - opcode is a string op (otherwise no descriptor exists)
+    //   - hasREP / repType / CX / DF / segOverride / IRQ / TF gates
+    //     fall under the same panic-or-bail rules as the hardcoded path
+    //   - CMPS/SCAS post-tick `rep_already_exited` short-circuit (item
+    //     11 in the scoping doc): the CSS may have already terminated
+    //     the REP this tick via the ZF flip, in which case post-tick
+    //     IP/CX/SI/DI/flags are correct as-is and we must not run the
+    //     applier on top of them
+    //
+    // The hardcoded path runs all of those gates inline below. The
+    // generic dispatch reuses them by deferring to the bottom of this
+    // function — only the actual mutation step is replaced. Keeping the
+    // gates in one place (here) means they're identical between the two
+    // paths and the dual harness's diff is meaningful.
+    if rep_generic_enabled() && (is_stos_movs || is_cmps_scas) {
+        if try_apply_generic(program, state, slots, opcode, is_cmps_scas) {
+            return;
+        }
+        // Fell through: applier returned Unsupported. Continue with the
+        // hardcoded path so the cabinet still works, but log on stderr
+        // so an operator running with the flag on can see which shapes
+        // still need recogniser support.
     }
     if !is_stos_movs && !is_cmps_scas {
         // Current instruction is not a string op at all. Most ticks land here.
@@ -6295,7 +6321,13 @@ fn rep_fast_forward_cmps_scas(
 /// Compute the 8086 flag word produced by SUB(dst, src), preserving the
 /// upper control bits (TF=0x100, IF=0x200, DF=0x400) from `prev_flags`.
 /// Mirrors kiln's `--subFlags8` / `--subFlags16` + `+ and(prev, 1792)`.
-fn compute_sub_flags(dst: i32, src: i32, is_word: bool, prev_flags: i32) -> i32 {
+///
+/// `pub(crate)` so the descriptor-driven applier (`pattern::rep_applier`)
+/// can re-use it for the CMPS/SCAS state-var commit. This is part of the
+/// Q3 Option A wart documented in `apply_read_only` — moving to Option B
+/// (structural ComparisonShape on the descriptor) is the next cardinal-
+/// rule cleanup once the hardcoded REP path is retired.
+pub(crate) fn compute_sub_flags(dst: i32, src: i32, is_word: bool, prev_flags: i32) -> i32 {
     let mask: i32 = if is_word { 0xFFFF } else { 0xFF };
     let sign_bit: i32 = if is_word { 0x8000 } else { 0x80 };
     let dst_u = dst & mask;
@@ -6395,150 +6427,171 @@ fn rep_fast_forward_panic(
     );
 }
 
-/// Phase-2 validator (gated by `CALCITE_REP_GENERIC=1`).
+/// Step-7 dispatcher: if `CALCITE_REP_GENERIC=1` and a descriptor exists
+/// for this opcode, run the descriptor-driven applier with full state-var
+/// commits and return `true`. Returns `false` to signal "fall back to the
+/// hardcoded path" — used when the descriptor is missing, when the
+/// applier returns `Unsupported`, or when one of the panic-or-bail gates
+/// triggers (replicated here so the generic path observes the same panic
+/// shape).
 ///
-/// For each opcode that triggers `rep_fast_forward`, confirm that the
-/// loop-descriptor recogniser produced a matching descriptor with
-/// shape consistent with the runtime hardcoded behaviour. Mismatches
-/// log to stderr (once per opcode) so we can see when the recogniser's
-/// view of the cabinet diverges from what the hardcoded path is doing.
-///
-/// The validator is read-only — it never changes the runtime path.
-/// Phase 3 will flip the data flow so the descriptor decides; the
-/// hardcoded path will become the validator. Phase 5 deletes the
-/// hardcoded path altogether.
+/// This is the entire flip from "hardcoded fast-forward" to "descriptor-
+/// driven fast-forward". The hardcoded path remains as the fall-back so
+/// shapes the recogniser doesn't yet handle continue to work; once the
+/// recogniser covers every shape the hardcoded path handles (steps 8/9
+/// verify this), the hardcoded path can be deleted.
 #[cfg(not(target_arch = "wasm32"))]
-fn validate_descriptor_for_opcode(
+fn try_apply_generic(
     program: &CompiledProgram,
-    state: &State,
+    state: &mut State,
     slots: &[i32],
     opcode: i32,
-) {
-    use std::sync::Mutex;
-    use std::sync::OnceLock;
-    static SEEN: OnceLock<Mutex<std::collections::HashSet<i32>>> = OnceLock::new();
-    let seen = SEEN.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
-    {
-        let mut s = seen.lock().unwrap();
-        if !s.insert(opcode) {
-            return; // already validated for this opcode
+    is_cmps_scas: bool,
+) -> bool {
+    fn read_prop(program: &CompiledProgram, state: &State, slots: &[i32], name: &str) -> Option<i32> {
+        if let Some(&s) = program.property_slots.get(name) {
+            return Some(slots[s as usize]);
+        }
+        let bare = name.strip_prefix("--").unwrap_or(name);
+        state.get_var(bare)
+    }
+
+    // Find the descriptor.
+    let Some(descriptor) = program
+        .loop_descriptors
+        .iter()
+        .find(|d| d.key_value == opcode as i64)
+    else {
+        // No descriptor: recogniser miss. Fall back to hardcoded path.
+        // The hardcoded path will still panic on truly unsupported
+        // shapes, so we don't lose loud-failure semantics.
+        return false;
+    };
+
+    // Replicate the hardcoded path's gates verbatim (same conditions, same
+    // panic vs silent-bail decisions). These keep behaviour parity even
+    // when we end up calling the generic applier.
+    let has_rep = read_prop(program, state, slots, "--hasREP").unwrap_or(0);
+    let rep_type = read_prop(program, state, slots, "--repType").unwrap_or(0);
+    let cx_raw = read_prop(program, state, slots, "--CX");
+    let flags_raw = read_prop(program, state, slots, "--flags").unwrap_or(0);
+    let seg_override = read_prop(program, state, slots, "--hasSegOverride").unwrap_or(0);
+    if has_rep != 1 {
+        return true; // CSS handled it as a single iter; nothing to do.
+    }
+    let cs_for_diag = read_prop(program, state, slots, "--CS").unwrap_or(0);
+    let ip_for_diag = state.get_var("IP").unwrap_or(0);
+    let is_stos_movs = matches!(opcode, 0xAA | 0xAB | 0xA4 | 0xA5);
+    if is_stos_movs && rep_type != 1 {
+        rep_fast_forward_panic(
+            "repType-ne-1",
+            opcode, rep_type, cx_raw.unwrap_or(0), flags_raw, cs_for_diag, ip_for_diag,
+            "STOS/MOVS with REPNE prefix — extend rep_fast_forward / generic applier to handle repType=2",
+        );
+    }
+    if is_cmps_scas && rep_type != 1 && rep_type != 2 {
+        return true; // CSS handled as single iter; nothing to do.
+    }
+    let cx = match cx_raw {
+        Some(v) => v,
+        None => rep_fast_forward_panic(
+            "no-CX",
+            opcode, rep_type, 0, flags_raw, cs_for_diag, ip_for_diag,
+            "--CX slot missing — every cabinet should expose CX",
+        ),
+    };
+    if cx <= 0 {
+        return true; // CX=0 entering REP: no work.
+    }
+    if seg_override != 0 {
+        rep_fast_forward_panic(
+            "seg-override",
+            opcode, rep_type, cx, flags_raw, cs_for_diag, ip_for_diag,
+            "REP with segment override — extend rep_fast_forward / generic applier to honor --segOverrideValue",
+        );
+    }
+    let irq_active = read_prop(program, state, slots, "--_irqActive").unwrap_or(0);
+    let tf_active = read_prop(program, state, slots, "--_tf").unwrap_or(0);
+    if irq_active != 0 || tf_active != 0 {
+        return true; // CSS already vectored this tick; do nothing.
+    }
+    // CMPS/SCAS post-tick rep_already_exited short-circuit (scoping doc
+    // hardcoded-knowledge item 11). Identical to the hardcoded path.
+    if is_cmps_scas {
+        let zf_post = (flags_raw >> 6) & 1;
+        let rep_already_exited =
+            (rep_type == 1 && zf_post == 0) ||
+            (rep_type == 2 && zf_post == 1);
+        if rep_already_exited {
+            return true; // CSS finished this tick; observable state already correct.
         }
     }
 
-    // 1. Find a descriptor whose key_value matches this opcode.
-    let desc = program
-        .loop_descriptors
-        .iter()
-        .find(|d| d.key_value == opcode as i64);
-    let Some(desc) = desc else {
-        eprintln!(
-            "[rep-generic-validator] MISS: opcode {:#04x} fired rep_fast_forward but no descriptor was emitted by the recogniser. \
-             {} descriptors total: {:?}",
-            opcode,
-            program.loop_descriptors.len(),
-            program.loop_descriptors.iter().map(|d| format!("{:#04x}", d.key_value)).collect::<Vec<_>>(),
-        );
-        return;
-    };
+    // Fire diagnostic counters (mirrors what the hardcoded path does so
+    // CALCITE_REP_DIAG output is unchanged under the flag).
+    rep_diag_bail("00-entered-generic");
 
-    // 2. Spot-check the structural fields against runtime expectations:
-    //    - There must be a counter slot (CX-equivalent for x86; whatever
-    //      the cabinet uses).
-    //    - Pointer count: 1 for STOS/SCAS, 2 for MOVS/CMPS. The recogniser
-    //      shouldn't know x86, but we *do* know the cabinet's hardcoded
-    //      runtime path. The validator is allowed to.
-    //    - The IP property's slot resolves; the IP advance literal is 1
-    //      (single-byte instruction). Extending to flag-conditioned
-    //      exits (CMPS/SCAS) lands with phase 3.
-    let mut issues: Vec<String> = Vec::new();
-    if desc.counter.is_none() {
-        issues.push("no counter recognised".to_string());
-    }
-    let expected_pointers = match opcode {
-        0xAA | 0xAB | 0xAE | 0xAF => 1, // STOS/SCAS: just DI
-        0xA4 | 0xA5 | 0xA6 | 0xA7 => 2, // MOVS/CMPS: DI and SI
-        _ => 0,
-    };
-    if desc.pointers.len() != expected_pointers {
-        issues.push(format!(
-            "pointer count {} != expected {}",
-            desc.pointers.len(),
-            expected_pointers
-        ));
-    }
-    if desc.ip_advance_literal != 1 {
-        issues.push(format!(
-            "ip_advance_literal {} != 1 (instrLen for string ops)",
-            desc.ip_advance_literal
-        ));
-    }
-    // The IP property and counter property should both resolve to known
-    // slots/state-vars (i.e. running cabinet has them).
-    let ip_resolves = program.property_slots.contains_key(&desc.ip_property)
-        || state
-            .state_var_index
-            .contains_key(desc.ip_property.trim_start_matches("--"));
-    if !ip_resolves {
-        issues.push(format!("ip_property `{}` doesn't resolve", desc.ip_property));
-    }
-
-    // Phase 3a: validate flag-conditioning matches what the runtime
-    // path treats as a flag-conditioned exit (CMPS/SCAS), and that the
-    // bulk classification is consistent with the runtime's hardcoded
-    // behaviour. The runtime always treats:
-    //   STOS (0xAA/AB) → Fill (constant from AL/AX)
-    //   MOVS (0xA4/A5) → Copy (reads through SI mirror)
-    //   CMPS/SCAS (0xA6/A7/AE/AF) → ReadOnly (no memory writes)
-    //   LODS (0xAC/AD) → ReadOnly
-    let expected_flag_cond = matches!(opcode, 0xA6 | 0xA7 | 0xAE | 0xAF);
-    if desc.flag_conditioned != expected_flag_cond {
-        issues.push(format!(
-            "flag_conditioned {} != expected {}",
-            desc.flag_conditioned, expected_flag_cond,
-        ));
-    }
+    // Dispatch on the descriptor's BulkClass — purely structural, no
+    // opcode lookup here. The applier handles every observable mutation
+    // (memory + state vars).
     use crate::pattern::loop_descriptor::BulkClass;
-    let expected_class = match opcode {
-        0xAA | 0xAB => BulkClass::Fill,
-        0xA4 | 0xA5 => BulkClass::Copy,
-        _ => BulkClass::ReadOnly,
+    use crate::pattern::rep_applier::{
+        apply_copy_with_commit, apply_fill_with_commit, apply_read_only_with_commit,
+        ApplyOutcome, CommitMode,
     };
-    if desc.bulk_class != expected_class {
-        issues.push(format!(
-            "bulk_class {:?} != expected {:?}",
-            desc.bulk_class, expected_class,
-        ));
-    }
-    let _ = slots; // currently unused, may be used by deeper structural checks
-
-    if issues.is_empty() {
-        eprintln!(
-            "[rep-generic-validator] OK opcode {:#04x}: counter={} pointers={} writes={} ip={} flag_cond={} bulk={:?}",
-            opcode,
-            desc.counter.is_some(),
-            desc.pointers.len(),
-            desc.writes.len(),
-            desc.ip_property,
-            desc.flag_conditioned,
-            desc.bulk_class,
-        );
-    } else {
-        eprintln!(
-            "[rep-generic-validator] DRIFT opcode {:#04x}: {}",
-            opcode,
-            issues.join("; ")
-        );
+    let outcome = match descriptor.bulk_class {
+        BulkClass::Fill => apply_fill_with_commit(
+            descriptor, program, state, slots, CommitMode::Full,
+        ),
+        BulkClass::Copy => apply_copy_with_commit(
+            descriptor, program, state, slots, CommitMode::Full,
+        ),
+        BulkClass::ReadOnly => apply_read_only_with_commit(
+            descriptor, program, state, slots, CommitMode::Full,
+        ),
+        BulkClass::PerIter => {
+            eprintln!(
+                "[rep-generic] BulkClass::PerIter for opcode {:#04x}: no fast-forward applier yet, falling back to hardcoded path",
+                opcode,
+            );
+            return false;
+        }
+    };
+    match outcome {
+        ApplyOutcome::Applied { iterations } => {
+            rep_diag_fire(opcode, iterations);
+            true
+        }
+        ApplyOutcome::Unsupported(reason) => {
+            eprintln!(
+                "[rep-generic] applier refused opcode {:#04x} ({:?}): {}; falling back to hardcoded path",
+                opcode, descriptor.bulk_class, reason,
+            );
+            false
+        }
     }
 }
 
 #[cfg(target_arch = "wasm32")]
-fn validate_descriptor_for_opcode(
+fn try_apply_generic(
     _program: &CompiledProgram,
-    _state: &State,
+    _state: &mut State,
     _slots: &[i32],
     _opcode: i32,
-) {
+    _is_cmps_scas: bool,
+) -> bool {
+    false
 }
+
+// Phase-2 read-only validator (`validate_descriptor_for_opcode`) was
+// retired here as part of step 7. Under `CALCITE_REP_GENERIC=1`, the
+// descriptor-driven applier IS the validation: any structural shape the
+// applier can't handle returns `Unsupported`, falls back to the hardcoded
+// path, and surfaces a stderr diagnostic. The dual harness
+// (`CALCITE_REP_DUAL=1`) provides a stronger byte-for-byte equivalence
+// check than the validator ever did. Removing this function reduces
+// surface area and avoids the temptation to grow opcode-knowledge in
+// what was supposed to be a structural pass.
 
 #[cfg(not(target_arch = "wasm32"))]
 fn rep_diag_fire(opcode: i32, n: i32) {
