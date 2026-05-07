@@ -11,6 +11,51 @@ and the Criterion benchmarks.
 
 ---
 
+## 2026-05-07 — phase 3b step 5: `BulkClass::Copy` applier (worktree)
+
+`crates/calcite-core/src/pattern/rep_applier.rs::apply_copy` is the
+MOVS-shape sibling of step 4's `apply_fill`. It consumes the
+`val_indirect_read` metadata Step 2 added to `WriteEntry`: the source
+segment + pointer slots are read from the descriptor's
+`IndirectRead { seg_property, pointer_property, .. }`, so the applier
+never has to evaluate the cabinet's intermediate-slot dispatch body
+per-iter — the structural plumbing already handed it the pair. The
+key design call: identify dst pointer from
+`writes[*].addr_decomposition.pointer_property` and src pointer from
+`writes[*].val_indirect_read.pointer_property`, then look both up in
+`descriptor.pointers` by whole-name equality. The applier verifies
+structurally that the two pointers share `base_step`, `flag_property`,
+and `flag_bit` (the MOVS shape — both pointers gated by the same
+direction flag) rather than assuming it. Per-iter source bytes go
+through `state.read_mem` so packed cells / windowed-byte-array /
+extended map all route correctly without the applier knowing they
+exist; per-iter writes go through `bulk_store_byte` (already lifted
+to `pub(crate)` in step 4). Position-as-byte-offset within an
+iteration carries over from `apply_fill` — the structural assumption
+matches the hardcoded path's MOVSW lo/hi ordering. Wired into the
+dual harness via the variant allow-list (`CALCITE_REP_DUAL_VARIANTS=Copy`
+or `Fill,Copy`); the should-panic copy-arm test in
+`rep_dual_harness.rs` is now a should-not-panic test, mirroring the
+Fill arm. Cardinal-rule shape: the applier reads zero property names
+as text — every name lookup is whole-name slot equality. Tests: 228
+passing in `cargo test -p calcite-core --lib` (14 new), 4
+pre-existing failures unchanged. New tests cover MOVSB forward and
+reverse, MOVSW forward and reverse, zero-counter no-op,
+overlapping-forward (verifies the applier reproduces the hardcoded
+path's per-byte-iteration-order propagation), five refusal paths
+(non-Copy, single pointer, missing val_indirect_read, missing src
+seg, mismatched pointer steps), a brainfuck-style genericity probe
+with unrelated names, and two dual-mode equivalence tests against
+direct mirrors of `compile.rs`'s MOVSB/MOVSW loops. wasm32 builds
+clean. Real-cabinet verification deferred (CSS-DOS read-only this
+session). State-var updates (DI/SI/CX/IP/cycleCount) and the prefix
+length still belong to step 7's flip; the applier returns
+`Unsupported` rather than mutating those.
+
+Pick up at step 6: `BulkClass::ReadOnly` for CMPS/SCAS/LODS.
+
+---
+
 ## 2026-05-07 — phase 3b step 4: `BulkClass::Fill` applier landed (worktree)
 
 Step 4 of the [rep-3b 10-step plan](../docs/rep-3b-scoping.md): the

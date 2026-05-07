@@ -1,9 +1,12 @@
 //! Descriptor-driven REP fast-forward applier.
 //!
-//! Phase 3b step 4 ships [`apply_fill`] — the `BulkClass::Fill` arm of the
-//! eventual replacement for `compile.rs::rep_fast_forward`'s hardcoded
-//! per-opcode `match`. Steps 5-6 fill in `Copy` and `ReadOnly` next to it;
-//! step 7 then rips out the hardcoded path.
+//! Phase 3b step 4 shipped [`apply_fill`] — the `BulkClass::Fill` arm of
+//! the eventual replacement for `compile.rs::rep_fast_forward`'s hardcoded
+//! per-opcode `match`. Step 5 adds [`apply_copy`] — the `BulkClass::Copy`
+//! arm, MOVS-shaped: each iteration reads a byte (or a small block of
+//! bytes) at a stepping source pointer and writes it at a stepping
+//! destination pointer. Step 6 fills in `ReadOnly` next to them; step 7
+//! then rips out the hardcoded path.
 //!
 //! ## What "descriptor-driven" means here
 //!
@@ -278,6 +281,263 @@ pub(crate) fn apply_fill(
     }
 
     ApplyOutcome::Applied { iterations }
+}
+
+/// Apply a `BulkClass::Copy` descriptor to state. The structural contract:
+///
+/// 1. Resolve counter, identify the destination and source pointers.
+///    The destination pointer is the one named in every write entry's
+///    `addr_decomposition.pointer_property`; the source pointer is the
+///    one named in every write entry's `val_indirect_read.pointer_property`.
+///    Both names must resolve to entries in `descriptor.pointers` so we
+///    can find each pointer's `base_step`, `flag_property`, and `flag_bit`.
+/// 2. Resolve segment slots: destination from `addr_decomposition.seg_property`,
+///    source from `val_indirect_read.seg_property`. Both must be present
+///    (`None` from the recogniser means the address shape was too messy
+///    to decompose — bail to hardcoded path).
+/// 3. For each iteration `i ∈ [0, n)`, for each write entry `k`:
+///       byte = state.read_mem(src_seg*16 + src_ptr + signed_step*i + k)
+///       bulk_store_byte(dst_seg*16 + dst_ptr + signed_step*i + k, byte)
+///    The `signed_step` is the same for both pointers — MOVS-shape loops
+///    advance both pointers by the same direction-flag-multiplied step,
+///    and the descriptor's two pointer entries structurally describe
+///    that (same flag_property, same flag_bit, same base_step). We
+///    verify those structurally rather than assume.
+///
+/// Per-iter, per-write `state.read_mem` calls match the hardcoded path's
+/// MOVS shape exactly — the fetch routes through packed cells, windowed
+/// byte arrays, and the extended map without any of that knowledge
+/// leaking up here. Overlap semantics are preserved by the
+/// read-then-write iteration order: forward direction with overlapping
+/// ranges (e.g. dst = src + 1) sees the source bytes after they've been
+/// rewritten by earlier iterations, exactly as the hardcoded path
+/// (and real x86 MOVS) does.
+///
+/// Cardinal-rule shape: like [`apply_fill`], the applier reads zero
+/// property names as text. The `descriptor.pointers` lookup is
+/// whole-name string equality (a HashMap lookup, not a substring
+/// inspection), and the position-as-byte-offset within an iteration is
+/// a structural fact about the write vector's order — the same as in
+/// `apply_fill`.
+///
+/// Returns the iteration count so the caller can charge cycles.
+pub(crate) fn apply_copy(
+    descriptor: &LoopDescriptor,
+    program: &CompiledProgram,
+    state: &mut State,
+    slots: &[i32],
+) -> ApplyOutcome {
+    if descriptor.bulk_class != BulkClass::Copy {
+        return ApplyOutcome::Unsupported("not Copy class");
+    }
+    let Some(counter) = descriptor.counter.as_ref() else {
+        return ApplyOutcome::Unsupported("no counter");
+    };
+    let Some(n) = read_prop(program, state, slots, &counter.property) else {
+        return ApplyOutcome::Unsupported("counter unresolved");
+    };
+    if n <= 0 {
+        return ApplyOutcome::Applied { iterations: 0 };
+    }
+
+    // A Copy needs exactly two pointers: a destination and a source.
+    // Anything else is shape we don't recognise — bail.
+    if descriptor.pointers.len() != 2 {
+        return ApplyOutcome::Unsupported("Copy expects exactly two pointers");
+    }
+    if descriptor.writes.is_empty() {
+        return ApplyOutcome::Unsupported("Copy expects at least one write");
+    }
+
+    // Identify destination and source pointers structurally from the
+    // write entries. Every write must agree on both pointer names — a
+    // canonical MOVS-shape loop has all writes targeting the same dst
+    // and reading from the same src. Disagreement signals a shape we
+    // don't yet handle.
+    let first_dst_ptr = descriptor.writes[0]
+        .addr_decomposition
+        .as_ref()
+        .map(|(_, p)| p.as_str());
+    let first_src = descriptor.writes[0]
+        .val_indirect_read
+        .as_ref()
+        .map(|ir| ir.pointer_property.as_str());
+    let (Some(dst_ptr_name), Some(src_ptr_name)) = (first_dst_ptr, first_src) else {
+        return ApplyOutcome::Unsupported(
+            "Copy needs addr_decomposition + val_indirect_read on first write",
+        );
+    };
+    if dst_ptr_name == src_ptr_name {
+        // The dst and src must be different stepping pointers.
+        return ApplyOutcome::Unsupported("Copy dst and src pointer names match");
+    }
+    for w in &descriptor.writes {
+        let Some((_, p)) = w.addr_decomposition.as_ref() else {
+            return ApplyOutcome::Unsupported("Copy write missing addr_decomposition");
+        };
+        if p != dst_ptr_name {
+            return ApplyOutcome::Unsupported("Copy writes disagree on dst pointer");
+        }
+        let Some(ir) = w.val_indirect_read.as_ref() else {
+            return ApplyOutcome::Unsupported("Copy write missing val_indirect_read");
+        };
+        if ir.pointer_property != src_ptr_name {
+            return ApplyOutcome::Unsupported("Copy writes disagree on src pointer");
+        }
+    }
+
+    // Resolve the two pointer entries by name. Whole-name equality —
+    // identical to how `read_prop` resolves a slot.
+    let dst_entry = descriptor
+        .pointers
+        .iter()
+        .find(|p| p.self_property == dst_ptr_name);
+    let src_entry = descriptor
+        .pointers
+        .iter()
+        .find(|p| p.self_property == src_ptr_name);
+    let (Some(dst_entry), Some(src_entry)) = (dst_entry, src_entry) else {
+        return ApplyOutcome::Unsupported(
+            "Copy pointer names not found in descriptor.pointers",
+        );
+    };
+
+    // MOVS-shape: both pointers advance by the same signed step
+    // (same direction-flag bit, same base_step). Structurally enforce
+    // that — if the descriptor says the two pointers move
+    // independently, the cabinet is doing something we don't yet
+    // model and the hardcoded path should keep the wheel.
+    if dst_entry.base_step != src_entry.base_step {
+        return ApplyOutcome::Unsupported("Copy pointers have different base_step");
+    }
+    if dst_entry.flag_property != src_entry.flag_property
+        || dst_entry.flag_bit != src_entry.flag_bit
+    {
+        return ApplyOutcome::Unsupported(
+            "Copy pointers gated by different direction flags",
+        );
+    }
+    let step: i32 = dst_entry.base_step;
+    if descriptor.writes.len() != step as usize {
+        return ApplyOutcome::Unsupported(
+            "writes.len() != base_step (per-iter byte count mismatch)",
+        );
+    }
+
+    // Resolve segment slots and pointer values. For Copy we need both
+    // segments to be cleanly decomposed — `seg_property: None` from
+    // the recogniser means the source address expression had a shape
+    // we couldn't simplify, and per-iter raw-Expr evaluation isn't
+    // wired up yet.
+    let dst_seg_name = descriptor.writes[0]
+        .addr_decomposition
+        .as_ref()
+        .map(|(s, _)| s.as_str())
+        .unwrap();
+    let src_seg_name_opt = descriptor.writes[0]
+        .val_indirect_read
+        .as_ref()
+        .and_then(|ir| ir.seg_property.as_deref());
+    let Some(src_seg_name) = src_seg_name_opt else {
+        return ApplyOutcome::Unsupported(
+            "Copy val_indirect_read has no seg decomposition",
+        );
+    };
+    // Every write must agree on its decomposed segment slots too.
+    for w in &descriptor.writes {
+        let dst_seg = w.addr_decomposition.as_ref().map(|(s, _)| s.as_str()).unwrap();
+        if dst_seg != dst_seg_name {
+            return ApplyOutcome::Unsupported("Copy writes disagree on dst seg");
+        }
+        let src_seg = w
+            .val_indirect_read
+            .as_ref()
+            .and_then(|ir| ir.seg_property.as_deref());
+        if src_seg != Some(src_seg_name) {
+            return ApplyOutcome::Unsupported("Copy writes disagree on src seg");
+        }
+    }
+    let Some(dst_ptr_value) = read_prop(program, state, slots, dst_ptr_name) else {
+        return ApplyOutcome::Unsupported("dst pointer slot unresolved");
+    };
+    let Some(src_ptr_value) = read_prop(program, state, slots, src_ptr_name) else {
+        return ApplyOutcome::Unsupported("src pointer slot unresolved");
+    };
+    let Some(dst_seg_value) = read_prop(program, state, slots, dst_seg_name) else {
+        return ApplyOutcome::Unsupported("dst seg slot unresolved");
+    };
+    let Some(src_seg_value) = read_prop(program, state, slots, src_seg_name) else {
+        return ApplyOutcome::Unsupported("src seg slot unresolved");
+    };
+    let Some(flags) = read_prop(program, state, slots, &dst_entry.flag_property) else {
+        return ApplyOutcome::Unsupported("flag_property unresolved");
+    };
+    let df_active = ((flags >> dst_entry.flag_bit) & 1) != 0;
+    let signed_step: i32 = if df_active { -step } else { step };
+
+    // Pointer-wrap check, both ranges (16-bit segment offset). Each
+    // iteration touches `step` bytes at `ptr + i*signed_step` for
+    // both src and dst.
+    let n64 = n as i64;
+    let step64 = step as i64;
+    let bounds = |ptr: i32| -> (i64, i64) {
+        if df_active {
+            (ptr as i64 - (n64 - 1) * step64, ptr as i64 + step64)
+        } else {
+            (ptr as i64, ptr as i64 + n64 * step64)
+        }
+    };
+    let (dst_lo, dst_hi) = bounds(dst_ptr_value);
+    let (src_lo, src_hi) = bounds(src_ptr_value);
+    if dst_lo < 0 || dst_hi > 0x10000 {
+        return ApplyOutcome::Unsupported("dst pointer would wrap past 16-bit segment");
+    }
+    if src_lo < 0 || src_hi > 0x10000 {
+        return ApplyOutcome::Unsupported("src pointer would wrap past 16-bit segment");
+    }
+
+    // Virtual-region overlap on the destination only — the source side
+    // is read through `state.read_mem`, which transparently handles
+    // packed cells / extended map / windowed byte arrays. The
+    // destination is written through `bulk_store_byte` which routes
+    // similarly, but the hardcoded path bails on virtual-region writes
+    // (it has stricter assumptions about whether the bulk path matches
+    // CSS-side writeback). Match its behaviour.
+    let dst_seg_base = (dst_seg_value as i64) * 16;
+    let dst_lo_linear = dst_seg_base + dst_lo;
+    let dst_hi_linear = dst_seg_base + dst_hi;
+    if ranges_overlap_virtual(state, dst_lo_linear, dst_hi_linear - dst_lo_linear) {
+        return ApplyOutcome::Unsupported("destination range overlaps virtual region");
+    }
+
+    // Hot loop. Walk per-iter, per-write — same as the hardcoded MOVSW
+    // path. For step=1 (MOVSB-shape) this is one read+write per iter;
+    // for step=2 (MOVSW-shape) this is two read+writes per iter, in
+    // position order (low byte at offset 0, high byte at offset 1).
+    //
+    // The read-then-write order within an iteration matters for
+    // overlap: if dst overlaps src downstream of the iteration's
+    // current position, an earlier iteration's write may overwrite a
+    // future iteration's source. The hardcoded path walks per-byte in
+    // hardware iteration order to preserve those semantics; this
+    // applier does the same by reading and writing each byte through
+    // `state.read_mem` / `bulk_store_byte` in the same order.
+    let src_seg_base = (src_seg_value as i64) * 16;
+    let dst_ptr_i64 = dst_ptr_value as i64;
+    let src_ptr_i64 = src_ptr_value as i64;
+    for i in 0..n64 {
+        let iter_off = i * (signed_step as i64);
+        let dst_iter_base = dst_seg_base + dst_ptr_i64 + iter_off;
+        let src_iter_base = src_seg_base + src_ptr_i64 + iter_off;
+        for k in 0..(descriptor.writes.len() as i64) {
+            let s = src_iter_base + k;
+            let d = dst_iter_base + k;
+            let b = (state.read_mem(s as i32) & 0xFF) as u8;
+            bulk_store_byte(state, d, b);
+        }
+    }
+
+    ApplyOutcome::Applied { iterations: n }
 }
 
 // ---------------------------------------------------------------------------
@@ -847,6 +1107,569 @@ mod tests {
         assert_eq!(
             state_a.memory, state_b.memory,
             "applier word-fill must match direct per-byte writes byte-for-byte"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Step 5 — apply_copy (BulkClass::Copy / MOVS-shape) tests.
+    // -----------------------------------------------------------------
+
+    /// Build a MOVSB-shape descriptor: two byte-step pointers, one write
+    /// entry. The write's addr_decomposition resolves to (ES, DI); its
+    /// val_indirect_read resolves to (DS, SI) via a derived intermediate
+    /// slot named `--_strSrcByte`.
+    fn movsb_descriptor() -> LoopDescriptor {
+        LoopDescriptor {
+            key_property: "--opcode".to_string(),
+            key_value: 0xA4,
+            ip_property: "--IP".to_string(),
+            ip_self_property: "--IP_prev".to_string(),
+            ip_advance_literal: 1,
+            predicate_properties: vec!["--repContinue".to_string()],
+            predicate: StyleTest::Single {
+                property: "--repContinue".to_string(),
+                value: Expr::Literal(1.0),
+            },
+            counter: Some(CounterEntry {
+                property: "--CX".to_string(),
+                self_property: "--CX_prev".to_string(),
+                step: 1,
+            }),
+            pointers: vec![
+                PointerEntry {
+                    property: "--DI".to_string(),
+                    self_property: "--DI".to_string(),
+                    base_step: 1,
+                    flag_property: "--flags".to_string(),
+                    flag_bit: 10,
+                },
+                PointerEntry {
+                    property: "--SI".to_string(),
+                    self_property: "--SI".to_string(),
+                    base_step: 1,
+                    flag_property: "--flags".to_string(),
+                    flag_bit: 10,
+                },
+            ],
+            writes: vec![WriteEntry {
+                addr_property: "--mAddr0".to_string(),
+                val_property: "--mVal0".to_string(),
+                addr_expr: Expr::Literal(0.0),
+                val_expr: Expr::Var {
+                    name: "--_strSrcByte".to_string(),
+                    fallback: None,
+                },
+                addr_decomposition: Some(("--ES".to_string(), "--DI".to_string())),
+                val_indirect_read: Some(IndirectRead {
+                    seg_property: Some("--DS".to_string()),
+                    pointer_property: "--SI".to_string(),
+                    intermediate_property: "--_strSrcByte".to_string(),
+                }),
+            }],
+            flag_conditioned: false,
+            bulk_class: BulkClass::Copy,
+        }
+    }
+
+    /// MOVSW-shape descriptor: two word-step pointers, two write entries
+    /// (low byte at offset 0, high byte at offset 1).
+    fn movsw_descriptor() -> LoopDescriptor {
+        LoopDescriptor {
+            key_property: "--opcode".to_string(),
+            key_value: 0xA5,
+            ip_property: "--IP".to_string(),
+            ip_self_property: "--IP_prev".to_string(),
+            ip_advance_literal: 1,
+            predicate_properties: vec!["--repContinue".to_string()],
+            predicate: StyleTest::Single {
+                property: "--repContinue".to_string(),
+                value: Expr::Literal(1.0),
+            },
+            counter: Some(CounterEntry {
+                property: "--CX".to_string(),
+                self_property: "--CX_prev".to_string(),
+                step: 1,
+            }),
+            pointers: vec![
+                PointerEntry {
+                    property: "--DI".to_string(),
+                    self_property: "--DI".to_string(),
+                    base_step: 2,
+                    flag_property: "--flags".to_string(),
+                    flag_bit: 10,
+                },
+                PointerEntry {
+                    property: "--SI".to_string(),
+                    self_property: "--SI".to_string(),
+                    base_step: 2,
+                    flag_property: "--flags".to_string(),
+                    flag_bit: 10,
+                },
+            ],
+            writes: vec![
+                WriteEntry {
+                    addr_property: "--mAddr0".to_string(),
+                    val_property: "--mVal0".to_string(),
+                    addr_expr: Expr::Literal(0.0),
+                    val_expr: Expr::Var {
+                        name: "--_strSrcByteLo".to_string(),
+                        fallback: None,
+                    },
+                    addr_decomposition: Some(("--ES".to_string(), "--DI".to_string())),
+                    val_indirect_read: Some(IndirectRead {
+                        seg_property: Some("--DS".to_string()),
+                        pointer_property: "--SI".to_string(),
+                        intermediate_property: "--_strSrcByteLo".to_string(),
+                    }),
+                },
+                WriteEntry {
+                    addr_property: "--mAddr1".to_string(),
+                    val_property: "--mVal1".to_string(),
+                    addr_expr: Expr::Literal(0.0),
+                    val_expr: Expr::Var {
+                        name: "--_strSrcByteHi".to_string(),
+                        fallback: None,
+                    },
+                    addr_decomposition: Some(("--ES".to_string(), "--DI".to_string())),
+                    val_indirect_read: Some(IndirectRead {
+                        seg_property: Some("--DS".to_string()),
+                        pointer_property: "--SI".to_string(),
+                        intermediate_property: "--_strSrcByteHi".to_string(),
+                    }),
+                },
+            ],
+            flag_conditioned: false,
+            bulk_class: BulkClass::Copy,
+        }
+    }
+
+    /// Helper to seed source bytes at DS:SI for MOVS-shape tests.
+    fn seed_bytes(state: &mut State, base_linear: usize, bytes: &[u8]) {
+        for (i, &b) in bytes.iter().enumerate() {
+            state.memory[base_linear + i] = b;
+        }
+    }
+
+    /// Byte copy, forward direction: copy 8 bytes from DS:SI = 0x1000:0x40
+    /// to ES:DI = 0x2000:0x80. Source range is non-overlapping with dest.
+    #[test]
+    fn copy_byte_forward() {
+        let desc = movsb_descriptor();
+        let prog = empty_program_with_descriptor(desc.clone());
+        let mut state = rigged_state(&["CX", "DI", "SI", "ES", "DS", "flags"]);
+        state.set_var("CX", 8);
+        state.set_var("DI", 0x80);
+        state.set_var("SI", 0x40);
+        state.set_var("ES", 0x2000);
+        state.set_var("DS", 0x1000);
+        state.set_var("flags", 0); // DF=0
+        let src_base = 0x1000 * 16 + 0x40;
+        let dst_base = 0x2000 * 16 + 0x80;
+        seed_bytes(&mut state, src_base, &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]);
+
+        let outcome = apply_copy(&desc, &prog, &mut state, &[]);
+        assert_eq!(outcome, ApplyOutcome::Applied { iterations: 8 });
+
+        for (i, &b) in [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88].iter().enumerate() {
+            assert_eq!(state.memory[dst_base + i], b, "dst byte {}", i);
+        }
+        // Source untouched (no overlap).
+        assert_eq!(state.memory[src_base], 0x11);
+        assert_eq!(state.memory[src_base + 7], 0x88);
+        // Boundaries.
+        assert_eq!(state.memory[dst_base + 8], 0);
+    }
+
+    /// Byte copy, reverse direction (DF=1): SI=0x47, DI=0x87, n=8. Both
+    /// pointers walk backward by 1 each iteration.
+    #[test]
+    fn copy_byte_reverse() {
+        let desc = movsb_descriptor();
+        let prog = empty_program_with_descriptor(desc.clone());
+        let mut state = rigged_state(&["CX", "DI", "SI", "ES", "DS", "flags"]);
+        state.set_var("CX", 8);
+        state.set_var("DI", 0x87);
+        state.set_var("SI", 0x47);
+        state.set_var("ES", 0x2000);
+        state.set_var("DS", 0x1000);
+        state.set_var("flags", 1 << 10); // DF=1
+        let src_base = 0x1000 * 16 + 0x40;
+        let dst_base = 0x2000 * 16 + 0x80;
+        // Source bytes seeded across [0x40..0x48). Iter 0 reads from
+        // 0x47, iter 1 from 0x46, ... iter 7 from 0x40. Same for dst.
+        seed_bytes(&mut state, src_base, &[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x10, 0x20]);
+
+        let outcome = apply_copy(&desc, &prog, &mut state, &[]);
+        assert_eq!(outcome, ApplyOutcome::Applied { iterations: 8 });
+
+        // Destination bytes at [0x80..0x88) should be the same source
+        // bytes — reverse iteration on parallel pointers preserves byte
+        // ordering between equivalent positions.
+        for (i, &b) in [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x10, 0x20].iter().enumerate() {
+            assert_eq!(state.memory[dst_base + i], b, "dst byte {}", i);
+        }
+    }
+
+    /// Word copy, forward: copy 4 words from DS:SI to ES:DI.
+    #[test]
+    fn copy_word_forward() {
+        let desc = movsw_descriptor();
+        let prog = empty_program_with_descriptor(desc.clone());
+        let mut state = rigged_state(&["CX", "DI", "SI", "ES", "DS", "flags"]);
+        state.set_var("CX", 4);
+        state.set_var("DI", 0x100);
+        state.set_var("SI", 0x80);
+        state.set_var("ES", 0x3000);
+        state.set_var("DS", 0x1000);
+        state.set_var("flags", 0);
+        let src_base = 0x1000 * 16 + 0x80;
+        let dst_base = 0x3000 * 16 + 0x100;
+        seed_bytes(
+            &mut state,
+            src_base,
+            &[0xCE, 0xFA, 0xEF, 0xBE, 0x0D, 0xF0, 0xAD, 0xDE],
+        );
+
+        let outcome = apply_copy(&desc, &prog, &mut state, &[]);
+        assert_eq!(outcome, ApplyOutcome::Applied { iterations: 4 });
+
+        for (i, &b) in [0xCE, 0xFA, 0xEF, 0xBE, 0x0D, 0xF0, 0xAD, 0xDE].iter().enumerate() {
+            assert_eq!(state.memory[dst_base + i], b, "dst byte {}", i);
+        }
+        assert_eq!(state.memory[dst_base + 8], 0);
+    }
+
+    /// Word copy, reverse: SI / DI start at the *end* of the data and
+    /// walk backward by 2.
+    #[test]
+    fn copy_word_reverse() {
+        let desc = movsw_descriptor();
+        let prog = empty_program_with_descriptor(desc.clone());
+        let mut state = rigged_state(&["CX", "DI", "SI", "ES", "DS", "flags"]);
+        state.set_var("CX", 3);
+        state.set_var("DI", 0x110);
+        state.set_var("SI", 0x90);
+        state.set_var("ES", 0x3000);
+        state.set_var("DS", 0x1000);
+        state.set_var("flags", 1 << 10); // DF=1
+        let src_base = 0x1000 * 16;
+        let dst_base = 0x3000 * 16;
+        // Iter 0: SI=0x90 → reads two bytes at [0x90, 0x91].
+        // Iter 1: SI=0x8E → reads at [0x8E, 0x8F].
+        // Iter 2: SI=0x8C → reads at [0x8C, 0x8D].
+        // Same offsets for dst around 0x110.
+        seed_bytes(&mut state, src_base + 0x8C, &[0x10, 0x11, 0x12, 0x13, 0x14, 0x15]);
+
+        let outcome = apply_copy(&desc, &prog, &mut state, &[]);
+        assert_eq!(outcome, ApplyOutcome::Applied { iterations: 3 });
+
+        // dst[0x110..0x112) = src[0x90..0x92) = [0x14, 0x15]
+        // dst[0x10E..0x110) = src[0x8E..0x90) = [0x12, 0x13]
+        // dst[0x10C..0x10E) = src[0x8C..0x8E) = [0x10, 0x11]
+        let want: &[(usize, u8)] = &[
+            (0x110, 0x14), (0x111, 0x15),
+            (0x10E, 0x12), (0x10F, 0x13),
+            (0x10C, 0x10), (0x10D, 0x11),
+        ];
+        for &(off, b) in want {
+            assert_eq!(state.memory[dst_base + off], b, "addr {:#x}", off);
+        }
+        assert_eq!(state.memory[dst_base + 0x10B], 0);
+        assert_eq!(state.memory[dst_base + 0x112], 0);
+    }
+
+    /// Counter already zero: applier returns `Applied { iterations: 0 }`
+    /// without touching memory.
+    #[test]
+    fn copy_with_zero_counter_is_noop() {
+        let desc = movsb_descriptor();
+        let prog = empty_program_with_descriptor(desc.clone());
+        let mut state = rigged_state(&["CX", "DI", "SI", "ES", "DS", "flags"]);
+        state.set_var("CX", 0);
+        state.set_var("DI", 0x80);
+        state.set_var("SI", 0x40);
+        state.set_var("ES", 0x2000);
+        state.set_var("DS", 0x1000);
+        state.set_var("flags", 0);
+        state.memory[0x1000 * 16 + 0x40] = 0xAB;
+        state.memory[0x2000 * 16 + 0x80] = 0xCD; // sentinel, must not be overwritten
+
+        let outcome = apply_copy(&desc, &prog, &mut state, &[]);
+        assert_eq!(outcome, ApplyOutcome::Applied { iterations: 0 });
+        assert_eq!(state.memory[0x2000 * 16 + 0x80], 0xCD);
+    }
+
+    /// Overlapping ranges, forward: dst = src + 1, n=4. The hardcoded
+    /// path's per-byte-in-iteration-order semantics produce a byte-fill
+    /// effect (every dst byte ends up equal to the original src[0]).
+    /// The applier must match this byte-for-byte.
+    ///
+    /// src = [0x11, 0x22, 0x33, 0x44] at offset 0x100..0x104
+    /// dst starts at 0x101 (one byte forward of src)
+    /// Iter 0: read[0x100]=0x11, write[0x101]=0x11 → src now [0x11, 0x11, 0x33, 0x44]
+    /// Iter 1: read[0x101]=0x11, write[0x102]=0x11 → src now [0x11, 0x11, 0x11, 0x44]
+    /// Iter 2: read[0x102]=0x11, write[0x103]=0x11 → src now [0x11, 0x11, 0x11, 0x11]
+    /// Iter 3: read[0x103]=0x11, write[0x104]=0x11
+    /// Final: [0x11, 0x11, 0x11, 0x11, 0x11] at 0x100..0x105
+    #[test]
+    fn copy_overlapping_forward_propagates_first_byte() {
+        let desc = movsb_descriptor();
+        let prog = empty_program_with_descriptor(desc.clone());
+        // Use the same segment so the overlap is real.
+        let mut state = rigged_state(&["CX", "DI", "SI", "ES", "DS", "flags"]);
+        state.set_var("CX", 4);
+        state.set_var("DI", 0x101);
+        state.set_var("SI", 0x100);
+        state.set_var("ES", 0x1000);
+        state.set_var("DS", 0x1000);
+        state.set_var("flags", 0); // DF=0 forward
+        let base = 0x1000 * 16;
+        seed_bytes(&mut state, base + 0x100, &[0x11, 0x22, 0x33, 0x44]);
+
+        let outcome = apply_copy(&desc, &prog, &mut state, &[]);
+        assert_eq!(outcome, ApplyOutcome::Applied { iterations: 4 });
+
+        // Same pattern as the hardcoded path's per-byte forward walk:
+        // first byte propagates through the destination.
+        assert_eq!(state.memory[base + 0x100], 0x11); // src[0] unchanged
+        assert_eq!(state.memory[base + 0x101], 0x11);
+        assert_eq!(state.memory[base + 0x102], 0x11);
+        assert_eq!(state.memory[base + 0x103], 0x11);
+        assert_eq!(state.memory[base + 0x104], 0x11);
+        assert_eq!(state.memory[base + 0x105], 0); // boundary
+    }
+
+    /// Refusal paths.
+    #[test]
+    fn copy_refuses_non_copy_class() {
+        let mut desc = movsb_descriptor();
+        desc.bulk_class = BulkClass::Fill;
+        let prog = empty_program_with_descriptor(desc.clone());
+        let mut state = rigged_state(&["CX", "DI", "SI", "ES", "DS", "flags"]);
+        state.set_var("CX", 1);
+        let outcome = apply_copy(&desc, &prog, &mut state, &[]);
+        assert!(matches!(outcome, ApplyOutcome::Unsupported(_)));
+    }
+
+    #[test]
+    fn copy_refuses_when_only_one_pointer() {
+        let mut desc = movsb_descriptor();
+        desc.pointers.pop();
+        let prog = empty_program_with_descriptor(desc.clone());
+        let mut state = rigged_state(&["CX", "DI", "SI", "ES", "DS", "flags"]);
+        state.set_var("CX", 1);
+        let outcome = apply_copy(&desc, &prog, &mut state, &[]);
+        assert!(matches!(outcome, ApplyOutcome::Unsupported(_)));
+    }
+
+    #[test]
+    fn copy_refuses_when_val_indirect_read_missing() {
+        let mut desc = movsb_descriptor();
+        desc.writes[0].val_indirect_read = None;
+        let prog = empty_program_with_descriptor(desc.clone());
+        let mut state = rigged_state(&["CX", "DI", "SI", "ES", "DS", "flags"]);
+        state.set_var("CX", 1);
+        let outcome = apply_copy(&desc, &prog, &mut state, &[]);
+        assert!(matches!(outcome, ApplyOutcome::Unsupported(_)));
+    }
+
+    #[test]
+    fn copy_refuses_when_indirect_read_seg_missing() {
+        let mut desc = movsb_descriptor();
+        if let Some(ir) = desc.writes[0].val_indirect_read.as_mut() {
+            ir.seg_property = None;
+        }
+        let prog = empty_program_with_descriptor(desc.clone());
+        let mut state = rigged_state(&["CX", "DI", "SI", "ES", "DS", "flags"]);
+        state.set_var("CX", 1);
+        let outcome = apply_copy(&desc, &prog, &mut state, &[]);
+        assert!(matches!(outcome, ApplyOutcome::Unsupported(_)));
+    }
+
+    #[test]
+    fn copy_refuses_when_pointers_have_different_step() {
+        let mut desc = movsb_descriptor();
+        desc.pointers[1].base_step = 2;
+        let prog = empty_program_with_descriptor(desc.clone());
+        let mut state = rigged_state(&["CX", "DI", "SI", "ES", "DS", "flags"]);
+        state.set_var("CX", 1);
+        let outcome = apply_copy(&desc, &prog, &mut state, &[]);
+        assert!(matches!(outcome, ApplyOutcome::Unsupported(_)));
+    }
+
+    /// Genericity probe: a Copy descriptor with completely unrelated
+    /// property names (no DI/SI/ES/DS/CX/flags) must produce identical
+    /// behaviour. Verifies the applier reads no name as text — every
+    /// resolution is whole-name slot lookup, every structural decision
+    /// is by `Expr` shape and slot identity.
+    #[test]
+    fn copy_genericity_unrelated_names() {
+        let desc = LoopDescriptor {
+            key_property: "--opaque_key".to_string(),
+            key_value: 0xBC, // arbitrary
+            ip_property: "--ip_x".to_string(),
+            ip_self_property: "--ip_x_prev".to_string(),
+            ip_advance_literal: 1,
+            predicate_properties: vec!["--cont_x".to_string()],
+            predicate: StyleTest::Single {
+                property: "--cont_x".to_string(),
+                value: Expr::Literal(1.0),
+            },
+            counter: Some(CounterEntry {
+                property: "--alpha".to_string(),
+                self_property: "--alpha_prev".to_string(),
+                step: 1,
+            }),
+            pointers: vec![
+                PointerEntry {
+                    property: "--beta".to_string(),
+                    self_property: "--beta".to_string(),
+                    base_step: 1,
+                    flag_property: "--gamma".to_string(),
+                    flag_bit: 5, // arbitrary
+                },
+                PointerEntry {
+                    property: "--zeta".to_string(),
+                    self_property: "--zeta".to_string(),
+                    base_step: 1,
+                    flag_property: "--gamma".to_string(),
+                    flag_bit: 5,
+                },
+            ],
+            writes: vec![WriteEntry {
+                addr_property: "--w_addr".to_string(),
+                val_property: "--w_val".to_string(),
+                addr_expr: Expr::Literal(0.0),
+                val_expr: Expr::Var {
+                    name: "--theta".to_string(),
+                    fallback: None,
+                },
+                addr_decomposition: Some(("--epsilon".to_string(), "--beta".to_string())),
+                val_indirect_read: Some(IndirectRead {
+                    seg_property: Some("--eta".to_string()),
+                    pointer_property: "--zeta".to_string(),
+                    intermediate_property: "--theta".to_string(),
+                }),
+            }],
+            flag_conditioned: false,
+            bulk_class: BulkClass::Copy,
+        };
+        let prog = empty_program_with_descriptor(desc.clone());
+        let mut state =
+            rigged_state(&["alpha", "beta", "zeta", "epsilon", "eta", "gamma", "theta"]);
+        state.set_var("alpha", 5);
+        state.set_var("beta", 0x10); // dst pointer
+        state.set_var("zeta", 0x20); // src pointer
+        state.set_var("epsilon", 0x4000); // dst seg
+        state.set_var("eta", 0x2000); // src seg
+        state.set_var("gamma", 0); // bit 5 clear → forward
+        let src_base = 0x2000 * 16 + 0x20;
+        let dst_base = 0x4000 * 16 + 0x10;
+        seed_bytes(&mut state, src_base, &[0xA1, 0xA2, 0xA3, 0xA4, 0xA5]);
+
+        let outcome = apply_copy(&desc, &prog, &mut state, &[]);
+        assert_eq!(outcome, ApplyOutcome::Applied { iterations: 5 });
+        for (i, &b) in [0xA1, 0xA2, 0xA3, 0xA4, 0xA5].iter().enumerate() {
+            assert_eq!(state.memory[dst_base + i], b);
+        }
+    }
+
+    /// Dual-mode equivalence (byte): drive the same setup through the
+    /// applier and through a direct mirror of the hardcoded MOVSB loop
+    /// on independent State clones. Memory must be byte-for-byte
+    /// identical.
+    #[test]
+    fn copy_equivalence_byte_matches_direct_loop() {
+        let desc = movsb_descriptor();
+        let prog = empty_program_with_descriptor(desc.clone());
+        let names = &["CX", "DI", "SI", "ES", "DS", "flags"];
+        let mut state_a = rigged_state(names);
+        let mut state_b = rigged_state(names);
+        let n = 64usize;
+        let src_base = 0x1000 * 16 + 0x100;
+        for s in [&mut state_a, &mut state_b] {
+            s.set_var("CX", n as i32);
+            s.set_var("DI", 0x200);
+            s.set_var("SI", 0x100);
+            s.set_var("ES", 0x4000);
+            s.set_var("DS", 0x1000);
+            s.set_var("flags", 0);
+            // Seed src.
+            for k in 0..n {
+                s.memory[src_base + k] = (0x10 + k as u8) ^ 0x5A;
+            }
+        }
+
+        // Path A: applier.
+        let outcome = apply_copy(&desc, &prog, &mut state_a, &[]);
+        assert_eq!(outcome, ApplyOutcome::Applied { iterations: n as i32 });
+
+        // Path B: mirror the hardcoded MOVSB loop from compile.rs.
+        let es_base = 0x4000i64 * 16;
+        let ds_base = 0x1000i64 * 16;
+        let di = 0x200i64;
+        let si = 0x100i64;
+        for k in 0..(n as i64) {
+            let s_addr = ds_base + si + k;
+            let d_addr = es_base + di + k;
+            let b = (state_b.read_mem(s_addr as i32) & 0xFF) as u8;
+            bulk_store_byte(&mut state_b, d_addr, b);
+        }
+
+        assert_eq!(
+            state_a.memory, state_b.memory,
+            "applier byte-copy must match direct loop byte-for-byte"
+        );
+    }
+
+    /// Dual-mode equivalence (word, reverse): MOVSW DF=1 against a
+    /// direct mirror of the hardcoded MOVSW loop.
+    #[test]
+    fn copy_equivalence_word_reverse_matches_direct_loop() {
+        let desc = movsw_descriptor();
+        let prog = empty_program_with_descriptor(desc.clone());
+        let names = &["CX", "DI", "SI", "ES", "DS", "flags"];
+        let mut state_a = rigged_state(names);
+        let mut state_b = rigged_state(names);
+        let n = 50i64;
+        let src_base = 0x2000 * 16 + 0x500;
+        for s in [&mut state_a, &mut state_b] {
+            s.set_var("CX", n as i32);
+            s.set_var("DI", 0x600); // walks backward from 0x600
+            s.set_var("SI", 0x500); // walks backward from 0x500
+            s.set_var("ES", 0x5000);
+            s.set_var("DS", 0x2000);
+            s.set_var("flags", 1 << 10); // DF=1
+            // Seed src across [0x500-2*49 .. 0x500+2) = [0x43E .. 0x502).
+            for k in 0..(n * 2) {
+                let off = 0x500 - (n - 1) * 2 + k;
+                s.memory[(src_base as i64 - (n - 1) * 2 + k) as usize] =
+                    ((off as u8) ^ 0xC3) & 0xFF;
+            }
+        }
+
+        // Path A: applier.
+        let outcome = apply_copy(&desc, &prog, &mut state_a, &[]);
+        assert_eq!(outcome, ApplyOutcome::Applied { iterations: n as i32 });
+
+        // Path B: mirror the hardcoded MOVSW reverse loop.
+        let es_base = 0x5000i64 * 16;
+        let ds_base = 0x2000i64 * 16;
+        let di = 0x600i64;
+        let si = 0x500i64;
+        for k in 0..n {
+            let off = -k * 2; // DF=1
+            let s_addr = ds_base + si + off;
+            let d_addr = es_base + di + off;
+            let lo = (state_b.read_mem(s_addr as i32) & 0xFF) as u8;
+            let hi = (state_b.read_mem((s_addr + 1) as i32) & 0xFF) as u8;
+            bulk_store_byte(&mut state_b, d_addr, lo);
+            bulk_store_byte(&mut state_b, d_addr + 1, hi);
+        }
+
+        assert_eq!(
+            state_a.memory, state_b.memory,
+            "applier word-copy reverse must match direct loop byte-for-byte"
         );
     }
 }

@@ -170,15 +170,16 @@ fn apply_descriptor(
     state: &mut State,
     slots: &[i32],
 ) -> ApplierResult {
-    use crate::pattern::rep_applier::{apply_fill, ApplyOutcome};
+    use crate::pattern::rep_applier::{apply_copy, apply_fill, ApplyOutcome};
     match descriptor.bulk_class {
         BulkClass::Fill => match apply_fill(descriptor, program, state, slots) {
             ApplyOutcome::Applied { .. } => ApplierResult::Diff,
             ApplyOutcome::Unsupported(reason) => ApplierResult::Skip(reason),
         },
-        BulkClass::Copy => unimplemented!(
-            "BulkClass::Copy applier lands in phase 3b step 5 — MOVS-shaped copies via val_indirect_read"
-        ),
+        BulkClass::Copy => match apply_copy(descriptor, program, state, slots) {
+            ApplyOutcome::Applied { .. } => ApplierResult::Diff,
+            ApplyOutcome::Unsupported(reason) => ApplierResult::Skip(reason),
+        },
         BulkClass::ReadOnly => unimplemented!(
             "BulkClass::ReadOnly applier lands in phase 3b step 6 — CMPS/SCAS/LODS"
         ),
@@ -435,13 +436,21 @@ mod tests {
         assert!(matches!(result, ApplierResult::Skip(_)));
     }
 
+    /// Step 5 implements `BulkClass::Copy`. Dispatch should reach
+    /// [`crate::pattern::rep_applier::apply_copy`] without panicking.
+    /// The minimal `descriptor_with_class` helper produces a structurally
+    /// invalid `Copy` descriptor (only one pointer, no val_indirect_read),
+    /// so the applier returns `Unsupported` and the dispatcher returns
+    /// `ApplierResult::Skip` — which is the expected behaviour for any
+    /// shape the applier doesn't recognise. The point of the test is
+    /// that the `BulkClass::Copy` arm is no longer `unimplemented!()`.
     #[test]
-    #[should_panic(expected = "BulkClass::Copy applier lands in phase 3b step 5")]
-    fn stub_applier_dispatches_on_copy_arm() {
+    fn stub_applier_dispatches_on_copy_arm_without_panic() {
         let desc = descriptor_with_class(0xA4, BulkClass::Copy);
         let mut state = State::new(0x10);
         let prog = empty_program();
-        let _ = apply_descriptor(&desc, &prog, &mut state, &[]);
+        let result = apply_descriptor(&desc, &prog, &mut state, &[]);
+        assert!(matches!(result, ApplierResult::Skip(_)));
     }
 
     #[test]
