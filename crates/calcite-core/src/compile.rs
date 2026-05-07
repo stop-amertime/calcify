@@ -3346,18 +3346,15 @@ pub fn compile(
     let lsfused = fuse_loadstate_branch(&mut program);
     log::info!("[compile detail] fuse_loadstate_branch: {} fused, {:.2}s", lsfused, _ct.elapsed().as_secs_f64());
 
-    // BIfNEL2 fusion: OFF by default. Static analysis shows 1330 adjacent
-    // diff-slot AND-guard pairs in doom8088 (95% of all such pairs), but
-    // web bench shows the saved dispatch is offset by the `pc += 2; continue;`
-    // cost and possibly cache effects from a new Op variant. Net wash on
-    // doom8088. See logbook 2026-04-30. Set CALCITE_BIF2_FUSE=1 to enable
-    // for measurement / future cabinets.
+    // BIfNEL2 fusion: ON. doom8088 bench (2026-05-07) showed +47.3 %
+    // throughput / -31.8 % wall on doom-loading; 794 fusions covering
+    // 13.5 % of dispatched ops at runtime. The 2026-04-30 measurement on a
+    // different reference cabinet was net wash; we accept that risk on
+    // any non-ship cabinet to keep the win on doom8088. If a future
+    // cabinet regresses, gate this with a structural shape predicate
+    // (e.g. fusion-count threshold), not an env var.
     let _ct = web_time::Instant::now();
-    let bif2_fused = if std::env::var("CALCITE_BIF2_FUSE").is_ok() {
-        fuse_diff_slot_bifnel_pairs(&mut program)
-    } else {
-        0
-    };
+    let bif2_fused = fuse_diff_slot_bifnel_pairs(&mut program);
     log::info!("[compile detail] fuse_diff_slot_bifnel_pairs: {} fused, {:.2}s", bif2_fused, _ct.elapsed().as_secs_f64());
 
     let _ct = web_time::Instant::now();
