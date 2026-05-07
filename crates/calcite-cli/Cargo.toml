@@ -7,6 +7,7 @@ description = "CLI tool for running computational CSS through calc(ite)"
 
 [dependencies]
 calcite-core = { workspace = true }
+calcite-pc-video = { workspace = true }
 log = { workspace = true }
 env_logger = "0.11"
 clap = { version = "4", features = ["derive"] }

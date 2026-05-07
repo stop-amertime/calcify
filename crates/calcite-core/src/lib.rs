@@ -2,8 +2,8 @@
 //!
 //! Parses CSS files, recognises computational patterns (large if(style()) dispatch chains,
 //! broadcast writes, bitwise decomposition), and compiles them into efficient native
-//! operations. The primary target is running x86CSS faster than Chrome's native style
-//! resolver.
+//! operations. The primary target is running computational-CSS cabinets (such as
+//! CSS-DOS) faster than Chrome's native style resolver.
 
 /// CSS expression compiler — flattens Expr trees into flat bytecode.
 pub mod compile;
@@ -36,8 +36,6 @@ pub mod state;
 pub mod tick_period;
 /// Signature-based cycle detector (experimental, WIP — projection bug).
 pub mod cycle_tracker;
-/// Execution summary — event log, block segmenter, prose renderer.
-pub mod summary;
 /// IR type definitions — expressions, assignments, programs.
 pub mod types;
 

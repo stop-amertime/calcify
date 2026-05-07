@@ -7,6 +7,8 @@ description = "MCP debug server for calcite — step, inspect, compare CSS execu
 
 [dependencies]
 calcite-core = { workspace = true, features = ["conformance"] }
+calcite-debug-summary = { workspace = true }
+calcite-pc-video = { workspace = true }
 log = { workspace = true }
 env_logger = "0.11"
 serde = { version = "1", features = ["derive"] }

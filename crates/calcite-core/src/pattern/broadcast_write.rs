@@ -52,7 +52,7 @@ pub struct BroadcastResult {
 
 /// Analyse a set of assignments to detect the broadcast write pattern.
 ///
-/// Memory cells in x86CSS check multiple write ports:
+/// Memory cells in cabinets like CSS-DOS check multiple write ports:
 ///   `--m0: if(style(--addrDestA:0): valA; style(--addrDestB:0): valB; else: keep)`
 ///
 /// We create one `BroadcastWrite` per port. Assignments where ALL branches are

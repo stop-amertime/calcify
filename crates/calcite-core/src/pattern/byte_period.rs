@@ -9,17 +9,19 @@
 //! detector. Same algorithm, different alphabet:
 //!
 //!   - replicated_body operates on compiled Ops (one per CSS dispatch
-//!     entry). The doom column drawer's 16 reps don't show up there
-//!     because Kiln emits one dispatch entry per opcode, so the static
-//!     op stream sees fragments, not unrolled bodies.
+//!     entry). Cabinet emitters that produce one dispatch entry per
+//!     opcode end up with the static op stream seeing fragments rather
+//!     than unrolled bodies, even when the underlying program text
+//!     contains them.
 //!
 //!   - This module operates on rom-disk memory bytes — the actual cart
 //!     program text, where the 16 unrolled bodies sit literally
 //!     back-to-back as 21-byte sequences.
 //!
-//! The detector knows nothing about x86, opcodes, or Doom. It finds
-//! byte-level periodicity. Whether a found region is *fusible* is a
-//! separate question answered by the simulator downstream.
+//! The detector knows nothing about the upstream program — opcodes,
+//! ISAs, or specific cabinets. It finds byte-level periodicity. Whether
+//! a found region is *fusible* is a separate question answered by the
+//! simulator downstream.
 //!
 //! Genericity: the same detector fires on any cart that emits unrolled
 //! bodies as repeated byte sequences — 6502 unrolled blits, brainfuck
@@ -28,9 +30,8 @@
 //!
 //! Wildcards (varying immediates across reps) are intentionally
 //! out-of-scope for this first cut. If reps differ in any byte, the
-//! region is not reported. Doom8088's column drawer is fully literal
-//! (all 16 reps share the same `EC 00` stride immediate), so this is
-//! enough to find it.
+//! region is not reported. Many real-world unrolled bodies are fully
+//! literal (every rep byte-identical), so this is enough to find them.
 //!
 //! Future extension: a second phase that identifies positions varying
 //! linearly across reps (constant stride per-rep) and emits a
@@ -49,16 +50,16 @@
 //!      total span); on tie, prefer smaller p (tighter pattern).
 //!
 //! The MAX_PERIOD bound keeps the inner loop O(len * MAX_PERIOD) total.
-//! For doom-shaped fusion candidates, periods are small (the doom
-//! column drawer is 21 bytes; 6502 unrolled blits are typically
-//! <40 bytes per rep). MAX_PERIOD = 256 is generous and still cheap:
+//! For typical unrolled-body fusion candidates, periods are small
+//! (~21 bytes for an 8086-class blit, <40 bytes for 6502 unrolled
+//! blits). MAX_PERIOD = 256 is generous and still cheap:
 //! 256 * 4 MB = 1 GB byte-compares, ~1 s on modern hardware. We
 //! tighten this further at call sites if needed.
 //!
 //! MIN_REPS = 4 is the threshold below which fusion likely doesn't pay
-//! for the dispatch-wiring overhead. The doom column drawer at K = 16
-//! is well above this; we want to catch shorter unrolls too (e.g.,
-//! 4-rep blits) so the floor is conservative.
+//! for the dispatch-wiring overhead. Typical unrolled blits sit above
+//! this comfortably; we want to catch shorter unrolls too (e.g., 4-rep
+//! blits) so the floor is conservative.
 
 /// A periodic region in a byte slice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

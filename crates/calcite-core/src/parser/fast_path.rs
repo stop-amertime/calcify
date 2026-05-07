@@ -3,10 +3,10 @@
 //! # Motivation
 //!
 //! Real programs emit huge contiguous runs of near-identical declarations.
-//! In CSS-DOS rogue output, 76.4% of the CSS is 367,776 memory-cell
-//! assignments (`--mN: if(...)`) that are byte-identical except for the
-//! single integer `N` threaded through them. Another 7.9% is 367,776
-//! `@property --mN { ... }` blocks with the same property.
+//! For example, in one measured cabinet, 76.4% of the CSS is 367,776
+//! memory-cell assignments (`--mN: if(...)`) that are byte-identical
+//! except for the single integer `N` threaded through them. Another 7.9%
+//! is 367,776 `@property --mN { ... }` blocks with the same shape.
 //!
 //! cssparser handles these correctly but it tokenises every byte — for this
 //! one file that's ~4 seconds spent building then throwing away 18M+ heap
@@ -72,9 +72,10 @@ pub struct FastPathResult {
     /// Pre-built `BroadcastWrite`s from assignment-templated runs.
     pub broadcast_writes: Vec<BroadcastWrite>,
     /// Pre-built `PackedSlotPort`s from packed `--applySlot` assignment runs
-    /// (CSS-DOS PACK_SIZE=2 memory cells). Each port covers every absorbed
-    /// cell; downstream packed_broadcast_write merges these with any ports
-    /// the post-parse recogniser finds on non-absorbed assignments.
+    /// (PACK_SIZE=2 memory cells, the layout cabinets like CSS-DOS emit).
+    /// Each port covers every absorbed cell; downstream packed_broadcast_write
+    /// merges these with any ports the post-parse recogniser finds on
+    /// non-absorbed assignments.
     pub packed_broadcast_ports: Vec<PackedSlotPort>,
     /// Property names the caller should treat as already consumed — the
     /// ordinary assignment loop won't see them, but the caller needs to
@@ -557,8 +558,8 @@ fn emit_assignment_run(
         }
     };
 
-    // Try packed `--applySlot(...)` chain shape first (CSS-DOS PACK_SIZE=2
-    // memory cells). If that doesn't match, fall back to the flat broadcast
+    // Try packed `--applySlot(...)` chain shape first (PACK_SIZE=2 memory
+    // cells). If that doesn't match, fall back to the flat broadcast
     // `if(style(...))` shape.
     //
     // The packed shape is a nested function-call chain where each layer

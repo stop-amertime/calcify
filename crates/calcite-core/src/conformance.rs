@@ -1,7 +1,7 @@
 //! Conformance testing harness for comparing calc(ify) output against Chrome.
 //!
 //! The conformance test protocol:
-//! 1. Chrome baseline: Run x86CSS in Chrome, capture state after each tick via
+//! 1. Chrome baseline: Run the cabinet in Chrome, capture state after each tick via
 //!    getComputedStyle(). Save as JSON snapshots.
 //! 2. Engine comparison: Run the same CSS through calc(ify) for the same number
 //!    of ticks. Compare state after each tick against Chrome snapshots.

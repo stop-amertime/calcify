@@ -3,7 +3,9 @@ resolver = "2"
 members = [
     "crates/calcite-core",
     "crates/calcite-cli",
+    "crates/calcite-debug-summary",
     "crates/calcite-debugger",
+    "crates/calcite-pc-video",
     "crates/calcite-wasm",
 ]
 
@@ -15,6 +17,8 @@ repository = "https://github.com/stop-amertime/calcite"
 
 [workspace.dependencies]
 calcite-core = { path = "crates/calcite-core" }
+calcite-debug-summary = { path = "crates/calcite-debug-summary" }
+calcite-pc-video = { path = "crates/calcite-pc-video" }
 cssparser = "0.37"
 log = "0.4"
 thiserror = "2"
