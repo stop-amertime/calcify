@@ -11,6 +11,57 @@ and the Criterion benchmarks.
 
 ---
 
+## 2026-05-07 — `CALCITE_BIF2_FUSE=1` is a 31.8 % wall win on doom-loading
+
+Cross-link: CSS-DOS LOGBOOK 2026-05-07 entry of the same name.
+
+After retiring the widened `fuse_loadstate_branch` lead (entry
+below), characterised the runtime adjacency profile via
+`calcite-cli --restore <snap> --op-profile` (existed already, no new
+tooling needed). Top runtime pair on doom8088 across cold / loading
+/ in-game windows: **`BIfNEL → BIfNEL` at 12.7–13.5 %**.
+
+`fuse_diff_slot_bifnel_pairs` in `crates/calcite-core/src/compile.rs:3821`
++ `Op::BranchIfNotEqLit2` at compile.rs:359 already implement this
+fusion. Gated off by default behind `CALCITE_BIF2_FUSE`. The
+2026-04-30 measurement said it was net wash; that was on the
+**reference cabinet** at the time. The current doom8088 is a
+different shape.
+
+**Re-test on doom8088.** Bench `tests/bench/driver/run.mjs
+doom-loading --target=cli`:
+
+| | ticks/sec | runMsToInGame |
+|---|---:|---:|
+| baseline (median-3) | 142 656 | 241 872 ms |
+| `CALCITE_BIF2_FUSE=1` | 210 155 | 164 878 ms |
+
+**+47.3 % throughput, −31.8 % wall.** Smoke 7/7 PASS with the env
+var set (107.9 s, all 7 carts).
+
+Static fusion count on doom8088:
+- `fuse_cmp_branch: 77100`
+- `fuse_loadstate_branch: 50`
+- `fuse_diff_slot_bifnel_pairs: 794` (only with `BIF2_FUSE=1`)
+
+794 BIfNEL2 fusions covering ~13.5 % of dispatched ops in the
+runtime profile = the dispatch savings dominate the `pc += 2;
+continue;` cost the 2026-04-30 measurement was concerned about.
+
+**Recommendation:** flip `CALCITE_BIF2_FUSE` to default ON. Before
+that, re-verify on the cabinet the 2026-04-30 measurement was taken
+against (whichever was "the reference cabinet" at that point) so we
+don't regress that shape. If it's a wash there too, the gate stays
+in place but the *default* should switch since doom8088 is the ship
+target.
+
+The ungate would also let us delete the env-var read at compile.rs:3370.
+Probably wait one cabinet-and-bench cycle before doing that — keep
+the gate as a kill switch for the next person who finds an
+adjacency-poor cabinet.
+
+---
+
 ## 2026-05-07 — Widened `fuse_loadstate_branch`: NEGATIVE RESULT, lead retired
 
 Cross-link: pre-ship Doom8088 FPS brief in
