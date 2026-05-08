@@ -3346,15 +3346,16 @@ pub fn compile(
     let lsfused = fuse_loadstate_branch(&mut program);
     log::info!("[compile detail] fuse_loadstate_branch: {} fused, {:.2}s", lsfused, _ct.elapsed().as_secs_f64());
 
-    // BIfNEL2 fusion: ON. doom8088 bench (2026-05-07) showed +47.3 %
-    // throughput / -31.8 % wall on doom-loading; 794 fusions covering
-    // 13.5 % of dispatched ops at runtime. The 2026-04-30 measurement on a
-    // different reference cabinet was net wash; we accept that risk on
-    // any non-ship cabinet to keep the win on doom8088. If a future
-    // cabinet regresses, gate this with a structural shape predicate
-    // (e.g. fusion-count threshold), not an env var.
+    // BIfNEL2 fusion: HARDCODED OFF for current bench measurement
+    // (2026-05-08, isolating the keyboard-revert win from the BIF2 win).
+    // To re-enable, flip BIF2_FUSE_ENABLED. The pass itself is intact.
+    const BIF2_FUSE_ENABLED: bool = false;
     let _ct = web_time::Instant::now();
-    let bif2_fused = fuse_diff_slot_bifnel_pairs(&mut program);
+    let bif2_fused: usize = if BIF2_FUSE_ENABLED {
+        fuse_diff_slot_bifnel_pairs(&mut program)
+    } else {
+        0
+    };
     log::info!("[compile detail] fuse_diff_slot_bifnel_pairs: {} fused, {:.2}s", bif2_fused, _ct.elapsed().as_secs_f64());
 
     let _ct = web_time::Instant::now();
