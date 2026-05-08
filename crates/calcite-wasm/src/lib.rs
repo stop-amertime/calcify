@@ -43,6 +43,15 @@ pub struct CalciteEngine {
     /// `WATCH_CHUNK_TICKS` ticks) and the host drains events via
     /// `drain_measurements`.
     watch_registry: calcite_core::script::WatchRegistry,
+    /// Monotonic clock the watch poll uses for `Stride{every}` checks.
+    /// Starts at 0 in `new()` and increments by exactly `chunk_ticks`
+    /// per `run_batch_watched` inner iteration so `tick % every == 0`
+    /// lands on clean boundaries — the CLI does the same with its
+    /// `cursor` variable. Don't use `state.frame_counter` here: it's
+    /// non-zero by the time the host registers watches (the engine
+    /// has already booted), so a fresh stride watch never aligns with
+    /// the existing frame_counter modulus and never fires.
+    watch_clock: u32,
 }
 
 #[wasm_bindgen]
@@ -110,7 +119,7 @@ impl CalciteEngine {
         // MeasurementEvents that the host drains.
         let mut watch_registry = calcite_core::script::WatchRegistry::new();
         watch_registry.set_dump_sink(calcite_core::script::DumpSink::Memory);
-        Ok(CalciteEngine { state, evaluator, initial_properties, watch_registry })
+        Ok(CalciteEngine { state, evaluator, initial_properties, watch_registry, watch_clock: 0 })
     }
 
     /// Diagnostic: number of recognised packed-broadcast ports.
@@ -148,6 +157,7 @@ impl CalciteEngine {
         let mut new_reg = calcite_core::script::WatchRegistry::new();
         new_reg.set_dump_sink(calcite_core::script::DumpSink::Memory);
         self.watch_registry = new_reg;
+        self.watch_clock = 0;
     }
 
     /// Run a batch of ticks and return the property changes as a JSON string.
@@ -268,15 +278,14 @@ impl CalciteEngine {
         }
         let chunk = if chunk_ticks == 0 { count.max(1) } else { chunk_ticks };
         let mut remaining = count;
-        let mut tick_now: u32 = self.state.frame_counter;
         while remaining > 0 {
             let n = remaining.min(chunk);
             self.evaluator.run_batch_silent(&mut self.state, n);
-            tick_now = tick_now.saturating_add(n);
+            self.watch_clock = self.watch_clock.saturating_add(n);
             calcite_core::script_eval::poll(
                 &mut self.watch_registry,
                 &mut self.state,
-                tick_now,
+                self.watch_clock,
             );
             if self.watch_registry.halt_requested() {
                 return true;

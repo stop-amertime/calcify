@@ -86,9 +86,25 @@ fn evaluate_watch(
     tick: u32,
 ) -> bool {
     let fires = match &reg.watches[idx].kind {
-        WatchKind::Stride { every } => {
+        WatchKind::Stride { every, last_fired_at } => {
             let every = *every;
-            every > 0 && tick > 0 && tick % every == 0
+            if every == 0 || tick == 0 {
+                false
+            } else {
+                // Fire if at least `every` ticks have elapsed since
+                // last fire. This is host-call-cadence independent;
+                // the previous `tick % every == 0` check required the
+                // host to poll at tick values that align with `every`,
+                // which doesn't hold when the bridge polls on adaptive
+                // batch boundaries instead of fixed strides.
+                let last = last_fired_at.get();
+                if tick.saturating_sub(last) >= every {
+                    last_fired_at.set(tick);
+                    true
+                } else {
+                    false
+                }
+            }
         }
         WatchKind::Burst { every, count } => {
             let every = *every;
@@ -386,7 +402,7 @@ mod tests {
         let mut reg = WatchRegistry::new();
         reg.register(WatchSpec {
             name: "tick100".to_string(),
-            kind: WatchKind::Stride { every: 100 },
+            kind: WatchKind::Stride { every: 100, last_fired_at: std::cell::Cell::new(0) },
             gate: None,
             actions: vec![Action::Emit],
             sample_vars: Vec::new(),

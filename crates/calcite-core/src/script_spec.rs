@@ -228,7 +228,7 @@ pub fn parse_watch(spec: &str) -> Result<WatchSpec, String> {
     let kind = match kind_str {
         "stride" => {
             let every = parse_int(require_kv(&spec_payload, "every")?, "every")? as u32;
-            WatchKind::Stride { every }
+            WatchKind::Stride { every, last_fired_at: std::cell::Cell::new(0) }
         }
         "burst" => {
             // every=N,count=K
