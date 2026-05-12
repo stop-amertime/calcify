@@ -11,6 +11,81 @@ and the Criterion benchmarks.
 
 ---
 
+## 2026-05-12 — Per-dispatch-key specialisation, phase 3 wedge: compile-only verify-mode diagnostic
+
+Plan: CSS-DOS `docs/plans/2026-05-12-per-dispatch-key-specialisation.md`,
+phase 3. Phases 1-2 (discovery + Expr-level specialiser, 18 unit tests)
+landed earlier today; this is the first phase-3 wedge.
+
+**What landed.** Behind `CALCITE_SPECIALISE_VERIFY=1`, the
+`from_parsed` diagnostic now clones the post-sort assignment set, runs
+`specialise_assignments(key, v)` for the smallest N values
+(`CALCITE_SPECIALISE_MAX_VALUES`, default 4), and pushes each through
+the full `compile::compile` pipeline against the SAME pre-computed
+broadcast/packed sets. No `Evaluator` wiring; pure compile-cost +
+structural-shape diagnostic.
+
+**doom8088 numbers (4 of 232 `--opcode` values, calcite-cli, -n 1):**
+
+| metric                          | unspecialised | specialised (per value) |
+|---------------------------------|--------------:|------------------------:|
+| per-variant compile             |       —       |         1.07 – 1.17 s   |
+| post-fuse op count              |      280 K    |              ~280 K     |
+| slot count                      |      12 473   |              12 473     |
+| `inline calls` sites            |      13 089   |             ~10 270     |
+| `fuse_cmp_branch`               |      77 100   |             ~16 450     |
+| `dispatch chains`               |        208    |                  34     |
+| `fuse_loadstate_branch`         |         50    |                   8     |
+| `fuse_diff_slot_bifnel_pairs`   |        794    |                  30     |
+
+Op count is nearly identical, but the unspecialised compile produces
+**26 × more BIfNEL2 fusions** (794 vs 30) and **4.7 × more CmpBranch
+fusions** (77 K vs 16 K). Those represent branches the existing peephole
+stack collapses; specialised IR doesn't have those branches to begin
+with. The per-tick path through the unspecialised stream is
+branch-heavy (the fusion stack mitigates this); the specialised stream
+is closer to straight-line. **That's where the win lives** — not in op
+count, in path shape.
+
+**Compile-cost reality.** 232 values × 1.1 s ≈ 250 s = 9 × baseline.
+Far over the 1.5 × gate (41.7 s) the plan requires before shipping.
+Phase 5 (value-set dedup) is mandatory, not optional. Alternative
+paths to budget:
+
+- Prologue/tail factoring: only the assignments downstream of
+  `--opcode`'s computation need specialising. Re-using the prologue
+  compile across all N variants saves O(N) work.
+- Skip broadcast/packed re-recognition per variant. Broadcasts /
+  packed broadcasts don't change shape under specialisation (the
+  recognised cells / addresses are the same). Currently
+  `compile::compile` re-runs that work each call; an `compile_with_*`
+  variant that takes pre-compiled broadcast / packed metadata and
+  only re-runs the assignment-loop portion would cut compile time
+  drastically.
+
+**Why the `--opcode` is mid-tick complicates phase 3b.** `--opcode` is
+NOT a state-var (`@property` declarations only cover registers, halt,
+cycle counters, etc.). It's recomputed each tick as
+`--opcode = var(--q0)`. So the dispatching key isn't readable until
+*after* the prologue runs in the current tick. Phase 3b's runtime
+swap needs either:
+
+- (a) a prologue/tail split: run the unspecialised prologue, read
+      `--opcode`, dispatch into the specialised tail.
+- (b) a differential check (run unspecialised first, then read
+      `--opcode` from its slot via `compiled.property_slots`, then run
+      the matching specialised body on a state clone and diff).
+
+Picking (b) for verify-mode bit-equivalence. (a) is the eventual
+runtime path once (b) confirms specialised IR is correct.
+
+**Smoke not run yet.** Verify-mode is compile-only so far; per-tick
+diff comes in the next wedge.
+
+Commits: 1f890c4 (calcite, this) + corresponding CSS-DOS log entry.
+
+---
+
 ## 2026-05-07 — `CALCITE_BIF2_FUSE=1` is a 31.8 % wall win on doom-loading
 
 Cross-link: CSS-DOS LOGBOOK 2026-05-07 entry of the same name.
