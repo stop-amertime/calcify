@@ -975,11 +975,12 @@ fn main() {
                 });
                 let mut out = std::io::BufWriter::new(out_file);
                 use std::io::Write;
-                writeln!(out, "tick,cs,ip,sp,burst_id").ok();
+                writeln!(out, "tick,cs,ip,sp,cycles,burst_id").ok();
 
                 let cs_slot = state.state_var_names.iter().position(|n| n == "CS");
                 let ip_slot = state.state_var_names.iter().position(|n| n == "IP");
                 let sp_slot = state.state_var_names.iter().position(|n| n == "SP");
+                let cc_slot = state.state_var_names.iter().position(|n| n == "cycleCount");
                 let read = |state: &calcite_core::State, slot: Option<usize>| -> i32 {
                     slot.map(|i| state.state_vars[i]).unwrap_or(0)
                 };
@@ -1006,7 +1007,8 @@ fn main() {
                             let cs = read(&state, cs_slot);
                             let ip = read(&state, ip_slot);
                             let sp = read(&state, sp_slot);
-                            writeln!(out, "{},{},{},{},{}", tick, cs, ip, sp, bid).ok();
+                            let cc = read(&state, cc_slot);
+                            writeln!(out, "{},{},{},{},{},{}", tick, cs, ip, sp, cc, bid).ok();
                         }
                         burst_count += 1;
                     } else {
@@ -1025,7 +1027,8 @@ fn main() {
                         let cs = read(&state, cs_slot);
                         let ip = read(&state, ip_slot);
                         let sp = read(&state, sp_slot);
-                        writeln!(out, "{},{},{},{},{}", tick, cs, ip, sp, -1).ok();
+                        let cc = read(&state, cc_slot);
+                        writeln!(out, "{},{},{},{},{},{}", tick, cs, ip, sp, cc, -1).ok();
                         singles += 1;
                     }
                     sample_count += 1;

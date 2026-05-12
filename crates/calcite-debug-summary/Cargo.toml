@@ -1,0 +1,9 @@
+[package]
+name = "calcite-debug-summary"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Per-tick event log + block segmenter + prose renderer for calcite execution traces"
+
+[dependencies]
+calcite-core = { workspace = true }

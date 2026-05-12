@@ -1,0 +1,9 @@
+[package]
+name = "calcite-pc-video"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "PC-specific video helpers (CGA/VGA palette, CP437, text and framebuffer rendering) over calcite-core State"
+
+[dependencies]
+calcite-core = { workspace = true }

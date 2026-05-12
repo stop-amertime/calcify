@@ -516,6 +516,35 @@ impl Evaluator {
         let assignments = topological_sort_assignments(numeric_assignments, &functions);
 
         log::info!("[compile phase] topological sort: {:.2}s", _t.elapsed().as_secs_f64());
+        // NOTE 2026-05-12: identity-branch pruning pass
+        // (`crate::pattern::identity_prune`) is implemented but NOT wired
+        // in. It drops StyleCondition branches whose `then` matches the
+        // enclosing condition's `fallback` — a semantics-preserving
+        // rewrite at the Expr level. On doom8088 it found 16 prunable
+        // branches structurally, but enabling it breaks the cabinet:
+        // CLI runs to 50M ticks without reaching in-game (control: 34.65M).
+        // The semantic equivalence at the Expr level is real, but some
+        // downstream pattern recogniser (broadcast_write?,
+        // dispatch_table?, replicated_body?) appears to depend on the
+        // dispatch-key SET being explicitly present, even when its
+        // value equals the fallback. Pruning shrinks the key set and
+        // breaks that recogniser's input expectation. Re-enable only
+        // after identifying which downstream pass changes behaviour
+        // when the key set shrinks. Set CALCITE_IDENTITY_PRUNE=1 to
+        // re-enable for testing.
+        let _t = Instant::now();
+        let mut assignments = assignments;
+        if std::env::var("CALCITE_IDENTITY_PRUNE").as_deref() == Ok("1") {
+            let prune_stats = crate::pattern::identity_prune::prune_assignments(&mut assignments);
+            log::info!(
+                "[compile phase] identity-prune: {:.2}s — dropped {} of {} branches ({} conditions collapsed) [EXPERIMENTAL — disabled by default; breaks doom8088]",
+                _t.elapsed().as_secs_f64(),
+                prune_stats.branches_dropped(),
+                prune_stats.branches_before,
+                prune_stats.conditions_eliminated,
+            );
+        }
+
         let _t = Instant::now();
         let buffer_copies = program
             .assignments
@@ -2671,7 +2700,7 @@ mod tests {
 
         let mut state = State::default();
         state.load_properties(&program.properties);
-        let evaluator = Evaluator::from_parsed(&program);
+        let mut evaluator = Evaluator::from_parsed(&program);
 
         // Bindings compiled from the input edges.
         assert_eq!(evaluator.input_edge_bindings.len(), 2);
