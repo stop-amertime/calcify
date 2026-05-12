@@ -5573,6 +5573,51 @@ fn packed_splice_word_aligned(
 }
 
 /// Execute a compiled program for one tick.
+/// Run only the main op stream of `program` against `state`/`slots`,
+/// skipping writeback / broadcast writes / packed broadcast writes /
+/// rep_fast_forward.
+///
+/// Used by per-dispatch-key specialisation as a side-effect-free
+/// "prelude" — compute slot values for properties the tail needs to
+/// dispatch on, without any State mutation. The caller reads the
+/// chosen dispatch-key slot directly from `slots` after this returns.
+///
+/// `exec_ops` is private to this module; this is the thin public
+/// wrapper. The branch on `op_profile_active` mirrors `execute()` so
+/// profiling captures these slot-only runs too.
+pub fn execute_ops_only(program: &CompiledProgram, state: &mut State, slots: &mut Vec<i32>) {
+    if slots.len() != program.slot_count as usize {
+        slots.resize(program.slot_count as usize, 0);
+    }
+    let op_profile_active = crate::pattern::op_profile::op_profile_is_enabled();
+    if op_profile_active {
+        crate::pattern::op_profile::op_profile_break_sequence();
+        exec_ops_with_op_profile(
+            &program.ops,
+            &program.dispatch_tables,
+            &program.chain_tables,
+            &program.flat_dispatch_arrays,
+            &program.functions,
+            &program.packed_cell_tables,
+            &program.packed_exception_tables,
+            state,
+            slots,
+        );
+    } else {
+        exec_ops(
+            &program.ops,
+            &program.dispatch_tables,
+            &program.chain_tables,
+            &program.flat_dispatch_arrays,
+            &program.functions,
+            &program.packed_cell_tables,
+            &program.packed_exception_tables,
+            state,
+            slots,
+        );
+    }
+}
+
 pub fn execute(program: &CompiledProgram, state: &mut State, slots: &mut Vec<i32>) {
     // Size slots appropriately; keep stale values between ticks. The compiler
     // guarantees slots are written before being read within a tick (every read

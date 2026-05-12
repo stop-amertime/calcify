@@ -274,6 +274,174 @@ fn collect_values_in_test(t: &StyleTest, key: &str, values: &mut BTreeSet<i64>) 
 }
 
 // ----------------------------------------------------------------------
+// Phase 3 prologue/tail split: given a target property name (typically
+// the hot dispatch key, e.g. `--opcode`), find the transitive closure
+// of assignments whose computation that property depends on. The
+// returned set is the "prologue" — assignments that must run before
+// the dispatch key's value is known, so they CAN'T be specialised on
+// the key's value. The complement is the "tail" — what we specialise.
+//
+// Genericity: works for any target property name. No knowledge of
+// what `--opcode` means. The set is purely "what feeds into the
+// computation of this property name."
+// ----------------------------------------------------------------------
+
+use std::collections::HashSet;
+
+/// Find the transitive closure of property names whose computation the
+/// `target` property depends on. The returned set includes `target`
+/// itself (the prologue must compute `target`).
+///
+/// Walks each assignment's Expr tree backwards from `target`. For
+/// every `Var { name }` reference encountered, if there's an assignment
+/// computing that name, recurse into its Expr. Stops at properties not
+/// computed by any assignment in the slice (e.g. state-var reads —
+/// those are valid prologue inputs, not transitively-walked deps).
+///
+/// Returns a `HashSet<String>` of property names (including the leading
+/// `--`). Empty set means `target` has no assignment in the slice.
+pub fn find_prologue_properties(
+    assignments: &[Assignment],
+    target: &str,
+) -> HashSet<String> {
+    // Index by property name → Expr for O(1) lookup.
+    let by_name: HashMap<&str, &Expr> = assignments
+        .iter()
+        .map(|a| (a.property.as_str(), &a.value))
+        .collect();
+
+    let mut closure: HashSet<String> = HashSet::new();
+    let mut stack: Vec<String> = Vec::new();
+
+    if by_name.contains_key(target) {
+        stack.push(target.to_string());
+    }
+
+    while let Some(name) = stack.pop() {
+        if !closure.insert(name.clone()) {
+            continue; // already visited
+        }
+        if let Some(expr) = by_name.get(name.as_str()) {
+            let mut refs: HashSet<String> = HashSet::new();
+            collect_var_refs(expr, &mut refs);
+            for r in refs {
+                if !closure.contains(&r) && by_name.contains_key(r.as_str()) {
+                    stack.push(r);
+                }
+            }
+        }
+    }
+
+    closure
+}
+
+/// Walk an Expr collecting every `Var { name }` reference (including
+/// those inside `style(--prop: literal)` tests, since those property
+/// names ARE dependencies — the test reads that property's value).
+/// Used internally by `find_prologue_properties`.
+fn collect_var_refs(e: &Expr, out: &mut HashSet<String>) {
+    match e {
+        Expr::Var { name, fallback } => {
+            out.insert(name.clone());
+            if let Some(fb) = fallback {
+                collect_var_refs(fb, out);
+            }
+        }
+        Expr::StyleCondition { branches, fallback } => {
+            for b in branches {
+                collect_var_refs_in_test(&b.condition, out);
+                collect_var_refs(&b.then, out);
+            }
+            collect_var_refs(fallback, out);
+        }
+        Expr::Calc(op) => collect_var_refs_in_calc(op, out),
+        Expr::Concat(parts) => {
+            for p in parts {
+                collect_var_refs(p, out);
+            }
+        }
+        Expr::FunctionCall { args, .. } => {
+            for a in args {
+                collect_var_refs(a, out);
+            }
+        }
+        Expr::Literal(_) | Expr::StringLiteral(_) => {}
+    }
+}
+
+fn collect_var_refs_in_calc(op: &CalcOp, out: &mut HashSet<String>) {
+    match op {
+        CalcOp::Add(a, b)
+        | CalcOp::Sub(a, b)
+        | CalcOp::Mul(a, b)
+        | CalcOp::Div(a, b)
+        | CalcOp::Mod(a, b)
+        | CalcOp::Pow(a, b) => {
+            collect_var_refs(a, out);
+            collect_var_refs(b, out);
+        }
+        CalcOp::Min(args) | CalcOp::Max(args) => {
+            for x in args {
+                collect_var_refs(x, out);
+            }
+        }
+        CalcOp::Clamp(a, b, c) => {
+            collect_var_refs(a, out);
+            collect_var_refs(b, out);
+            collect_var_refs(c, out);
+        }
+        CalcOp::Round(_, a, b) => {
+            collect_var_refs(a, out);
+            collect_var_refs(b, out);
+        }
+        CalcOp::Sign(a) | CalcOp::Abs(a) | CalcOp::Negate(a) => {
+            collect_var_refs(a, out);
+        }
+    }
+}
+
+fn collect_var_refs_in_test(t: &StyleTest, out: &mut HashSet<String>) {
+    match t {
+        StyleTest::Single { property, value } => {
+            // The `property` IS a dependency — the test reads its value.
+            out.insert(property.clone());
+            collect_var_refs(value, out);
+        }
+        StyleTest::And(parts) | StyleTest::Or(parts) => {
+            for p in parts {
+                collect_var_refs_in_test(p, out);
+            }
+        }
+    }
+}
+
+/// Split a topologically-sorted assignment slice into (prologue, tail)
+/// where `prologue` contains every assignment in `prologue_props` (in
+/// the same relative order) and `tail` contains the rest. The relative
+/// ordering within each half is preserved.
+///
+/// Assumes the input is already topologically sorted — the split
+/// preserves dependency ordering inside each half. Crucially, no tail
+/// assignment depends on another tail assignment in a way that crosses
+/// the split (if it did, that other assignment would have to be in
+/// the prologue, contradicting the closure definition).
+pub fn split_prologue_tail(
+    sorted: Vec<Assignment>,
+    prologue_props: &HashSet<String>,
+) -> (Vec<Assignment>, Vec<Assignment>) {
+    let mut prologue = Vec::new();
+    let mut tail = Vec::new();
+    for a in sorted {
+        if prologue_props.contains(&a.property) {
+            prologue.push(a);
+        } else {
+            tail.push(a);
+        }
+    }
+    (prologue, tail)
+}
+
+// ----------------------------------------------------------------------
 // Phase 2: Expr-level specialisation (partial evaluation against a
 // known (key, value) binding).
 // ----------------------------------------------------------------------
@@ -298,6 +466,10 @@ pub struct SpecialiseStats {
     pub conditions_collapsed_to_fallback: usize,
     /// Number of `StyleCondition` nodes visited.
     pub conditions_visited: usize,
+    /// Number of `Var { name = key }` references folded to `Literal(value)`.
+    /// A direct read of the dispatch key returns the binding's value, so
+    /// every such read is collapsed at compile time.
+    pub var_refs_folded: usize,
 }
 
 impl SpecialiseStats {
@@ -306,6 +478,7 @@ impl SpecialiseStats {
         self.conditions_decided += o.conditions_decided;
         self.conditions_collapsed_to_fallback += o.conditions_collapsed_to_fallback;
         self.conditions_visited += o.conditions_visited;
+        self.var_refs_folded += o.var_refs_folded;
     }
 }
 
@@ -478,7 +651,16 @@ pub fn specialise_expr(expr: &mut Expr, key: &str, value: i64, stats: &mut Speci
                 specialise_expr(a, key, value, stats);
             }
         }
-        Expr::Var { fallback, .. } => {
+        Expr::Var { name, fallback } => {
+            // If this Var references the binding's key, fold it to a literal.
+            // The binding `(key = value)` means every read of `key` returns
+            // `value`. Tracked separately from style-condition folding so the
+            // stats stay informative.
+            if name == key {
+                stats.var_refs_folded += 1;
+                *expr = Expr::Literal(value as f64);
+                return;
+            }
             if let Some(fb) = fallback {
                 specialise_expr(fb, key, value, stats);
             }
@@ -942,5 +1124,95 @@ mod tests {
             value: var("--y"),
         };
         assert_eq!(test_outcome(&t, "--op", 64), BranchOutcome::Unknown);
+    }
+
+    #[test]
+    fn var_ref_to_key_folds_to_literal() {
+        // var(--op) under binding --op=64 → Literal(64).
+        // Direct read of the dispatch key returns the binding's value.
+        let mut e = var("--op");
+        let mut stats = SpecialiseStats::default();
+        specialise_expr(&mut e, "--op", 64, &mut stats);
+        assert_eq!(e, Expr::Literal(64.0));
+        assert_eq!(stats.var_refs_folded, 1);
+    }
+
+    #[test]
+    fn var_ref_to_other_key_unchanged() {
+        // var(--rm) under binding --op=64 → unchanged.
+        let mut e = var("--rm");
+        let mut stats = SpecialiseStats::default();
+        specialise_expr(&mut e, "--op", 64, &mut stats);
+        assert_eq!(e, var("--rm"));
+        assert_eq!(stats.var_refs_folded, 0);
+    }
+
+    #[test]
+    fn var_ref_inside_calc_folds() {
+        // calc(var(--op) + 1) under --op=64 → calc(Literal(64) + 1).
+        // The Var inside the Calc gets folded; the Calc structure preserved.
+        let mut e = Expr::Calc(CalcOp::Add(
+            Box::new(var("--op")),
+            Box::new(lit(1.0)),
+        ));
+        let mut stats = SpecialiseStats::default();
+        specialise_expr(&mut e, "--op", 64, &mut stats);
+        assert_eq!(
+            e,
+            Expr::Calc(CalcOp::Add(Box::new(lit(64.0)), Box::new(lit(1.0))))
+        );
+        assert_eq!(stats.var_refs_folded, 1);
+    }
+
+    #[test]
+    fn find_prologue_returns_closure_with_target() {
+        // --target depends on --a, which depends on --b. --c is unrelated.
+        // find_prologue(target=--target) should return {--target, --a, --b}.
+        let a = assign("--target", var("--a"));
+        let b = assign("--a", var("--b"));
+        let c = assign("--b", lit(0.0));
+        let d = assign("--c", lit(99.0));
+        let props = find_prologue_properties(&[a, b, c, d], "--target");
+        let mut got: Vec<&str> = props.iter().map(|s| s.as_str()).collect();
+        got.sort();
+        assert_eq!(got, vec!["--a", "--b", "--target"]);
+    }
+
+    #[test]
+    fn find_prologue_handles_style_condition_deps() {
+        // --target reads --a inside a style test → --a is a dependency.
+        // --target also depends on --b for the then-value.
+        let target = assign(
+            "--target",
+            cond(
+                vec![branch(single("--a", 1), var("--b"))],
+                lit(0.0),
+            ),
+        );
+        let a = assign("--a", lit(1.0));
+        let b = assign("--b", lit(2.0));
+        let c = assign("--c", lit(3.0));
+        let props = find_prologue_properties(&[target, a, b, c], "--target");
+        let mut got: Vec<&str> = props.iter().map(|s| s.as_str()).collect();
+        got.sort();
+        assert_eq!(got, vec!["--a", "--b", "--target"]);
+    }
+
+    #[test]
+    fn split_prologue_tail_preserves_order() {
+        let assignments = vec![
+            assign("--p1", lit(1.0)),
+            assign("--t1", lit(2.0)),
+            assign("--p2", lit(3.0)),
+            assign("--t2", lit(4.0)),
+        ];
+        let mut prologue_props = HashSet::new();
+        prologue_props.insert("--p1".to_string());
+        prologue_props.insert("--p2".to_string());
+        let (prologue, tail) = split_prologue_tail(assignments, &prologue_props);
+        let p_names: Vec<&str> = prologue.iter().map(|a| a.property.as_str()).collect();
+        let t_names: Vec<&str> = tail.iter().map(|a| a.property.as_str()).collect();
+        assert_eq!(p_names, vec!["--p1", "--p2"]);
+        assert_eq!(t_names, vec!["--t1", "--t2"]);
     }
 }
