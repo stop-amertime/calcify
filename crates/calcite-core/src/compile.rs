@@ -3355,6 +3355,32 @@ pub fn compile(
     let chains = build_dispatch_chains(&mut program);
     log::info!("[compile detail] dispatch chains: {} chains built, {:.2}s", chains, _ct.elapsed().as_secs_f64());
 
+    // Same-key DispatchChain run analysis: how often does the post-
+    // build_dispatch_chains op stream contain runs of consecutive
+    // DispatchChain ops keyed on the same slot, with only the case
+    // bodies between them? Each such run is a candidate for merging
+    // into one outer dispatch on the shared key, with concatenated
+    // per-value bodies. Diagnostic-only for now: no transformation.
+    if std::env::var("CALCITE_DISPATCH_RUN_DIAG").is_ok() {
+        let _ct = web_time::Instant::now();
+        let runs = scan_same_key_chain_runs(&program.ops);
+        log::info!(
+            "[dispatch-run-diag] {:.3}s — {} runs total, biggest run = {} chains, total chains in runs ≥2 = {}",
+            _ct.elapsed().as_secs_f64(),
+            runs.len(),
+            runs.iter().map(|r| r.len()).max().unwrap_or(0),
+            runs.iter().filter(|r| r.len() >= 2).map(|r| r.len()).sum::<usize>(),
+        );
+        for run in runs.iter().filter(|r| r.len() >= 2).take(5) {
+            log::info!(
+                "[dispatch-run-diag]   run of {} chains keyed on slot {}: chain_ids={:?}",
+                run.len(),
+                run[0].key_slot,
+                run.iter().map(|c| c.chain_id).collect::<Vec<_>>(),
+            );
+        }
+    }
+
     let _ct = web_time::Instant::now();
     let lsfused = fuse_loadstate_branch(&mut program);
     log::info!("[compile detail] fuse_loadstate_branch: {} fused, {:.2}s", lsfused, _ct.elapsed().as_secs_f64());
@@ -4465,6 +4491,87 @@ fn build_dispatch_chains(program: &mut CompiledProgram) -> usize {
         }
     }
     total
+}
+
+/// Identification of a single DispatchChain instance in the main op stream:
+/// where it lives, what slot it keys on, and where execution converges
+/// after all its case bodies + fallback have run. Produced by
+/// `scan_same_key_chain_runs` and grouped into "runs" of consecutive
+/// same-slot chains for the merge pass.
+#[derive(Debug, Clone)]
+struct ChainInRun {
+    /// Index in `program.ops` of the `Op::DispatchChain` itself.
+    chain_pc: usize,
+    /// Chain table id (index into `program.chain_tables`).
+    chain_id: u32,
+    /// Slot the chain keys on (`Op::DispatchChain.a`).
+    key_slot: Slot,
+    /// Index of the first op AFTER this chain's bodies/fallback — i.e.
+    /// the convergence point all case `Jump`s land on. Two chains
+    /// are "adjacent" iff one chain's `end_pc` equals the other's
+    /// `chain_pc`.
+    end_pc: usize,
+}
+
+/// Walk the main op stream and find runs of consecutive `Op::DispatchChain`
+/// ops that all key on the same slot. Each run is a `Vec<ChainInRun>` of
+/// chains where chain[i].end_pc == chain[i+1].chain_pc and all chains
+/// share the same `key_slot`.
+fn scan_same_key_chain_runs(ops: &[Op]) -> Vec<Vec<ChainInRun>> {
+    // First pass: build a flat list of all DispatchChain ops with their
+    // computed end_pc.
+    let mut chains: Vec<ChainInRun> = Vec::new();
+    for (pc, op) in ops.iter().enumerate() {
+        if let Op::DispatchChain { a, chain_id, .. } = op {
+            // Find a case body to walk: pick the first jump-to-end we
+            // hit by scanning forward from chain_pc + 1. Every case body
+            // ends with `Op::Jump { target: END }` and END is shared
+            // across all bodies of this chain. The first such Jump we
+            // encounter gives us END.
+            let mut end_pc: Option<usize> = None;
+            let mut probe = pc + 1;
+            while probe < ops.len() && end_pc.is_none() {
+                // If we hit another DispatchChain before finding our
+                // Jump-to-END, that's structurally unexpected — bail.
+                if let Op::DispatchChain { .. } = &ops[probe] {
+                    break;
+                }
+                if let Op::Jump { target } = &ops[probe] {
+                    end_pc = Some(*target as usize);
+                    break;
+                }
+                probe += 1;
+            }
+            if let Some(end) = end_pc {
+                chains.push(ChainInRun {
+                    chain_pc: pc,
+                    chain_id: *chain_id,
+                    key_slot: *a,
+                    end_pc: end,
+                });
+            }
+        }
+    }
+
+    // Second pass: group into runs of consecutive same-key adjacent chains.
+    let mut runs: Vec<Vec<ChainInRun>> = Vec::new();
+    let mut current: Vec<ChainInRun> = Vec::new();
+    for c in chains {
+        match current.last() {
+            None => current.push(c),
+            Some(prev) if prev.end_pc == c.chain_pc && prev.key_slot == c.key_slot => {
+                current.push(c);
+            }
+            _ => {
+                runs.push(std::mem::take(&mut current));
+                current.push(c);
+            }
+        }
+    }
+    if !current.is_empty() {
+        runs.push(current);
+    }
+    runs
 }
 
 /// Minimum chain length to convert. Below this, linear BranchIfNotEqLit
