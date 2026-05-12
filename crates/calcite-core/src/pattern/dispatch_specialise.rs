@@ -1,10 +1,13 @@
-//! Per-dispatch-key specialisation — phase 1: discovery diagnostics.
+//! Per-dispatch-key specialisation — discovery + Expr-level partial
+//! evaluator.
 //!
 //! ## What this is
 //!
-//! The first stage of the per-dispatch-key specialisation plan
-//! (CSS-DOS `docs/plans/2026-05-12-per-dispatch-key-specialisation.md`).
-//! No specialisation, no codegen — just two structural primitives:
+//! Phases 1-2 of the per-dispatch-key specialisation plan (CSS-DOS
+//! `docs/plans/2026-05-12-per-dispatch-key-specialisation.md`). No
+//! runtime integration yet — pure compile-time structural transforms.
+//!
+//! Phase-1 primitives (discovery):
 //!
 //! - `discover_hot_key(assignments)` — return the custom-property name
 //!   that the most `StyleCondition`-`Single` tests across all
@@ -13,12 +16,18 @@
 //!   literal `i64` values that `Single` tests on that key compare
 //!   against.
 //!
-//! Together they answer "is this cabinet specialisable, and against
-//! what?" without committing to any transformation.
+//! Phase-2 primitives (specialisation):
+//!
+//! - `specialise_assignments(&mut [Assignment], key, value)` —
+//!   partial-evaluate every assignment's `Expr` tree against the
+//!   binding `(key = value)`. Drops branches whose test rejects the
+//!   binding, folds chains decided by a guaranteed-true test, leaves
+//!   undecidable branches in place.
+//! - `specialise_expr(&mut Expr, key, value)` — same, on a single tree.
 //!
 //! ## Cardinal-rule defence
 //!
-//! Both primitives are purely structural:
+//! Everything here is purely structural:
 //!
 //! - We read property *names* but never read characters out of them
 //!   (no prefix matching, no convention-based filtering).
@@ -27,6 +36,10 @@
 //! - The hot-key choice is fully determined by `(count, name)`. The
 //!   secondary lexicographic ordering on name is for determinism
 //!   only — same cabinet, same answer, on any machine.
+//! - Specialisation evaluates `StyleTest`s against the binding using
+//!   only `Single { property == key, value == Literal }` resolution
+//!   + And/Or shape. It never tries to evaluate `Var(...)` against
+//!   current cabinet state.
 //!
 //! A 6502 cabinet's hot dispatch key would be discovered identically.
 //! A brainfuck cabinet's `--currentCommand` key would be picked if it
@@ -37,7 +50,7 @@
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 
-use crate::types::{Assignment, CalcOp, Expr, StyleTest};
+use crate::types::{Assignment, CalcOp, Expr, StyleBranch, StyleTest};
 
 /// Result of `discover_hot_key`: the chosen key and how many
 /// `StyleCondition`-`Single` tests reference it across all walked
@@ -256,6 +269,251 @@ fn collect_values_in_test(t: &StyleTest, key: &str, values: &mut BTreeSet<i64>) 
             for p in parts {
                 collect_values_in_test(p, key, values);
             }
+        }
+    }
+}
+
+// ----------------------------------------------------------------------
+// Phase 2: Expr-level specialisation (partial evaluation against a
+// known (key, value) binding).
+// ----------------------------------------------------------------------
+
+/// Aggregate counters reported by `specialise_assignments`.
+///
+/// All counts are over the assignment slice *as a whole* — i.e. summed
+/// across every tree walked. Useful for the phase-2 gate
+/// ("StyleCondition count ≤ 10 % of unspecialised").
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SpecialiseStats {
+    /// Number of `StyleBranch`es that were dropped because their test
+    /// `NeverTakes` under the binding.
+    pub branches_dropped: usize,
+    /// Number of `StyleCondition`s that collapsed because some branch
+    /// `AlwaysTakes` under the binding (entire condition replaced with
+    /// the decided branch's `then`).
+    pub conditions_decided: usize,
+    /// Number of `StyleCondition`s that collapsed because all their
+    /// branches were dropped (only the fallback remained, so the
+    /// condition was replaced with the specialised fallback).
+    pub conditions_collapsed_to_fallback: usize,
+    /// Number of `StyleCondition` nodes visited.
+    pub conditions_visited: usize,
+}
+
+impl SpecialiseStats {
+    fn add(&mut self, o: &SpecialiseStats) {
+        self.branches_dropped += o.branches_dropped;
+        self.conditions_decided += o.conditions_decided;
+        self.conditions_collapsed_to_fallback += o.conditions_collapsed_to_fallback;
+        self.conditions_visited += o.conditions_visited;
+    }
+}
+
+/// Outcome of testing a single `StyleTest` against a known
+/// `(key, value)` binding. Public so phase-3 code paths that want to
+/// reason about partial decidability can share the same shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BranchOutcome {
+    /// The test is guaranteed to fire (every reachable `Single` on
+    /// `key` matches `value`, and the compound shape resolves to true).
+    AlwaysTakes,
+    /// The test can never fire (some required `Single` on `key`
+    /// rejects `value`, or every `Or` arm rejects).
+    NeverTakes,
+    /// The test reads something other than the known binding (or has
+    /// a non-literal `Single` RHS); outcome can't be decided at
+    /// compile time. Keep the branch.
+    Unknown,
+}
+
+/// Evaluate a `StyleTest` under the binding `(key = value)`.
+///
+/// Only `StyleTest::Single { property == key, value == Literal(L) }`
+/// is resolved. Any other shape (different property, non-literal RHS,
+/// nested condition) contributes `Unknown`. Compound `And`/`Or` are
+/// composed: `And` is `AlwaysTakes` iff every arm is `AlwaysTakes`,
+/// `NeverTakes` if any arm rejects; `Or` is `AlwaysTakes` if any arm
+/// matches, `NeverTakes` iff every arm rejects.
+pub fn test_outcome(t: &StyleTest, key: &str, value: i64) -> BranchOutcome {
+    match t {
+        StyleTest::Single { property, value: v } => {
+            if property != key {
+                return BranchOutcome::Unknown;
+            }
+            match v {
+                Expr::Literal(lit) => {
+                    if (*lit as i64) == value {
+                        BranchOutcome::AlwaysTakes
+                    } else {
+                        BranchOutcome::NeverTakes
+                    }
+                }
+                _ => BranchOutcome::Unknown,
+            }
+        }
+        StyleTest::And(parts) => {
+            let mut all_take = true;
+            for p in parts {
+                match test_outcome(p, key, value) {
+                    BranchOutcome::NeverTakes => return BranchOutcome::NeverTakes,
+                    BranchOutcome::Unknown => all_take = false,
+                    BranchOutcome::AlwaysTakes => {}
+                }
+            }
+            if all_take {
+                BranchOutcome::AlwaysTakes
+            } else {
+                BranchOutcome::Unknown
+            }
+        }
+        StyleTest::Or(parts) => {
+            let mut any_take = false;
+            let mut all_reject = true;
+            for p in parts {
+                match test_outcome(p, key, value) {
+                    BranchOutcome::AlwaysTakes => any_take = true,
+                    BranchOutcome::NeverTakes => {}
+                    BranchOutcome::Unknown => all_reject = false,
+                }
+            }
+            if any_take {
+                BranchOutcome::AlwaysTakes
+            } else if all_reject {
+                BranchOutcome::NeverTakes
+            } else {
+                BranchOutcome::Unknown
+            }
+        }
+    }
+}
+
+/// Partial-evaluate every assignment's `Expr` tree against the binding
+/// `(key = value)`. In-place. Returns aggregate stats.
+///
+/// See `specialise_expr` for the per-tree contract.
+pub fn specialise_assignments(
+    assignments: &mut [Assignment],
+    key: &str,
+    value: i64,
+) -> SpecialiseStats {
+    let mut total = SpecialiseStats::default();
+    for a in assignments.iter_mut() {
+        let mut s = SpecialiseStats::default();
+        specialise_expr(&mut a.value, key, value, &mut s);
+        total.add(&s);
+    }
+    total
+}
+
+/// Partial-evaluate a single `Expr` against the binding `(key = value)`.
+/// In-place. The `stats` argument accumulates per-tree counters.
+///
+/// Rules (generic, structural):
+///
+/// - `StyleCondition { branches, fallback }`:
+///   * Walk branches in order. Drop any branch whose test
+///     `NeverTakes`.
+///   * If a branch's test `AlwaysTakes`, the chain is decided at
+///     compile time: replace the entire condition with that branch's
+///     specialised `then`, dropping subsequent branches and the
+///     fallback.
+///   * Otherwise keep the branch; specialise its `then`.
+///   * If no branches remain, collapse the condition to the
+///     specialised fallback.
+/// - `Calc` / `Concat` / `FunctionCall` / `Var.fallback`: recurse into
+///   children.
+/// - `Var` / `Literal` / `StringLiteral`: leaf; no change.
+pub fn specialise_expr(expr: &mut Expr, key: &str, value: i64, stats: &mut SpecialiseStats) {
+    match expr {
+        Expr::StyleCondition { branches, fallback } => {
+            stats.conditions_visited += 1;
+            let mut new_branches: Vec<StyleBranch> = Vec::with_capacity(branches.len());
+            let mut decided: Option<Expr> = None;
+            for b in branches.drain(..) {
+                match test_outcome(&b.condition, key, value) {
+                    BranchOutcome::NeverTakes => {
+                        stats.branches_dropped += 1;
+                    }
+                    BranchOutcome::AlwaysTakes => {
+                        // Chain is decided. Specialise this branch's `then`
+                        // and use it as the whole result.
+                        let mut t = b.then;
+                        specialise_expr(&mut t, key, value, stats);
+                        decided = Some(t);
+                        break;
+                    }
+                    BranchOutcome::Unknown => {
+                        let StyleBranch { condition, mut then } = b;
+                        specialise_expr(&mut then, key, value, stats);
+                        new_branches.push(StyleBranch { condition, then });
+                    }
+                }
+            }
+
+            if let Some(t) = decided {
+                stats.conditions_decided += 1;
+                *expr = t;
+                return;
+            }
+
+            // No branch was guaranteed; specialise fallback too.
+            specialise_expr(fallback, key, value, stats);
+
+            if new_branches.is_empty() {
+                stats.conditions_collapsed_to_fallback += 1;
+                let fb = std::mem::replace(fallback.as_mut(), Expr::Literal(0.0));
+                *expr = fb;
+            } else {
+                *branches = new_branches;
+            }
+        }
+        Expr::Calc(op) => specialise_calc(op, key, value, stats),
+        Expr::Concat(parts) => {
+            for p in parts {
+                specialise_expr(p, key, value, stats);
+            }
+        }
+        Expr::FunctionCall { args, .. } => {
+            for a in args {
+                specialise_expr(a, key, value, stats);
+            }
+        }
+        Expr::Var { fallback, .. } => {
+            if let Some(fb) = fallback {
+                specialise_expr(fb, key, value, stats);
+            }
+        }
+        Expr::Literal(_) | Expr::StringLiteral(_) => {}
+    }
+}
+
+fn specialise_calc(op: &mut CalcOp, key: &str, value: i64, stats: &mut SpecialiseStats) {
+    match op {
+        CalcOp::Add(a, b)
+        | CalcOp::Sub(a, b)
+        | CalcOp::Mul(a, b)
+        | CalcOp::Div(a, b)
+        | CalcOp::Mod(a, b)
+        | CalcOp::Pow(a, b) => {
+            specialise_expr(a, key, value, stats);
+            specialise_expr(b, key, value, stats);
+        }
+        CalcOp::Min(args) | CalcOp::Max(args) => {
+            for x in args {
+                specialise_expr(x, key, value, stats);
+            }
+        }
+        CalcOp::Clamp(a, b, c) => {
+            specialise_expr(a, key, value, stats);
+            specialise_expr(b, key, value, stats);
+            specialise_expr(c, key, value, stats);
+        }
+        CalcOp::Round(_, a, b) => {
+            specialise_expr(a, key, value, stats);
+            specialise_expr(b, key, value, stats);
+        }
+        CalcOp::Sign(a) | CalcOp::Abs(a) | CalcOp::Negate(a) => {
+            specialise_expr(a, key, value, stats);
         }
     }
 }
@@ -481,5 +739,208 @@ mod tests {
         assert_eq!(ranked[0].count, 3);
         assert_eq!(ranked[1].name, "--rm");
         assert_eq!(ranked[1].count, 2);
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 2 — specialise_assignments / specialise_expr / test_outcome
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn specialise_folds_matching_single_branch() {
+        // if(--op: 64: lit(10); --op: 65: lit(20); else: lit(0))
+        // with binding --op=64 → folds to lit(10).
+        let mut e = cond(
+            vec![
+                branch(single("--op", 64), lit(10.0)),
+                branch(single("--op", 65), lit(20.0)),
+            ],
+            lit(0.0),
+        );
+        let mut s = SpecialiseStats::default();
+        specialise_expr(&mut e, "--op", 64, &mut s);
+        assert_eq!(e, lit(10.0));
+        assert_eq!(s.conditions_decided, 1);
+    }
+
+    #[test]
+    fn specialise_drops_rejecting_single_branch() {
+        // if(--op: 65: lit(20); else: lit(0))  with --op=64
+        // → fold to lit(0). Branch dropped (NeverTakes), fallback used.
+        let mut e = cond(
+            vec![branch(single("--op", 65), lit(20.0))],
+            lit(0.0),
+        );
+        let mut s = SpecialiseStats::default();
+        specialise_expr(&mut e, "--op", 64, &mut s);
+        assert_eq!(e, lit(0.0));
+        assert_eq!(s.branches_dropped, 1);
+        assert_eq!(s.conditions_collapsed_to_fallback, 1);
+    }
+
+    #[test]
+    fn specialise_keeps_unknown_single_branch() {
+        // if(--rm: 3: lit(7); else: lit(0))  with --op=64
+        // → unchanged (different property). Branch kept; no drops/decides.
+        let original = cond(
+            vec![branch(single("--rm", 3), lit(7.0))],
+            lit(0.0),
+        );
+        let mut e = original.clone();
+        let mut s = SpecialiseStats::default();
+        specialise_expr(&mut e, "--op", 64, &mut s);
+        assert_eq!(e, original);
+        assert_eq!(s.branches_dropped, 0);
+        assert_eq!(s.conditions_decided, 0);
+        assert_eq!(s.conditions_collapsed_to_fallback, 0);
+        assert_eq!(s.conditions_visited, 1);
+    }
+
+    #[test]
+    fn specialise_and_of_two_matching_folds() {
+        // if(--op: 64 AND --reg: 0: lit(99); else: lit(0))
+        // binding --op=64 alone leaves --reg unresolved → branch is
+        // Unknown, NOT AlwaysTakes (And of {matching, unknown} = Unknown).
+        let mut e = cond(
+            vec![branch(
+                StyleTest::And(vec![single("--op", 64), single("--reg", 0)]),
+                lit(99.0),
+            )],
+            lit(0.0),
+        );
+        let mut s = SpecialiseStats::default();
+        specialise_expr(&mut e, "--op", 64, &mut s);
+        // Branch kept (Unknown), but condition still visited.
+        match &e {
+            Expr::StyleCondition { branches, .. } => assert_eq!(branches.len(), 1),
+            _ => panic!("expected StyleCondition, got {:?}", e),
+        }
+
+        // Now repeat the test where BOTH operands of the And resolve to
+        // AlwaysTakes (both on --op).
+        let mut e2 = cond(
+            vec![branch(
+                StyleTest::And(vec![single("--op", 64), single("--op", 64)]),
+                lit(99.0),
+            )],
+            lit(0.0),
+        );
+        let mut s2 = SpecialiseStats::default();
+        specialise_expr(&mut e2, "--op", 64, &mut s2);
+        assert_eq!(e2, lit(99.0));
+        assert_eq!(s2.conditions_decided, 1);
+    }
+
+    #[test]
+    fn specialise_or_of_matching_and_rejecting_folds() {
+        // if((--op: 64 OR --op: 65): lit(77); else: lit(0))  with --op=64
+        // → Or of {AlwaysTakes, NeverTakes} = AlwaysTakes; folds to lit(77).
+        let mut e = cond(
+            vec![branch(
+                StyleTest::Or(vec![single("--op", 64), single("--op", 65)]),
+                lit(77.0),
+            )],
+            lit(0.0),
+        );
+        let mut s = SpecialiseStats::default();
+        specialise_expr(&mut e, "--op", 64, &mut s);
+        assert_eq!(e, lit(77.0));
+        assert_eq!(s.conditions_decided, 1);
+
+        // And the reverse: --op=99 with the same Or → both arms reject,
+        // Or is NeverTakes → branch dropped → fold to fallback.
+        let mut e2 = cond(
+            vec![branch(
+                StyleTest::Or(vec![single("--op", 64), single("--op", 65)]),
+                lit(77.0),
+            )],
+            lit(0.0),
+        );
+        let mut s2 = SpecialiseStats::default();
+        specialise_expr(&mut e2, "--op", 99, &mut s2);
+        assert_eq!(e2, lit(0.0));
+        assert_eq!(s2.branches_dropped, 1);
+        assert_eq!(s2.conditions_collapsed_to_fallback, 1);
+    }
+
+    #[test]
+    fn specialise_nested_in_calc_recurses() {
+        // calc(if(--op:64: lit(10); else: lit(0)) + lit(5))  with --op=64
+        // → calc(lit(10) + lit(5)). The Calc node is preserved; the
+        // inner condition collapses.
+        let inner = cond(vec![branch(single("--op", 64), lit(10.0))], lit(0.0));
+        let mut e = Expr::Calc(CalcOp::Add(Box::new(inner), Box::new(lit(5.0))));
+        let mut s = SpecialiseStats::default();
+        specialise_expr(&mut e, "--op", 64, &mut s);
+        match &e {
+            Expr::Calc(CalcOp::Add(a, b)) => {
+                assert_eq!(**a, lit(10.0));
+                assert_eq!(**b, lit(5.0));
+            }
+            _ => panic!("expected Calc::Add, got {:?}", e),
+        }
+        assert_eq!(s.conditions_decided, 1);
+    }
+
+    #[test]
+    fn specialise_assignments_aggregates_stats() {
+        // Two assignments, three SCs total, two of them decided by --op=64.
+        let a1 = assign(
+            "--AX",
+            cond(
+                vec![
+                    branch(single("--op", 64), lit(1.0)),     // AlwaysTakes
+                    branch(single("--op", 65), lit(2.0)),     // dropped
+                ],
+                lit(0.0),
+            ),
+        );
+        let a2 = assign(
+            "--BX",
+            cond(
+                vec![
+                    branch(single("--rm", 3), lit(10.0)),     // Unknown, kept
+                    branch(single("--op", 99), lit(20.0)),    // dropped
+                ],
+                lit(0.0),
+            ),
+        );
+        let mut input = vec![a1, a2];
+        let stats = specialise_assignments(&mut input, "--op", 64);
+
+        // a1 collapses to lit(1.0).
+        assert_eq!(input[0].value, lit(1.0));
+        // a2 keeps the --rm branch but drops the --op:99 branch.
+        match &input[1].value {
+            Expr::StyleCondition { branches, fallback } => {
+                assert_eq!(branches.len(), 1);
+                assert_eq!(branches[0].then, lit(10.0));
+                assert_eq!(**fallback, lit(0.0));
+            }
+            _ => panic!("expected StyleCondition, got {:?}", input[1].value),
+        }
+
+        // Aggregate stats:
+        //   conditions_visited = 2 (a1, a2)
+        //   branches_dropped   = 1 (a2's --op:99 only; a1 short-circuits
+        //                          on the AlwaysTakes branch and never
+        //                          looks at --op:65)
+        //   conditions_decided = 1 (a1)
+        //   conditions_collapsed_to_fallback = 0
+        assert_eq!(stats.conditions_visited, 2);
+        assert_eq!(stats.branches_dropped, 1);
+        assert_eq!(stats.conditions_decided, 1);
+        assert_eq!(stats.conditions_collapsed_to_fallback, 0);
+    }
+
+    #[test]
+    fn test_outcome_handles_non_literal_rhs_as_unknown() {
+        // Single test with non-literal RHS → Unknown, even if the property
+        // matches. Defensive: parser is unlikely to emit this, but the API
+        // should not panic or guess.
+        let t = StyleTest::Single {
+            property: "--op".to_string(),
+            value: var("--y"),
+        };
+        assert_eq!(test_outcome(&t, "--op", 64), BranchOutcome::Unknown);
     }
 }

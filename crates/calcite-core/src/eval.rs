@@ -545,17 +545,24 @@ impl Evaluator {
             );
         }
 
-        // Per-dispatch-key specialisation — phase 1: discovery diagnostic.
+        // Per-dispatch-key specialisation — phases 1-2 diagnostic.
         // Plan: CSS-DOS docs/plans/2026-05-12-per-dispatch-key-
-        // specialisation.md. Logs the cabinet's hot dispatch key and its
-        // literal value set; gated on CALCITE_SPECIALISE_DIAG=1 because
-        // it walks every Expr tree twice and we don't want that cost
-        // unconditionally during phase 1. Phase 3 will move discovery
-        // into the unconditional path.
+        // specialisation.md. Logs the cabinet's hot dispatch key + its
+        // literal value set (phase 1), then partially evaluates a clone
+        // of the assignments against (hot_key = first_value) and reports
+        // the SC collapse (phase 2). Gated on CALCITE_SPECIALISE_DIAG=1
+        // — the specialise pass is cheap on the post-fast-path set (~100s
+        // of assignments) but we don't want even a small unconditional
+        // cost during phase 1-2. Phase 3 moves discovery + specialise
+        // into the unconditional path with real codegen.
+        //
+        // CALCITE_SPECIALISE_VALUE=<int> overrides the value to specialise
+        // against; default is the smallest literal value in the discovered
+        // value set (deterministic; "first" by BTreeSet order).
         if std::env::var("CALCITE_SPECIALISE_DIAG").as_deref() == Ok("1") {
             let _t = Instant::now();
             let ranked = crate::pattern::dispatch_specialise::rank_dispatch_keys(&assignments, 5);
-            if let Some(hot) = ranked.first() {
+            if let Some(hot) = ranked.first().cloned() {
                 let values = crate::pattern::dispatch_specialise::discover_key_value_set(
                     &assignments, &hot.name,
                 );
@@ -572,6 +579,47 @@ impl Evaluator {
                     values.len(),
                     top_str,
                 );
+
+                // Phase 2 trial run: specialise a clone of the assignments
+                // for ONE chosen value and report the SC collapse.
+                if !values.is_empty() {
+                    let chosen = std::env::var("CALCITE_SPECIALISE_VALUE")
+                        .ok()
+                        .and_then(|s| s.parse::<i64>().ok())
+                        .filter(|v| values.contains(v))
+                        .unwrap_or_else(|| *values.iter().next().unwrap());
+
+                    let _t = Instant::now();
+                    let mut sc_before = 0usize;
+                    for a in &assignments {
+                        sc_before += count_style_conditions(&a.value);
+                    }
+                    let mut cloned: Vec<_> = assignments.clone();
+                    let stats = crate::pattern::dispatch_specialise::specialise_assignments(
+                        &mut cloned, &hot.name, chosen,
+                    );
+                    let mut sc_after = 0usize;
+                    for a in &cloned {
+                        sc_after += count_style_conditions(&a.value);
+                    }
+                    let kept_pct = if sc_before == 0 {
+                        0.0
+                    } else {
+                        100.0 * (sc_after as f64) / (sc_before as f64)
+                    };
+                    log::info!(
+                        "[specialise-trial]  {:.2}s — {}={} → StyleConditions {} → {} ({:.1}% kept); decided={}, fallback-collapsed={}, branches dropped={}",
+                        _t.elapsed().as_secs_f64(),
+                        hot.name,
+                        chosen,
+                        sc_before,
+                        sc_after,
+                        kept_pct,
+                        stats.conditions_decided,
+                        stats.conditions_collapsed_to_fallback,
+                        stats.branches_dropped,
+                    );
+                }
             } else {
                 log::info!(
                     "[specialise-discover] {:.2}s — no specialisable key (no StyleCondition Single tests in assignments)",
@@ -1411,6 +1459,45 @@ impl Evaluator {
 /// Reorder assignments by data dependencies.
 ///
 /// CSS evaluates all custom properties simultaneously, but our sequential evaluator
+/// Count `Expr::StyleCondition` nodes in an expression tree (recursive).
+/// Used by the `CALCITE_SPECIALISE_DIAG` reporter to size the per-tree
+/// dispatch budget before vs after specialisation. Generic — does not
+/// look at property names or values.
+fn count_style_conditions(e: &Expr) -> usize {
+    use crate::types::CalcOp;
+    match e {
+        Expr::StyleCondition { branches, fallback } => {
+            let mut n = 1;
+            for b in branches {
+                n += count_style_conditions(&b.then);
+            }
+            n + count_style_conditions(fallback)
+        }
+        Expr::Calc(op) => match op {
+            CalcOp::Add(a, b)
+            | CalcOp::Sub(a, b)
+            | CalcOp::Mul(a, b)
+            | CalcOp::Div(a, b)
+            | CalcOp::Mod(a, b)
+            | CalcOp::Pow(a, b) => count_style_conditions(a) + count_style_conditions(b),
+            CalcOp::Min(args) | CalcOp::Max(args) => {
+                args.iter().map(count_style_conditions).sum()
+            }
+            CalcOp::Clamp(a, b, c) => {
+                count_style_conditions(a)
+                    + count_style_conditions(b)
+                    + count_style_conditions(c)
+            }
+            CalcOp::Round(_, a, b) => count_style_conditions(a) + count_style_conditions(b),
+            CalcOp::Sign(a) | CalcOp::Abs(a) | CalcOp::Negate(a) => count_style_conditions(a),
+        },
+        Expr::Concat(parts) => parts.iter().map(count_style_conditions).sum(),
+        Expr::FunctionCall { args, .. } => args.iter().map(count_style_conditions).sum(),
+        Expr::Var { fallback, .. } => fallback.as_ref().map_or(0, |fb| count_style_conditions(fb)),
+        Expr::Literal(_) | Expr::StringLiteral(_) => 0,
+    }
+}
+
 /// processes them in declaration order. If assignment B's expression references
 /// property A (via `var(--A)` or `style(--A: ...)`), then A must be computed
 /// before B. This performs a topological sort on the dependency graph while
