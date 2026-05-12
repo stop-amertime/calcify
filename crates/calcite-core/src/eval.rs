@@ -134,35 +134,6 @@ pub struct Evaluator {
     ///
     /// [plan]: ../../../CSS-DOS/docs/plans/2026-05-06-rep-fast-forward-genericity.md
     pub loop_descriptors: Vec<crate::pattern::loop_descriptor::LoopDescriptor>,
-
-    /// Per-dispatch-key specialisation runtime state. `None` unless
-    /// `CALCITE_SPECIALISE=1` and discovery found a usable hot key with
-    /// a non-empty value set. When `Some`, `tick()` runs the prelude,
-    /// reads the hot-key slot value, and dispatches to a specialised
-    /// full program instead of `compiled`.
-    ///
-    /// Plan: `docs/plans/2026-05-12-per-dispatch-key-specialisation.md`,
-    /// phase 3. Bit-equivalence with `compiled` is the gate.
-    specialise: Option<SpecialiseRuntime>,
-}
-
-/// Compile-time and runtime data for per-dispatch-key specialisation.
-struct SpecialiseRuntime {
-    /// Property name of the hot dispatch key (e.g. `--opcode`).
-    hot_key: String,
-    /// Side-effect-free prelude that computes the hot key's value.
-    /// `execute_ops_only` is the entry point; this program has empty
-    /// writeback/broadcast/packed sets.
-    prelude: crate::compile::CompiledProgram,
-    /// Slot in `prelude.property_slots` holding the hot key's value.
-    prelude_key_slot: crate::compile::Slot,
-    /// Scratch slots for the prelude. Sized to `prelude.slot_count`.
-    prelude_slots: Vec<i32>,
-    /// Per-value specialised full program. Sorted by key for binary
-    /// search at dispatch time. Each entry is the result of folding
-    /// `(hot_key = value)` through every assignment + compiling
-    /// against the full broadcast/packed/dispatch-table set.
-    by_value: Vec<(i64, crate::compile::CompiledProgram)>,
 }
 
 /// Compiled form of a `ParsedProgram::input_edges` entry. The
@@ -657,136 +628,6 @@ impl Evaluator {
             }
         }
 
-        // Phase 3 prologue/tail split diagnostic — gated on
-        // CALCITE_SPECIALISE_SPLIT=1. Reports how many assignments fall
-        // into the prologue (transitive closure of properties needed
-        // to compute the hot key) vs the tail. Diagnostic only.
-        if std::env::var("CALCITE_SPECIALISE_SPLIT").as_deref() == Ok("1") {
-            let _t = Instant::now();
-            if let Some(hot) = crate::pattern::dispatch_specialise::discover_hot_key(&assignments) {
-                let prologue_props = crate::pattern::dispatch_specialise::find_prologue_properties(
-                    &assignments, &hot.name,
-                );
-                let (prologue, tail) = crate::pattern::dispatch_specialise::split_prologue_tail(
-                    assignments.clone(), &prologue_props,
-                );
-                log::info!(
-                    "[specialise-split] {:.3}s — hot key = {}, prologue = {} assignments, tail = {} assignments",
-                    _t.elapsed().as_secs_f64(),
-                    hot.name,
-                    prologue.len(),
-                    tail.len(),
-                );
-                if log::log_enabled!(log::Level::Debug) {
-                    let names: Vec<&str> = prologue.iter().map(|a| a.property.as_str()).collect();
-                    log::debug!("[specialise-split]   prologue: {}", names.join(", "));
-                }
-            }
-        }
-
-        // Phase 3 entry — specialised compilation per hot-key value.
-        // Behind CALCITE_SPECIALISE_VERIFY=1: discovers the hot key + value
-        // set, and for each value (capped by CALCITE_SPECIALISE_MAX_VALUES
-        // — default 4) clones the assignments, specialises them via
-        // `specialise_assignments`, runs them through the full compile
-        // pipeline against the SAME pre-computed broadcast/packed sets, and
-        // logs per-value op-count + compile-wall.
-        //
-        // This is plumbing-only: no Evaluator integration yet, no runtime
-        // dispatch. Purpose is to:
-        //   1. Confirm specialised compilation doesn't panic / fail
-        //      structurally on real cabinets.
-        //   2. Measure the per-value compile-cost, which feeds the
-        //      compile-time budget conversation for the 1.5× gate.
-        //   3. Surface op-count delta vs the unspecialised compile —
-        //      structural validation that smaller IR → smaller ops.
-        //
-        // The verify-mode tick-time differential check (run specialised
-        // alongside unspecialised, diff writebacks) lands in the next
-        // wedge; this one stops at "compile succeeds, log sizes."
-        if std::env::var("CALCITE_SPECIALISE_VERIFY").as_deref() == Ok("1") {
-            let _t_all = Instant::now();
-            let ranked = crate::pattern::dispatch_specialise::rank_dispatch_keys(&assignments, 1);
-            if let Some(hot) = ranked.first().cloned() {
-                let values = crate::pattern::dispatch_specialise::discover_key_value_set(
-                    &assignments, &hot.name,
-                );
-                let max_values = std::env::var("CALCITE_SPECIALISE_MAX_VALUES")
-                    .ok()
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(4);
-                let chosen: Vec<i64> = values.iter().copied().take(max_values).collect();
-                log::info!(
-                    "[specialise-verify] compiling {} specialised variants for {} (full value set has {})",
-                    chosen.len(),
-                    hot.name,
-                    values.len(),
-                );
-                for v in &chosen {
-                    let _t = Instant::now();
-                    let mut spec_assignments: Vec<Assignment> = assignments.clone();
-                    let stats = crate::pattern::dispatch_specialise::specialise_assignments(
-                        &mut spec_assignments, &hot.name, *v,
-                    );
-                    let t_spec = _t.elapsed().as_secs_f64();
-                    // Re-topological-sort: specialisation may have eliminated
-                    // some style() references that created ordering constraints.
-                    let _t_sort = Instant::now();
-                    let spec_assignments =
-                        topological_sort_assignments(spec_assignments, &functions);
-                    let t_sort = _t_sort.elapsed().as_secs_f64();
-                    let _t_comp = Instant::now();
-                    let spec_compiled = compile::compile(
-                        &spec_assignments,
-                        &broadcast_result.writes,
-                        &packed_bw_result.ports,
-                        &functions,
-                        &dispatch_tables,
-                    );
-                    let t_comp = _t_comp.elapsed().as_secs_f64();
-                    log::info!(
-                        "[specialise-verify]   {}={} → specialise {:.2}s + sort {:.2}s + compile {:.2}s; ops={} slots={} (stats: decided={} fallback-collapsed={} dropped={})",
-                        hot.name, v,
-                        t_spec, t_sort, t_comp,
-                        spec_compiled.ops.len(),
-                        spec_compiled.slot_count,
-                        stats.conditions_decided,
-                        stats.conditions_collapsed_to_fallback,
-                        stats.branches_dropped,
-                    );
-                }
-                log::info!(
-                    "[specialise-verify] total {:.2}s for {} variants",
-                    _t_all.elapsed().as_secs_f64(),
-                    chosen.len(),
-                );
-            } else {
-                log::info!(
-                    "[specialise-verify] {:.2}s — no specialisable key",
-                    _t_all.elapsed().as_secs_f64(),
-                );
-            }
-        }
-
-        // Phase 3 runtime specialisation. Behind CALCITE_SPECIALISE=1
-        // (separate from the *_VERIFY and *_SPLIT diagnostics above).
-        // Builds the per-value specialised programs + the side-effect-free
-        // prelude that computes the hot key's value at the start of each
-        // tick. Capped by CALCITE_SPECIALISE_MAX_VALUES so first-cut runs
-        // can validate correctness on a small subset before paying the
-        // full compile cost.
-        let specialise_runtime = if std::env::var("CALCITE_SPECIALISE").as_deref() == Ok("1") {
-            build_specialise_runtime(
-                &assignments,
-                &broadcast_result.writes,
-                &packed_bw_result.ports,
-                &functions,
-                &dispatch_tables,
-            )
-        } else {
-            None
-        };
-
         let _t = Instant::now();
         let buffer_copies = program
             .assignments
@@ -928,7 +769,6 @@ impl Evaluator {
             input_edge_groups: None,
             last_apply_was_nonzero: false,
             loop_descriptors,
-            specialise: specialise_runtime,
         }
     }
 
@@ -1052,40 +892,8 @@ impl Evaluator {
         // Snapshot state vars for change detection
         let prev_vars = state.state_vars.clone();
 
-        // Specialised dispatch path: run the side-effect-free prelude to
-        // determine the hot key's value, look up the matching specialised
-        // program, run that. Falls back to the unspecialised compile
-        // (and logs once) when no specialised entry exists for the
-        // observed key value. Plan reference:
-        // CSS-DOS docs/plans/2026-05-12-per-dispatch-key-specialisation.md.
-        let used_specialised = if let Some(ref mut spec) = self.specialise {
-            compile::execute_ops_only(&spec.prelude, state, &mut spec.prelude_slots);
-            let key_value = spec.prelude_slots[spec.prelude_key_slot as usize] as i64;
-            match spec.by_value.binary_search_by_key(&key_value, |&(k, _)| k) {
-                Ok(idx) => {
-                    compile::execute(&spec.by_value[idx].1, state, &mut self.slots);
-                    true
-                }
-                Err(_) => {
-                    // No specialised variant for this value — fall back.
-                    // Logged once per missing value so a noisy stream doesn't
-                    // overwhelm the log (HashSet on the Evaluator could move
-                    // this from "once per call" to "once per value"; for now
-                    // it's a warn-level event that catches misses).
-                    log::warn!(
-                        "[specialise] no specialised entry for {} = {}; running unspecialised",
-                        spec.hot_key, key_value,
-                    );
-                    compile::execute(&self.compiled, state, &mut self.slots);
-                    false
-                }
-            }
-        } else {
-            // Execute numeric assignments via compiled bytecode
-            compile::execute(&self.compiled, state, &mut self.slots);
-            false
-        };
-        let _ = used_specialised; // suppress unused-binding warning
+        // Execute numeric assignments via compiled bytecode
+        compile::execute(&self.compiled, state, &mut self.slots);
 
 
         // Evaluate string assignments via interpreter (after compiled pass,
@@ -1688,138 +1496,6 @@ fn count_style_conditions(e: &Expr) -> usize {
         Expr::Var { fallback, .. } => fallback.as_ref().map_or(0, |fb| count_style_conditions(fb)),
         Expr::Literal(_) | Expr::StringLiteral(_) => 0,
     }
-}
-
-/// Build the per-dispatch-key specialisation runtime: the prelude
-/// that computes the hot key's value side-effect-free, and the table
-/// of fully-specialised programs keyed by hot-key value.
-///
-/// `assignments` is the post-filter, post-sort, post-prune set —
-/// exactly what the unspecialised `compile::compile` consumes.
-/// Specialisation operates on a clone of this set, then runs through
-/// the same compile pipeline against the supplied broadcast / packed /
-/// function / dispatch-table inputs.
-///
-/// Capped by `CALCITE_SPECIALISE_MAX_VALUES` (default: full set).
-/// Returns `None` if no specialisable hot key was found.
-fn build_specialise_runtime(
-    assignments: &[Assignment],
-    broadcast_writes: &[crate::pattern::broadcast_write::BroadcastWrite],
-    packed_broadcast_ports: &[crate::pattern::packed_broadcast_write::PackedSlotPort],
-    functions: &HashMap<String, FunctionDef>,
-    dispatch_tables: &HashMap<String, crate::pattern::dispatch_table::DispatchTable>,
-) -> Option<SpecialiseRuntime> {
-    let _t_all = Instant::now();
-
-    let hot = crate::pattern::dispatch_specialise::discover_hot_key(assignments)?;
-    let values = crate::pattern::dispatch_specialise::discover_key_value_set(assignments, &hot.name);
-    if values.is_empty() {
-        log::info!("[specialise] hot key {} has no literal values; skipping", hot.name);
-        return None;
-    }
-
-    let max_values = std::env::var("CALCITE_SPECIALISE_MAX_VALUES")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(usize::MAX);
-    let chosen: Vec<i64> = values.iter().copied().take(max_values).collect();
-
-    // Build the prelude: assignments needed to compute the hot key,
-    // compiled WITHOUT broadcast / packed sets. Each prelude assignment
-    // is unspecialised — the prelude exists precisely to determine
-    // what value the hot key takes this tick.
-    let prologue_props =
-        crate::pattern::dispatch_specialise::find_prologue_properties(assignments, &hot.name);
-    let (prologue_assignments, _tail_unused) =
-        crate::pattern::dispatch_specialise::split_prologue_tail(
-            assignments.to_vec(),
-            &prologue_props,
-        );
-    let _t_prelude = Instant::now();
-    let prelude = compile::compile(
-        &prologue_assignments,
-        &[],
-        &[],
-        functions,
-        dispatch_tables,
-    );
-    let Some(&prelude_key_slot) = prelude.property_slots.get(&hot.name) else {
-        log::warn!(
-            "[specialise] hot key {} not in prelude property_slots after compile; aborting",
-            hot.name,
-        );
-        return None;
-    };
-    log::info!(
-        "[specialise] prelude compiled in {:.2}s — {} assignments, {} ops, {} slots, hot-key slot = {}",
-        _t_prelude.elapsed().as_secs_f64(),
-        prologue_assignments.len(),
-        prelude.ops.len(),
-        prelude.slot_count,
-        prelude_key_slot,
-    );
-
-    // Build the specialised full programs. Each starts from a clone of
-    // the FULL assignment set, runs `specialise_assignments` to fold
-    // (hot_key = value) into both StyleConditions AND var refs, then
-    // re-topo-sorts (specialisation can shrink dependency footprints)
-    // and re-runs the full compile pipeline.
-    log::info!(
-        "[specialise] compiling {} specialised variants for {} (full value set has {})",
-        chosen.len(),
-        hot.name,
-        values.len(),
-    );
-    let mut by_value: Vec<(i64, crate::compile::CompiledProgram)> = Vec::with_capacity(chosen.len());
-    for v in &chosen {
-        let _t = Instant::now();
-        let mut spec_assignments: Vec<Assignment> = assignments.to_vec();
-        let stats = crate::pattern::dispatch_specialise::specialise_assignments(
-            &mut spec_assignments,
-            &hot.name,
-            *v,
-        );
-        let t_spec = _t.elapsed().as_secs_f64();
-        let _t_sort = Instant::now();
-        let spec_assignments = topological_sort_assignments(spec_assignments, functions);
-        let t_sort = _t_sort.elapsed().as_secs_f64();
-        let _t_comp = Instant::now();
-        let spec_compiled = compile::compile(
-            &spec_assignments,
-            broadcast_writes,
-            packed_broadcast_ports,
-            functions,
-            dispatch_tables,
-        );
-        let t_comp = _t_comp.elapsed().as_secs_f64();
-        log::debug!(
-            "[specialise]   {}={} → specialise {:.2}s + sort {:.2}s + compile {:.2}s; ops={} slots={} (folded {} var-refs, decided {} fb-collapsed {} dropped {})",
-            hot.name, v,
-            t_spec, t_sort, t_comp,
-            spec_compiled.ops.len(),
-            spec_compiled.slot_count,
-            stats.var_refs_folded,
-            stats.conditions_decided,
-            stats.conditions_collapsed_to_fallback,
-            stats.branches_dropped,
-        );
-        by_value.push((*v, spec_compiled));
-    }
-    // Sort by key value for binary-search dispatch at runtime.
-    by_value.sort_by_key(|&(k, _)| k);
-    log::info!(
-        "[specialise] runtime built in {:.2}s total ({} variants)",
-        _t_all.elapsed().as_secs_f64(),
-        by_value.len(),
-    );
-
-    Some(SpecialiseRuntime {
-        hot_key: hot.name,
-        prelude,
-        prelude_key_slot,
-        prelude_slots: Vec::new(),
-        by_value,
-    })
 }
 
 /// processes them in declaration order. If assignment B's expression references
