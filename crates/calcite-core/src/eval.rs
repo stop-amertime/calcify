@@ -545,6 +545,41 @@ impl Evaluator {
             );
         }
 
+        // Per-dispatch-key specialisation — phase 1: discovery diagnostic.
+        // Plan: CSS-DOS docs/plans/2026-05-12-per-dispatch-key-
+        // specialisation.md. Logs the cabinet's hot dispatch key and its
+        // literal value set; gated on CALCITE_SPECIALISE_DIAG=1 because
+        // it walks every Expr tree twice and we don't want that cost
+        // unconditionally during phase 1. Phase 3 will move discovery
+        // into the unconditional path.
+        if std::env::var("CALCITE_SPECIALISE_DIAG").as_deref() == Ok("1") {
+            let _t = Instant::now();
+            let ranked = crate::pattern::dispatch_specialise::rank_dispatch_keys(&assignments, 5);
+            if let Some(hot) = ranked.first() {
+                let values = crate::pattern::dispatch_specialise::discover_key_value_set(
+                    &assignments, &hot.name,
+                );
+                let top_str = ranked
+                    .iter()
+                    .map(|k| format!("{}={}", k.name, k.count))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                log::info!(
+                    "[specialise-discover] {:.2}s — hot key = {}, count = {}, distinct literal values = {} (top 5: {})",
+                    _t.elapsed().as_secs_f64(),
+                    hot.name,
+                    hot.count,
+                    values.len(),
+                    top_str,
+                );
+            } else {
+                log::info!(
+                    "[specialise-discover] {:.2}s — no specialisable key (no StyleCondition Single tests in assignments)",
+                    _t.elapsed().as_secs_f64(),
+                );
+            }
+        }
+
         let _t = Instant::now();
         let buffer_copies = program
             .assignments

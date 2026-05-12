@@ -15,6 +15,7 @@
 
 pub mod broadcast_write;
 pub mod byte_period;
+pub mod dispatch_specialise;
 pub mod dispatch_table;
 pub mod fusion_sim;
 pub mod identity_prune;
