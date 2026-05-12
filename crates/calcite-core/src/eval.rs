@@ -628,6 +628,90 @@ impl Evaluator {
             }
         }
 
+        // Phase 3 entry — specialised compilation per hot-key value.
+        // Behind CALCITE_SPECIALISE_VERIFY=1: discovers the hot key + value
+        // set, and for each value (capped by CALCITE_SPECIALISE_MAX_VALUES
+        // — default 4) clones the assignments, specialises them via
+        // `specialise_assignments`, runs them through the full compile
+        // pipeline against the SAME pre-computed broadcast/packed sets, and
+        // logs per-value op-count + compile-wall.
+        //
+        // This is plumbing-only: no Evaluator integration yet, no runtime
+        // dispatch. Purpose is to:
+        //   1. Confirm specialised compilation doesn't panic / fail
+        //      structurally on real cabinets.
+        //   2. Measure the per-value compile-cost, which feeds the
+        //      compile-time budget conversation for the 1.5× gate.
+        //   3. Surface op-count delta vs the unspecialised compile —
+        //      structural validation that smaller IR → smaller ops.
+        //
+        // The verify-mode tick-time differential check (run specialised
+        // alongside unspecialised, diff writebacks) lands in the next
+        // wedge; this one stops at "compile succeeds, log sizes."
+        if std::env::var("CALCITE_SPECIALISE_VERIFY").as_deref() == Ok("1") {
+            let _t_all = Instant::now();
+            let ranked = crate::pattern::dispatch_specialise::rank_dispatch_keys(&assignments, 1);
+            if let Some(hot) = ranked.first().cloned() {
+                let values = crate::pattern::dispatch_specialise::discover_key_value_set(
+                    &assignments, &hot.name,
+                );
+                let max_values = std::env::var("CALCITE_SPECIALISE_MAX_VALUES")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(4);
+                let chosen: Vec<i64> = values.iter().copied().take(max_values).collect();
+                log::info!(
+                    "[specialise-verify] compiling {} specialised variants for {} (full value set has {})",
+                    chosen.len(),
+                    hot.name,
+                    values.len(),
+                );
+                for v in &chosen {
+                    let _t = Instant::now();
+                    let mut spec_assignments: Vec<Assignment> = assignments.clone();
+                    let stats = crate::pattern::dispatch_specialise::specialise_assignments(
+                        &mut spec_assignments, &hot.name, *v,
+                    );
+                    let t_spec = _t.elapsed().as_secs_f64();
+                    // Re-topological-sort: specialisation may have eliminated
+                    // some style() references that created ordering constraints.
+                    let _t_sort = Instant::now();
+                    let spec_assignments =
+                        topological_sort_assignments(spec_assignments, &functions);
+                    let t_sort = _t_sort.elapsed().as_secs_f64();
+                    let _t_comp = Instant::now();
+                    let spec_compiled = compile::compile(
+                        &spec_assignments,
+                        &broadcast_result.writes,
+                        &packed_bw_result.ports,
+                        &functions,
+                        &dispatch_tables,
+                    );
+                    let t_comp = _t_comp.elapsed().as_secs_f64();
+                    log::info!(
+                        "[specialise-verify]   {}={} → specialise {:.2}s + sort {:.2}s + compile {:.2}s; ops={} slots={} (stats: decided={} fallback-collapsed={} dropped={})",
+                        hot.name, v,
+                        t_spec, t_sort, t_comp,
+                        spec_compiled.ops.len(),
+                        spec_compiled.slot_count,
+                        stats.conditions_decided,
+                        stats.conditions_collapsed_to_fallback,
+                        stats.branches_dropped,
+                    );
+                }
+                log::info!(
+                    "[specialise-verify] total {:.2}s for {} variants",
+                    _t_all.elapsed().as_secs_f64(),
+                    chosen.len(),
+                );
+            } else {
+                log::info!(
+                    "[specialise-verify] {:.2}s — no specialisable key",
+                    _t_all.elapsed().as_secs_f64(),
+                );
+            }
+        }
+
         let _t = Instant::now();
         let buffer_copies = program
             .assignments
