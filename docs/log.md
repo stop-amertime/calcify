@@ -11,6 +11,65 @@ and the Criterion benchmarks.
 
 ---
 
+## 2026-05-18 — feat/retire-keyboard bundle hand-partitioned into two clean branches
+
+**Why.** `feat/retire-keyboard` (tip `a05d85c`, 19 commits over
+`ef44f20`) bundled two unrelated concerns: the `:active` pseudo-class
+keyboard-input rework and the cardinal-rule genericity / perf-diagnostic
+stack. A commit-level split was impossible — a prior history rewrite
+(rebase/squash) fused both concerns in *every* commit's tree from
+`866d1b3` onward (the May-6-authored keyboard commit's tree already
+contains `calcite_pc_video` refs that the May-12-authored "upkeep"
+commit supposedly introduced). Author dates don't track tree lineage;
+cherry-pick and rebase splitting both fail. Only a hand-partition works.
+
+**Method.** Diffed `ef44f20 → feat/retire-keyboard` (38 files,
++8567/-993), classified every file (and every hunk of the 5 genuinely
+cross-cutting files — `eval.rs`, `compile.rs`, `state.rs`,
+`calcite-cli/main.rs`, `calcite-wasm/lib.rs`) as keyboard vs
+genericity. No single hunk truly mixed the two except ~3 mechanical
+1-line interleaves (the `loop_descriptors` field sitting next to the
+keyboard fields in the `Evaluator` struct def + 2 init sites).
+Whole-file buckets applied via `git checkout`; the 4 partial files
+split with per-hunk filtered patches + hand edits for the mechanical
+interleaves.
+
+**Result.**
+
+- `feat/keyboard-pseudo-input` (`baf3086`, off `ef44f20`, 12 files,
+  +1051/-253): `State::pseudo_active` + `set_pseudo_class_active`,
+  InputEdge recogniser, per-tick `apply_input_edges`, cli
+  `--press-events`, wasm export, web `press` bridge, `SetVarPulse` /
+  `Stride{last_fired_at}` watch-refactor. Build gate clean (2m08s);
+  `input_edges_drive_state_var` + integration test pass.
+- `feat/calcite-genericity` (`a89067a`, off `ef44f20`, 29 files):
+  new `calcite-pc-video` + `calcite-debug-summary` crates, de-x86
+  comment sweep, `column_drawer_fast_forward` deletion,
+  `State::virtual_regions`, `pattern::loop_descriptor` /
+  `dispatch_specialise` / `identity_prune`, `scan_same_key_chain_runs`,
+  BIF2 default-ON, probe bins. Build gate clean (2m05s).
+
+Full file coverage verified — every bundle-touched file lands on
+exactly one branch, no orphans. Build gate for both is
+`cargo build --release -p calcite-core -p calcite-cli -p calcite-wasm`
+(never core-only — core-only once passed while cli/wasm were broken).
+
+**Pre-existing base debt surfaced (NOT introduced, NOT fixed here):**
+`ef44f20`'s lib-*test* target already fails to compile —
+`script.rs` defines `WatchKind::Stride{every,last_fired_at}` but
+`script_spec.rs:309` matches `Stride{every}`. The `Stride{every}`
+simplification is keyboard-era (it ships on `feat/keyboard-pseudo-input`,
+which incidentally fixes the base test); `feat/calcite-genericity`
+correctly leaves `script*.rs` at `ef44f20` and inherits the broken
+base test. `cargo build` (the agreed gate) is green on both branches;
+only `cargo test` surfaces the inherited mismatch on the genericity
+branch. Out of scope for a mechanical split to "fix" base debt.
+
+`main` unchanged at `ef44f20`. `feat/retire-keyboard` (`a05d85c`)
+retained intact. Nothing pushed — all local.
+
+---
+
 ## 2026-05-12 — Per-dispatch-key specialisation, phase 3 wedge: compile-only verify-mode diagnostic
 
 Plan: CSS-DOS `docs/plans/2026-05-12-per-dispatch-key-specialisation.md`,
