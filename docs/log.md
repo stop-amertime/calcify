@@ -11,6 +11,782 @@ and the Criterion benchmarks.
 
 ---
 
+## 2026-05-12 — Per-dispatch-key specialisation, phase 3 wedge: compile-only verify-mode diagnostic
+
+Plan: CSS-DOS `docs/plans/2026-05-12-per-dispatch-key-specialisation.md`,
+phase 3. Phases 1-2 (discovery + Expr-level specialiser, 18 unit tests)
+landed earlier today; this is the first phase-3 wedge.
+
+**What landed.** Behind `CALCITE_SPECIALISE_VERIFY=1`, the
+`from_parsed` diagnostic now clones the post-sort assignment set, runs
+`specialise_assignments(key, v)` for the smallest N values
+(`CALCITE_SPECIALISE_MAX_VALUES`, default 4), and pushes each through
+the full `compile::compile` pipeline against the SAME pre-computed
+broadcast/packed sets. No `Evaluator` wiring; pure compile-cost +
+structural-shape diagnostic.
+
+**doom8088 numbers (4 of 232 `--opcode` values, calcite-cli, -n 1):**
+
+| metric                          | unspecialised | specialised (per value) |
+|---------------------------------|--------------:|------------------------:|
+| per-variant compile             |       —       |         1.07 – 1.17 s   |
+| post-fuse op count              |      280 K    |              ~280 K     |
+| slot count                      |      12 473   |              12 473     |
+| `inline calls` sites            |      13 089   |             ~10 270     |
+| `fuse_cmp_branch`               |      77 100   |             ~16 450     |
+| `dispatch chains`               |        208    |                  34     |
+| `fuse_loadstate_branch`         |         50    |                   8     |
+| `fuse_diff_slot_bifnel_pairs`   |        794    |                  30     |
+
+Op count is nearly identical, but the unspecialised compile produces
+**26 × more BIfNEL2 fusions** (794 vs 30) and **4.7 × more CmpBranch
+fusions** (77 K vs 16 K). Those represent branches the existing peephole
+stack collapses; specialised IR doesn't have those branches to begin
+with. The per-tick path through the unspecialised stream is
+branch-heavy (the fusion stack mitigates this); the specialised stream
+is closer to straight-line. **That's where the win lives** — not in op
+count, in path shape.
+
+**Compile-cost reality.** 232 values × 1.1 s ≈ 250 s = 9 × baseline.
+Far over the 1.5 × gate (41.7 s) the plan requires before shipping.
+Phase 5 (value-set dedup) is mandatory, not optional. Alternative
+paths to budget:
+
+- Prologue/tail factoring: only the assignments downstream of
+  `--opcode`'s computation need specialising. Re-using the prologue
+  compile across all N variants saves O(N) work.
+- Skip broadcast/packed re-recognition per variant. Broadcasts /
+  packed broadcasts don't change shape under specialisation (the
+  recognised cells / addresses are the same). Currently
+  `compile::compile` re-runs that work each call; an `compile_with_*`
+  variant that takes pre-compiled broadcast / packed metadata and
+  only re-runs the assignment-loop portion would cut compile time
+  drastically.
+
+**Why the `--opcode` is mid-tick complicates phase 3b.** `--opcode` is
+NOT a state-var (`@property` declarations only cover registers, halt,
+cycle counters, etc.). It's recomputed each tick as
+`--opcode = var(--q0)`. So the dispatching key isn't readable until
+*after* the prologue runs in the current tick. Phase 3b's runtime
+swap needs either:
+
+- (a) a prologue/tail split: run the unspecialised prologue, read
+      `--opcode`, dispatch into the specialised tail.
+- (b) a differential check (run unspecialised first, then read
+      `--opcode` from its slot via `compiled.property_slots`, then run
+      the matching specialised body on a state clone and diff).
+
+Picking (b) for verify-mode bit-equivalence. (a) is the eventual
+runtime path once (b) confirms specialised IR is correct.
+
+**Smoke not run yet.** Verify-mode is compile-only so far; per-tick
+diff comes in the next wedge.
+
+Commits: 1f890c4 (calcite, this) + corresponding CSS-DOS log entry.
+
+---
+
+## 2026-05-07 — `CALCITE_BIF2_FUSE=1` is a 31.8 % wall win on doom-loading
+
+Cross-link: CSS-DOS LOGBOOK 2026-05-07 entry of the same name.
+
+After retiring the widened `fuse_loadstate_branch` lead (entry
+below), characterised the runtime adjacency profile via
+`calcite-cli --restore <snap> --op-profile` (existed already, no new
+tooling needed). Top runtime pair on doom8088 across cold / loading
+/ in-game windows: **`BIfNEL → BIfNEL` at 12.7–13.5 %**.
+
+`fuse_diff_slot_bifnel_pairs` in `crates/calcite-core/src/compile.rs:3821`
++ `Op::BranchIfNotEqLit2` at compile.rs:359 already implement this
+fusion. Gated off by default behind `CALCITE_BIF2_FUSE`. The
+2026-04-30 measurement said it was net wash; that was on the
+**reference cabinet** at the time. The current doom8088 is a
+different shape.
+
+**Re-test on doom8088.** Bench `tests/bench/driver/run.mjs
+doom-loading --target=cli`:
+
+| | ticks/sec | runMsToInGame |
+|---|---:|---:|
+| baseline (median-3) | 142 656 | 241 872 ms |
+| `CALCITE_BIF2_FUSE=1` | 210 155 | 164 878 ms |
+
+**+47.3 % throughput, −31.8 % wall.** Smoke 7/7 PASS with the env
+var set (107.9 s, all 7 carts).
+
+Static fusion count on doom8088:
+- `fuse_cmp_branch: 77100`
+- `fuse_loadstate_branch: 50`
+- `fuse_diff_slot_bifnel_pairs: 794` (only with `BIF2_FUSE=1`)
+
+794 BIfNEL2 fusions covering ~13.5 % of dispatched ops in the
+runtime profile = the dispatch savings dominate the `pc += 2;
+continue;` cost the 2026-04-30 measurement was concerned about.
+
+**Recommendation:** flip `CALCITE_BIF2_FUSE` to default ON. Before
+that, re-verify on the cabinet the 2026-04-30 measurement was taken
+against (whichever was "the reference cabinet" at that point) so we
+don't regress that shape. If it's a wash there too, the gate stays
+in place but the *default* should switch since doom8088 is the ship
+target.
+
+The ungate would also let us delete the env-var read at compile.rs:3370.
+Probably wait one cabinet-and-bench cycle before doing that — keep
+the gate as a kill switch for the next person who finds an
+adjacency-poor cabinet.
+
+---
+
+## 2026-05-07 — Widened `fuse_loadstate_branch`: NEGATIVE RESULT, lead retired
+
+Cross-link: pre-ship Doom8088 FPS brief in
+[`../../CSS-DOS/docs/agent-briefs/2026-05-07-pre-ship-fps-leads.md`](../../CSS-DOS/docs/agent-briefs/2026-05-07-pre-ship-fps-leads.md)
+listed widening `fuse_loadstate_branch` to allow non-aliasing
+intervening ops between `LoadState{dst:X}` and `BranchIfNotEqLit{a:X}`
+as the highest-leverage pre-ship lead, motivated by the stale
+`compile.rs:6738` "96%+" comment vs the measured 0.8 % runtime
+hit-rate.
+
+**Implementation.** Replaced `fuse_ls_ops`'s single-step adjacency
+check with a forward scan up to `LS_WINDOW=8`, breaking on:
+intervening op reads/writes slot X, writes memory, is a jump target,
+is a branch/jump/dispatch op. Behaviour preserved on linear flow,
+fall-through, and the (forbidden) external-jump-to-branch case. Built
+clean, ran on doom8088. **Found exactly the same 50 fusions as the
+adjacent path.** Reverted.
+
+**Diagnosis — probe.** Wrote
+`crates/calcite-cli/src/bin/probe_bif_predecessor.rs`: for every
+isolated `BranchIfNotEqLit` in the post-compile op stream (across
+main ops, dispatch entries + fallbacks, broadcast value_ops +
+spillovers), classify the predecessor at `i-1` and walk back up to 16
+ops within the basic block looking for a matching
+`LoadState{dst:X}`. On `tests/bench/cache/doom8088.css`:
+
+```
+Total isolated BIfNEL ops:    80118
+With LoadState{dst:X} in 16-window: 0 (0.00%)
+Without:                            80118
+
+Predecessor op kinds for BIfNEL (ops[i-1]):
+  Jump                              77970 (97.3%)
+  BranchIfNotEqLit                   1395 (1.7%)
+  LoadSlot                            164 (0.2%)
+  LoadLit                             113 (0.1%)
+  DispatchChain                        49 (0.1%)
+  Add                                  22 (0.0%)
+  ... (long tail)
+```
+
+The brief assumed kiln emits `LoadState → LoadLit → CmpEq →
+BranchIfZero → ...` with intervening slot-shuffles, leaving residual
+gaps for a widened scan. Reality: `fuse_cmp_branch` already collapses
+the `LoadLit + CmpEq + BranchIfZero` triplet to `BranchIfNotEqLit`
+upstream, and `build_dispatch_chains` lays out chain-miss exits as
+`...; Jump <chain entry body>; BranchIfNotEqLit <next-test>; ...`.
+The BIfNEL is reached *as a jump target* from elsewhere — not via the
+adjacent `Jump` — so the LoadState that originally fed it lives on a
+different basic block (or has been folded into a `LoadStateAnd...`).
+**0 candidates for any window size.**
+
+**Bench (sanity).** Median of 3 on `doom-loading --target=cli`:
+241.872s. Not changed by the (reverted) widened scan. Per-tick op
+floor on doom8088 in steady state isn't moved by widening this peephole
+because there are no opportunities to widen.
+
+**Static fusion counts** (compile.rs INFO):
+- `fuse_cmp_branch: 77100 fused`
+- `fuse_loadstate_branch: 50 fused` (both adjacent and widened)
+- `fuse_diff_slot_bifnel_pairs: 0 fused` (gated off by default)
+
+**What's kept.** `probe_bif_predecessor.rs` is in-tree as a permanent
+diagnostic — quick way to sanity-check any future fusion lead that
+assumes a specific predecessor pattern around BIfNEL.
+
+**Lessons.** A stale code comment claiming a hit-rate is not evidence
+of an opportunity. Always probe the actual post-compile static stream
+before designing a peephole; the cost is 200 lines of probe + 1 cargo
+run, vs hours of an uncalibrated implementation. The brief for next
+iteration has been updated to retire lead #1 and elevate lead #3
+(`apply_input_edges` short-circuit) to top pick.
+
+---
+
+## 2026-05-07 — `rep_fast_forward` genericity mission, phase 3a: CMPS/SCAS recognition + BulkClass classification
+
+Cross-link: see CSS-DOS
+[`docs/plans/2026-05-06-rep-fast-forward-genericity.md`](../../CSS-DOS/docs/plans/2026-05-06-rep-fast-forward-genericity.md)
+checkpoint 3 — landed today as **phase 3a** (recogniser + classification,
+diagnostic-bedded). Phase 3b (the actual descriptor-driven applier
+flip + memory snapshot diffs + ±1% perf gate) is deferred to a future
+session. Same in-session re-scope rationale that split phase 2 into a
+diagnostic-bedded validator: trying to ship both halves of phase 3
+together in one session is high-risk on a perf-gated mission.
+
+What landed in calcite:
+
+- **CMPS/SCAS-shape recognition.** `match_ip_stay_or_advance` now
+  accepts multi-branch IP bodies where N≥1 branches all yield the same
+  "stay" body and the fallback advances (or vice versa). The
+  synthesised predicate is `Or(branch1.condition, branch2.condition,
+  ...)`. The single-branch shape (STOS/MOVS/LODS) is unchanged; the
+  multi-branch shape (CMPS/SCAS via kiln's `repCondIP`) is new. Pure
+  structural — no opcode awareness.
+- **`BulkClass` enum on `LoopDescriptor`.** Computed at descriptor
+  build time by `classify_bulk()`. Four variants:
+  - `ReadOnly` — no writes. CMPS/SCAS/LODS land here.
+  - `Fill` — writes exist; no value expression transitively references
+    any pointer's `self_property` mirror. STOSB/STOSW land here, as
+    does the cabinet-shape MOVSB/MOVSW that uses an intermediate slot
+    (`--_strSrcByte`) instead of reading directly through SI's mirror.
+  - `Copy` — at least one value expression references a pointer
+    mirror. The structural test is `expr_references_any(val_expr,
+    {pointer.self_property})` — whole-name equality only, no
+    substring inspection.
+  - `PerIter` — fallback. Currently unused but reserved for future
+    shapes the classifier can't simplify.
+- **Validator extended.** `validate_descriptor_for_opcode` now also
+  asserts `flag_conditioned` and `bulk_class` against runtime
+  expectations (CMPS/SCAS expected `flag_conditioned=true`,
+  ReadOnly; STOS expected Fill; MOVS expected Copy). DRIFT messages
+  surface the mismatches honestly rather than papering over them.
+- **5 new unit tests** in `pattern::loop_descriptor::tests`:
+  - `cmps_shape_recognised_with_flag_conditioning` — multi-branch IP
+    body, `Or` synthesised predicate, flag_conditioned, ReadOnly.
+  - `scas_shape_recognised_with_one_pointer_and_readonly_class`.
+  - `cabinet_a_classifies_stos_as_fill_and_movs_as_copy` — documents
+    that cabinet A's MOVSB classifies as Fill (not Copy) because the
+    val_expr is `var("--_strSrcByte")`, not a pointer mirror. Real
+    structural finding, not a bug.
+  - `pointer_mirror_in_value_expr_classifies_as_copy` — explicit
+    cabinet whose val_expr reads through the pointer mirror. Confirms
+    the classifier flips to Copy when the dependency is structurally
+    visible.
+  - `brainfuck_cmps_shape_classifies_identically_to_x86_cmps_shape` —
+    cardinal-rule probe for phase 3a: arbitrary-named CMPS-shaped
+    cabinet produces the same structural classification.
+- 15 / 15 loop-descriptor tests pass.
+
+Validator output on the live doom8088 cabinet:
+
+```
+[rep-generic-validator] OK opcode 0xab: ... flag_cond=false bulk=Fill
+[rep-generic-validator] OK opcode 0xaa: ... flag_cond=false bulk=Fill
+[rep-generic-validator] DRIFT opcode 0xa4: bulk_class Fill != expected Copy
+[rep-generic-validator] DRIFT opcode 0xa5: bulk_class Fill != expected Copy
+[rep-generic-validator] OK opcode 0xa6: ... flag_cond=true bulk=ReadOnly
+[rep-generic-validator] OK opcode 0xae: ... flag_cond=true bulk=ReadOnly
+[rep-generic-validator] OK opcode 0xa7: ... flag_cond=true bulk=ReadOnly
+[rep-generic-validator] OK opcode 0xaf: ... flag_cond=true bulk=ReadOnly
+```
+
+The MOVS DRIFT is a real, structurally-honest finding: the kiln-emitted
+cabinet inserts an intermediate slot (`--_strSrcByte`) between SI's
+prior-tick mirror and the write value, so the pure-shape classifier
+can't see the pointer dependency. Phase 3b's runtime applier needs
+either a separate pass that traces intermediates, or to fall back to
+PerIter for cabinets where Copy isn't structurally visible.
+
+`CALCITE_LOOP_DIAG=1` on doom8088 now reports 10 descriptors (was 6
+in phase 1+2): adds 0xA6/A7/AE/AF (CMPS/SCAS) all with
+`flag_cond=true bulk=ReadOnly`.
+
+Smoke 7/7 PASS. doom-loading bench reaches in-game at tick 34.65M on
+calcite-cli with the flag both off and on (parity with pre-mission
+baseline). Validator runs at most 8 times per session (once per
+fast-forwarded opcode), so cost is negligible.
+
+Default still OFF — diagnostic-bedded landing, same shape as phase 2.
+
+Pickup notes for whoever takes phase 3b: the pieces that would benefit
+from earlier-than-final landing are already there. The recogniser
+covers all 8 opcodes. The descriptor carries `bulk_class`. The
+validator surfaces drift. What remains is the actual applier — and the
+honest finding that real-cabinet MOVS classifies as Fill structurally
+means phase 3b either (a) ships an intermediate-tracing classification
+pass that promotes Fill→Copy where applicable, or (b) accepts that
+some shapes will only ever be PerIter and the bulk fast-path covers
+STOS but not MOVS.
+
+---
+
+## 2026-05-07 — `rep_fast_forward` genericity mission, phase 2: descriptor validator + virtual_regions
+
+Cross-link: see CSS-DOS
+[`docs/plans/2026-05-06-rep-fast-forward-genericity.md`](../../CSS-DOS/docs/plans/2026-05-06-rep-fast-forward-genericity.md)
+checkpoint 2 — landed today as a diagnostic-bedded validator (path B
+of the in-session re-scope) rather than the original full per-iter
+applier (path A). Path A was deferred to checkpoint 3 once the
+bulk specialisations land alongside it; building both at once in one
+session was judged too risky for a perf-gated mission.
+
+What landed in calcite:
+
+- **`CALCITE_REP_GENERIC=1` env-var gate.** Default off. When on, fires
+  a per-tick validator inside `rep_fast_forward` that checks the
+  recognised descriptor agrees with what the runtime is doing.
+- **`loop_descriptors` mirrored onto `CompiledProgram`.** Phase 1 only
+  stored them on `Evaluator`; the per-tick fast-forward hook only
+  sees `&CompiledProgram`, so `Evaluator::from_parsed` now also
+  writes the descriptor list onto `compiled.loop_descriptors`.
+- **`state.virtual_regions: Vec<VirtualRegion>`.** Populated at compile
+  time by recognisers that own a region. Currently the
+  windowed-byte-array recogniser registers its window. The bulk
+  fast-forward path consults this list instead of the hardcoded
+  0xD0000 carve-out. The 0xF0000+ extended-map boundary stays a
+  State invariant (every read above lives in `state.extended`, not
+  per-cabinet). The stale 0x500 keyboard-bridge entry, obsolete since
+  the input-edge recogniser landed, is removed.
+- **Memwrite addr/val pairing by assignment-order proximity.**
+  Replaces the phase-1 name-sort heuristic with a positional pairing
+  rule: for each address slot, the matching value slot is the unpaired
+  value whose `assignment_index` is closest, ties broken in favour of
+  "immediately after". Cabinets that emit pairs adjacently (kiln does)
+  pair correctly; others degrade to "closest available" which is no
+  worse than name-sort. Cardinal-rule clean — purely positional, no
+  character-level reads. Locked in by
+  `memwrite_pairing_uses_assignment_order_proximity` test.
+
+Validator findings on the live doom8088 cabinet:
+
+```
+[rep-generic-validator] OK opcode 0xab: counter=true pointers=1 writes=2 ip=--IP
+[rep-generic-validator] OK opcode 0xaa: counter=true pointers=1 writes=1 ip=--IP
+[rep-generic-validator] OK opcode 0xa4: counter=true pointers=2 writes=1 ip=--IP
+[rep-generic-validator] OK opcode 0xa5: counter=true pointers=2 writes=2 ip=--IP
+[rep-generic-validator] MISS: opcode 0xa6 ... no descriptor (CMPS/SCAS, expected — phase 3)
+[rep-generic-validator] MISS: opcode 0xa7 ... no descriptor (CMPS/SCAS, expected — phase 3)
+[rep-generic-validator] MISS: opcode 0xae ... no descriptor (CMPS/SCAS, expected — phase 3)
+[rep-generic-validator] MISS: opcode 0xaf ... no descriptor (CMPS/SCAS, expected — phase 3)
+```
+
+The OK lines confirm phase 1's recogniser sees STOS/MOVS exactly as the
+runtime path expects them. The MISS lines are exactly as documented in
+the phase-1 brief: the recogniser doesn't yet handle flag-conditioned
+exits. Phase 3 extends the predicate matcher to recognise
+`<rep-continue> AND <flag-bit-condition>` shape and fold CMPS/SCAS in.
+
+Verification: smoke 7/7 with flag both off and on. Doom8088 reaches
+in-game on calcite-cli at tick 34.65M with flag on (parity with
+pre-mission baseline). Validator is read-only — runtime path
+unchanged.
+
+Files: `crates/calcite-core/src/compile.rs` (validator function,
+env-var gate, `ranges_overlap_virtual` consults state),
+`crates/calcite-core/src/state.rs` (`VirtualRegion` struct,
+`State::virtual_regions` field), `crates/calcite-core/src/eval.rs`
+(register virtual region when wiring `windowed_byte_array`,
+mirror descriptors onto `compiled`),
+`crates/calcite-core/src/pattern/loop_descriptor.rs` (`assignment_index`
+on `FamilyMember`, addr/val pairing by proximity),
+`crates/calcite-core/src/pattern/loop_descriptor/tests.rs`
+(positional pairing test).
+
+Tests: 10 pattern::loop_descriptor unit tests (was 9, +1 for new
+pairing test). 4 pre-existing test failures in compile/eval modules
+unrelated to this change — same as on prior tip.
+
+Pickup notes for checkpoint 3: extend
+`pattern::loop_descriptor::match_ip_stay_or_advance` to accept
+conjunction predicates; flip `flag_conditioned: bool` on the
+descriptor when the predicate has the AND-with-flag-bit shape. Build
+the per-iter applier (and its bulk_fill / bulk_copy specialisations)
+inside `compile.rs::rep_fast_forward` behind the same flag. When the
+applier runs, it makes the validator redundant — collapse the validator
+into the applier (or just keep both for one more checkpoint as a
+fail-safe).
+
+---
+
+## 2026-05-06 — `rep_fast_forward` genericity mission, phase 1: structural loop recogniser
+
+Cross-link: see CSS-DOS
+[`docs/plans/2026-05-06-rep-fast-forward-genericity.md`](../../CSS-DOS/docs/plans/2026-05-06-rep-fast-forward-genericity.md)
+for the multi-session mission brief.
+[`../CSS-DOS/docs/logbook/LOGBOOK.md`](../../CSS-DOS/docs/logbook/LOGBOOK.md)
+2026-05-06 mirrors this entry for cross-cutting visibility.
+
+Phase 1 landed: a compile-time recogniser that produces structural
+self-loop descriptors from the cabinet's dispatch family, with no
+runtime path change. Phase 2 (descriptor-driven applier behind a
+flag) is the next checkpoint.
+
+### What landed
+
+- **New module**: `crates/calcite-core/src/pattern/loop_descriptor.rs`
+  (recogniser + types) and `pattern/loop_descriptor/tests.rs` (9
+  synthetic-CSS unit tests). The recogniser runs against
+  `ParsedProgram::assignments` and emits a
+  `Vec<LoopDescriptor>`. Each descriptor captures: the dispatch key
+  property and key value, the IP slot, the IP-advance literal, the
+  loop predicate, an optional counter slot, zero or more pointer
+  slots (with base step magnitude and direction-flag slot/bit), and
+  zero or more memwrite descriptors (address-side and value-side
+  expressions).
+- **Wiring**: `Evaluator::loop_descriptors: Vec<LoopDescriptor>`
+  populated in `from_parsed`. `CALCITE_LOOP_DIAG=1` env var prints
+  the recognised set to stderr at evaluator construction.
+- **Genericity probe**: two synthetic test cabinets, one x86-shaped
+  (`--CX`/`--DI`/`--__1IP`/etc.) and one brainfuck-shaped
+  (`--tapeUses`/`--tapeWriteHead`/`--priorCursor`/etc., no x86 ABI,
+  no shared naming convention with cabinet A). Both produce
+  structurally identical descriptors with no calcite-side change.
+  A renaming test verifies the recogniser is invariant under
+  arbitrary slot-name substitution.
+
+### Cardinal-rule contract enforced
+
+The recogniser inspects:
+- Slot/property *identity* (string-equality on whole names).
+- Expression-tree *shape* (variant, arity, literals).
+- Slot *repetition* (counts of references, structural co-occurrence).
+
+It does NOT inspect any character of any slot name. No prefix
+sniffing, no underscore checks, no substring searches. The renaming
+test in the unit suite locks this in.
+
+### Recogniser shape
+
+The "killer signature" is the IP-stay-or-advance shape: a per-V
+StyleCondition body whose two branches produce
+`calc(self - subtrahend)` and `calc(self + literal)` (in either
+order, against a common self slot). When found, the predicate
+becomes the loop predicate; other family members' per-V bodies are
+classified against it as counter/pointer/memwrite by their own
+structural shapes:
+
+- Counter: `if(<gate>: self; else: max(0, calc(self - step)))`
+  (or with branches flipped).
+- Pointer: `if(<gate>: self; else: outerCall(calc(self + k - innerCall(flag, bit) * 2k), modulus))`
+  (or flipped). Outer/inner function names are not inspected; only
+  arity and the literal-2 modulus structure.
+- Memwrite: any per-V body containing the `-1` literal somewhere
+  becomes the address side; everything else becomes the value side.
+
+Outer wrappers are stripped structurally:
+- `calc(<inner-dispatch> + <anything>)` (kiln's prefixLen wrapper
+  around IP).
+- Wrapper StyleCondition whose fallback contains the real
+  single-key dispatch (kiln's TF/IRQ override layer that takes
+  precedence over instruction execution).
+- Mixed-key StyleCondition where one property dominates the branch
+  set ≥50% (kiln's memwrite-slot layout, where TF/IRQ override
+  branches are folded into the same `if(...)` chain as the
+  opcode-keyed branches). The dominant-key branches are extracted;
+  others are ignored as wrapper noise.
+
+### Recogniser output on doom8088
+
+```
+[loop_descriptor] recognised 6 self-loop descriptor(s):
+  key=--opcode=0xa4 ip=--IP ip_self=--__1IP adv=1 counter=true pointers=2 pointer_steps=[1, 1] writes=1 flag_cond=false
+  key=--opcode=0xa5 ip=--IP ip_self=--__1IP adv=1 counter=true pointers=2 pointer_steps=[2, 2] writes=2 flag_cond=false
+  key=--opcode=0xaa ip=--IP ip_self=--__1IP adv=1 counter=true pointers=1 pointer_steps=[1] writes=1 flag_cond=false
+  key=--opcode=0xab ip=--IP ip_self=--__1IP adv=1 counter=true pointers=1 pointer_steps=[2] writes=2 flag_cond=false
+  key=--opcode=0xac ip=--IP ip_self=--__1IP adv=1 counter=true pointers=1 pointer_steps=[1] writes=0 flag_cond=false
+  key=--opcode=0xad ip=--IP ip_self=--__1IP adv=1 counter=true pointers=1 pointer_steps=[2] writes=0 flag_cond=false
+```
+
+Cross-checked against x86 string-op semantics (verifying the
+recogniser, not encoding it): MOVSB reads/writes 1 pointer pair
+with byte stride; MOVSW with word stride; STOSB writes 1 byte;
+STOSW writes lo+hi; LODSB/LODSW read but don't write. All match.
+
+CMPSB/CMPSW (0xA6/A7) and SCASB/SCASW (0xAE/AF) are NOT yet
+recognised — their IP shape uses the conjunction-of-style-tests
+predicate (kiln's `repCondIP`, with the ZF check), and the current
+matcher only handles single-test predicates. That's a known gap;
+phase 1's plan-noted limitation. CMPS/SCAS recognition lands in
+phase 2 alongside the runtime applier, where flag-conditioned
+exits are first-class.
+
+### Verification
+
+- `cargo test -p calcite-core --lib loop_descriptor`: 9/9 pass.
+- `cargo test -p calcite-core --lib`: 172/176 pass (4 pre-existing
+  rep_fast_forward unit-test failures unchanged — same baseline as
+  before the mission).
+- `cargo build --release` (workspace): clean.
+- `cargo build --release --target wasm32-unknown-unknown -p
+  calcite-wasm`: clean.
+- CSS-DOS `node tests/harness/run.mjs smoke`: 7/7 PASS pre and post
+  change.
+- doom8088 cabinet: recogniser fires with 6 valid descriptors at
+  evaluator construction (under `CALCITE_LOOP_DIAG=1`). Old
+  `rep_fast_forward` path remains the active runtime; phase 1 only
+  produces descriptors, doesn't consume them.
+
+### Plan checkpoint
+
+Plan §"Checkpoints / Checkpoint 1" complete:
+- [x] Add `LoopDescriptor` and friends.
+- [x] Implement the recogniser pass on the dispatch table.
+- [x] Synthetic-CSS unit tests (cabinets A + B + negatives + rename
+      probe).
+- [x] Real doom8088 verification with 6 recognised descriptors at
+      sensible opcode values (0xA4/A5/AA/AB/AC/AD; structural facts
+      cross-check against x86 semantics).
+
+Old `rep_fast_forward` still active. Smoke + doom8088 in-game
+unchanged. Phase 2 (runtime applier behind `CALCITE_REP_GENERIC`
+flag) is the next pickup point.
+
+---
+
+## 2026-05-06 — `pseudo_pulse` action + `--press-events` CLI flag, retiring `set_keyboard`
+
+Closing out the keyboard-cheat retirement. Phase B (2026-05-05) gave
+calcite the structural input-edge recogniser and the
+`set_pseudo_class_active` host API; the legacy `set_keyboard`
+side-channel stayed for back-compat. Today the back-compat went away.
+
+### What landed
+
+- **Script DSL**: new `Action::PseudoActivePulse { pseudo, selector,
+  hold_ticks }` and `pseudo_pulse=PSEUDO,SELECTOR,HOLD_TICKS` parser
+  support in `script_spec.rs`. Mirror of `SetVarPulse` but on the
+  pseudo-class surface — flips `(pseudo, selector)` active now,
+  schedules the release HOLD_TICKS later. Same skip-if-pending
+  semantics so a sustain-cond + pulse loop produces a clean
+  make/break/make/break cadence the cabinet's edge detector reads.
+- **`PendingRelease` typed as enum**: was `{release_tick, var_name}`,
+  now `{release_tick, kind: PendingReleaseKind}` with `Var{name}` /
+  `Pseudo{pseudo, selector}` variants. `same_target` helper for
+  the pending/just-released checks. `released_this_poll` switched
+  from `Vec<String>` to `Vec<PendingReleaseKind>` for the same
+  reason. Both `SetVarPulse` and `PseudoActivePulse` go through the
+  same poll-time release dispatcher.
+- **`--press-events` flag** on calcite-cli replaces `--key-events`:
+  `TICK:[+|-]SELECTOR,...` (no prefix or `+` = press, `-` = release).
+  All 7 use sites in `main.rs` (dump-tick path, watch-cell, trace-halt,
+  trace-json, the main run loop's batch-cap and per-tick fire) walk
+  the same `apply_press_events` helper, which calls
+  `state.set_pseudo_class_active("active", sel, value)`.
+- **Interactive REPL keyboard**: was `state.set_var("keyboard",
+  scancode<<8|ascii)` on press + `state.set_var("keyboard", 0)` on
+  release; now `state.set_pseudo_class_active("active", kb-X,
+  true|false)` via a new `key_to_selector` map mirroring kiln's
+  `KEYBOARD_KEYS`. The BDA-ring push (`state.bda_push_key`) for
+  programs that bypass IRQ 1 stays — it's separate from the cabinet
+  `--keyboard` slot.
+- **`engine.set_keyboard` deleted** from calcite-wasm. The
+  `set_pseudo_class_active(pseudo, selector, value)` method (added
+  2026-05-05) is now the only host-facing keyboard surface.
+
+### Tests
+
+- 16/16 calcite-core script tests green:
+  - 3 new: `parse_pseudo_pulse_action`,
+    `parse_pseudo_pulse_rejects_bad_arity`,
+    `pseudo_pulse_make_then_release`.
+  - 13 existing pass unchanged.
+- `cargo build --release -p calcite-cli -p calcite-debugger` clean.
+- Wasm rebuild clean.
+
+### Verification
+
+- CSS-DOS smoke 7/7 PASS.
+- doom-loading bench (CLI target, doom8088 cabinet 316 MB) reaches
+  in-game at tick 34,650,000 via `pseudo_pulse=active,kb-enter,50000`
+  watches. Identical tick budget to the prior `setvar_pulse=keyboard`
+  baseline.
+- Browser e2e probe (`pseudo-active-api-probe.html`) PASS in
+  headless Chrome against the post-deletion wasm: 561 → 8338 → 0
+  sequence through `set_pseudo_class_active` + `tick_batch`.
+
+### Cardinal-rule check
+
+Calcite no longer has any keyboard-shaped cheats. Inventory:
+
+- `0x500` literal — gone (deleted 2026-05-05 morning).
+- `set_keyboard` wrapper — gone (today).
+- `--key-events` flag — gone (today).
+- `keyboard` string literals in calcite-core production code —
+  none (verified `grep -n keyboard crates/calcite-core/src/*.rs`,
+  matches are doc comments only).
+
+The recogniser fires on shape `&:has(#IDENT:IDENT) { --PROP: <expr> }`
+and the host flips arbitrary `(pseudo, selector)` edges. Calcite
+doesn't know what `kb-1` is or that `--keyboard` is keyboard. The
+cabinet's CSS supplies the value lookup; the host supplies the gate
+state; calcite is just the structural matcher between them.
+
+The remaining cardinal-rule issue in calcite-core is
+`rep_fast_forward` (~341 lines of x86 string-op semantics) — its
+own perf-gated mission, captured in the audit list.
+
+## 2026-05-05 — calcite-genericity cleanup (4 of 5 items)
+
+Cross-repo: see `../CSS-DOS/docs/logbook/LOGBOOK.md` 2026-05-05 for the
+full audit-list context and CSS-DOS-side details.
+
+Calcite-side changes:
+
+- **Deleted `column_drawer_fast_forward`** (compile.rs). Off by default
+  since 2026-04-29; doom-specific 21-byte ROM body recogniser, net
+  perf loss in measurement. Removed the function, `FusionDiag`
+  thread-local funnel, `CALCITE_FUSION_FASTFWD` /
+  `CALCITE_FUSION_DIAG` env-var gates, the `rom_match` helper, and
+  the corresponding `fusion_diag_enable` /
+  `fusion_diag_snapshot` / `fusion_fire_count` plumbing in
+  calcite-cli.
+- **New crate `calcite-debug-summary`.** `crates/calcite-core/src/summary.rs`
+  → `crates/calcite-debug-summary/src/lib.rs`. The whole module is
+  CS/IP/opcode/_irqActive-aware (per-tick event log + block segmenter
+  for execution diagnostics) — doesn't belong in the engine.
+  `calcite-debugger` migrated to the new crate. Integration test
+  moved into the new crate's `tests/`.
+- **New crate `calcite-pc-video`.** `CGA_PALETTE`, `VGA_DAC_LINEAR`,
+  `cp437_to_unicode`, and the `render_screen` / `render_screen_ansi` /
+  `render_screen_html` / `render_framebuffer` / `read_framebuffer_rgba` /
+  `read_video_memory` methods on `State` moved out as free functions
+  taking `&State`. Consumers migrated: calcite-wasm (public
+  `pub fn`s now delegate to the new crate; wasm-bindgen surface
+  unchanged so the `web/pkg/` JS API stays stable), calcite-cli,
+  calcite-debugger.
+- **Comment pass on calcite-core/src/.** Reframed
+  doom8088/x86CSS/CSS-DOS references in production-path comments to
+  generic phrasings ("the reference cabinet", "measured cabinets",
+  "the cabinet's bytecode"). Test code untouched. Comments inside
+  `rep_fast_forward` left alone — those describe genuine
+  cardinal-rule violations the *code* makes; rewriting just the
+  comments would hide the issue.
+
+`rep_fast_forward` itself (~341 lines of hardcoded x86 string-op
+semantics) is the remaining audit item; deferred — it's a perf-gated
+mission (doom8088 web+CLI within 1% of current) requiring a real
+CSS-shape recogniser, not a comment cleanup.
+
+Verification: `cargo build --release` (workspace), `cargo test
+--release -p calcite-pc-video -p calcite-debug-summary` (6 tests
+green), `cargo build --release --target wasm32-unknown-unknown -p
+calcite-wasm` clean, `wasm-pack build` clean. CSS-DOS-side smoke
+suite 7/7 PASS pre and post each task. The 4 pre-existing
+`rep_fast_forward`-related calcite-core unit-test panics on cabinets
+without `--opcode` slots are unchanged (they pre-date this work).
+
+## 2026-05-05 — Phase B: structural input-edge recogniser + `set_pseudo_class_active`
+
+Phase B of the keyboard-cheat removal landed. Calcite now recognises
+`&:has(#SELECTOR:PSEUDO) { --PROP: VALUE; }` rules at parse time and
+exposes a generic host API to flip those gates. The
+`engine.set_keyboard` side-channel is no longer required for the
+principled path, though it remains for compatibility.
+
+### What landed
+
+- **Parser** — `parser/stylesheet.rs`: `parse_declarations` now detects
+  the leading `&` token and dispatches to `try_parse_input_edge_rule`,
+  which walks `:has(#IDENT:IDENT)` and the nested `{ --PROP: <expr>; }`
+  block, recording each gated assignment as an `InputEdge` on the
+  `ParsedProgram`. Recognition is purely structural: the parser doesn't
+  care whether the property is `--keyboard` or `--mood`, or whether the
+  selector is `kb-1` or `power-button`. Nested rules that don't fit the
+  shape (e.g. `&:nth-child(2)`) are skipped without breaking the
+  surrounding declaration block.
+- **Type** — `types::InputEdge { property, pseudo, selector, value: Expr }`
+  + `ParsedProgram::input_edges: Vec<InputEdge>`.
+- **State** — `state::State::pseudo_active: HashMap<(String, String), bool>`,
+  with `set_pseudo_class_active(pseudo, selector, value)` and
+  `pseudo_class_active(pseudo, selector)`. Sparse: only entries the
+  host actually flips occupy the map.
+- **Evaluator** — at construction time, `Evaluator::from_parsed`
+  compiles each `InputEdge` whose value is a literal into an
+  `InputEdgeBinding { property, pseudo, selector, value: i32 }`. Per
+  tick, before `compile::execute`, `apply_input_edges` walks the
+  bindings: for each gated property it finds, sums the values of edges
+  whose `(pseudo, selector)` is currently active per host, and writes
+  the sum into the underlying state-var slot. Properties with no
+  active edges get 0 (release semantics). Cheap: the typical
+  "nothing pressed" case is `n_edges` HashMap probes. The pre-tick
+  apply runs in `tick`, `tick_no_diff`, `tick_profiled`, and
+  `tick_interpreted` — every entry point.
+- **Wasm** — `engine.set_pseudo_class_active(pseudo, selector, value)`
+  delegates to State; `engine.input_edges()` returns a JS array of
+  `{property, pseudo, selector, value}` so the host knows which edges
+  to drive. `engine.set_keyboard` retained but documented as legacy
+  side-channel.
+- **Tests** — three new parser unit tests (input edges recognised;
+  complex value expression; nonsense nested rules skipped); one
+  evaluator unit test (input-edge bindings drive state var with
+  release semantics + sum on multi-press); one integration test
+  exercising the full parse→compile→tick pipeline with
+  `set_pseudo_class_active`. All green. Pre-existing 4 lib failures
+  in the `rep_fast_forward` suite (no `--opcode` slot in their test
+  cabinets) unchanged.
+
+### Cardinal-rule check
+
+The recogniser fires on shape `&:has(#IDENT:IDENT) { --PROP: <expr> }`
+and nothing else. It doesn't look at property names, scancodes, or
+ASCII values; it doesn't know that `kb-1` is a key or that `--keyboard`
+is a keyboard slot. A 6502 cabinet that emitted
+`&:has(#brake-pedal:active) { --braking: 1 }` would get the same
+treatment with no calcite-side change.
+
+The host plumbing (SW URL parsing, bridge drainer) still has the same
+shape — it just translates pseudo-class events instead of scancodes —
+and the cabinet's CSS now does the actual lookup of "what value does
+this gate produce" via its own
+`&:has(#kb-X:active) { --keyboard: V; }` rules.
+
+### Verification
+
+- 165/169 calcite-core lib tests pass (4 pre-existing rep_fast_forward
+  failures unchanged).
+- 1 new integration test passes
+  (`input_edges_drive_keyboard_via_set_pseudo_class_active`).
+- doom8088 cabinet (316 MB, post-build) parses with **59 input edges
+  recognised** (matches the 59 `:has(#kb-` rules kiln emits).
+- Wasm e2e probe (`web/player/experiments/pseudo-active-api-probe.html`)
+  loads a tiny synthetic cabinet, calls `set_pseudo_class_active` for
+  presses/releases, observes `--keyboard` flipping correctly through
+  `tick_batch` (561 → 8338 → 0).
+- CSS-DOS smoke 7/7 PASS pre and post change.
+
+### Work remaining (not in this commit)
+
+- Migrate the bench harness `doom-loading.mjs` from `setvar_pulse=keyboard`
+  to the new pseudo-class API (currently still uses `--key-events`-style
+  scancodes via `setvar_pulse`; this is independent of the new
+  recogniser).
+- Eventually retire `engine.set_keyboard` entirely. Held back here
+  for back-compat: existing browser-builder UIs and the bench harness
+  still emit `key=` URLs and call `set_keyboard`. Once both have moved
+  to the pseudo path the side-channel can go.
+
+## 2026-05-05 — cleanup: delete `0x500` keyboard fallback in `property_to_address`
+
+Cardinal-rule cleanup. `eval.rs::property_to_address` had a hardcoded
+fallback: `keyboard / __1keyboard / __2keyboard → 0x500`. Six lines,
+upstream knowledge (DOS BDA keyboard slot is at 0x500 in CSS-DOS land,
+which calcite has no business knowing). Deleted.
+
+The fallback was dead code on every current cabinet — kiln declares
+`@property --keyboard` in `template.mjs::emitPropertyDecls`, so
+`State::load_properties` registers it in the address map at a
+state-var slot, and `property_to_address("keyboard")` returns that
+slot before reaching the fallback. Verified by running CSS-DOS smoke
+(7 carts including dos-smoke, montezuma, zork1) end-to-end before and
+after the deletion: identical pass set, identical tick budgets reached.
+
+The remaining keyboard input path in calcite — the SW link route into
+`engine.set_keyboard` — stays. That's host plumbing under the no-page-JS
+constraint and is legitimate. The cheat being removed here was the
+*name-based literal* in calcite-core, which made calcite assume any
+property called `keyboard` lives at 0x500 regardless of what the cabinet
+actually says. With the kiln-side `@property --keyboard` declaration the
+address map handles this generically.
+
+Part of the broader plan in CSS-DOS LOGBOOK 2026-05-05 ("JS-free
+keyboard via :active, removes calcite cheat"). Phase A on the CSS-DOS
+side is in progress; Phase B's structural recogniser
+(`:has(...:pseudo)` edges + `engine.set_pseudo_class_active`) is still
+to come. This deletion is the smallest, safest, one-way step that
+clears the literal cheat without waiting for the recogniser to land.
+
+Files: `crates/calcite-core/src/eval.rs` (-6 lines).
+
 ## 2026-05-02 — script: setvar_pulse + cond:repeat sustain mode
 
 Closes the first follow-up from the 2026-05-01 chunk D entry: the

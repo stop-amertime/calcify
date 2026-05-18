@@ -1,4 +1,5 @@
-//! Packed broadcast-write pattern recognizer for CSS-DOS PACK_SIZE=2 memory.
+//! Packed broadcast-write pattern recognizer for PACK_SIZE=2 memory
+//! layouts (the shape cabinets like CSS-DOS emit).
 //!
 //! In packed memory, each `--mc{N}` cell holds two bytes (`b0 | b1<<8`).
 //! Instead of the unpacked `if(style(--memAddrK: N): valK; ...; else: keep)`

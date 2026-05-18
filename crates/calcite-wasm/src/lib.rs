@@ -340,7 +340,7 @@ impl CalciteEngine {
     pub fn read_video_memory(&self, base_addr: usize, width: usize, height: usize) -> Vec<u8> {
         // Packed cabinets need unified reads; unpacked passes through.
         if self.state.packed_cell_table.is_empty() {
-            return self.state.read_video_memory(base_addr, width, height);
+            return calcite_pc_video::read_video_memory(&self.state, base_addr, width, height);
         }
         let n = width * height;
         let mut buf = vec![0u8; n];
@@ -445,12 +445,12 @@ impl CalciteEngine {
 
     /// Render text-mode video memory as a string (for debugging).
     pub fn render_screen(&self, base_addr: usize, width: usize, height: usize) -> String {
-        self.state.render_screen(base_addr, width, height)
+        calcite_pc_video::render_screen(&self.state, base_addr, width, height)
     }
 
     /// Render text-mode video memory as HTML with CGA color spans.
     pub fn render_screen_html(&self, base_addr: usize, width: usize, height: usize) -> String {
-        self.state.render_screen_html(base_addr, width, height)
+        calcite_pc_video::render_screen_html(&self.state, base_addr, width, height)
     }
 
     /// Render a graphics-mode framebuffer as a PPM P6 image.
@@ -459,7 +459,7 @@ impl CalciteEngine {
     /// is a complete PPM P6 file including header. For VGA Mode 13h:
     /// `render_framebuffer(0xA0000, 320, 200)`.
     pub fn render_framebuffer(&self, base_addr: usize, width: usize, height: usize) -> Vec<u8> {
-        self.state.render_framebuffer(base_addr, width, height)
+        calcite_pc_video::render_framebuffer(&self.state, base_addr, width, height)
     }
 
     /// Read a graphics-mode framebuffer as raw RGBA bytes.
@@ -474,45 +474,39 @@ impl CalciteEngine {
         height: usize,
     ) -> Vec<u8> {
         // Packed cabinets need the VRAM materialised from state vars before
-        // the palette-resolving code runs (State::read_framebuffer_rgba indexes
-        // `self.memory[]` directly). For unpacked cabinets the packed table is
+        // the palette-resolving code runs (read_framebuffer_rgba indexes
+        // memory[] directly). For unpacked cabinets the packed table is
         // empty and this unification is a no-op pass-through.
         if self.state.packed_cell_table.is_empty() {
-            return self.state.read_framebuffer_rgba(base_addr, width, height);
+            return calcite_pc_video::read_framebuffer_rgba(&self.state, base_addr, width, height);
         }
         let pixels = width * height;
-        // Borrow state mutably only long enough to stage the bytes, then
-        // call through the palette logic. Keeping a scratch buffer inside
-        // State avoids an allocation per frame.
         let mut vram = vec![0u8; pixels];
         for i in 0..pixels {
             vram[i] = self.read_byte_unified((base_addr + i) as i32);
         }
         // Build a mini State view whose `memory` covers just the framebuffer
-        // at base_addr, then call the existing palette resolver. DAC entries
-        // are materialised into `scratch.extended` via the unified read path:
-        // on packed cabinets the OUT 0x3C9 writes are routed through the
-        // packed broadcast-write port directly into `state_vars` — they do
-        // NOT go through `write_mem` and so never land in `self.extended`.
-        // Just cloning `self.extended` here misses every DAC byte and the
-        // palette-resolver falls back to CGA, producing the magenta/cyan
-        // garbage we saw on Doom8088 / Prince of Persia in the web player.
+        // at base_addr, then call the palette resolver. DAC entries are
+        // materialised into `scratch.extended` via the unified read path: on
+        // packed cabinets the OUT 0x3C9 writes are routed through the packed
+        // broadcast-write port directly into `state_vars` — they do NOT go
+        // through `write_mem` and so never land in `self.extended`. Just
+        // cloning `self.extended` here misses every DAC byte and the palette
+        // resolver falls back to CGA.
         let mut scratch = calcite_core::State::default();
         if scratch.memory.len() < base_addr + pixels {
             scratch.memory.resize(base_addr + pixels, 0);
         }
         scratch.memory[base_addr..base_addr + pixels].copy_from_slice(&vram);
         scratch.extended = self.state.extended.clone();
-        // Populate DAC palette via the unified path so packed cabinets work.
-        // 768 bytes = 256 entries x RGB (matches CSS-DOS kiln/memory.mjs DAC_BYTES).
         for i in 0..768i32 {
-            let addr = calcite_core::state::VGA_DAC_LINEAR + i;
+            let addr = calcite_pc_video::VGA_DAC_LINEAR + i;
             let v = self.read_byte_unified(addr) as i32;
             if v != 0 {
                 scratch.extended.insert(addr, v);
             }
         }
-        scratch.read_framebuffer_rgba(base_addr, width, height)
+        calcite_pc_video::read_framebuffer_rgba(&scratch, base_addr, width, height)
     }
 
     /// Read the current video mode from the BDA (0x0449).

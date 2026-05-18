@@ -930,8 +930,8 @@ struct DebugSession {
     css_file: String,
     property_names: Vec<String>,
     /// Optional per-tick event recorder. When `Some`, `step_one` feeds it
-    /// after each tick. Blocks/prose come from `calcite_core::summary`.
-    summary: Option<calcite_core::summary::EventLogger>,
+    /// after each tick. Blocks/prose come from `calcite_debug_summary`.
+    summary: Option<calcite_debug_summary::EventLogger>,
 }
 
 impl DebugSession {
@@ -1168,7 +1168,7 @@ impl DebugSession {
     }
 
     fn render_screen(&self, addr: i32, width: usize, height: usize) -> ScreenResult {
-        let text = self.state.render_screen(addr as usize, width, height);
+        let text = calcite_pc_video::render_screen(&self.state, addr as usize, width, height);
         ScreenResult { addr, width, height, text }
     }
 
@@ -2647,7 +2647,7 @@ impl DebuggerHandler {
         &self,
         Parameters(p): Parameters<SummaryParams>,
     ) -> Result<Json<SummaryResult>, ErrorData> {
-        use calcite_core::summary::{EventLogger, SegmentConfig, SummaryConfig, render_block, segment};
+        use calcite_debug_summary::{EventLogger, SegmentConfig, SummaryConfig, render_block, segment};
         let sess = self.get_session(&p.session)?;
         let mut guard = sess.lock().unwrap();
         let s = &mut *guard;
@@ -2755,7 +2755,7 @@ impl DebuggerHandler {
         &self,
         Parameters(p): Parameters<SummariseParams>,
     ) -> Result<Json<SummaryResult>, ErrorData> {
-        use calcite_core::summary::{EventLogger, SegmentConfig, SummaryConfig, render_block, segment};
+        use calcite_debug_summary::{EventLogger, SegmentConfig, SummaryConfig, render_block, segment};
         if p.max_ticks > SUMMARISE_HARD_CAP {
             return Err(invalid_params(format!(
                 "max_ticks={} exceeds the {SUMMARISE_HARD_CAP} hard cap. \

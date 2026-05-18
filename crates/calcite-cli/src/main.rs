@@ -492,15 +492,6 @@ fn main() {
             let mut evaluator = calcite_core::Evaluator::from_parsed(&parsed);
             let compile_time = t1.elapsed();
 
-            // Fusion FFD diag: enable thread-local funnel counters before
-            // the run starts so column_drawer_fast_forward records every
-            // tick. Cheap (one TLS load + branch per tick when disabled;
-            // a few non-atomic increments when enabled). End-of-run prints
-            // via fusion_diag_snapshot().report().
-            if std::env::var("CALCITE_FUSION_DIAG").is_ok() {
-                calcite_core::compile::fusion_diag_enable();
-            }
-
             // --op-profile: enable adjacency tracking before the run starts.
             // The CSV + summary print happens at end-of-run.
             if cli.op_profile_path.is_some() {
@@ -718,8 +709,8 @@ fn main() {
                         for x in 0..320 {
                             let top = state.read_mem(0xA0000 + y * 320 + x) as usize & 0x0F;
                             let bot = state.read_mem(0xA0000 + (y + 1) * 320 + x) as usize & 0x0F;
-                            let (tr, tg, tb) = calcite_core::state::CGA_PALETTE[top];
-                            let (br, bg_, bb) = calcite_core::state::CGA_PALETTE[bot];
+                            let (tr, tg, tb) = calcite_pc_video::CGA_PALETTE[top];
+                            let (br, bg_, bb) = calcite_pc_video::CGA_PALETTE[bot];
                             out.push_str(&format!(
                                 "\x1b[38;2;{};{};{}m\x1b[48;2;{};{};{}m▀",
                                 tr, tg, tb, br, bg_, bb
@@ -736,7 +727,7 @@ fn main() {
                     } else {
                         eprint!("\x1b[H");
                     }
-                    let screen = state.render_screen_ansi(0xB8000, width, height);
+                    let screen = calcite_pc_video::render_screen_ansi(state, 0xB8000, width, height);
                     eprint!("┌{}┐\r\n", "─".repeat(width));
                     for line in screen.lines() {
                         eprint!("│{line}\x1b[0m│\r\n");
@@ -892,11 +883,12 @@ fn main() {
                 });
                 let mut out = std::io::BufWriter::new(out_file);
                 use std::io::Write;
-                writeln!(out, "tick,cs,ip,sp,burst_id").ok();
+                writeln!(out, "tick,cs,ip,sp,cycles,burst_id").ok();
 
                 let cs_slot = state.state_var_names.iter().position(|n| n == "CS");
                 let ip_slot = state.state_var_names.iter().position(|n| n == "IP");
                 let sp_slot = state.state_var_names.iter().position(|n| n == "SP");
+                let cc_slot = state.state_var_names.iter().position(|n| n == "cycleCount");
                 let read = |state: &calcite_core::State, slot: Option<usize>| -> i32 {
                     slot.map(|i| state.state_vars[i]).unwrap_or(0)
                 };
@@ -923,7 +915,8 @@ fn main() {
                             let cs = read(&state, cs_slot);
                             let ip = read(&state, ip_slot);
                             let sp = read(&state, sp_slot);
-                            writeln!(out, "{},{},{},{},{}", tick, cs, ip, sp, bid).ok();
+                            let cc = read(&state, cc_slot);
+                            writeln!(out, "{},{},{},{},{},{}", tick, cs, ip, sp, cc, bid).ok();
                         }
                         burst_count += 1;
                     } else {
@@ -942,7 +935,8 @@ fn main() {
                         let cs = read(&state, cs_slot);
                         let ip = read(&state, ip_slot);
                         let sp = read(&state, sp_slot);
-                        writeln!(out, "{},{},{},{},{}", tick, cs, ip, sp, -1).ok();
+                        let cc = read(&state, cc_slot);
+                        writeln!(out, "{},{},{},{},{},{}", tick, cs, ip, sp, cc, -1).ok();
                         singles += 1;
                     }
                     sample_count += 1;
@@ -1487,14 +1481,6 @@ fn main() {
                 ticks_run,
                 ticks_run as f64 / tick_time.as_secs_f64(),
             );
-            let fusion_fires = calcite_core::compile::fusion_fire_count();
-            if fusion_fires > 0 {
-                eprintln!("Fusion fast-forward: {} body iterations applied", fusion_fires);
-            }
-            if std::env::var("CALCITE_FUSION_DIAG").is_ok() {
-                eprint!("{}", calcite_core::compile::fusion_diag_snapshot().report());
-            }
-
             // --op-profile: dump matrix CSV + print summary to stderr.
             if let Some(path) = &cli.op_profile_path {
                 let snap = calcite_core::pattern::op_profile::op_profile_snapshot();
@@ -1532,7 +1518,7 @@ fn main() {
             if let Some(path) = cli.framebuffer_out.as_ref() {
                 let video_mode = state.read_mem(0x0449) as u8;
                 if video_mode == 0x13 {
-                    let ppm = state.render_framebuffer(0xA0000, 320, 200);
+                    let ppm = calcite_pc_video::render_framebuffer(&state, 0xA0000, 320, 200);
                     match std::fs::write(path, &ppm) {
                         Ok(()) => eprintln!("Framebuffer: wrote {} bytes to {}", ppm.len(), path),
                         Err(e) => {

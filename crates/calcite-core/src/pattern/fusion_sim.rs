@@ -499,8 +499,8 @@ pub struct SimResult {
 /// the fused entry fires. If the assertion is wrong, the fused
 /// expression returns wrong results — caller's responsibility.
 ///
-/// On the doom column drawer, common assumptions are:
-///   --df = 0 (CLD has fired)
+/// For an x86-style unrolled blit body, common assumptions are:
+///   --df = 0 (direction-flag clear has fired)
 ///   --es-prefix-active = 0 (no segment override)
 #[derive(Debug, Clone, Default)]
 pub struct Assumptions {
