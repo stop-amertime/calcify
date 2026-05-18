@@ -92,19 +92,8 @@ pub struct WatchSpec {
 /// docs for the cheap/expensive split.
 #[derive(Debug)]
 pub enum WatchKind {
-    /// Fire every `every` ticks. Cheap. Uses `last_fired_at` to track
-    /// the last tick we fired on so we don't depend on the host calling
-    /// poll() at tick values divisible by `every` — fires whenever
-    /// `tick - last_fired_at >= every`. The CLI naturally aligns its
-    /// poll cadence to stride boundaries; the wasm bridge polls on
-    /// adaptive batch boundaries that may not align.
-    Stride {
-        every: u32,
-        /// Internal: tick of the most recent fire. Initialised to 0 so
-        /// the first poll past `every` fires regardless of starting
-        /// tick value.
-        last_fired_at: Cell<u32>,
-    },
+    /// Fire every `every` ticks. Cheap.
+    Stride { every: u32 },
     /// Fire on `count` consecutive ticks every `every` ticks. Cheap.
     Burst { every: u32, count: u32 },
     /// Fire exactly once at tick `tick`. Cheap. Replaces the old
@@ -210,6 +199,17 @@ pub enum Action {
     /// [`WatchRegistry::poll`] when its `tick` argument reaches the
     /// scheduled release-tick.
     SetVarPulse { name: String, value: i32, hold_ticks: u32 },
+    /// Set a pseudo-class match edge active immediately, then release
+    /// (set inactive) after `hold_ticks` ticks. Generic edge-pair
+    /// primitive; CSS-DOS-side profiles use it for keyboard taps that
+    /// drive the cabinet's `&:has(#SEL:PSEUDO) { --PROP: V }` rules
+    /// through calcite's input-edge recogniser. Mirror of `SetVarPulse`
+    /// but on the pseudo-class surface.
+    PseudoActivePulse {
+        pseudo: String,
+        selector: String,
+        hold_ticks: u32,
+    },
     /// Request the host stop the run. Effective from
     /// [`WatchRegistry::halt_requested`] after this watch's other
     /// actions have run.
@@ -290,18 +290,44 @@ pub struct WatchRegistry {
     /// any whose release_tick has passed. Sorted on insertion so the
     /// front entries are always the soonest-due.
     pub(crate) pending_releases: Vec<PendingRelease>,
-    /// Var names that had releases dispatched at the start of THIS
+    /// Surfaces that had releases dispatched at the start of THIS
     /// poll. Pulse actions that target one of these skip — gives the
-    /// engine a full inter-poll batch with the var at 0 between
-    /// pulses, the break edge edge-detectors need.
-    pub(crate) released_this_poll: Vec<String>,
+    /// engine a full inter-poll batch with the surface in its
+    /// "released" state between pulses, the break edge edge-detectors
+    /// need.
+    pub(crate) released_this_poll: Vec<PendingReleaseKind>,
 }
 
-/// A `SetVarPulse` release scheduled for a future tick.
+/// A pulsed release scheduled for a future tick. `kind` carries which
+/// surface the make-edge wrote to, so `poll` knows whether to set the
+/// state var to 0 or flip a pseudo-class edge to inactive.
 #[derive(Debug, Clone)]
 pub(crate) struct PendingRelease {
     pub release_tick: u32,
-    pub var_name: String,
+    pub kind: PendingReleaseKind,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum PendingReleaseKind {
+    /// `SetVarPulse` release — set the named state var to 0.
+    Var { name: String },
+    /// `PseudoActivePulse` release — set the (pseudo, selector) match
+    /// edge inactive on `state.pseudo_active`.
+    Pseudo { pseudo: String, selector: String },
+}
+
+impl PendingReleaseKind {
+    /// True if `self` and `other` target the same surface.
+    pub(crate) fn same_target(&self, other: &PendingReleaseKind) -> bool {
+        match (self, other) {
+            (Self::Var { name: a }, Self::Var { name: b }) => a == b,
+            (
+                Self::Pseudo { pseudo: ap, selector: as_ },
+                Self::Pseudo { pseudo: bp, selector: bs },
+            ) => ap == bp && as_ == bs,
+            _ => false,
+        }
+    }
 }
 
 impl WatchRegistry {
@@ -387,7 +413,7 @@ mod tests {
         let mut r = WatchRegistry::new();
         let idx = r.register(WatchSpec {
             name: "tick".to_string(),
-            kind: WatchKind::Stride { every: 100, last_fired_at: std::cell::Cell::new(0) },
+            kind: WatchKind::Stride { every: 100 },
             gate: None,
             actions: vec![Action::Emit],
             sample_vars: Vec::new(),

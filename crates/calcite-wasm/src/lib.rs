@@ -43,15 +43,6 @@ pub struct CalciteEngine {
     /// `WATCH_CHUNK_TICKS` ticks) and the host drains events via
     /// `drain_measurements`.
     watch_registry: calcite_core::script::WatchRegistry,
-    /// Monotonic clock the watch poll uses for `Stride{every}` checks.
-    /// Starts at 0 in `new()` and increments by exactly `chunk_ticks`
-    /// per `run_batch_watched` inner iteration so `tick % every == 0`
-    /// lands on clean boundaries — the CLI does the same with its
-    /// `cursor` variable. Don't use `state.frame_counter` here: it's
-    /// non-zero by the time the host registers watches (the engine
-    /// has already booted), so a fresh stride watch never aligns with
-    /// the existing frame_counter modulus and never fires.
-    watch_clock: u32,
 }
 
 #[wasm_bindgen]
@@ -119,7 +110,7 @@ impl CalciteEngine {
         // MeasurementEvents that the host drains.
         let mut watch_registry = calcite_core::script::WatchRegistry::new();
         watch_registry.set_dump_sink(calcite_core::script::DumpSink::Memory);
-        Ok(CalciteEngine { state, evaluator, initial_properties, watch_registry, watch_clock: 0 })
+        Ok(CalciteEngine { state, evaluator, initial_properties, watch_registry })
     }
 
     /// Diagnostic: number of recognised packed-broadcast ports.
@@ -157,7 +148,6 @@ impl CalciteEngine {
         let mut new_reg = calcite_core::script::WatchRegistry::new();
         new_reg.set_dump_sink(calcite_core::script::DumpSink::Memory);
         self.watch_registry = new_reg;
-        self.watch_clock = 0;
     }
 
     /// Run a batch of ticks and return the property changes as a JSON string.
@@ -212,20 +202,39 @@ impl CalciteEngine {
         self.state.restore(blob).map_err(JsError::new)
     }
 
-    /// Inject a keypress.
-    /// Pass (scancode << 8 | ascii), matching the standard PC keyboard convention.
-    /// Writes the `--keyboard` shadow at linear 0x500; the cabinet's IRQ 1 edge
-    /// detection then fires INT 09h, which is what populates the BDA ring buffer
-    /// at 0x41E for INT 16h consumers (zork, etc.) and lets DOOM read the
-    /// scancode via `IN AL, 0x60`. To produce a make/break pair the caller posts
-    /// (key=N, then key=0) on consecutive `set_keyboard` calls.
-    pub fn set_keyboard(&mut self, key: i32) {
-        // Drive the `--keyboard` state-var that calcite watches for IRQ 1
-        // edges. The cabinet's INT 09h ISR is the single source of BDA ring
-        // pushes. Earlier versions of this method also called bda_push_key
-        // directly; once corduroy installed an INT 09h handler that also
-        // pushes, every press doubled (zork "G" → "gg").
-        self.state.set_var("keyboard", key & 0xFFFF);
+    /// Report a pseudo-class match edge as active or inactive.
+    ///
+    /// This is the principled input surface: the cabinet's CSS uses
+    /// `&:has(#SELECTOR:PSEUDO) { --PROP: VALUE; }` rules to bind the
+    /// match state to a custom property. The host calls this to flip
+    /// the (pseudo, selector) edge; the next tick's evaluation
+    /// produces VALUE on PROP via calcite's input-edge recogniser.
+    ///
+    /// `pseudo` is the pseudo-class name without the leading `:`
+    /// (e.g. `"active"`). `selector` is the id-selector text without
+    /// the leading `#` (e.g. `"kb-1"`). `value` is the boolean state.
+    ///
+    /// The host is responsible for sending matching false edges
+    /// (release) — calcite does not synthesise key-up automatically.
+    pub fn set_pseudo_class_active(&mut self, pseudo: &str, selector: &str, value: bool) {
+        self.state.set_pseudo_class_active(pseudo, selector, value);
+    }
+
+    /// Returns the input edges the recogniser found in this cabinet's
+    /// CSS, as a JS array of `{property, pseudo, selector, value}`
+    /// objects. Useful for the host to know which edges to drive.
+    pub fn input_edges(&self) -> JsValue {
+        let edges = self.evaluator.input_edges_for_host();
+        let arr = js_sys::Array::new();
+        for (property, pseudo, selector, value) in edges {
+            let obj = js_sys::Object::new();
+            let _ = js_sys::Reflect::set(&obj, &"property".into(), &property.into());
+            let _ = js_sys::Reflect::set(&obj, &"pseudo".into(), &pseudo.into());
+            let _ = js_sys::Reflect::set(&obj, &"selector".into(), &selector.into());
+            let _ = js_sys::Reflect::set(&obj, &"value".into(), &value.into());
+            arr.push(&obj);
+        }
+        arr.into()
     }
 
     /// Register a watch (script-primitive) with the engine. The spec
@@ -278,14 +287,15 @@ impl CalciteEngine {
         }
         let chunk = if chunk_ticks == 0 { count.max(1) } else { chunk_ticks };
         let mut remaining = count;
+        let mut tick_now: u32 = self.state.frame_counter;
         while remaining > 0 {
             let n = remaining.min(chunk);
             self.evaluator.run_batch_silent(&mut self.state, n);
-            self.watch_clock = self.watch_clock.saturating_add(n);
+            tick_now = tick_now.saturating_add(n);
             calcite_core::script_eval::poll(
                 &mut self.watch_registry,
                 &mut self.state,
-                self.watch_clock,
+                tick_now,
             );
             if self.watch_registry.halt_requested() {
                 return true;

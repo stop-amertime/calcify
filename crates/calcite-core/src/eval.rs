@@ -106,6 +106,58 @@ pub struct Evaluator {
     pub(crate) compiled: CompiledProgram,
     /// Slot array reused across ticks (avoids per-tick allocation).
     slots: Vec<i32>,
+    /// Input-edge bindings recognised from nested `:has(…:pseudo)` rules.
+    /// Each entry compiles a single `&:has(#SELECTOR:PSEUDO) { --PROP: VAL; }`
+    /// rule into something we can apply per-tick. `value` is pre-evaluated
+    /// at compile time as a literal i32 — non-literal RHS values fall back
+    /// to 0 with a warning (the recogniser is structural; the value-side
+    /// expression evaluator isn't worth the complexity for the current
+    /// shapes kiln emits).
+    pub(crate) input_edge_bindings: Vec<InputEdgeBinding>,
+    /// Resolved + grouped form of `input_edge_bindings`. `None` until
+    /// the first `apply_input_edges` call, populated using the live
+    /// `State.state_var_index` and reused on every subsequent tick.
+    /// One entry per state-var slot that any edge writes to.
+    input_edge_groups: Option<Vec<InputEdgeGroup>>,
+    /// "Last apply wrote a non-zero value to at least one slot" flag.
+    /// Combined with `state.pseudo_active.is_empty()`, lets the per-tick
+    /// fast path short-circuit when nothing's pressed AND nothing was
+    /// pressed last tick (so no clear-to-zero is needed). Without this,
+    /// we'd have to write zero to every grouped slot on every empty
+    /// tick, which is the regression behaviour we're fixing.
+    last_apply_was_nonzero: bool,
+}
+
+/// Compiled form of a `ParsedProgram::input_edges` entry. The
+/// state-var slot is resolved lazily on first tick once
+/// `state.load_properties` has run; cached after that on the
+/// evaluator's `input_edge_groups`.
+#[derive(Debug, Clone)]
+pub(crate) struct InputEdgeBinding {
+    pub property: String,
+    pub pseudo: String,
+    pub selector: String,
+    pub value: i32,
+}
+
+/// Bindings grouped by the state-var slot they write to, with all the
+/// slot/string lookups resolved once. Built lazily on the first
+/// `apply_input_edges` call after state vars are loaded; reused on
+/// every subsequent tick. The `apply_input_edges` hot loop reads only
+/// this struct + the host-driven `state.pseudo_active` set.
+#[derive(Debug, Clone)]
+struct InputEdgeGroup {
+    /// The state-var slot all `edges` in this group write to.
+    slot: usize,
+    /// Edges whose `bare(property)` resolved to `slot`.
+    edges: Vec<InputEdgeGroupEntry>,
+}
+
+#[derive(Debug, Clone)]
+struct InputEdgeGroupEntry {
+    pseudo: String,
+    selector: String,
+    value: i32,
 }
 
 /// Granular timing breakdown from [`Evaluator::tick_profiled`].
@@ -493,6 +545,37 @@ impl Evaluator {
 
         let slot_count = compiled.slot_count as usize;
         let properties_capacity = assignments.len();
+
+        // Compile input edges. Only literal values are supported in v1;
+        // non-literal RHS expressions are skipped with a warning.
+        let mut input_edge_bindings = Vec::with_capacity(program.input_edges.len());
+        for edge in &program.input_edges {
+            let value = match &edge.value {
+                Expr::Literal(v) => *v as i32,
+                _ => {
+                    log::warn!(
+                        "input edge {}:{} on {} has non-literal value; skipping",
+                        edge.pseudo,
+                        edge.selector,
+                        edge.property,
+                    );
+                    continue;
+                }
+            };
+            input_edge_bindings.push(InputEdgeBinding {
+                property: edge.property.clone(),
+                pseudo: edge.pseudo.clone(),
+                selector: edge.selector.clone(),
+                value,
+            });
+        }
+        if !input_edge_bindings.is_empty() {
+            log::info!(
+                "Compiled {} input edges (pseudo-class gated assignments)",
+                input_edge_bindings.len(),
+            );
+        }
+
         Evaluator {
             functions,
             assignments,
@@ -507,7 +590,104 @@ impl Evaluator {
             string_property_names,
             compiled,
             slots: Vec::with_capacity(slot_count),
+            input_edge_bindings,
+            input_edge_groups: None,
+            last_apply_was_nonzero: false,
         }
+    }
+
+    /// Return the input edges the recogniser bound, as
+    /// `(property, pseudo, selector, value)` tuples. Hosts use this to
+    /// know which edges they can drive via `set_pseudo_class_active`.
+    /// The strings are owned to make the wasm boundary easy.
+    pub fn input_edges_for_host(&self) -> Vec<(String, String, String, i32)> {
+        self.input_edge_bindings
+            .iter()
+            .map(|b| {
+                (
+                    b.property.clone(),
+                    b.pseudo.clone(),
+                    b.selector.clone(),
+                    b.value,
+                )
+            })
+            .collect()
+    }
+
+    /// Apply input-edge bindings to state vars. For each gated state-var
+    /// slot, sum the values of edges whose `(pseudo, selector)` pair is
+    /// reported active by the host, and write the result. Slots with no
+    /// active edges get 0 (release semantics).
+    ///
+    /// **Hot path.** Called at the top of every tick batch. Three layers
+    /// of fast-out:
+    ///
+    /// 1. No bindings → return immediately (used by carts without input
+    ///    edges, e.g. all the smoke set except doom8088).
+    /// 2. Lazy compile-once of the resolved-and-grouped form.
+    ///    `state.var_slot(bare(property))` is a HashMap probe; we cache
+    ///    the slot per binding on first call so subsequent ticks skip
+    ///    string conversion + HashMap lookup entirely.
+    /// 3. `state.pseudo_active.is_empty()` AND last apply wrote zero
+    ///    everywhere → return. The common case on doom8088 is "no key
+    ///    pressed and none pressed last tick"; cuts the per-tick cost
+    ///    of input-edge handling to a single bool check.
+    ///
+    /// Without these the function used to do ~59 string allocations,
+    ///  ~59 HashMap probes, and an O(n²) accumulator scan per tick on
+    /// doom8088. That cost was the regression introduced in commit
+    /// `a5e8eee` (2026-05-05) — bench bisect showed a 42 % throughput
+    /// drop attributable to this function alone.
+    fn apply_input_edges(&mut self, state: &mut State) {
+        if self.input_edge_bindings.is_empty() {
+            return;
+        }
+
+        // Layer 2: lazy resolution + grouping. Only happens once.
+        if self.input_edge_groups.is_none() {
+            self.input_edge_groups = Some(build_input_edge_groups(
+                &self.input_edge_bindings,
+                state,
+            ));
+        }
+        let groups = self.input_edge_groups.as_ref().expect("just built");
+        if groups.is_empty() {
+            return;
+        }
+
+        // Layer 3: nothing-pressed-and-was-nothing-pressed-last-tick fast path.
+        // The first conjunct skips the per-edge work; the second skips
+        // the redundant zero-write to all grouped slots.
+        if state.pseudo_active.is_empty() && !self.last_apply_was_nonzero {
+            return;
+        }
+
+        // Slow path: at least one pseudo active OR we need to clear last
+        // tick's writes. Walk groups, sum the active edges per slot,
+        // write the result. Single linear pass — no O(n²) acc scan.
+        let mut any_nonzero = false;
+        for group in groups {
+            let mut sum: i32 = 0;
+            // pseudo_active is a HashSet; the empty-set case was already
+            // filtered out above (we only get here if it's non-empty or
+            // we're clearing). When empty, this loop just sums zeros and
+            // writes 0 to the slot, which is exactly the clear-to-zero
+            // we want for the "release everything" tick.
+            if !state.pseudo_active.is_empty() {
+                for edge in &group.edges {
+                    if state.pseudo_class_active_pair(&edge.pseudo, &edge.selector) {
+                        sum += edge.value;
+                    }
+                }
+            }
+            if group.slot < state.state_vars.len() {
+                state.state_vars[group.slot] = sum;
+            }
+            if sum != 0 {
+                any_nonzero = true;
+            }
+        }
+        self.last_apply_was_nonzero = any_nonzero;
     }
 
     /// Register a pre-tick hook that is called before each tick.
@@ -525,6 +705,13 @@ impl Evaluator {
         for hook in &self.pre_tick_hooks {
             hook(state);
         }
+
+        // Apply input-edge bindings: for each gated property, sum the
+        // values of edges whose host-state is currently active and write
+        // into the underlying state-var slot. Properties with no active
+        // edges get 0 (release semantics). Done before `compile::execute`
+        // so the bytecode sees the new value during this tick.
+        self.apply_input_edges(state);
 
         // Snapshot state vars for change detection
         let prev_vars = state.state_vars.clone();
@@ -658,6 +845,7 @@ impl Evaluator {
         for hook in &self.pre_tick_hooks {
             hook(state);
         }
+        self.apply_input_edges(state);
         compile::execute(&self.compiled, state, &mut self.slots);
         if !self.string_assignments.is_empty() {
             self.properties.clear();
@@ -699,6 +887,8 @@ impl Evaluator {
         }
         let t1 = Instant::now();
         profile.hooks += t1.duration_since(t0).as_secs_f64();
+
+        self.apply_input_edges(state);
 
         // Snapshot
         let prev_vars = state.state_vars.clone();
@@ -762,6 +952,8 @@ impl Evaluator {
         for hook in &self.pre_tick_hooks {
             hook(state);
         }
+
+        self.apply_input_edges(state);
 
         self.properties.clear();
         self.call_depth = 0;
@@ -1352,6 +1544,42 @@ fn is_buffer_copy(name: &str) -> bool {
     name.starts_with("--__0") || name.starts_with("--__1") || name.starts_with("--__2")
 }
 
+/// Resolve and group input-edge bindings by their target state-var slot.
+/// Called once on the first `apply_input_edges` after the host has loaded
+/// state vars. Bindings whose `bare(property)` doesn't resolve to a slot
+/// are silently dropped — they correspond to recogniser hits on
+/// properties the host's `program.json` filtered out, which is rare but
+/// possible.
+fn build_input_edge_groups(
+    bindings: &[InputEdgeBinding],
+    state: &State,
+) -> Vec<InputEdgeGroup> {
+    use std::collections::HashMap;
+    let mut by_slot: HashMap<usize, Vec<InputEdgeGroupEntry>> = HashMap::new();
+    for b in bindings {
+        let bare = to_bare_name(&b.property);
+        let slot = match state.var_slot(bare) {
+            Some(s) => s,
+            None => continue,
+        };
+        by_slot
+            .entry(slot)
+            .or_default()
+            .push(InputEdgeGroupEntry {
+                pseudo: b.pseudo.clone(),
+                selector: b.selector.clone(),
+                value: b.value,
+            });
+    }
+    let mut groups: Vec<InputEdgeGroup> = by_slot
+        .into_iter()
+        .map(|(slot, edges)| InputEdgeGroup { slot, edges })
+        .collect();
+    // Stable order by slot for predictable diagnostics.
+    groups.sort_by_key(|g| g.slot);
+    groups
+}
+
 /// Extract the bare register/memory name from a CSS custom property name.
 ///
 /// Strips the `--` prefix (if present) and any triple-buffer prefix
@@ -1399,12 +1627,6 @@ pub fn property_to_address(name: &str) -> Option<i32> {
     // Generic fallback: --m{N} → memory address N
     if let Some(rest) = canonical.strip_prefix('m') {
         return parse_mem_address(rest);
-    }
-
-    // keyboard / __1keyboard / __2keyboard → linear address 0x500.
-    // The CSS-DOS BIOS polls address 0x500 (word) for keystrokes.
-    if canonical == "keyboard" || canonical == "__1keyboard" || canonical == "__2keyboard" {
-        return Some(0x500);
     }
 
     None
@@ -2106,6 +2328,9 @@ mod tests {
             string_property_names: HashSet::new(),
             compiled,
             slots: Vec::new(),
+            input_edge_bindings: Vec::new(),
+            input_edge_groups: None,
+            last_apply_was_nonzero: false,
         };
         (evaluator, state)
     }
@@ -2319,6 +2544,71 @@ mod tests {
         assert_eq!(state.memory[0], 255);
         assert_eq!(result.ticks_executed, 1);
         assert!(!result.changes.is_empty());
+    }
+
+    #[test]
+    fn input_edges_drive_state_var() {
+        // Tests apply_input_edges in isolation (not the full tick
+        // pipeline) so the test stays robust to compile.rs's
+        // post-tick rep_fast_forward, which panics on cabinets
+        // without --opcode (a pre-existing constraint).
+        use crate::types::{InputEdge, PropertyDef};
+        let program = ParsedProgram {
+            properties: vec![PropertyDef {
+                name: "--keyboard".to_string(),
+                syntax: crate::types::PropertySyntax::Integer,
+                inherits: true,
+                initial_value: Some(crate::types::CssValue::Integer(0)),
+            }],
+            functions: vec![],
+            assignments: vec![],
+            input_edges: vec![
+                InputEdge {
+                    property: "--keyboard".to_string(),
+                    pseudo: "active".to_string(),
+                    selector: "kb-1".to_string(),
+                    value: Expr::Literal(561.0),
+                },
+                InputEdge {
+                    property: "--keyboard".to_string(),
+                    pseudo: "active".to_string(),
+                    selector: "kb-a".to_string(),
+                    value: Expr::Literal(7777.0),
+                },
+            ],
+            ..Default::default()
+        };
+
+        let mut state = State::default();
+        state.load_properties(&program.properties);
+        let mut evaluator = Evaluator::from_parsed(&program);
+
+        // Bindings compiled from the input edges.
+        assert_eq!(evaluator.input_edge_bindings.len(), 2);
+
+        // Nothing pressed → apply leaves slot at 0.
+        evaluator.apply_input_edges(&mut state);
+        assert_eq!(state.get_var("keyboard").unwrap(), 0);
+
+        // Press kb-1 → 561.
+        state.set_pseudo_class_active("active", "kb-1", true);
+        evaluator.apply_input_edges(&mut state);
+        assert_eq!(state.get_var("keyboard").unwrap(), 561);
+
+        // Hold kb-1, also press kb-a → sum to 8338.
+        state.set_pseudo_class_active("active", "kb-a", true);
+        evaluator.apply_input_edges(&mut state);
+        assert_eq!(state.get_var("keyboard").unwrap(), 8338);
+
+        // Release kb-a → back to 561.
+        state.set_pseudo_class_active("active", "kb-a", false);
+        evaluator.apply_input_edges(&mut state);
+        assert_eq!(state.get_var("keyboard").unwrap(), 561);
+
+        // Release kb-1 → cleared to 0.
+        state.set_pseudo_class_active("active", "kb-1", false);
+        evaluator.apply_input_edges(&mut state);
+        assert_eq!(state.get_var("keyboard").unwrap(), 0);
     }
 
     #[test]
