@@ -17,19 +17,23 @@ Cross-link: CSS-DOS
 [`docs/plans/2026-05-18-genericity-perf-cost-isolation.md`](../../CSS-DOS/docs/plans/2026-05-18-genericity-perf-cost-isolation.md)
 and LOGBOOK 2026-05-18 FINDING of the same name.
 
-Decomposed `feat/calcite-genericity` (`a89067a`, 30 files over
-`ef44f20`) into a verified per-change perf table. **No per-tick
-regression exists on the branch.** All new pattern modules
+Decomposed `feat/calcite-genericity` (`a89067a`/`3592bf0`, 30 files
+over `ef44f20`) into a verified per-change perf table **and benched
+it end-to-end** (prior log numbers treated as untrusted). One
+`doom-all --headed` run on `3592bf0` vs the on-disk `ef44f20`/
+BIF2-off baseline: **75.9 s / 448.5K t/s / doomLoad 64.8 s** vs
+baseline **77–82 s / 416–443K / 65–70 s** — at or below the fastest
+baseline run on every metric. **No regression — measured.** Static
+analysis agrees: all new pattern modules
 (`loop_descriptor`/`dispatch_specialise`/`identity_prune`) are called
 only from `Evaluator::from_parsed` (compile-time) or behind
-default-off `OnceLock` env gates; `git grep` confirms zero call sites
-in `execute`/`exec_ops`. The one default-on change (BIF2 fusion
-default-on) is the +4.5%/+8% web win. `column_drawer_fast_forward`
-deletion removes dead-by-default code. The measured
-`apply_input_edges` regression (`a5e8eee`→`6d9e80a`) is
-**`feat/keyboard-pseudo-input`**, not this branch. The only
-genericity change with unknown perf cost is the `rep_fast_forward`
-generic applier — unknown because it was never built.
+default-off `OnceLock` gates; `git grep` confirms zero call sites in
+`execute`/`exec_ops`. `column_drawer_fast_forward` deletion removes
+dead-by-default code. The `apply_input_edges` drop
+(`a5e8eee`→`6d9e80a`) is **`feat/keyboard-pseudo-input`**, not this
+branch. The only genericity change with unknown perf cost is the
+`rep_fast_forward` generic applier — unknown because it was never
+built.
 
 ---
 
