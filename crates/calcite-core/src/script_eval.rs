@@ -93,9 +93,25 @@ fn evaluate_watch(
     tick: u32,
 ) -> bool {
     let fires = match &reg.watches[idx].kind {
-        WatchKind::Stride { every } => {
+        WatchKind::Stride { every, last_fired_at } => {
             let every = *every;
-            every > 0 && tick > 0 && tick % every == 0
+            if every == 0 || tick == 0 {
+                false
+            } else {
+                // Fire if at least `every` ticks have elapsed since
+                // last fire. This is host-call-cadence independent;
+                // the previous `tick % every == 0` check required the
+                // host to poll at tick values that align with `every`,
+                // which doesn't hold when the bridge polls on adaptive
+                // batch boundaries instead of fixed strides.
+                let last = last_fired_at.get();
+                if tick.saturating_sub(last) >= every {
+                    last_fired_at.set(tick);
+                    true
+                } else {
+                    false
+                }
+            }
         }
         WatchKind::Burst { every, count } => {
             let every = *every;
@@ -421,7 +437,7 @@ mod tests {
         let mut reg = WatchRegistry::new();
         reg.register(WatchSpec {
             name: "tick100".to_string(),
-            kind: WatchKind::Stride { every: 100 },
+            kind: WatchKind::Stride { every: 100, last_fired_at: std::cell::Cell::new(0) },
             gate: None,
             actions: vec![Action::Emit],
             sample_vars: Vec::new(),
@@ -434,6 +450,37 @@ mod tests {
         }
         // ticks 100, 200, ..., 1000 = 10 fires (tick=0 excluded).
         assert_eq!(count, 10);
+    }
+
+    #[test]
+    fn stride_fires_on_unaligned_poll_cadence() {
+        // Regression: the wasm bridge calls poll() at adaptive batch
+        // boundaries that are NOT multiples of `every`. A `tick % every
+        // == 0` check would never fire here; elapsed-since-last-fire
+        // must. Poll cadence below is deliberately coprime-ish to 100.
+        let mut reg = WatchRegistry::new();
+        reg.register(WatchSpec {
+            name: "tick100".to_string(),
+            kind: WatchKind::Stride { every: 100, last_fired_at: std::cell::Cell::new(0) },
+            gate: None,
+            actions: vec![Action::Emit],
+            sample_vars: Vec::new(),
+        });
+        let mut state = empty_state();
+        let mut count = 0;
+        // Poll at 137, 274, 411, ... — never a multiple of 100.
+        let mut tick = 0u32;
+        while tick <= 10_000 {
+            tick += 137;
+            poll(&mut reg, &mut state, tick);
+            count += reg.drain_events().len();
+        }
+        // 10_000 / 100 = 100 stride windows; with a 137-tick poll step
+        // the watch fires once per poll once a full `every` has elapsed
+        // since the last fire. It must fire substantially (not zero,
+        // which is the bug) — at least once per ~137-tick window past
+        // the first, i.e. ~70+.
+        assert!(count >= 70, "stride starved on unaligned poll: only {count} fires");
     }
 
     #[test]

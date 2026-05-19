@@ -11,6 +11,49 @@ and the Criterion benchmarks.
 
 ---
 
+## 2026-05-19 — script: WatchKind::Stride regression fix (wasm poll cadence)
+
+Branch `feat/keyboard-pseudo-input`. Cross-link: CSS-DOS
+`docs/logbook/LOGBOOK.md` 2026-05-19 (same investigation, the
+companion bridge fix lives there).
+
+`baf3086` ("keyboard: :active pseudo-class input model, split from
+genericity bundle") silently reverted `WatchKind::Stride` from the
+elapsed-since-last-fire form (introduced by `e442f74`) back to
+`tick % every == 0`. The CLI watch runner is immune — it advances
+its cursor in `min_stride`-sized steps, so the tick passed to
+`poll()` is always a multiple of `every`. The wasm path
+(`run_batch_watched`) polls at `frame_counter + cumulative chunk`
+boundaries that are adaptively sized and essentially never a
+multiple of 50_000, so `tick % 50_000 == 0` was almost never true:
+the `poll` stride watch never fired, every `gate=poll` cond watch
+(title/menu/loading/ingame in the CSS-DOS doom-loading profile)
+starved, and the web bench appeared stuck even though the engine
+was executing fine (1B+ cycles, mode 0x13).
+
+Fix: restored the elapsed-since-last-fire `Stride { every,
+last_fired_at: Cell<u32> }` form across `script.rs` (enum + doc),
+`script_eval.rs` (evaluate logic), `script_spec.rs` (parse
+constructor + test pattern), `tests/script_primitives.rs` (5
+constructors), and the `calcite-cli` `min_stride` match arm
+(`{ every, .. }`). Added `script_eval::tests::
+stride_fires_on_unaligned_poll_cadence` — polls at a 137-tick
+cadence (never a multiple of `every`) and asserts the watch still
+fires, reproducing the exact wasm failure mode (would fail on the
+`% ` form, passes now). 17 script tests green.
+
+This was not a keyboard bug. The keyboard input model
+(`:has(#kb-X:active)` → input-edge recogniser → pre-tick
+`apply_input_edges`) is sound: a clean CLI `doom-loading` run
+reaches in-game at tick 34,650,000 — exact parity with the
+2026-05-02 `setvar_pulse` baseline. The prior "keyboard stuck at
+title" finding was wrong; the symptom was this stride regression
+(web) plus a CSS-DOS-side bench-run watch-wipe (logged CSS-DOS
+side). Post-fix the web `doom-loading` bench reaches in-game at
+tick 34,294,512 (`ok:true`, all six stages fire).
+
+---
+
 ## 2026-05-02 — script: setvar_pulse + cond:repeat sustain mode
 
 Closes the first follow-up from the 2026-05-01 chunk D entry: the

@@ -6,7 +6,7 @@
 //!
 //! ## Primitives
 //!
-//! * [`WatchKind::Stride`] — fires every N ticks (cheap; one mod compare).
+//! * [`WatchKind::Stride`] — fires every N ticks (cheap; elapsed-since-last-fire).
 //! * [`WatchKind::Burst`] — fires on K consecutive ticks every N (cheap).
 //! * [`WatchKind::At`] — fires exactly once at a target tick (cheap;
 //!   replaces the old `--script-event` scheduling).
@@ -92,8 +92,19 @@ pub struct WatchSpec {
 /// docs for the cheap/expensive split.
 #[derive(Debug)]
 pub enum WatchKind {
-    /// Fire every `every` ticks. Cheap.
-    Stride { every: u32 },
+    /// Fire every `every` ticks. Cheap. Uses `last_fired_at` to track
+    /// the last tick we fired on so we don't depend on the host calling
+    /// poll() at tick values divisible by `every` — fires whenever
+    /// `tick - last_fired_at >= every`. The CLI naturally aligns its
+    /// poll cadence to stride boundaries; the wasm bridge polls on
+    /// adaptive batch boundaries that may not align.
+    Stride {
+        every: u32,
+        /// Internal: tick of the most recent fire. Initialised to 0 so
+        /// the first poll past `every` fires regardless of starting
+        /// tick value.
+        last_fired_at: Cell<u32>,
+    },
     /// Fire on `count` consecutive ticks every `every` ticks. Cheap.
     Burst { every: u32, count: u32 },
     /// Fire exactly once at tick `tick`. Cheap. Replaces the old
@@ -413,7 +424,7 @@ mod tests {
         let mut r = WatchRegistry::new();
         let idx = r.register(WatchSpec {
             name: "tick".to_string(),
-            kind: WatchKind::Stride { every: 100 },
+            kind: WatchKind::Stride { every: 100, last_fired_at: Cell::new(0) },
             gate: None,
             actions: vec![Action::Emit],
             sample_vars: Vec::new(),

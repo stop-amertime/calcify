@@ -1420,7 +1420,7 @@ fn main() {
                             calcite_core::script::WatchKind::At { tick: t } => {
                                 at_targets.push(t);
                             }
-                            calcite_core::script::WatchKind::Stride { every } => {
+                            calcite_core::script::WatchKind::Stride { every, .. } => {
                                 if every > 0 && every < min_stride {
                                     min_stride = every;
                                 }
